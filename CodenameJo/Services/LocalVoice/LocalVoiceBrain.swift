@@ -3,7 +3,7 @@ import Foundation
 import FoundationModels
 
 /// What answers on a local call: the dispatch worker's tool loop over `/v1/responses` on the user's key,
-/// or, with no key or no connection, Apple's on-device model with no tools.
+/// or, with no key or no connection, Apple's on-device model with the calendar tools.
 enum LocalVoiceBrain {
     enum Engine: String, Equatable {
         case openAI, onDevice
@@ -165,21 +165,24 @@ enum LocalVoiceBrain {
 
     // MARK: - On device
 
-    static func offlinePrompt(_ transcript: String, history: [Exchange]) -> String {
+    /// The turn as the on-device model reads it, dated so "tomorrow" and "Thursday" can become a day offset.
+    static func offlinePrompt(_ transcript: String, history: [Exchange], now: Date = Date()) -> String {
         let context = history.suffix(4).map { "User: \($0.user.prefix(600))\nJo: \($0.assistant.prefix(600))" }
             .joined(separator: "\n\n")
-        return context.isEmpty ? transcript
-            : "Recent conversation, for context only:\n\(context)\n\nCurrent user message:\n\(transcript)"
+        let dated = "Now: \(LocalVoiceCalendar.spokenNow(now)).\n"
+        return context.isEmpty ? dated + transcript
+            : dated + "Recent conversation, for context only:\n\(context)\n\nCurrent user message:\n\(transcript)"
     }
 
     private static func respondOnDevice(_ transcript: String, history: [Exchange],
                                         text: LivePrompt.Text = .bundled,
                                         delta: (String) -> Void) async throws {
         guard onDeviceAvailable else { throw NoBrain() }
-        let session = LanguageModelSession(instructions: try text(offlinePromptName))
         let started = Date()
+        let session = LanguageModelSession(tools: LocalVoiceCalendar.tools(transcript: transcript, now: started),
+                                           instructions: try text(offlinePromptName))
         var previous = ""
-        for try await snapshot in session.streamResponse(to: offlinePrompt(transcript, history: history),
+        for try await snapshot in session.streamResponse(to: offlinePrompt(transcript, history: history, now: started),
                                                          options: GenerationOptions(temperature: 0.5,
                                                                                     maximumResponseTokens: 220)) {
             try Task.checkCancellation()

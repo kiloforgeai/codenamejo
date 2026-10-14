@@ -243,8 +243,9 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
                     icon: "iphone.and.arrow.forward",
                     detail: "Everything stays on this phone: speech recognition, Apple's on-device "
                         + "model and the phone's own voice. Nothing goes to OpenAI. Jo can still "
-                        + "go through your inbox with you — archive, skip, draft a reply — talking "
-                        + "to Gmail directly, but can't reach your calendar. Off, the phone's "
+                        + "go through your inbox with you — archive, delete, mark spam, file under "
+                        + "a label, draft a reply — and read or add to your calendar, talking to "
+                        + "Google directly. Off, the phone's "
                         + "voice still steps in on its own whenever the live call can't connect "
                         + "or drops, keeping your mail and calendar while there's a connection."
                 )

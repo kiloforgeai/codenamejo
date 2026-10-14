@@ -32,8 +32,13 @@ final class LocalVoiceBrainTests: XCTestCase {
     }
 
     func testTheOfflinePromptKeepsOnlyRecentContextAndTheInstructionsEndWithTheLocalPrompt() throws {
-        XCTAssertEqual(LocalVoiceBrain.offlinePrompt("hi", history: []), "hi")
-        let prompt = LocalVoiceBrain.offlinePrompt("hi", history: [.init(user: "u", assistant: "a")])
+        let now = Date(timeIntervalSince1970: 1_792_005_120)
+        let bare = LocalVoiceBrain.offlinePrompt("hi", history: [], now: now)
+        XCTAssertTrue(bare.hasPrefix("Now: "))
+        XCTAssertTrue(bare.contains(LocalVoiceCalendar.spokenNow(now)))
+        XCTAssertTrue(bare.hasSuffix("\nhi"))
+        let prompt = LocalVoiceBrain.offlinePrompt("hi", history: [.init(user: "u", assistant: "a")], now: now)
+        XCTAssertTrue(prompt.hasPrefix("Now: "))
         XCTAssertTrue(prompt.hasSuffix("Current user message:\nhi"))
         XCTAssertTrue(prompt.contains("User: u\nJo: a"))
         let instructions = try LocalVoiceBrain.instructions(mail: true, calendar: false, notion: false)
