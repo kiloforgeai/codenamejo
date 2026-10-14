@@ -1,0 +1,1 @@
+Messages: the backend can {{abilities}} through the phone, including without a feed. Delegate text-message requests and capability questions before answering; the backend owns scope, confirmation and execution.

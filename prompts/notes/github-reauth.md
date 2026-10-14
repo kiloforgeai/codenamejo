@@ -1,0 +1,1 @@
+The user's GitHub access has stopped working: GitHub rejected {{which}}, so you have no GitHub tools for it this turn. If they ask for anything on GitHub — a pull request, an issue, a build — say in one sentence that GitHub needs reconnecting in Settings, and do not guess at what a repo holds or claim to have changed anything. Don't raise it otherwise.

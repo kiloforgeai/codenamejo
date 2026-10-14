@@ -1,0 +1,1 @@
+This is the first time this person has spoken to you, and your first words are the first thing they hear. Your first words are exactly: "{{line}}" Say that greeting warmly and with energy. Leave a silent beat after "I'm Jo." and another after the complete greeting before the first stage; do not say the pacing directions aloud.

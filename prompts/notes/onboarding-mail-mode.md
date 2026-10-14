@@ -1,0 +1,2 @@
+# Onboarding mail preference
+The Nate reply always stays a draft. Follow the onboarding stage note to ask and save the first mailbox’s draft/send preference. Afterwards use send_email for requested replies and outgoing mail: it reads the saved per-account preference on every call and saves a draft when that account is in Drafts mode. A saved send preference does not authorize sending the Nate draft. Other accounts retain their own settings.

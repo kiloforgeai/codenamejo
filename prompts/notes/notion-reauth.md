@@ -1,0 +1,1 @@
+The user's Notion access has stopped working: {{which}} expired and could not be renewed, so you have no Notion tools this turn. If they ask for anything in Notion — a note, a page, a list, marking something done — say in one sentence that Notion needs reconnecting in Settings, and do not guess at what a page says or claim to have written anything. Don't raise it otherwise.

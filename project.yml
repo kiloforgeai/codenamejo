@@ -1,0 +1,387 @@
+name: CodenameJo
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+options:
+  # **26.4 for CarPlay, and it is a smaller decision than the 26.0 one was.**
+  # 26.0 was a *hardware* cut — A13 or later, so iPhone XR/XS/XS Max can no longer
+  # install the app at all. This is a
+  # point release: it excludes no device, only users who haven't updated iOS, and no
+  # toggle reverses it for them either — the App Store keeps serving them the last
+  # 26.0-floored build.
+  #
+  # **Why not a runtime gate.** The entitlement requires 26.4, but so do the only
+  # controls the voice template has: `CPVoiceControlTemplate.actionButtons`,
+  # `maximumActionButtonCount` and the navigation-bar buttons are all
+  # `API_AVAILABLE(ios(26.4))`. Below 26.4 the template renders a voice indicator
+  # with no Mute and no End on it, which is a worse product than no CarPlay — and
+  # the icon cannot be hidden per user, so "no CarPlay" is not available either.
+  # Gating would also have introduced the first `@available` in these sources.
+  #
+  # The cost, stated plainly: users on 26.0–26.3 stop receiving *every* app update,
+  # not just this feature. Re-check install-base analytics before citing 26.4
+  # adoption as a fact, the same way the 26.0 entry says its own claim should be.
+  deploymentTarget:
+    iOS: "26.4"
+packages:
+  Prefire:
+    url: https://github.com/BarredEwe/Prefire
+    exactVersion: 5.7.1
+  swift-snapshot-testing:
+    url: https://github.com/pointfreeco/swift-snapshot-testing
+    exactVersion: 1.19.4
+  # Compile-time-safe DI container. 3.x renamed the library product from
+  # `Factory` to `FactoryKit`, so the import is `import FactoryKit`.
+  Factory:
+    url: https://github.com/hmlongco/Factory
+    exactVersion: 3.3.2
+  # IMVVM is NOT here on purpose — it is vendored under
+  # CodenameJo/ThirdPartyCode/IMVVM. Upstream
+  # (github.com/neakor/swiftui-imvvm) last shipped code in June 2023 and has 14
+  # stars, so an SPM pin buys nothing an unmaintained dependency can deliver:
+  # no fixes are coming, and the vendored copy already drops its
+  # swift-collections/OrderedCollections dependency. Factory above is the
+  # opposite case — actively maintained, so it takes the package.
+  # SQLite with FTS5, for the on-device tool-result store (`LocalContextStore`).
+  # Not SwiftData and not `app_records`: the rows are Google's data rather than
+  # the user's own records, they are written from inside a live voice turn, and
+  # what makes them useful is a full-text index — none of which the Data API
+  # offers. Latest at the time of adding.
+  GRDB:
+    url: https://github.com/groue/GRDB.swift
+    exactVersion: 7.11.1
+  # Prebuilt WebRTC binary (Google's libwebrtc). iOS ships no built-in WebRTC,
+  # so this is required for the OpenAI Realtime WebRTC transport (the transport
+  # OpenAI recommends for mobile). Binary xcframework, no swift-syntax macros.
+  #
+  # **This was `stasel/WebRTC` at M150 and moved to LiveKit's build at M144 so
+  # that a call can be recorded.** Stock libwebrtc has no audio sink of any kind:
+  # `RTCAudioTrack` exposes only `source`, and while `RTCVideoRenderer` exists
+  # there is no audio equivalent, so neither side of a hands-free call could be
+  # captured. LiveKit builds from `webrtc-sdk/webrtc`, which patches in
+  # `RTCAudioRenderer` (`render(pcmBuffer:)`) plus `addRenderer:`/`removeRenderer:`
+  # on the track, and a `RTCAudioCustomProcessingDelegate` that hands over
+  # post-AEC capture frames. `SessionRecorder` needs both.
+  #
+  # Four costs, all knowingly accepted:
+  #  - **Upstream fixes arrive on LiveKit's cadence, not ours.** This is M144
+  #    where stasel was M150, but "six milestones back" is not itself the cost —
+  #    `144.7559.11` is LiveKit's *current* release, so the gap is between two
+  #    vendors' release cadences and cannot be closed by choosing a different
+  #    pin. What it actually means: libwebrtc is a network-facing C++ stack that
+  #    parses untrusted RTP/SRTP/DTLS, so upstream security fixes matter, and we
+  #    now wait on LiveKit to cut a build instead of bumping ourselves. The
+  #    exposure is narrower than it sounds — the only peer is OpenAI's Realtime
+  #    endpoint over DTLS-SRTP, not arbitrary internet peers — but a libwebrtc
+  #    bug fixed in M145–M150 is one we sit on until LiveKit ships it.
+  #  - **Symbols are `LK`-prefixed** (the build sets `RTC_OBJC_TYPE_PREFIX=LK`),
+  #    so every `RTCFoo` imports as `LKRTCFoo`. `WebRTCAliases.swift` maps them
+  #    back in one place; call sites still read as ordinary WebRTC code.
+  #  - **No `.dSYM` in the release**, so a crash inside libwebrtc comes back
+  #    unsymbolicated. There is no vendor-supplied symbol path to point at.
+  #  - MIT, and it ships a `PrivacyInfo.xcprivacy` declaring no collected data
+  #    and no tracking (required-reason: boot time, file timestamp). The licence
+  #    notice belongs in the third-party notices before this ships.
+  #
+  # Pinned exactly, not `from:` — the version *is* the audit. A minor bump moves
+  # the audio patches this app now depends on, so it should be a deliberate
+  # re-check rather than something resolution does on its own.
+  WebRTC:
+    url: https://github.com/livekit/webrtc-xcframework
+    exactVersion: 144.7559.14
+  # The local call's voice and turn detection, ported from the Local Jo prototype.
+  # FluidAudio (Apache-2.0) supplies Silero VAD for Smart Turn and the Misaki
+  # lexicon + G2P that the Paradee voice is phonemized with. Pinned to the commit
+  # Local Jo was trialled on, not a release: the G2P types it uses are what was
+  # tested. ONNX Runtime (MIT) runs Paradee-8M, Kokoro-82M's af_heart voice
+  # distilled, on the CPU. Both are linked only for `Services/LocalVoice`.
+  FluidAudio:
+    url: https://github.com/FluidInference/FluidAudio
+    revision: 04e363c29d9a754022d602d6fe1468ab80a0f705
+  onnxruntime:
+    url: https://github.com/microsoft/onnxruntime-swift-package-manager
+    exactVersion: 1.24.2
+  #
+  # Two packages are deliberately absent, both gone with **D28**. (`FluidAudio`
+  # went on 2026-08-07 with the turn-based voice path and its Supertonic-3 and
+  # PocketTTS voices, and came back above with the local call's Paradee voice.
+  # **Check for a stranded package after deleting a feature**: nothing in the
+  # build fails when one is linked and unused.)
+  #
+  # - `WhisperKit` (Argmax's `argmax-oss-swift`), for its `TTSKit` product — the
+  #   Qwen3-TTS voice. Its `WhisperKit` STT product went with **D20**; the pin
+  #   stayed only for that voice, and nothing imports `TTSKit` now.
+  # - `mlx-swift`, for the vendored Magpie voice (`ThirdPartyCode/MagpieTTS`,
+  #   also deleted). It was the app's only GPU-side dependency and the only
+  #   reason the CI workflows installed Xcode 26's separate ~688 MB Metal
+  #   toolchain component — mlx-swift compiles `.metal` shaders. Those steps are
+  #   gone now (2026-07-31); re-adding a package with shader sources means
+  #   re-adding them to build-check.yml and build-and-upload.yml too.
+  #
+  # Don't re-add either without the voice that needs it. `speech-swift` is still
+  # not an option if Magpie ever comes back: it pulls swift-transformers, which
+  # SwiftPM refuses to resolve alongside the WhisperKit *package* ("Disabled
+  # default traits on package 'swift-transformers'"), which is why Magpie was
+  # vendored in the first place.
+targets:
+  CodenameJo:
+    type: application
+    platform: iOS
+    deploymentTarget: "26.4"
+    # `Shared` is top-level rather than under `CodenameJo/` deliberately:
+    # it is compiled into BOTH this target and JoLiveActivity, and a directory
+    # nested inside another target's source root that is also listed by a second
+    # target makes Xcode warn that the project is malformed ("file reference is a
+    # member of multiple groups"). Its position says what it is.
+    #
+    # What's in it: the ActivityAttributes, the two Live Activity intents, and the
+    # remote-control seam — which is how a widget can build `Button(intent:)` for
+    # an intent whose body runs in the app process. See Shared/VoiceRemoteControl.swift.
+    sources:
+      - CodenameJo
+      - Shared
+      - WatchShared
+      # The Live prompt text, bundled as `prompts/` and assembled by `LivePrompt`.
+      - path: prompts
+        type: folder
+        buildPhase: resources
+      # Smart Turn v3.2 (BSD-2-Clause), the local call's end-of-turn model, with its
+      # licence and provenance. See `SemanticTurnDetector`.
+      - path: SmartTurn
+        type: folder
+        buildPhase: resources
+    configFiles:
+      Debug: Config/Version.xcconfig
+      Release: Config/Version.xcconfig
+    dependencies:
+      - package: Prefire
+        product: Prefire
+      - package: GRDB
+        product: GRDB
+      - package: WebRTC
+        product: LiveKitWebRTC
+      - package: Factory
+        product: FactoryKit
+      - package: FluidAudio
+      - package: onnxruntime
+      # Embedded so the Live Activity has somewhere to be drawn. XcodeGen puts an
+      # `app-extension` dependency in the Embed Foundation Extensions phase.
+      - target: JoLiveActivity
+        embed: true
+      - target: JoWatch
+        embed: true
+    settings:
+      base:
+        # **Automatic, and CarPlay did not change that — tested rather than assumed.**
+        # Apple's CarPlay Developer Guide says to "turn off Automatically manage
+        # signing", so this was briefly `Manual` on that instruction. A device build on
+        # 2026-08-17 disproved the need: with `Automatic` plus
+        # `-allowProvisioningUpdates`, Xcode regenerated the managed profile, picked up
+        # the CarPlay capability from the App ID, and the signed app carries
+        # `com.apple.developer.carplay-voice-based-conversation`. Verified with
+        # `codesign -d --entitlements -` on the built `.app` and on its
+        # `embedded.mobileprovision`.
+        #
+        # **`Manual` was worse than unnecessary here.** Automatic signing *reconciles*
+        # the entitlements file against the profile — the file asks for
+        # `aps-environment: production` and a development profile grants `development`,
+        # so Xcode substitutes the profile's value and the build succeeds. Manual
+        # signing validates instead of reconciling, which is what the entitlements
+        # file's own comment means by a development profile "refusing to sign" a
+        # `production` entitlement. So `Manual` would have blocked every local Debug
+        # device build to buy a capability `Automatic` already provisions.
+        #
+        # What CarPlay *does* require is the capability on the **App ID** — enabled
+        # 2026-08-17. CI needs nothing beyond that: `scripts/create_profile.py`
+        # recreates the App Store profile from the App ID every run, and
+        # `.github/workflows/build-and-upload.yml` patches its own
+        # `CODE_SIGN_STYLE=Manual` plus per-target profiles onto the project anyway, so
+        # this setting never reaches the TestFlight path.
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: CodenameJo/CodenameJo.entitlements
+        INFOPLIST_FILE: CodenameJo/Resources/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID)
+        PRODUCT_NAME: CodenameJo
+        SWIFT_VERSION: "5.0"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS: YES
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+        SWIFT_EMIT_LOC_STRINGS: YES
+        # iPhone-only. A universal binary makes App Store Connect hard-require
+        # an iPad Pro 12.9" screenshot set (with deliver's 2nd/3rd-gen naming
+        # minefield) and adds an iPad UI surface nobody designs for.
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
+      configs:
+        Debug:
+          ENABLE_TESTABILITY: YES
+        Release:
+          ENABLE_TESTABILITY: NO
+  JoWatch:
+    type: application
+    platform: watchOS
+    deploymentTarget: "26.0"
+    sources:
+      - JoWatch
+      - WatchShared
+      - path: CodenameJo/ThirdPartyCode/IMVVM
+        group: CodenameJo/ThirdPartyCode
+    dependencies:
+      - package: Factory
+        product: FactoryKit
+    configFiles:
+      Debug: Config/Version.xcconfig
+      Release: Config/Version.xcconfig
+    info:
+      path: JoWatch/Info.plist
+      properties:
+        CFBundleDisplayName: Codename Jo
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: "1"
+        WKApplication: true
+        WKCompanionAppBundleIdentifier: $(APP_BUNDLE_ID)
+        WKRunsIndependentlyOfCompanionApp: false
+        NSMicrophoneUsageDescription: Talk to Jo through your Apple Watch.
+        UIBackgroundModes: [audio]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID).watchkitapp
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "4"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SKIP_INSTALL: YES
+
+  # The Lock Screen / Dynamic Island surface for a background voice session.
+  #
+  # Links nothing: no packages, no app services. Everything it needs is the
+  # three files under `Shared/`, which are compiled into the app as well. That
+  # constraint is the design — an extension that linked RevenueCat and WebRTC
+  # to draw a button would be paying a launch cost on every Lock Screen render.
+  #
+  # Its colours are literals rather than `Theme`'s named colours for the same
+  # reason: the app's asset catalog lives in the app bundle, and a second copy
+  # here would drift. The one catalog it does carry (`Media.xcassets`) holds
+  # only the custom `OrbPedestal` symbol for the Start Voice control — a symbol
+  # image has to live in the bundle that draws it, and it duplicates nothing
+  # in the app.
+  JoLiveActivity:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "26.4"
+    sources:
+      - JoLiveActivity
+      - Shared
+    # Same source of truth as the app. App Store validation rejects a bundle
+    # whose embedded extension carries a different CFBundleShortVersionString,
+    # so this is not cosmetic — without it `$(MARKETING_VERSION)` resolves empty
+    # and the archive fails upload rather than at build.
+    configFiles:
+      Debug: Config/Version.xcconfig
+      Release: Config/Version.xcconfig
+    settings:
+      base:
+        PRODUCT_NAME: JoLiveActivity
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID).liveactivity
+        INFOPLIST_FILE: JoLiveActivity/Info.plist
+        SWIFT_VERSION: "5.0"
+        CODE_SIGN_STYLE: Automatic
+        # Widget extensions render into the system's process-managed UI; the
+        # asset symbol generation and app-icon settings the app target carries
+        # are meaningless here.
+        SKIP_INSTALL: YES
+        TARGETED_DEVICE_FAMILY: "1"
+
+  CodenameJoTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "26.4"
+    sources: [CodenameJoTests]
+    configFiles:
+      Debug: Config/Version.xcconfig
+      Release: Config/Version.xcconfig
+    dependencies:
+      - target: CodenameJo
+      - package: Prefire
+        product: Prefire
+      - package: swift-snapshot-testing
+        product: SnapshotTesting
+    settings:
+      base:
+        PRODUCT_NAME: CodenameJoTests
+        SWIFT_VERSION: "5.0"
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/CodenameJo.app/CodenameJo
+        BUNDLE_LOADER: $(TEST_HOST)
+        # This target now exists only to host Prefire's generated PreviewTests.swift
+        # — the Screenshots workflow writes it into CodenameJoTests/ and runs
+        # -only-testing:CodenameJoTests, so the target, its Prefire and
+        # snapshot-testing dependencies, and its place in the scheme all have to stay
+        # even though the folder holds nothing but a placeholder. The hand-written
+        # unit tests were deleted deliberately: only tests that render a screen earn
+        # their keep here. Signing is inert in CI (CODE_SIGNING_ALLOWED=NO).
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: YES
+  # On-demand UI navigation on a physical device. One compiled driver whose
+  # actions arrive at launch via TEST_RUNNER_UI_SCRIPT, so asking the app a new
+  # question costs a rerun rather than a rebuild. See
+  # CodenameJoUITests/NavigationDriverUITests.swift.
+  #
+  # Deliberately NOT in the CodenameJo scheme: that scheme is what CI and
+  # the documented test command run, and UI tests need a booted app, real
+  # signing, and minutes rather than seconds. It gets its own scheme instead.
+  CodenameJoUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "26.4"
+    sources: [CodenameJoUITests]
+    configFiles:
+      Debug: Config/Version.xcconfig
+      Release: Config/Version.xcconfig
+    dependencies:
+      - target: CodenameJo
+    settings:
+      base:
+        PRODUCT_NAME: CodenameJoUITests
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID).uitests
+        SWIFT_VERSION: "5.0"
+        TEST_TARGET_NAME: CodenameJo
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  JoWatch:
+    build:
+      targets:
+        JoWatch: all
+    run:
+      config: Debug
+  CodenameJoUITests:
+    build:
+      targets:
+        CodenameJo: all
+        CodenameJoUITests: [test]
+    test:
+      config: Debug
+      # A plan, only so screen recording can be forced on. Xcode's default keeps
+      # video when the *test* fails, which is not when validation fails: an
+      # injected run whose taps all land exits 0 and the recording of the
+      # conversation going wrong is deleted.
+      testPlans:
+        - path: CodenameJoUITests.xctestplan
+          defaultPlan: true
+      targets:
+        - CodenameJoUITests
+      gatherCoverageData: false
+  CodenameJo:
+    build:
+      targets:
+        CodenameJo: all
+        CodenameJoTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - CodenameJoTests
+      gatherCoverageData: true
+      coverageTargets:
+        - CodenameJo

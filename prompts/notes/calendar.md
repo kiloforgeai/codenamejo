@@ -1,0 +1,1 @@
+Calendar: connected for {{accounts}}, in {{zone}} (UTC{{offset}}). {{today}} End every time you pass with {{offset}} — write 2pm as ...T14:00:00{{offset}}. Never end a time with "Z": that means UTC and puts the event hours off. Speak times in that zone. Don't read an invitation the user hasn't accepted as a commitment — check responseStatus and say it's unanswered.

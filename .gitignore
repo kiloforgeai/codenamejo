@@ -1,0 +1,22 @@
+xcuserdata/
+*.xcuserstate
+build/
+DerivedData/
+.coverage/
+.coverage-tools/
+.DS_Store
+._*
+.swiftpm/
+*.xcworkspace/xcuserdata
+*.xcodeproj/
+
+# Local secrets — never commit.
+.env.local
+.env
+
+# Signing team, bundle ID and Google client — see Config/Local.xcconfig.example.
+Config/Local.xcconfig
+
+# Local Claude Code state and agent worktrees; project skills are shared.
+.claude/*
+!.claude/skills/

@@ -1,0 +1,120 @@
+{
+  "lessons": [
+    {
+      "capability": "feed",
+      "copy": "You're in your Feed right now. I bring up to-dos from all your connected tools, giving you an overview of what needs your attention. When I read an email, say what you want done, such as 'Archive this email' or 'Read the full email,' and I'll help you work through it."
+    },
+    {
+      "capability": "slack_connect",
+      "copy": "I work with Slack too. Once it's connected, I'll go through the Slack conversations waiting for you alongside your email, and you can reply, react, or mark them read just by saying so. Connect it in Settings, under Slack."
+    },
+    {
+      "capability": "voice_only",
+      "copy": "You never need to look at your phone with me. Everything you can do here, you can do by voice — put it in your pocket or on the counter and keep going while you walk, cook, or drive."
+    },
+    {
+      "capability": "archive_after_reply",
+      "copy": "When you reply to an email, I can take it out of your inbox at the same time, so answering it is what files it."
+    },
+    {
+      "capability": "archive_after_forward",
+      "copy": "When you forward an email to someone else, I can archive it, so handing it to the right person is what clears it."
+    },
+    {
+      "capability": "archive_after_label",
+      "copy": "When you file an email under a label, I can archive it in the same step, so it is filed rather than filed and still sitting in your inbox."
+    },
+    {
+      "capability": "dispatch",
+      "copy": "Dispatch handles longer work while we keep reviewing your inbox. Say 'Research the company in this email in the background and summarize what they do'; tell me the task and the result you want, and I'll hand it to Dispatch and bring back the result when it's ready."
+    },
+    {
+      "capability": "commands",
+      "copy": "You can save several steps as one voice command. Say 'Save a command called company research: look up the company in this email on the web, then summarize what it does'; choose your own short name and describe your steps in order. Once I confirm it's saved, say 'company research' while reviewing an email to run those steps again."
+    },
+    {
+      "capability": "feed_items",
+      "copy": "I can look things up for you every morning and tell you when you first call. Say 'Add Nvidia stock to my feed' or 'Add the weather in San Francisco to my feed.' Say 'What's in my feed' to hear the list, or 'Remove the weather' to stop one."
+    },
+    {
+      "capability": "bulk_sender_cleanup",
+      "copy": "You can clear messages from one sender together. While reviewing one of their emails, say 'Archive all remaining inbox messages from this sender,' or 'Label the remaining messages from this sender Receipts'; tell me the label name and whether you also want them archived."
+    },
+    {
+      "capability": "unsubscribe",
+      "copy": "You can ask me to unsubscribe and clean up a sender's mail. While reviewing their email, say 'Unsubscribe me from this sender and archive their remaining inbox messages'; I'll check the available unsubscribe method and tell you if you need to finish on a website."
+    },
+    {
+      "capability": "calendar_actions",
+      "copy": "You can turn an email into a calendar event. Say 'Add a follow-up for this email tomorrow at 2 p.m. for 30 minutes'; give me the date, time, and duration, and name anyone you want invited. If guests will be notified, I'll ask you to confirm before sending invitations."
+    },
+    {
+      "capability": "draft_vs_send",
+      "copy": "Choose how each inbox handles replies in Settings, under Sending: turn its switch on to save drafts, or off to send when you ask. With drafts on, say 'Reply saying Tuesday works for me,' then open Drafts in your mail app to review and send it yourself. With the switch off, that same request sends the reply."
+    },
+    {
+      "capability": "full_email_details",
+      "copy": "If a summary leaves something out, say 'Read the full email' while we're reviewing it. You can also ask 'What exactly did they say about the deadline?' and I'll check the message for that detail."
+    },
+    {
+      "capability": "related_context",
+      "copy": "You can ask me to find background in your connected email or calendar. Say 'Find earlier emails from this sender about the contract,' or 'Look for the meeting about the contract on my calendar'; name the person, topic, or date to help me find the right conversation."
+    },
+    {
+      "capability": "notion_notes",
+      "copy": "Your Notion is connected, so I can file a thought there or find one later. Say 'Add a note to my Ideas page that we should try annual pricing,' or 'What's still open in my Tasks database?' I search first and add to a page that exists rather than making a second one."
+    },
+    {
+      "capability": "notion_connect",
+      "copy": "I work with Notion too. Once it's connected, I can find and read your pages, file a note where you say, and mark things done in a database. Connect it in Settings, under Notion."
+    },
+    {
+      "capability": "queue_controls",
+      "copy": "Say 'Skip this email' to move on, 'Go back' to revisit the previous item, or 'Pause the inbox review' to stop. To choose a different set, say 'Review unread emails from today'; to start over, say 'Restart the inbox review.'"
+    },
+    {
+      "capability": "phone_mode",
+      "copy": "Phone mode needs no setup: during a call, hold your iPhone to your ear to move my voice from the loudspeaker to the earpiece and turn off the screen. Move it away from your ear to turn the screen back on and return to the loudspeaker."
+    },
+    {
+      "capability": "siri_launch",
+      "copy": "Say 'Hey Siri, open Codename Jo' to open the app. If I'm not listening yet, return to the main voice screen and tap the orb. You can also assign Start Voice Command to your iPhone's Action Button."
+    },
+    {
+      "capability": "airpods",
+      "copy": "Connect your AirPods to your iPhone, then start a Jo conversation. You'll hear me through your AirPods and can speak through their microphone, even with the phone in your pocket."
+    },
+    {
+      "capability": "profiles",
+      "copy": "Profiles keep separate sets of inboxes and conversations. Tap the profile name at the top of the main voice screen to add one, then connect its email there. Once you have a second, say 'Switch to my Work profile' and I'll change over and open that profile's inbox. An inbox belongs to one profile, so I only see the mail in the one you're in."
+    },
+    {
+      "capability": "multi_account_routing",
+      "copy": "If you've connected multiple inboxes, say 'Switch to my work inbox,' using its email address if the name is ambiguous. For a particular message, say 'Send this from my work account' and identify the connected address you want me to use."
+    },
+    {
+      "capability": "preferences_memory",
+      "copy": "You can give me a preference by saying 'For the rest of this conversation, keep email summaries to one sentence.' Tell me the behavior you want; this applies during our conversation and does not change your saved settings."
+    },
+    {
+      "capability": "undo_history",
+      "copy": "To review past activity, tap History at the top of the main voice screen. If you just archived an email by mistake, say 'Undo that archive' or 'Bring that email back to my inbox'; I can reverse supported mailbox actions, but cannot unsend an email."
+    },
+    {
+      "capability": "granola_meetings",
+      "copy": "Your Granola notes are connected, so you can ask about a past meeting by voice. Say 'What did we decide in Tuesday's sync with Rob?' and I'll find the meeting and answer from its notes."
+    },
+    {
+      "capability": "granola_action_items",
+      "copy": "I can pull the action items out of your meetings. Say 'What am I on the hook for from this week's meetings?' and I'll go through each one's next steps, starting with the ones you own."
+    },
+    {
+      "capability": "github_connect",
+      "copy": "I work with GitHub too. Connect it in Settings, under Connections, and you can ask what's waiting on your review or whether the build passed, without opening a laptop."
+    },
+    {
+      "capability": "github_reviews",
+      "copy": "Say 'What pull requests are waiting on my review?' or 'Why did the last build on main fail?' and I'll check GitHub. I can also merge a pull request, file an issue or start a workflow; I read those back first and wait for your yes."
+    }
+  ]
+}

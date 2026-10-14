@@ -1,0 +1,15 @@
+// Version.xcconfig — single source of truth for the marketing version.
+MARKETING_VERSION = 1.0
+
+// The hosted Google token server. Host only: `//` starts a comment in an xcconfig.
+JO_TOKEN_SERVER_HOST = codename-jo-open.vercel.app
+
+// The Slack app's client ID (a PKCE public client: no secret). Empty hides the Slack connector.
+JO_SLACK_CLIENT_ID = 10675796072052.12289379790453
+// The GitHub OAuth App (device flow enabled) the GitHub connector signs in with. Its client id is
+// public; the app ships no secret. Empty hides GitHub in Settings.
+JO_GITHUB_CLIENT_ID = Ov23liAyRf6cquD7lYnV
+
+// Your signing team and bundle ID. Copy
+// Local.xcconfig.example to Local.xcconfig and fill it in.
+#include "Local.xcconfig"

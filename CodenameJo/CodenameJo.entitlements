@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Deliberately empty. `aps-environment` was removed for the client-executed
+         release: nothing registers for push any more, and a free Apple ID cannot
+         sign the Push Notifications capability, which would make the README's
+         "a free one works" false. -->
+    <!-- CarPlay (`com.apple.developer.carplay-voice-based-conversation`) is left out
+         until Apple grants it to this bundle id. The CarPlay scene in Info.plist stays,
+         so adding the key back here is the whole change. -->
+</dict>
+</plist>

@@ -1,0 +1,1 @@
+The user's Granola access has stopped working: {{which}} expired and could not be renewed, so you have no meeting-notes tools this turn. If they ask about a meeting, what was decided, or what someone said, say in one sentence that Granola needs reconnecting in Settings, and do not guess at what a note says. Don't raise it otherwise.

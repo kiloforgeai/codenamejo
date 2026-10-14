@@ -1,0 +1,197 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundlePackageType</key>
+    <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+    <!-- **Both names, and they are read by different things.** `CFBundleDisplayName`
+         is the Home Screen label; `CFBundleName` is what the system quotes in its own
+         alerts — including `ASWebAuthenticationSession`'s "… Wants to Use
+         accounts.google.com to Sign In", which is the first sentence a new user reads
+         and used to quote the build's internal name.
+         Not `$(PRODUCT_NAME)`: that is the binary's name and renaming it renames the
+         .app, the scheme's product and the Live Activity's host. -->
+    <key>CFBundleName</key>
+    <string>Codename Jo</string>
+    <key>CFBundleDisplayName</key>
+    <string>Codename Jo</string>
+    <!-- Names Siri's launcher does not resolve, so an "Open …" phrase reaches the App
+         Shortcut instead. A variant of the display name is claimed by the launcher. -->
+    <key>INAlternativeAppNames</key>
+    <array>
+        <dict>
+            <key>INAlternativeAppName</key>
+            <string>Jo</string>
+            <key>INAlternativeAppNamePronunciationHint</key>
+            <string>Joe</string>
+        </dict>
+        <dict>
+            <key>INAlternativeAppName</key>
+            <string>Joe</string>
+        </dict>
+    </array>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>$(MARKETING_VERSION)</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
+    <!-- The launch frame is the app ground, not the accent: AccentColor here meant
+         every cold start opened on a full-screen brand violet and then cut to a
+         near-white (or obsidian) screen. ThemeBackground carries both appearance
+         variants, so the launch frame now matches the first real frame in either
+         mode. Note this resolves against the *system* appearance — an in-app
+         appearance pin can't reach it, since UIUserInterfaceStyle is deliberately
+         absent (see below). -->
+    <key>UILaunchScreen</key>
+    <dict>
+        <key>UIColorName</key>
+        <string>ThemeBackground</string>
+    </dict>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+    </array>
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
+    <!-- `audio` is what makes a background voice session possible at all. Without
+         it iOS suspends the process a few seconds after backgrounding, the
+         `AVAudioEngine` stops, and the Live Activity's Talk button opens a mic
+         gate over a dead graph — silently, which is the worst version of it.
+
+         It is not a keep-alive flag: the process stays alive only while the audio
+         session is genuinely running, which is why `RealtimeService` bounds the
+         stint with a ten-minute idle timeout and an End button rather than
+         leaving it to iOS. Codename Jo both records (the command) and plays (the spoken
+         reply) throughout, so this is the mode's intended use.
+
+         There is no `remote-notification`, `fetch` or `processing`: nothing sends
+         this app a push, and mail refreshes when the app opens. -->
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>audio</string>
+    </array>
+    <!-- Not a return of the scheduled refresh above. `BGContinuedProcessingTask` is
+         user-started work that keeps running off screen: `HangUpRunway` submits one per
+         dispatched job so it can finish after hang-up. The wildcard is because each job
+         needs its own identifier — registering one twice kills the app. -->
+    <key>BGTaskSchedulerPermittedIdentifiers</key>
+    <array>
+        <string>$(PRODUCT_BUNDLE_IDENTIFIER).dispatch.*</string>
+    </array>
+    <!-- **The first scene manifest this app has ever had**, added for CarPlay
+         (2026-08-17). Before this the app was pure SwiftUI lifecycle — a
+         `WindowGroup` plus an `AppDelegate` adaptor — and declaring the car screen
+         means declaring the iPhone window alongside it for the first time.
+
+         Three things here are load-bearing and each has a specific failure mode:
+
+         1. **`UIApplicationSupportsMultipleScenes` must be true.** The phone window
+            and the car screen are live at the same time. False makes the CarPlay
+            scene request fail rather than degrade.
+
+         2. **The window role carries NO `UISceneDelegateClassName`.** SwiftUI
+            installs its own delegate for a `WindowGroup`; naming ours here is how
+            the window silently stops being drawn. There is nothing to put there —
+            `AppDelegate` is attached with `@UIApplicationDelegateAdaptor` and is
+            unaffected by any of this.
+
+         3. **The CarPlay delegate class name is spelled out rather than built from
+            `$(PRODUCT_MODULE_NAME)`.** A build-setting substitution that resolves
+            empty yields ".CarPlaySceneDelegate", which fails at runtime *on the car
+            screen* with nothing wrong on the phone — the most expensive place in
+            this app to put a silent failure. The module name is PRODUCT_NAME in
+            project.yml; if that is ever renamed, this string is what has to move
+            with it, and it is greppable.
+
+         The known trap, recorded so nobody spends a day on it: a SwiftUI-lifecycle
+         app declaring a CarPlay scene commonly fails with "Application does not
+         implement CarPlay template application lifecycle methods in its scene
+         delegate" *even with a correct delegate*, because Xcode's generated scene
+         manifest overwrites the hand-written one. Our app target sets
+         INFOPLIST_FILE and not GENERATE_INFOPLIST_FILE (only the three test targets
+         generate one), so we are clear of it — do not add INFOPLIST_KEY_* settings
+         to the app target, which is how it comes back. -->
+    <key>UIApplicationSceneManifest</key>
+    <dict>
+        <key>UIApplicationSupportsMultipleScenes</key>
+        <true/>
+        <key>UISceneConfigurations</key>
+        <dict>
+            <key>UIWindowSceneSessionRoleApplication</key>
+            <array>
+                <dict>
+                    <key>UISceneConfigurationName</key>
+                    <string>Default Configuration</string>
+                </dict>
+            </array>
+            <key>CPTemplateApplicationSceneSessionRoleApplication</key>
+            <array>
+                <dict>
+                    <key>UISceneConfigurationName</key>
+                    <string>CarPlay</string>
+                    <key>UISceneDelegateClassName</key>
+                    <string>CodenameJo.CarPlaySceneDelegate</string>
+                </dict>
+            </array>
+        </dict>
+    </dict>
+    <!-- Required for ActivityKit. Belongs in the *app's* Info.plist, not the
+         widget extension's — the extension declares the WidgetKit extension
+         point, the app declares that it may request activities. Omitting it makes
+         `Activity.request` throw at runtime with a build that compiles fine. -->
+    <key>NSSupportsLiveActivities</key>
+    <true/>
+    <!-- URL schemes. There must be EXACTLY ONE CFBundleURLTypes key in this
+         file — a plist dict with a duplicate key is invalid, and a lenient
+         parser keeps only one of them, silently dropping the other scheme.
+         Anything that needs a new scheme MUST be appended as another <dict>
+         inside the array below, never as a second CFBundleURLTypes key.
+         `aurex` carries two things: the Google sign-in callback
+         (ASWebAuthenticationSession returns to aurex://google-auth from the
+         token server) and the widget-surface deep links, which the
+         host distinguishes — aurex://session from the Live Activity,
+         aurex://memo from the Home Screen note widget (MemoDeepLink). -->
+    <key>JoTokenServerHost</key>
+    <string>$(JO_TOKEN_SERVER_HOST)</string>
+    <key>JoGitHubClientID</key>
+    <string>$(JO_GITHUB_CLIENT_ID)</string>
+    <key>JoSlackClientId</key>
+    <string>$(JO_SLACK_CLIENT_ID)</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>$(APP_BUNDLE_ID).oauth</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>aurex</string>
+            </array>
+        </dict>
+    </array>
+    <!-- No UIUserInterfaceStyle: the app follows the system appearance and
+         adapts via the Light/Dark color sets in Assets.xcassets. -->
+
+    <key>NSContactsUsageDescription</key>
+    <string>Codename Jo looks up a contact's phone number when you ask it to text someone by name.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Codename Jo uses your microphone to capture voice commands and route them to your connected services.</string>
+    <!-- Back as of 2026-08-14, and not for the reason it left. It covered
+         SFSpeechRecognizer and went with hold-to-talk; what needs it now is
+         SpeechTranscriber, which puts the words on screen without the round trip
+         to OpenAI and keeps working while the mic is muted to the call. -->
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Codename Jo transcribes what you say on your device so your words appear as you speak them. The transcription never leaves your phone.</string>
+    <!-- Required by the linked WebRTC audio library, which references camera
+         APIs. Codename Jo is voice-only and does not capture video. Apple requires
+         the purpose string to be present regardless (ITMS-90683). -->
+    <key>NSCameraUsageDescription</key>
+    <string>Codename Jo does not use the camera. This permission is required by its real-time audio engine and is never used to capture video.</string>
+</dict>
+</plist>

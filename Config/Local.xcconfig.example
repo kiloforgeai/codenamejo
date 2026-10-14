@@ -1,0 +1,10 @@
+// Copy to Config/Local.xcconfig (git-ignored) and fill in.
+DEVELOPMENT_TEAM = ABCDE12345
+APP_BUNDLE_ID = com.example.jo
+
+// Optional: override the default Jo Mobile Slack client ID. Your app needs PKCE turned on
+// (OAuth & Permissions) and the redirect URL com.kiloforge.codenamejo://oauth/callback.
+// JO_SLACK_CLIENT_ID = 1234567890.1234567890123
+
+// Optional: your own GitHub OAuth App for the GitHub connector, with "Enable Device Flow" ticked.
+// JO_GITHUB_CLIENT_ID = Ov23li0000000000000a

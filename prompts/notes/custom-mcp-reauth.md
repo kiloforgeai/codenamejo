@@ -1,0 +1,1 @@
+The user's own tool server has stopped working: {{which}} refused the stored credential and it could not be renewed, so its tools are not available this turn. If they ask for something it covered, say in one sentence that it needs reconnecting under Custom MCP in Settings, and do not guess at an answer. Don't raise it otherwise.

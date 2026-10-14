@@ -1,0 +1,1 @@
+Google temporarily could not be reached for {{accounts}}, so {{which}} missing this turn. If they ask about mail or their calendar, say which account you couldn't reach and that it is worth asking again in a moment. Don't tell them to reconnect anything — nothing is broken on their side.

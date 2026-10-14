@@ -1,0 +1,26 @@
+{
+  "configurations" : [
+    {
+      "id" : "9F1C4E20-7A3B-4D18-9C55-1E7D2A6B4F30",
+      "name" : "Injected",
+      "options" : {
+
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "preferredScreenCaptureFormat" : "screenRecording",
+    "uiTestingScreenshotsLifetime" : "keepAlways",
+    "userAttachmentLifetime" : "keepAlways"
+  },
+  "testTargets" : [
+    {
+      "target" : {
+        "containerPath" : "container:CodenameJo.xcodeproj",
+        "identifier" : "90892BF323AB43EF65D87F75",
+        "name" : "CodenameJoUITests"
+      }
+    }
+  ],
+  "version" : 1
+}

@@ -1,0 +1,38 @@
+{
+  "model_type": "smart-turn-v3-coreml",
+  "architecture": "whisper-tiny-encoder + attention-pool + mlp",
+  "version": "3.2",
+  "upstream_model": "pipecat-ai/smart-turn-v3",
+  "upstream_revision": "f766f81d3cfdf7737ac64aad813d91bbfd56bf93",
+  "upstream_file": "smart-turn-v3.2-gpu.onnx",
+  "license": "bsd-2-clause",
+  "num_params": 8000386,
+  "sample_rate": 16000,
+  "window_samples": 128000,
+  "window_seconds": 8,
+  "padding": "zeros at the front, most recent audio last",
+  "front_end": {
+    "embedded": true,
+    "waveform_normalization": "zero-mean unit-variance over the padded window",
+    "n_fft": 400,
+    "hop_length": 160,
+    "n_mels": 80,
+    "frames": 800,
+    "log_floor": "max - 8",
+    "scale": "(x + 4) / 4"
+  },
+  "input_name": "audio",
+  "input_shape": [
+    1,
+    128000
+  ],
+  "output_name": "probability",
+  "output_shape": [
+    1,
+    1
+  ],
+  "threshold": 0.5,
+  "compiled_model": "smart_turn.mlmodelc",
+  "compute_precision": "float16 (float32 front-end)",
+  "minimum_deployment_target": "iOS17"
+}

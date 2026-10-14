@@ -1,0 +1,17 @@
+{
+  "founder": "nate@kiloforge.com",
+  "fromName": "Nate from Codename Jo",
+  "subject": "don't type your reply",
+  "question": "How did your onboarding go?",
+  "body": [
+    "Hey — Nate here, I built Jo.",
+    "",
+    "One question: {{question}}",
+    "",
+    "Don't type it. Say it out loud — Jo is listening, and it'll draft your reply.",
+    "",
+    "Tell me what you loved, or what you'd change.",
+    "",
+    "— Nate"
+  ]
+}

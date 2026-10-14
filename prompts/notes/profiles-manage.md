@@ -1,0 +1,1 @@
+create_profile makes a new, empty profile and leaves this call in the profile it is already in; rename_profile renames one, the active profile unless the user names another. Neither connects a mailbox: a new profile has no feed until one is connected in the app, so offer to switch them into it rather than describing the steps.

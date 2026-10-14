@@ -1,0 +1,25 @@
+{
+  "opening": "Hi! I'm Jo. I check your emails and help you get through them by doing things, not just talking about them.",
+  "steps": [
+    {
+      "id": "welcome",
+      "kind": "welcome",
+      "line": "Nate, the founder of Codename Jo, is wondering how your onboarding went. You can tell him you loved it, and I'll draft your reply."
+    },
+    {
+      "id": "mail_mode",
+      "kind": "mail_mode",
+      "question": "Going forward, should I send your emails, or keep them in Drafts?"
+    },
+    {
+      "id": "about",
+      "kind": "about"
+    },
+    {
+      "id": "finish",
+      "kind": "finish",
+      "tip": "You're in your Feed. I bring forward emails that need your attention and help you handle them by voice. Whenever you need something, just ask.",
+      "question": "Congrats on finishing onboarding! Want to keep going through your inbox?"
+    }
+  ]
+}
