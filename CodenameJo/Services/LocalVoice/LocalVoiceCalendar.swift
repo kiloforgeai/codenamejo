@@ -68,17 +68,27 @@ enum LocalVoiceCalendar {
         said(transcript, any: ["cancel", "delete", "remove", "scrap", "take off", "get rid"])
     }
 
-    /// The events whose title carries every word the user said, articles aside, soonest first.
-    static func matches(_ events: [CalendarStore.Event], title: String) -> [CalendarStore.Event] {
-        let wanted = words(title).filter { !["the", "a", "an", "my"].contains($0) }
-        guard !wanted.isEmpty else { return [] }
+    /// The events whose title carries every content word the user said ("12 to 1 lunch" is
+    /// "lunch") and, when they gave an hour, start in it; an hour alone finds the event at it.
+    static func matches(_ events: [CalendarStore.Event], title: String, hour: Int = -1,
+                        calendar: Calendar = .current) -> [CalendarStore.Event] {
+        let wanted = words(title).filter { !filler.contains($0) && Int($0) == nil }
+        guard !wanted.isEmpty || hour >= 0 else { return [] }
         return events.filter { $0.status != "cancelled" }
             .filter { event in
                 let have = Set(words(event.summary ?? ""))
-                return wanted.allSatisfy(have.contains)
+                guard wanted.allSatisfy(have.contains) else { return false }
+                guard hour >= 0, let start = event.startEpochMs else { return true }
+                return calendar.component(.hour, from: Date(timeIntervalSince1970: Double(start) / 1000)) == hour
             }
             .sorted { ($0.startEpochMs ?? 0) < ($1.startEpochMs ?? 0) }
     }
+
+    /// Words that name a time or a kind of thing rather than the event.
+    private static let filler: Set<String> = [
+        "the", "a", "an", "my", "to", "at", "from", "on", "am", "pm", "o", "clock", "oclock", "today", "tomorrow",
+        "this", "that", "event", "meeting", "appointment", "call", "block", "thing",
+    ]
 
     /// What to say when a name fits no event on the day, or more than one. Nil for exactly one.
     static func ambiguity(_ found: [CalendarStore.Event], title: String, dayOffset: Int, now: Date,
@@ -317,8 +327,10 @@ private struct CancelCalendarEvent: Tool {
     @Generable struct Arguments {
         @Guide(description: "Days from today: 0 is today, 1 is tomorrow.", .range(0...30))
         var dayOffset: Int
-        @Guide(description: "The event's name as the user said it, without words like the or my.")
+        @Guide(description: "The event's name as the user said it, without the time or words like the or my.")
         var title: String
+        @Guide(description: "Start hour, 0 to 23, when the user said a time; -1 when they did not.", .range(-1...23))
+        var hour: Int
     }
     let transcript: String
     let now: Date
@@ -334,10 +346,11 @@ private struct CancelCalendarEvent: Tool {
         guard !accounts.isEmpty else { return "No Google Calendar is connected." }
         let window = LocalVoiceCalendar.dayWindow(dayOffset: arguments.dayOffset, now: now)
         let (events, _) = await LocalVoiceCalendar.events(window, accounts: accounts)
-        let found = LocalVoiceCalendar.matches(events, title: arguments.title)
+        let found = LocalVoiceCalendar.matches(events, title: arguments.title, hour: arguments.hour)
         if let ambiguity = LocalVoiceCalendar.ambiguity(found, title: arguments.title, dayOffset: arguments.dayOffset,
                                                         now: now) {
-            RealtimeLog.log("local-calendar: cancel \"\(arguments.title)\" day \(arguments.dayOffset): \(found.count) match(es)")
+            RealtimeLog.log("local-calendar: cancel \"\(arguments.title)\" hour \(arguments.hour) day \(arguments.dayOffset): "
+                + "\(found.count) of \(events.count) match")
             return ambiguity
         }
         let event = found[0]

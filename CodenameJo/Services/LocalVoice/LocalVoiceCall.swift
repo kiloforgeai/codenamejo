@@ -264,6 +264,7 @@ final class LocalVoiceCall {
         transcriber.setMuted(true)
         guard !user.isEmpty else { listen(); return }
         onUserTranscript?(user, true)
+        RealtimeLog.log("local-voice: heard \"\(user.prefix(160))\"")
         if SpokenCommand.match(user) == .endCall {
             RealtimeLog.log("local-voice: spoken end")
             onEndRequested?()

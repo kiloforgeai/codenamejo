@@ -88,16 +88,22 @@ final class LocalVoiceCalendarTests: XCTestCase {
 
     func testANameFindsOneEventOrSaysWhyNot() {
         let dentist = event("Dentist", at: 1_792_090_800)
+        let lunch = event("Lunch", at: 1_792_080_000)
         let events = [
             event("Standup", at: 1_792_071_000),
             dentist,
+            lunch,
             event("Dentist follow-up", at: 1_792_071_000, status: "cancelled"),
             event("Team standup", at: 1_792_092_600),
         ]
         XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "the dentist").map(\.id), [dentist.id])
-        XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "DENTIST").map(\.id), [dentist.id])
+        XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "DENTIST appointment").map(\.id), [dentist.id])
+        XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "12 to 1 lunch").map(\.id), [lunch.id])
         XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "standup").count, 2)
-        XCTAssertTrue(LocalVoiceCalendar.matches(events, title: "lunch").isEmpty)
+        XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "standup", hour: 9, calendar: calendar).count, 1)
+        XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "3 pm", hour: 15, calendar: calendar).map(\.id),
+                       [dentist.id])
+        XCTAssertTrue(LocalVoiceCalendar.matches(events, title: "coffee").isEmpty)
         XCTAssertTrue(LocalVoiceCalendar.matches(events, title: "the").isEmpty)
 
         XCTAssertNil(LocalVoiceCalendar.ambiguity([dentist], title: "dentist", dayOffset: 1, now: now, calendar: calendar))
