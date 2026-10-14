@@ -36,8 +36,9 @@ enum EmailLinkTool {
         let accounts = account.isEmpty ? GoogleAccountStore.mailAccounts() : [account]
         var found: [GmailAPI.FullMessage] = []
         for candidate in accounts {
-            guard let token = try? await GmailReadTools.token(candidate),
-                  let message = try? await GmailAPI.fullMessage(token: token, id: messageId) else { continue }
+            guard let message = try? await MailBodyCache.fullMessage(account: candidate, id: messageId, token: {
+                try await GmailReadTools.token(candidate)
+            }) else { continue }
             found.append(message)
         }
         guard found.count == 1 else {

@@ -330,6 +330,16 @@ enum GmailAPI {
             seed: ids.first ?? "x", label: "messages.get")
     }
 
+    /// Full messages for up to 100 ids in one request, with `fullMessage`'s fields; failed sub-requests are dropped.
+    static func fullBatch(token: String, ids: [String]) async -> [FullMessage] {
+        guard !ids.isEmpty, !MailHeadersOnly.withholdsBodies else { return [] }
+        await GmailQuota.shared.spendBatch(of: ids.count)
+        return await batch(
+            token: token,
+            paths: ids.map { "messages/\($0)?format=full&fields=id,threadId,labelIds,snippet,internalDate,payload" },
+            seed: ids.first ?? "x", label: "messages.get full")
+    }
+
     /// Send a list of relative Gmail GET paths as one `multipart/mixed` request.
     ///
     /// Order is not guaranteed, so a caller that must tell the answers apart has to ask for a

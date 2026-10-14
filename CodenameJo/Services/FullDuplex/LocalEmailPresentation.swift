@@ -29,7 +29,7 @@ enum LocalEmailPresentation {
         static var live: Dependencies {
             Dependencies(
                 read: { account, id in
-                    try await GmailAPI.fullMessage(token: try await gmailToken(account), id: id)
+                    try await MailBodyCache.fullMessage(account: account, id: id) { try await gmailToken(account) }
                 },
                 respond: { body, timeout in
                     LiveOpenAI.outputText(try await LiveOpenAI.call("responses", body, timeout: timeout))

@@ -193,7 +193,7 @@ struct MailStore: Sendable {
     /// Throw the mail cache away and let the next refresh refill it from Gmail. Everything dropped is
     /// derived except the mark-read outbox, which is unattributable here.
     static func rebuildMailCache(_ db: Database) throws {
-        for table in ["mail_message_label", "mail_mark_read_outbox", "mail_sent_body",
+        for table in ["mail_message_label", "mail_mark_read_outbox", "mail_sent_body", "mail_message_body",
                       "mail_message_fts", "mail_message", "mail_draft", "mail_sync_state"] {
             try db.execute(sql: "DROP TABLE IF EXISTS \(table)")
         }
@@ -246,6 +246,7 @@ struct MailStore: Sendable {
             """)
         if try !db.tableExists("mail_message_fts") { try createSearchIndex(db) }
         try createSentBodies(db)
+        try createBodies(db)
     }
 
     static func createSchema(_ db: Database) throws {

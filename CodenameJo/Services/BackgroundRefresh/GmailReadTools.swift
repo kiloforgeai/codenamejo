@@ -1,4 +1,5 @@
 import Foundation
+import FactoryKit
 
 /// Gmail search and the three body reads, declared by the phone and run on its own Google grant.
 /// Result shapes are load-bearing: prompts and caches read them unchanged.
@@ -284,9 +285,14 @@ enum GmailReadTools {
         guard let id = string(args, "message_id") else {
             throw Refusal(text: "No message id — search first, then open a message from a result.")
         }
-        let found = try await firstAnswering(try targets(args)) { token in
+        let accounts = try targets(args)
+        if let hit = await MailBodyCache.cached(accounts: accounts, id: id, store: await Container.shared.mailStore()) {
+            return json([["account": hit.account, "result": envelope(hit.message)]])
+        }
+        let found = try await firstAnswering(accounts) { token in
             try await GmailAPI.fullMessage(token: token, id: id)
         }
+        if !MailBodyCache.withheld { await Container.shared.mailStore().saveBodies([found.value], account: found.account) }
         return json([["account": found.account, "result": envelope(found.value)]])
     }
 
