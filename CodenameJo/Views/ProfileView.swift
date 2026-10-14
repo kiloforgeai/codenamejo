@@ -244,8 +244,8 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
                     detail: "Everything stays on this phone: speech recognition, Apple's on-device "
                         + "model and the phone's own voice. Nothing goes to OpenAI. Jo can still "
                         + "go through your inbox with you — archive, delete, mark spam, file under "
-                        + "a label, draft a reply — and read or add to your calendar, talking to "
-                        + "Google directly. Off, the phone's "
+                        + "a label, draft a reply — and read your calendar, add events and cancel "
+                        + "them, talking to Google directly. Off, the phone's "
                         + "voice still steps in on its own whenever the live call can't connect "
                         + "or drops, keeping your mail and calendar while there's a connection."
                 )

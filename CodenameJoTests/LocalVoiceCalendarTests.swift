@@ -1,8 +1,8 @@
 import XCTest
 @testable import CodenameJo
 
-/// The on-device model only picks a day offset and a clock time; everything the user hears
-/// about the calendar is worded here.
+/// The on-device model only picks a day offset, a clock time or a name; everything the user
+/// hears about the calendar is worded here, and only their own words can write to it.
 final class LocalVoiceCalendarTests: XCTestCase {
     private let zone = TimeZone(identifier: "America/New_York")!
     private var calendar: Calendar {
@@ -36,6 +36,10 @@ final class LocalVoiceCalendarTests: XCTestCase {
         // A month clamps to a week: midnight on October 21.
         let week = LocalVoiceCalendar.window(dayOffset: 0, days: 30, now: now, calendar: calendar)
         XCTAssertEqual(week.endMs, 1_792_555_200_000)
+        // Cancelling looks at the whole of today, started or not.
+        let wholeDay = LocalVoiceCalendar.dayWindow(dayOffset: 0, now: now, calendar: calendar)
+        XCTAssertEqual(wholeDay.startMs, 1_791_950_400_000)
+        XCTAssertEqual(wholeDay.endMs, 1_792_036_800_000)
     }
 
     func testAStartIsStampedWithThePhonesOffsetOnThatDay() {
@@ -64,7 +68,7 @@ final class LocalVoiceCalendarTests: XCTestCase {
                        "Over the next 3 days you have one thing: Standup at 9:30 AM on Thursday.")
     }
 
-    func testOnlyTheUsersOwnWordsCanAddAnEvent() {
+    func testOnlyTheUsersOwnWordsCanAddOrCancel() {
         for text in ["add a dentist appointment tomorrow at 3", "block 2 to 3 for focus", "put it on my calendar",
                      "can you schedule lunch with Sam Friday at noon", "set up a call with Raghav at 4"] {
             XCTAssertTrue(LocalVoiceCalendar.allowsCreate(text), text)
@@ -73,6 +77,37 @@ final class LocalVoiceCalendarTests: XCTestCase {
                      "never put that on my calendar"] {
             XCTAssertFalse(LocalVoiceCalendar.allowsCreate(text), text)
         }
+        for text in ["cancel the dentist tomorrow", "delete my 3 o'clock", "take standup off my calendar",
+                     "get rid of the Friday lunch"] {
+            XCTAssertTrue(LocalVoiceCalendar.allowsCancel(text), text)
+        }
+        for text in ["is the dentist still on tomorrow", "don't cancel the dentist", "move the dentist to 4"] {
+            XCTAssertFalse(LocalVoiceCalendar.allowsCancel(text), text)
+        }
+    }
+
+    func testANameFindsOneEventOrSaysWhyNot() {
+        let dentist = event("Dentist", at: 1_792_090_800)
+        let events = [
+            event("Standup", at: 1_792_071_000),
+            dentist,
+            event("Dentist follow-up", at: 1_792_071_000, status: "cancelled"),
+            event("Team standup", at: 1_792_092_600),
+        ]
+        XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "the dentist").map(\.id), [dentist.id])
+        XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "DENTIST").map(\.id), [dentist.id])
+        XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "standup").count, 2)
+        XCTAssertTrue(LocalVoiceCalendar.matches(events, title: "lunch").isEmpty)
+        XCTAssertTrue(LocalVoiceCalendar.matches(events, title: "the").isEmpty)
+
+        XCTAssertNil(LocalVoiceCalendar.ambiguity([dentist], title: "dentist", dayOffset: 1, now: now, calendar: calendar))
+        XCTAssertEqual(LocalVoiceCalendar.ambiguity([], title: "lunch", dayOffset: 1, now: now, calendar: calendar),
+                       "Nothing called lunch tomorrow. Nothing was cancelled.")
+        XCTAssertEqual(
+            LocalVoiceCalendar.ambiguity(LocalVoiceCalendar.matches(events, title: "standup"), title: "standup",
+                                         dayOffset: 1, now: now, calendar: calendar),
+            "2 things tomorrow match standup: Standup at 9:30 AM, and Team standup at 3:30 PM. "
+                + "Ask which one; nothing was cancelled.")
     }
 
     func testAReceiptBecomesASpokenLineAndARefusalPassesThrough() {
@@ -89,5 +124,21 @@ final class LocalVoiceCalendarTests: XCTestCase {
         let refusal = "Need a title, a start and an end to create an event."
         XCTAssertEqual(LocalVoiceCalendar.added(refusal, title: "x", start: start, minutes: 60, now: now,
                                                 calendar: calendar), refusal)
+
+        let dentist = event("Dentist", at: 1_792_090_800)
+        XCTAssertEqual(
+            LocalVoiceCalendar.cancelled("Cancelled \"Dentist\" (Oct 15, 3:00 PM) on a@b.c.", event: dentist, now: now,
+                                         calendar: calendar),
+            "Cancelled Dentist, tomorrow at 3 PM.")
+        XCTAssertEqual(
+            LocalVoiceCalendar.cancelled("Cancelled \"Dentist\" on a@b.c. The 2 guests were emailed a cancellation.",
+                                         event: dentist, now: now, calendar: calendar),
+            "Cancelled Dentist, tomorrow at 3 PM. Your guests were told.")
+        XCTAssertEqual(
+            LocalVoiceCalendar.cancelled("Took \"Dentist\" off a@b.c's calendar. The user didn't organize it, so …",
+                                         event: dentist, now: now, calendar: calendar),
+            "Took Dentist, tomorrow at 3 PM off your calendar. You didn't organize it, so it's still on everyone else's.")
+        let already = "\"Dentist\" was already cancelled. Nothing to do, and nobody was notified again."
+        XCTAssertEqual(LocalVoiceCalendar.cancelled(already, event: dentist, now: now, calendar: calendar), already)
     }
 }
