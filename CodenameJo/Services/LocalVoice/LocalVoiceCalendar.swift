@@ -291,6 +291,7 @@ private struct AddCalendarEvent: Tool {
 
     func call(arguments: Arguments) async throws -> String {
         guard LocalVoiceCalendar.allowsCreate(transcript) else {
+            RealtimeLog.log("local-calendar: add refused — no create verb in the user's words")
             return "Not added: the user did not ask to put anything on the calendar."
         }
         guard await once.claim() else { return "Already added this turn. Do not repeat it." }
@@ -325,6 +326,7 @@ private struct CancelCalendarEvent: Tool {
 
     func call(arguments: Arguments) async throws -> String {
         guard LocalVoiceCalendar.allowsCancel(transcript) else {
+            RealtimeLog.log("local-calendar: cancel refused — no cancel verb in the user's words")
             return "Not cancelled: the user did not ask to cancel anything."
         }
         guard await once.claim() else { return "Already cancelled this turn. Do not repeat it." }
