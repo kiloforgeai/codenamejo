@@ -135,6 +135,14 @@ final class LocalMailWritesTests: XCTestCase {
         XCTAssertEqual(writes(archived).count, 1, "also_archive is message-wide; only the rule files the thread")
     }
 
+    func testASpokenLabelSplitIntoWordsIsTheExistingLabel() async {
+        let scripted = gmail(labels: [("Label_9", "Kiloforge", "user")])
+        let result = await run("label_message", ["message_id": "m1", "label": "Kilo Forge"])
+        XCTAssertEqual(result.text, "Labelled \"Kiloforge\" in \(owner).")
+        XCTAssertEqual(writes(scripted).map(\.path), ["messages/m1/modify"])
+        XCTAssertEqual(body(writes(scripted)[0]).add, ["Label_9"])
+    }
+
     func testAMissingLabelIsCreatedAndASimilarOneIsOfferedBackUnlessANewOneWasAsked() async {
         let created = gmail()
         let made = await run("label_message", ["message_id": "m1", "label": "Taxes"])

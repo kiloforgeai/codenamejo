@@ -191,7 +191,9 @@ enum LocalMailWrites {
         let byRule = !alsoArchive && StandingRule.archiveAfterLabel.isOn
 
         let labels = try await Manage.labels(token)
+        // A spoken name can arrive split into words ("Kilo Forge"): that is the label, not a near miss.
         let existing = labels.first { $0.name.lowercased() == label.lowercased() }
+            ?? labels.first { $0.user && normalized($0.name) == normalized(label) }
         if existing == nil, let refusal = similarRefusal(label, labels: labels, createNew: strictJSONBool(args["create_new"]) == true) {
             throw Refusal(text: refusal)
         }
@@ -245,13 +247,16 @@ enum LocalMailWrites {
 
     /// No exact match: the user's own labels that look like it are offered back, unless a new one was asked for.
     static func similarRefusal(_ label: String, labels: [GmailManageTools.Label], createNew: Bool) -> String? {
-        let normalize = { (value: String) in String(value.lowercased().unicodeScalars.filter(CharacterSet.alphanumerics.contains)) }
-        let wanted = normalize(label)
+        let wanted = normalized(label)
         guard !wanted.isEmpty, !createNew else { return nil }
-        let similar = labels.filter { $0.user && (normalize($0.name).contains(wanted) || wanted.contains(normalize($0.name))) }
+        let similar = labels.filter { $0.user && (normalized($0.name).contains(wanted) || wanted.contains(normalized($0.name))) }
         guard !similar.isEmpty else { return nil }
         let names = similar.map { "\"\($0.name)\"" }.joined(separator: ", ")
         return "No label exactly named \"\(label)\". Existing labels: \(names). Ask which one they mean before labelling."
+    }
+
+    private static func normalized(_ value: String) -> String {
+        String(value.lowercased().unicodeScalars.filter(CharacterSet.alphanumerics.contains))
     }
 
     // MARK: - Failure sentences
