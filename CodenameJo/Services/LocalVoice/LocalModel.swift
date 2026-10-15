@@ -82,17 +82,23 @@ enum LocalModel {
         }
     }
 
-    /// The fused Gemma 4 checkpoint with the Jo tool adapter, copied into Application Support
-    /// (2.5 GB for E2B, 4 GB for E4B); see `lora/README.md`.
+    /// The fused Gemma 4 checkpoint with the Jo tool adapter in Application Support (2.5 GB for
+    /// E2B, 4 GB for E4B): downloaded from `repo` on Wi-Fi at launch, or copied over by hand; see
+    /// `lora/README.md`.
     @available(iOS 27.0, *)
     enum Tuned {
-        /// The smaller checkpoint wins when both have been copied over.
-        static let directory: URL = {
-            let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        /// The E2B checkpoint trained on the short prompts, which `download()` fetches.
+        static let repo = "raghavnaras/gemma-4-e2b-jo"
+
+        private static let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+
+        /// The smaller checkpoint wins when both are there. Computed, not stored, so a download
+        /// that lands mid-session is picked up by the next call.
+        static var directory: URL {
             let candidates = ["gemma-4-e2b-jo", "gemma-4-e4b-jo"].map { support.appendingPathComponent($0, isDirectory: true) }
             return candidates.first { FileManager.default.fileExists(atPath: $0.appendingPathComponent("config.json").path) }
                 ?? candidates[0]
-        }()
+        }
 
         static var isPresent: Bool {
             FileManager.default.fileExists(atPath: directory.appendingPathComponent("config.json").path)
@@ -106,6 +112,36 @@ enum LocalModel {
                 try await loadModelContainer(from: #hubDownloader(), using: #huggingFaceTokenizerLoader(),
                                              configuration: configuration, progressHandler: progressHandler)
             })
+
+        /// Fetches the checkpoint when it isn't on the phone, on Wi-Fi only. The Hub client only
+        /// downloads through a cache, so the files are moved out of it into a staging directory that
+        /// is renamed into place once complete: a half-finished download never passes for the model.
+        static func download() async {
+            guard !isPresent, let id = Repo.ID(rawValue: repo) else { return }
+            let files = FileManager.default
+            let cache = support.appendingPathComponent("huggingface", isDirectory: true)
+            let staging = support.appendingPathComponent("gemma-4-e2b-jo.partial", isDirectory: true)
+            let configuration = URLSessionConfiguration.default
+            configuration.allowsExpensiveNetworkAccess = false
+            configuration.allowsConstrainedNetworkAccess = false
+            let client = HubClient(session: URLSession(configuration: configuration), cache: HubCache(cacheDirectory: cache))
+            let started = Date()
+            RealtimeLog.log("local-model: downloading tuned gemma from \(repo)")
+            do {
+                let snapshot = try await client.downloadSnapshot(of: id)
+                try? files.removeItem(at: staging)
+                try files.createDirectory(at: staging, withIntermediateDirectories: true)
+                for name in try files.contentsOfDirectory(atPath: snapshot.path) {
+                    try files.moveItem(at: snapshot.appendingPathComponent(name).resolvingSymlinksInPath(),
+                                       to: staging.appendingPathComponent(name))
+                }
+                try files.moveItem(at: staging, to: support.appendingPathComponent("gemma-4-e2b-jo", isDirectory: true))
+                try? files.removeItem(at: cache)
+                RealtimeLog.log("local-model: tuned gemma downloaded in \(Int(Date().timeIntervalSince(started))) s")
+            } catch {
+                RealtimeLog.log("local-model: tuned gemma download failed — \(error.localizedDescription)")
+            }
+        }
 
         static func preload() async throws {
             let started = Date()
