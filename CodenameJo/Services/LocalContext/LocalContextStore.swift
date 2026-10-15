@@ -652,6 +652,7 @@ final class LocalContextStore: Sendable {
         }
         migrator.registerMigration("v46-custom-commands", migrate: CustomCommandRows.createSchema)
         migrator.registerMigration("v47-calendar-busy-fields", migrate: CalendarStore.addBusyFields)
+        migrator.registerMigration("v48-mail-message-bodies", migrate: MailStore.createBodies)
         return migrator
     }
 }

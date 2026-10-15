@@ -51,6 +51,10 @@ enum BackgroundMailRefresh {
     /// Messages per `/batch/gmail/v1` request. Unbatched backfill rate-limits.
     static let batchSize = 50
 
+    /// The most bodies one pass fetches, and how many go in one batch: full messages are far larger than metadata.
+    static let bodyFetchLimit = 100
+    static let bodyBatchSize = 25
+
     /// The shortest gap between two foreground passes, so app-switching doesn't cost a Gmail round trip.
     static let launchThrottle: TimeInterval = 2 * 60
 
@@ -173,6 +177,7 @@ enum BackgroundMailRefresh {
         var anyReconciled = false
         var lastFailure: GoogleCredential.Failure?
         var fetchError: Error?
+        var reconciled: [(token: String, account: String)] = []
 
         for account in mailboxes {
             let token: GoogleCredential.Token
@@ -194,6 +199,7 @@ enum BackgroundMailRefresh {
                     store: store, trigger: trigger, elapsed: elapsed
                 )
                 anyReconciled = true
+                reconciled.append((token.accessToken, resolved))
                 // Best-effort: a drafts failure must not fail the mail sync. Skipped during onboarding,
                 // where the per-draft gets would compete with the onboarding queue for Gmail's rate limit.
                 if !OnboardingState.isComplete || OnboardingResume.runId != nil {
@@ -223,6 +229,13 @@ enum BackgroundMailRefresh {
         }
         if anyReconciled, trigger != .silentPush || appIsActive {
             await prepareDailyQueue(store: store)
+        }
+
+        // After the queue, so a call waiting on this pass isn't held up by body downloads.
+        if trigger != .silentPush, OnboardingState.isComplete {
+            for mailbox in reconciled {
+                await cacheBodies(token: mailbox.token, account: mailbox.account, store: store)
+            }
         }
 
         // `ContactScan`'s Gmail walk is unwired; the directory is built from cached mail and calendar.
@@ -267,6 +280,33 @@ enum BackgroundMailRefresh {
         }
         await Container.shared.localTriage().refreshTopicMembership(store: store, includeArrivals: true)
         await Container.shared.localTriage().prepareDailySnapshot(store: store, liveFeatures: true)
+    }
+
+    /// Fetch bodies for live cached mail that has none, so reading one aloud is local. Best-effort, newest first.
+    private static func cacheBodies(token: String, account: String, store: MailStore) async {
+        if MailHeadersOnly.withholdsBodies {
+            await store.purgeBodies()
+            return
+        }
+        guard ProfileRuntime.snapshot?.mailHeadersOnly != true else { return }
+        await store.pruneBodies(account: account)
+        let missing = await store.idsMissingBodies(account: account, limit: bodyFetchLimit)
+        var stored = 0
+        for start in stride(from: 0, to: missing.count, by: bodyBatchSize) {
+            guard !Task.isCancelled else { break }
+            let slice = Array(missing[start..<min(start + bodyBatchSize, missing.count)])
+            var messages = await GmailAPI.fullBatch(token: token, ids: slice)
+            // The batch endpoint drops sub-requests, as it does for metadata.
+            let returned = Set(messages.map(\.id))
+            for id in slice where !returned.contains(id) {
+                do { messages.append(try await GmailAPI.fullMessage(token: token, id: id)) } catch {
+                    RealtimeLog.log("mail: body \(id) not cached — \(label(for: error))")
+                }
+            }
+            await store.saveBodies(messages, account: account)
+            stored += messages.count
+        }
+        if !missing.isEmpty { RealtimeLog.log("mail: \(account) → \(stored) of \(missing.count) bodies cached") }
     }
 
     /// Retry every mark-read Gmail never confirmed for one mailbox.

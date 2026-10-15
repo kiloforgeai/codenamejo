@@ -244,8 +244,9 @@ final class LocalInbox {
         if !MailHeadersOnly.withholdsBodies {
             let fetched = try? await withThrowingTaskGroup(of: String?.self) { group in
                 group.addTask {
-                    let message = try await GmailAPI.fullMessage(token: try await GmailReadTools.token(email.account),
-                                                                 id: email.id)
+                    let message = try await MailBodyCache.fullMessage(account: email.account, id: email.id) {
+                        try await GmailReadTools.token(email.account)
+                    }
                     return LocalEmailPresentation.flattenBody(message.payload).text
                 }
                 group.addTask { try await Task.sleep(for: .seconds(3)); return nil }
