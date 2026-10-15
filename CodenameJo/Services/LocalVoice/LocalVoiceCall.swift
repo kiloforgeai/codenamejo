@@ -15,7 +15,7 @@ final class LocalVoiceCall {
         }
     }
 
-    typealias Brain = (String, [LocalVoiceBrain.Exchange], LocalVoiceBrain.Engine, String?, LocalVoiceBrain.Focus?)
+    typealias Brain = (String, [LocalVoiceBrain.Exchange], LocalVoiceBrain.Engine, String?, LocalVoiceBrain.Focus?, String?)
         -> AsyncThrowingStream<String, Error>
 
     static let tick: Duration = .milliseconds(150)
@@ -38,6 +38,8 @@ final class LocalVoiceCall {
     private let speech: LocalSpeech
     private let detector: SemanticTurnDetector
     private let profileId: String?
+    /// The call's id, which a write that fails in the background reports to.
+    private let conversationId: String?
     private let brain: Brain
     /// The words heard this turn, and the fallback end-of-turn rule when Smart Turn could not
     /// be prepared (its Silero model never downloaded): the words stop changing for 900 ms.
@@ -69,15 +71,16 @@ final class LocalVoiceCall {
 
     init(microphone: LocalMicrophone, speech: LocalSpeech, transcriber: LocalTranscriber = LocalTranscriber(),
          detector: SemanticTurnDetector = Container.shared.localTurnDetector(),
-         profileId: String? = ProfileRuntime.snapshot?.profileId,
+         profileId: String? = ProfileRuntime.snapshot?.profileId, conversationId: String? = nil,
          brain: @escaping Brain = {
-             LocalVoiceBrain.reply(to: $0, history: $1, engine: $2, profileId: $3, focus: $4)
+             LocalVoiceBrain.reply(to: $0, history: $1, engine: $2, profileId: $3, focus: $4, conversationId: $5)
          }) {
         self.microphone = microphone
         self.speech = speech
         self.transcriber = transcriber
         self.detector = detector
         self.profileId = profileId
+        self.conversationId = conversationId
         self.brain = brain
     }
 
@@ -118,6 +121,7 @@ final class LocalVoiceCall {
             return
         }
         RealtimeLog.log("local-voice: call open on \(engine.rawValue)")
+        if engine == .onDevice { Task { try? await LocalModel.preload() } }
         guard let inbox else { listen(); return }
         phase = .thinking
         onState?(.processing)
@@ -197,6 +201,9 @@ final class LocalVoiceCall {
             let detector = detector
             Task { await detector.reset() }
         }
+        if engine == .onDevice {
+            if let inbox, inbox.current != nil { inbox.prewarm() } else { LocalVoiceBrain.prewarm() }
+        }
         if !script.isEmpty {
             let line = script.removeFirst()
             Task { [weak self] in
@@ -264,6 +271,7 @@ final class LocalVoiceCall {
         transcriber.setMuted(true)
         guard !user.isEmpty else { listen(); return }
         onUserTranscript?(user, true)
+        RealtimeLog.log("local-voice: heard \"\(user.prefix(160))\"")
         if SpokenCommand.match(user) == .endCall {
             RealtimeLog.log("local-voice: spoken end")
             onEndRequested?()
@@ -280,13 +288,35 @@ final class LocalVoiceCall {
             let command = inbox?.current != nil ? await inbox?.command(user) : nil
             self.inboxBusy = false
             guard !Task.isCancelled, self.phase == .thinking else { return }
+            // Writes already reported as done that failed since are told first.
+            let notices = Container.shared.localWriteNotices().drain(conversation: self.conversationId)
             await self.speakTurn(user: user, started: started) {
-                if let command { return LocalSpeech.stream([command]) }
-                if let inbox, inbox.current != nil, engine == .onDevice { return inbox.answer(user) }
+                if let command { return Self.prefixed(notices, LocalSpeech.stream([command])) }
+                if let inbox, inbox.current != nil, engine == .onDevice { return Self.prefixed(notices, inbox.answer(user)) }
                 let focus = inbox?.openAIContext
-                return self.brain(user, self.history, engine, self.profileId,
-                                  focus.map { LocalVoiceBrain.Focus(cursor: $0.cursor, standingOn: $0.standingOn, note: $0.note) })
+                return Self.prefixed(notices, self.brain(
+                    user, self.history, engine, self.profileId,
+                    focus.map { LocalVoiceBrain.Focus(cursor: $0.cursor, standingOn: $0.standingOn, note: $0.note) },
+                    self.conversationId))
             }
+        }
+    }
+
+    /// `stream`, with `notices` spoken first.
+    private static func prefixed(_ notices: [String], _ stream: AsyncThrowingStream<String, Error>)
+        -> AsyncThrowingStream<String, Error> {
+        guard !notices.isEmpty else { return stream }
+        return AsyncThrowingStream { continuation in
+            for notice in notices { continuation.yield(notice + " ") }
+            let task = Task {
+                do {
+                    for try await delta in stream { continuation.yield(delta) }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 

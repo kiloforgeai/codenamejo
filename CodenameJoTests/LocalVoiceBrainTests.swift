@@ -31,9 +31,22 @@ final class LocalVoiceBrainTests: XCTestCase {
         XCTAssertEqual(items.last?["role"] as? String, "user")
     }
 
+    func testAnAnswerToJosQuestionInheritsTheRequestsVerb() {
+        let asked = [LocalVoiceBrain.Exchange(user: "cancel my doctor's appointment", assistant: "Which day is it on?")]
+        XCTAssertEqual(LocalVoiceBrain.authorizing("Friday at 2", history: asked), "cancel my doctor's appointment Friday at 2")
+        let told = [LocalVoiceBrain.Exchange(user: "what's on Friday", assistant: "On Friday you have one thing: Lunch at 12 PM.")]
+        XCTAssertEqual(LocalVoiceBrain.authorizing("cancel it", history: told), "cancel it")
+        XCTAssertEqual(LocalVoiceBrain.authorizing("hi", history: []), "hi")
+    }
+
     func testTheOfflinePromptKeepsOnlyRecentContextAndTheInstructionsEndWithTheLocalPrompt() throws {
-        XCTAssertEqual(LocalVoiceBrain.offlinePrompt("hi", history: []), "hi")
-        let prompt = LocalVoiceBrain.offlinePrompt("hi", history: [.init(user: "u", assistant: "a")])
+        let now = Date(timeIntervalSince1970: 1_792_005_120)
+        let bare = LocalVoiceBrain.offlinePrompt("hi", history: [], now: now)
+        XCTAssertTrue(bare.hasPrefix("Now: "))
+        XCTAssertTrue(bare.contains(LocalVoiceCalendar.spokenNow(now)))
+        XCTAssertTrue(bare.hasSuffix("\nhi"))
+        let prompt = LocalVoiceBrain.offlinePrompt("hi", history: [.init(user: "u", assistant: "a")], now: now)
+        XCTAssertTrue(prompt.hasPrefix("Now: "))
         XCTAssertTrue(prompt.hasSuffix("Current user message:\nhi"))
         XCTAssertTrue(prompt.contains("User: u\nJo: a"))
         let instructions = try LocalVoiceBrain.instructions(mail: true, calendar: false, notion: false)

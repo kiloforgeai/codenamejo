@@ -35,6 +35,18 @@ packages:
   Factory:
     url: https://github.com/hmlongco/Factory
     exactVersion: 3.3.2
+  # Gemma 4 through MLX for the local call's on-device engine, with Jo's tool adapter fused in
+  # (see lora/README.md). The two Hugging Face packages are what mlx-swift-lm's download and
+  # tokenizer macros expand to; its README pins them at these floors.
+  mlx-swift-lm:
+    url: https://github.com/ml-explore/mlx-swift-lm
+    exactVersion: 3.32.3
+  swift-huggingface:
+    url: https://github.com/huggingface/swift-huggingface
+    from: 0.9.0
+  swift-transformers:
+    url: https://github.com/huggingface/swift-transformers
+    from: 1.3.0
   # IMVVM is NOT here on purpose — it is vendored under
   # CodenameJo/ThirdPartyCode/IMVVM. Upstream
   # (github.com/neakor/swiftui-imvvm) last shipped code in June 2023 and has 14
@@ -164,6 +176,18 @@ targets:
         product: FactoryKit
       - package: FluidAudio
       - package: onnxruntime
+      - package: mlx-swift-lm
+        product: MLXLLM
+      - package: mlx-swift-lm
+        product: MLXLMCommon
+      - package: mlx-swift-lm
+        product: MLXHuggingFace
+      - package: mlx-swift-lm
+        product: MLXFoundationModels
+      - package: swift-huggingface
+        product: HuggingFace
+      - package: swift-transformers
+        product: Tokenizers
       # Embedded so the Live Activity has somewhere to be drawn. XcodeGen puts an
       # `app-extension` dependency in the Embed Foundation Extensions phase.
       - target: JoLiveActivity
