@@ -31,6 +31,14 @@ final class LocalVoiceBrainTests: XCTestCase {
         XCTAssertEqual(items.last?["role"] as? String, "user")
     }
 
+    func testAnAnswerToJosQuestionInheritsTheRequestsVerb() {
+        let asked = [LocalVoiceBrain.Exchange(user: "cancel my doctor's appointment", assistant: "Which day is it on?")]
+        XCTAssertEqual(LocalVoiceBrain.authorizing("Friday at 2", history: asked), "cancel my doctor's appointment Friday at 2")
+        let told = [LocalVoiceBrain.Exchange(user: "what's on Friday", assistant: "On Friday you have one thing: Lunch at 12 PM.")]
+        XCTAssertEqual(LocalVoiceBrain.authorizing("cancel it", history: told), "cancel it")
+        XCTAssertEqual(LocalVoiceBrain.authorizing("hi", history: []), "hi")
+    }
+
     func testTheOfflinePromptKeepsOnlyRecentContextAndTheInstructionsEndWithTheLocalPrompt() throws {
         let now = Date(timeIntervalSince1970: 1_792_005_120)
         let bare = LocalVoiceBrain.offlinePrompt("hi", history: [], now: now)

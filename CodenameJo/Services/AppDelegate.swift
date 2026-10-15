@@ -30,6 +30,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         Task { await BackgroundMailRefresh.run(trigger: .launch) }
         // Same trigger, separate cache and throttle state.
         Task { await BackgroundCalendarRefresh.run(trigger: .launch) }
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["LOCAL_TOOL_EVAL"] != nil { Task { await LocalToolEval.run() } }
+        #endif
 
         // MARK: - The local call's voice and turn detector
         // Both download on first use, and the local call is what answers when there is no

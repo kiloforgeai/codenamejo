@@ -40,6 +40,8 @@ enum LocalVoiceBrain {
 
     static let promptName = "local-voice"
     static let offlinePromptName = "local-voice-offline"
+    /// The tuned model's shorter instructions: it learned the rules, so the prompt only names them.
+    static let tunedPromptName = "local-voice-tuned"
     static let maxRounds = 8
     static let budget: TimeInterval = 45
     static let remembered = 8
@@ -52,6 +54,7 @@ enum LocalVoiceBrain {
     }
 
     static var onDeviceAvailable: Bool {
+        if LocalModel.usesOther { return true }
         if case .available = SystemLanguageModel.default.availability { return true }
         return false
     }
@@ -60,8 +63,10 @@ enum LocalVoiceBrain {
     /// OpenAI loop answers once its tool rounds are done, in one piece.
     static func reply(to transcript: String, history: [Exchange], engine: Engine,
                       profileId: String? = ProfileRuntime.snapshot?.profileId,
-                      focus: Focus? = nil) -> AsyncThrowingStream<String, Error> {
+                      focus: Focus? = nil, conversationId: String? = nil) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
+            // A tool speaks its own line and ends the turn; the model's repeat of it is cancelled.
+            let voice = Voice(say: { continuation.yield($0) }, done: { continuation.finish() })
             let task = Task {
                 do {
                     switch engine {
@@ -69,7 +74,8 @@ enum LocalVoiceBrain {
                         continuation.yield(try await respondOpenAI(transcript, history: history, profileId: profileId,
                                                                    focus: focus))
                     case .onDevice:
-                        try await respondOnDevice(transcript, history: history) { continuation.yield($0) }
+                        try await respondOnDevice(transcript, history: history, conversationId: conversationId,
+                                                  voice: voice) { continuation.yield($0) }
                     }
                     continuation.finish()
                 } catch {
@@ -174,13 +180,34 @@ enum LocalVoiceBrain {
             : dated + "Recent conversation, for context only:\n\(context)\n\nCurrent user message:\n\(transcript)"
     }
 
+    /// The words a tool may act on: this turn's, plus the previous turn's when Jo answered it
+    /// with a question, so "On Friday at 2" after "which day?" still carries the "cancel".
+    static func authorizing(_ transcript: String, history: [Exchange]) -> String {
+        guard let last = history.last, last.assistant.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
+        else { return transcript }
+        return last.user + " " + transcript
+    }
+
+    /// The on-device instructions for the model in use.
+    static func onDeviceInstructions(text: LivePrompt.Text = .bundled) throws -> String {
+        try text(LocalModel.usesTuned ? tunedPromptName : offlinePromptName)
+    }
+
+    /// Readies the next turn's session while the user is still talking.
+    static func prewarm() {
+        guard onDeviceAvailable, let instructions = try? onDeviceInstructions() else { return }
+        LocalModel.session(tools: LocalVoiceCalendar.tools(transcript: ""), instructions: instructions).prewarm()
+    }
+
     private static func respondOnDevice(_ transcript: String, history: [Exchange],
-                                        text: LivePrompt.Text = .bundled,
+                                        text: LivePrompt.Text = .bundled, conversationId: String?, voice: Voice,
                                         delta: (String) -> Void) async throws {
         guard onDeviceAvailable else { throw NoBrain() }
+        try await LocalModel.preload()
         let started = Date()
-        let session = LanguageModelSession(tools: LocalVoiceCalendar.tools(transcript: transcript, now: started),
-                                           instructions: try text(offlinePromptName))
+        let tools = LocalVoiceCalendar.tools(transcript: authorizing(transcript, history: history), now: started,
+                                             conversationId: conversationId, voice: voice)
+        let session = LocalModel.session(tools: tools, instructions: try onDeviceInstructions(text: text))
         var previous = ""
         for try await snapshot in session.streamResponse(to: offlinePrompt(transcript, history: history, now: started),
                                                          options: GenerationOptions(temperature: 0.5,

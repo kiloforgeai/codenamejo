@@ -2064,7 +2064,8 @@ extension RealtimeService {
     func beginLocalVoice(engine: LocalVoiceBrain.Engine, reason: String) {
         RealtimeLog.log("local-voice: standing in for Live on \(engine.rawValue) — \(reason)")
         let call = LocalVoiceCall(microphone: LocalMicrophone(queue: Container.shared.localVoiceQueue()),
-                                  speech: Container.shared.localSpeech())
+                                  speech: Container.shared.localSpeech(),
+                                  conversationId: activeConversationId?.uuidString)
         if LocalInbox.isAvailable {
             let inbox = LocalInbox(engine: engine, conversationId: activeConversationId?.uuidString)
             inbox.onFocus = { [weak self] focus in

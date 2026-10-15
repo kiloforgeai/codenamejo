@@ -78,9 +78,11 @@ final class LocalVoiceCalendarTests: XCTestCase {
             XCTAssertFalse(LocalVoiceCalendar.allowsCreate(text), text)
         }
         for text in ["cancel the dentist tomorrow", "delete my 3 o'clock", "take standup off my calendar",
-                     "get rid of the Friday lunch"] {
+                     "get rid of the Friday lunch", "decline the standup tomorrow at 4"] {
             XCTAssertTrue(LocalVoiceCalendar.allowsCancel(text), text)
         }
+        XCTAssertTrue(LocalVoiceCalendar.saysDecline("can you decline that standup for me"))
+        XCTAssertFalse(LocalVoiceCalendar.saysDecline("cancel the standup"))
         for text in ["is the dentist still on tomorrow", "don't cancel the dentist", "move the dentist to 4"] {
             XCTAssertFalse(LocalVoiceCalendar.allowsCancel(text), text)
         }
@@ -100,6 +102,7 @@ final class LocalVoiceCalendarTests: XCTestCase {
         XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "DENTIST appointment").map(\.id), [dentist.id])
         XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "12 to 1 lunch").map(\.id), [lunch.id])
         XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "standup").count, 2)
+        XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "stand up", hour: 15, calendar: calendar).count, 1)
         XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "standup", hour: 9, calendar: calendar).count, 1)
         XCTAssertEqual(LocalVoiceCalendar.matches(events, title: "3 pm", hour: 15, calendar: calendar).map(\.id),
                        [dentist.id])
@@ -116,35 +119,20 @@ final class LocalVoiceCalendarTests: XCTestCase {
                 + "Ask which one; nothing was cancelled.")
     }
 
-    func testAReceiptBecomesASpokenLineAndARefusalPassesThrough() {
+    func testAWriteIsSpokenAsWhatWillHappen() {
         let start = Date(timeIntervalSince1970: 1_792_090_800)
+        XCTAssertEqual(LocalVoiceCalendar.added(title: "Dentist", start: start, minutes: 60, now: now, calendar: calendar),
+                       "Added Dentist, tomorrow at 3 PM for an hour.")
         XCTAssertEqual(
-            LocalVoiceCalendar.added("Created \"Dentist\" (abc123) on a@b.c. https://calendar.google.com/x",
-                                     title: "Dentist", start: start, minutes: 60, now: now, calendar: calendar),
-            "Added Dentist, tomorrow at 3 PM for an hour.")
-        XCTAssertEqual(
-            LocalVoiceCalendar.added("Created \"Focus\" (abc123) on a@b.c.", title: "Focus",
-                                     start: Date(timeIntervalSince1970: 1_792_159_200), minutes: 90, now: now,
-                                     calendar: calendar),
+            LocalVoiceCalendar.added(title: "Focus", start: Date(timeIntervalSince1970: 1_792_159_200), minutes: 90,
+                                     now: now, calendar: calendar),
             "Added Focus, on Friday at 10 AM for an hour and a half.")
-        let refusal = "Need a title, a start and an end to create an event."
-        XCTAssertEqual(LocalVoiceCalendar.added(refusal, title: "x", start: start, minutes: 60, now: now,
-                                                calendar: calendar), refusal)
-
-        let dentist = event("Dentist", at: 1_792_090_800)
-        XCTAssertEqual(
-            LocalVoiceCalendar.cancelled("Cancelled \"Dentist\" (Oct 15, 3:00 PM) on a@b.c.", event: dentist, now: now,
-                                         calendar: calendar),
-            "Cancelled Dentist, tomorrow at 3 PM.")
-        XCTAssertEqual(
-            LocalVoiceCalendar.cancelled("Cancelled \"Dentist\" on a@b.c. The 2 guests were emailed a cancellation.",
-                                         event: dentist, now: now, calendar: calendar),
-            "Cancelled Dentist, tomorrow at 3 PM. Your guests were told.")
-        XCTAssertEqual(
-            LocalVoiceCalendar.cancelled("Took \"Dentist\" off a@b.c's calendar. The user didn't organize it, so …",
-                                         event: dentist, now: now, calendar: calendar),
-            "Took Dentist, tomorrow at 3 PM off your calendar. You didn't organize it, so it's still on everyone else's.")
-        let already = "\"Dentist\" was already cancelled. Nothing to do, and nobody was notified again."
-        XCTAssertEqual(LocalVoiceCalendar.cancelled(already, event: dentist, now: now, calendar: calendar), already)
+        XCTAssertEqual(LocalVoiceCalendar.cancelled(event("Dentist", at: 1_792_090_800), now: now, calendar: calendar),
+                       "Cancelled Dentist, tomorrow at 3 PM.")
+        XCTAssertEqual(LocalVoiceCalendar.cancelled(event("Standup", at: 1_792_094_400), declining: true, now: now,
+                                                    calendar: calendar),
+                       "Declined Standup, tomorrow at 4 PM.")
+        XCTAssertEqual(LocalVoiceCalendar.cancelled(event(nil, at: 1_792_159_200, allDay: true), now: now, calendar: calendar),
+                       "Cancelled the event, on Friday.")
     }
 }

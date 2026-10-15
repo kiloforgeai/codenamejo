@@ -2,19 +2,30 @@ import FactoryKit
 import Foundation
 import FoundationModels
 
+/// What a tool says to the user straight away, before the model's own turn ends, and the signal
+/// that the turn is over so nothing the model writes afterwards is spoken.
+struct Voice: Sendable {
+    let say: @Sendable (String) -> Void
+    let done: @Sendable () -> Void
+    static let silent = Voice(say: { _ in }, done: {})
+}
+
 /// The calendar for a local call's on-device engine: what is on a day, adding an event, and
 /// cancelling one. Reads come from the phone's cache when it covers the window, else from
-/// Google; writes go to Google.
+/// Google; writes are spoken at once and land on Google in the background.
 enum LocalVoiceCalendar {
     static let read = "read_calendar"
     static let add = "add_calendar_event"
     static let cancel = "cancel_calendar_event"
     static let maxDays = 7
 
-    /// All three tools. `transcript` is the user's own words, which alone can authorize a write.
-    static func tools(transcript: String, now: Date = Date()) -> [any Tool] {
-        [ReadCalendar(now: now), AddCalendarEvent(transcript: transcript, now: now),
-         CancelCalendarEvent(transcript: transcript, now: now)]
+    /// All three tools. `transcript` is the user's own words, which alone can authorize a write;
+    /// a write that fails in the background is told on `conversationId`'s next turn.
+    static func tools(transcript: String, now: Date = Date(), conversationId: String? = nil,
+                      voice: Voice = .silent) -> [any Tool] {
+        [ReadCalendar(now: now, voice: voice),
+         AddCalendarEvent(transcript: transcript, now: now, conversationId: conversationId, voice: voice),
+         CancelCalendarEvent(transcript: transcript, now: now, conversationId: conversationId, voice: voice)]
     }
 
     /// "Wednesday, October 14, 2026, 3:12 PM", so the model can turn a weekday into a day offset.
@@ -59,13 +70,21 @@ enum LocalVoiceCalendar {
         return "\(when.prefix(1).uppercased() + when.dropFirst()) you have \(count): \(joined(lines))."
     }
 
-    /// The user's own words must ask for the event, as `LocalInbox.allowsSend` requires "send".
+    /// The untuned models misfire on a confirmation or on Jo's own leaked speech, so for them the
+    /// user's own words must ask for the event; the tuned model is trusted to read the request.
     nonisolated static func allowsCreate(_ transcript: String) -> Bool {
-        said(transcript, any: ["add", "put", "schedule", "create", "block", "book", "set up", "hold"])
+        LocalModel.usesTuned || said(transcript, any: ["add", "put", "schedule", "create", "block", "book", "set up", "hold"])
     }
 
     nonisolated static func allowsCancel(_ transcript: String) -> Bool {
-        said(transcript, any: ["cancel", "delete", "remove", "scrap", "take off", "get rid"])
+        LocalModel.usesTuned
+            || said(transcript, any: ["cancel", "delete", "remove", "scrap", "take off", "get rid", "decline"])
+    }
+
+    /// "Decline" on someone else's invitation answers no, which tells the organizer; a cancel
+    /// would only take it off this calendar.
+    nonisolated static func saysDecline(_ transcript: String) -> Bool {
+        said(transcript, any: ["decline", "declined", "declining"])
     }
 
     /// The events whose title carries every content word the user said ("12 to 1 lunch" is
@@ -76,8 +95,10 @@ enum LocalVoiceCalendar {
         guard !wanted.isEmpty || hour >= 0 else { return [] }
         return events.filter { $0.status != "cancelled" }
             .filter { event in
-                let have = Set(words(event.summary ?? ""))
-                guard wanted.allSatisfy(have.contains) else { return false }
+                // "stand up" is "Standup": the words joined must appear too.
+                let have = words(event.summary ?? "")
+                let named = wanted.allSatisfy(Set(have).contains) || have.joined().contains(wanted.joined())
+                guard named else { return false }
                 guard hour >= 0, let start = event.startEpochMs else { return true }
                 return calendar.component(.hour, from: Date(timeIntervalSince1970: Double(start) / 1000)) == hour
             }
@@ -103,29 +124,19 @@ enum LocalVoiceCalendar {
         }
     }
 
-    /// "Added Dentist, tomorrow at 3 PM for an hour." from a `CalendarTools` create receipt; a
-    /// refusal or failure is passed through for the model to relay.
-    static func added(_ output: String, title: String, start: Date, minutes: Int, now: Date,
-                      calendar: Calendar = .current) -> String {
-        guard output.hasPrefix("Created \"") else { return output }
-        return "Added \(title), \(when(start, allDay: false, now: now, calendar: calendar)) for \(duration(minutes))."
+    /// "Added Dentist, tomorrow at 3 PM for an hour."
+    static func added(title: String, start: Date, minutes: Int, now: Date, calendar: Calendar = .current) -> String {
+        "Added \(title), \(when(start, allDay: false, now: now, calendar: calendar)) for \(duration(minutes))."
     }
 
-    /// "Cancelled Dentist, tomorrow at 3 PM." from a `LocalCalendarWrites` receipt, which also says
-    /// when the user was only a guest; a refusal or failure is passed through.
-    static func cancelled(_ output: String, event: CalendarStore.Event, now: Date,
+    /// "Cancelled Dentist, tomorrow at 3 PM.", or "Declined" when answering an invitation.
+    static func cancelled(_ event: CalendarStore.Event, declining: Bool = false, now: Date,
                           calendar: Calendar = .current) -> String {
         let name = event.summary?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let title = name.isEmpty ? "the event" : name
         let start = event.startEpochMs.map { Date(timeIntervalSince1970: Double($0) / 1000) }
         let at = start.map { ", " + when($0, allDay: event.isAllDay, now: now, calendar: calendar) } ?? ""
-        if output.hasPrefix("Cancelled \"") {
-            return "Cancelled \(title)\(at).\(output.contains("emailed a cancellation") ? " Your guests were told." : "")"
-        }
-        if output.hasPrefix("Took \"") {
-            return "Took \(title)\(at) off your calendar. You didn't organize it, so it's still on everyone else's."
-        }
-        return output
+        return "\(declining ? "Declined" : "Cancelled") \(title)\(at)."
     }
 
     // MARK: - Wording
@@ -266,16 +277,22 @@ private struct ReadCalendar: Tool {
         var days: Int
     }
     let now: Date
+    let voice: Voice
 
     func call(arguments: Arguments) async throws -> String {
         let accounts = await CalendarTools.accounts()
-        guard !accounts.isEmpty else { return "No Google Calendar is connected." }
-        let window = LocalVoiceCalendar.window(dayOffset: arguments.dayOffset, days: arguments.days, now: now)
-        let (events, unreachable) = await LocalVoiceCalendar.events(window, accounts: accounts)
-        RealtimeLog.log("local-calendar: read day \(arguments.dayOffset) for \(arguments.days) day(s): "
-            + "\(events.count) event(s)\(unreachable ? ", a calendar unreachable" : "")")
-        let spoken = LocalVoiceCalendar.spoken(events, dayOffset: arguments.dayOffset, days: arguments.days, now: now)
-        return unreachable ? spoken + " I couldn't reach one of your calendars." : spoken
+        var line = "No Google Calendar is connected."
+        if !accounts.isEmpty {
+            let window = LocalVoiceCalendar.window(dayOffset: arguments.dayOffset, days: arguments.days, now: now)
+            let (events, unreachable) = await LocalVoiceCalendar.events(window, accounts: accounts)
+            RealtimeLog.log("local-calendar: read day \(arguments.dayOffset) for \(arguments.days) day(s): "
+                + "\(events.count) event(s)\(unreachable ? ", a calendar unreachable" : "")")
+            line = LocalVoiceCalendar.spoken(events, dayOffset: arguments.dayOffset, days: arguments.days, now: now)
+            if unreachable { line += " I couldn't reach one of your calendars." }
+        }
+        voice.say(line)
+        voice.done()
+        return line
     }
 }
 
@@ -297,11 +314,15 @@ private struct AddCalendarEvent: Tool {
     }
     let transcript: String
     let now: Date
+    let conversationId: String?
+    let voice: Voice
     private let once = Once()
 
     func call(arguments: Arguments) async throws -> String {
         guard LocalVoiceCalendar.allowsCreate(transcript) else {
             RealtimeLog.log("local-calendar: add refused — no create verb in the user's words")
+            voice.say("I didn't hear you ask to add anything, so nothing changed.")
+            voice.done()
             return "Not added: the user did not ask to put anything on the calendar."
         }
         guard await once.claim() else { return "Already added this turn. Do not repeat it." }
@@ -311,12 +332,24 @@ private struct AddCalendarEvent: Tool {
             return "Not added: that time could not be placed on a day."
         }
         let end = start.addingTimeInterval(TimeInterval(arguments.durationMinutes * 60))
+        let line = LocalVoiceCalendar.added(title: title, start: start, minutes: arguments.durationMinutes, now: now)
+        voice.say(line)
         let body: [String: Any] = ["summary": title, "start": LocalVoiceCalendar.stamp(start),
                                    "end": LocalVoiceCalendar.stamp(end), "online": false]
-        let result = await CalendarTools.run(name: CalendarTools.create, argumentsJSON: LocalVoiceCalendar.json(body))
-        RealtimeLog.log("local-calendar: add \(result.failed ? "failed" : "done") — \(result.output.prefix(80))")
-        return LocalVoiceCalendar.added(result.output, title: title, start: start, minutes: arguments.durationMinutes,
-                                        now: now)
+        let json = LocalVoiceCalendar.json(body)
+        let conversationId = conversationId
+        // The write lands in the background; a failure is told on the next turn.
+        Task.detached {
+            let result = await CalendarTools.run(name: CalendarTools.create, argumentsJSON: json)
+            let landed = result.output.hasPrefix("Created \"")
+            RealtimeLog.log("local-calendar: add \(landed ? "landed" : "failed") — \(result.output.prefix(80))")
+            if !landed {
+                Container.shared.localWriteNotices().push("\(title) didn't make it onto the calendar after all.",
+                                                          conversation: conversationId)
+            }
+        }
+        voice.done()
+        return line
     }
 }
 
@@ -334,16 +367,24 @@ private struct CancelCalendarEvent: Tool {
     }
     let transcript: String
     let now: Date
+    let conversationId: String?
+    let voice: Voice
     private let once = Once()
 
     func call(arguments: Arguments) async throws -> String {
         guard LocalVoiceCalendar.allowsCancel(transcript) else {
             RealtimeLog.log("local-calendar: cancel refused — no cancel verb in the user's words")
+            voice.say("I didn't hear you ask to cancel anything, so nothing changed.")
+            voice.done()
             return "Not cancelled: the user did not ask to cancel anything."
         }
         guard await once.claim() else { return "Already cancelled this turn. Do not repeat it." }
         let accounts = await CalendarTools.accounts()
-        guard !accounts.isEmpty else { return "No Google Calendar is connected." }
+        guard !accounts.isEmpty else {
+            voice.say("No Google Calendar is connected.")
+            voice.done()
+            return "No Google Calendar is connected."
+        }
         let window = LocalVoiceCalendar.dayWindow(dayOffset: arguments.dayOffset, now: now)
         let (events, _) = await LocalVoiceCalendar.events(window, accounts: accounts)
         let found = LocalVoiceCalendar.matches(events, title: arguments.title, hour: arguments.hour)
@@ -351,18 +392,41 @@ private struct CancelCalendarEvent: Tool {
                                                         now: now) {
             RealtimeLog.log("local-calendar: cancel \"\(arguments.title)\" hour \(arguments.hour) day \(arguments.dayOffset): "
                 + "\(found.count) of \(events.count) match")
+            voice.say(ambiguity)
+            voice.done()
             return ambiguity
         }
         let event = found[0]
-        let body = ["event_id": event.id, "account": event.account]
-        let result = await LocalCalendarWrites.run(name: LocalCalendarWrites.cancel,
-                                                   argumentsJSON: LocalVoiceCalendar.json(body), defer: false)
-        RealtimeLog.log("local-calendar: cancel \(result.ok == true ? "done" : "refused") — \(result.text.prefix(80))")
-        if result.ok == true {
-            // A synchronous write leaves the cache to its caller, so the next read agrees.
-            _ = await CalendarStore(database: Container.shared.localContext().dbPool)
-                .removeEvent(id: event.id, account: event.account)
+        let declining = LocalVoiceCalendar.saysDecline(transcript)
+        let line = LocalVoiceCalendar.cancelled(event, declining: declining, now: now)
+        voice.say(line)
+        let conversationId = conversationId
+        // The write lands in the background; a failure is told on the next turn. A decline goes
+        // through the deferred path, which updates the cache and reports its own failure.
+        Task.detached {
+            if declining {
+                let json = LocalVoiceCalendar.json(["event_id": event.id, "account": event.account, "response": "declined"])
+                let result = await LocalCalendarWrites.run(name: LocalCalendarWrites.respond, argumentsJSON: json,
+                                                           defer: true, conversationId: conversationId)
+                RealtimeLog.log("local-calendar: decline \(result.ok == true ? "accepted" : "refused") — \(result.text.prefix(80))")
+                if result.ok != true {
+                    Container.shared.localWriteNotices().push("Declining \(event.summary ?? "that event") didn't go through.",
+                                                              conversation: conversationId)
+                }
+                return
+            }
+            let json = LocalVoiceCalendar.json(["event_id": event.id, "account": event.account])
+            let result = await LocalCalendarWrites.run(name: LocalCalendarWrites.cancel, argumentsJSON: json, defer: false)
+            RealtimeLog.log("local-calendar: cancel \(result.ok == true ? "landed" : "refused") — \(result.text.prefix(80))")
+            if result.ok == true {
+                _ = await CalendarStore(database: Container.shared.localContext().dbPool)
+                    .removeEvent(id: event.id, account: event.account)
+            } else {
+                Container.shared.localWriteNotices().push("Cancelling \(event.summary ?? "that event") didn't go through; "
+                    + "it's still on the calendar.", conversation: conversationId)
+            }
         }
-        return LocalVoiceCalendar.cancelled(result.text, event: event, now: now)
+        voice.done()
+        return line
     }
 }
