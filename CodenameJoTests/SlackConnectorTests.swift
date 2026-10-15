@@ -290,6 +290,94 @@ final class SlackConnectorTests: XCTestCase {
         XCTAssertEqual(queue.workspaces, ["Acme"])
     }
 
+    func testDMsAreProbedBeforeTheBudgetRunsOutOnChannels() async {
+        grants.save(grant())
+        let now = Date().timeIntervalSince1970
+        let channels = (1...60).map { ["id": "C\($0)", "name": "chan\($0)"] as [String: Any] }
+        let slack = serve { call in
+            switch call.method {
+            case "users.conversations":
+                return (200, ["ok": true, "channels": channels + [["id": "D1", "is_im": true, "user": "U2"]]])
+            case "conversations.info":
+                let id = call.params["channel"] ?? ""
+                return id == "D1"
+                    ? (200, ["ok": true, "channel": ["id": "D1", "is_im": true, "user": "U2", "last_read": "100.000001"]])
+                    : (200, ["ok": true, "channel": ["id": id, "name": id, "last_read": "100.000001"]])
+            case "conversations.history":
+                if call.params["channel"] != "D1" { return (200, ["ok": true, "messages": []]) }
+                return (200, ["ok": true, "messages": [["user": "U2", "text": "got a sec?", "ts": "\(now)"]]])
+            case "users.info":
+                return (200, ["ok": true, "user": ["id": "U2", "name": "sam", "profile": ["display_name": "Sam"]]])
+            default:
+                return (200, ["ok": false, "error": "unknown_method"])
+            }
+        }
+        let queue = await SlackSweep.buildQueue([SlackWorkspace(grant())], model: nil)
+        XCTAssertEqual(queue.items.map(\.channelId), ["D1"], "a DM listed after 60 channels is still asked about")
+        XCTAssertEqual(queue.items.first?.label, "Sam")
+        XCTAssertEqual(queue.report.unchecked, 11)
+        XCTAssertEqual(slack.calls.filter { $0.method == "conversations.history" }.count, SlackSweep.maxProbes)
+    }
+
+    func testADMWithoutABookmarkFallsBackToItsUnreadCount() async {
+        grants.save(grant())
+        let now = Date().timeIntervalSince1970
+        let slack = serve { call in
+            switch call.method {
+            case "users.conversations":
+                return (200, ["ok": true, "channels": [
+                    ["id": "D1", "is_im": true, "user": "U2"], ["id": "D2", "is_im": true, "user": "U3"]]])
+            case "conversations.info":
+                return call.params["channel"] == "D1"
+                    ? (200, ["ok": true, "channel": ["id": "D1", "is_im": true, "user": "U2",
+                                                     "last_read": "0000000000.000000", "unread_count_display": 2]])
+                    : (200, ["ok": true, "channel": ["id": "D2", "is_im": true, "user": "U3",
+                                                     "last_read": "0000000000.000000", "unread_count_display": 0]])
+            case "conversations.history":
+                return (200, ["ok": true, "has_more": true, "messages": [
+                    ["user": "U2", "text": "are you around?", "ts": "\(now)"],
+                    ["user": "U2", "text": "quick one", "ts": "\(now - 5)"]]])
+            case "users.info":
+                return (200, ["ok": true, "user": ["id": "U2", "name": "sam", "profile": ["display_name": "Sam"]]])
+            default:
+                return (200, ["ok": false, "error": "unknown_method"])
+            }
+        }
+        let queue = await SlackSweep.buildQueue([SlackWorkspace(grant())], model: nil)
+        XCTAssertEqual(queue.items.map(\.channelId), ["D1"])
+        XCTAssertEqual(queue.items.first?.unread, 2)
+        XCTAssertEqual(queue.items.first?.more, false, "older history is not more unread")
+        XCTAssertEqual(queue.report.readStateUnknown, 0, "a zero count is known: nothing unread")
+        let history = slack.calls.filter { $0.method == "conversations.history" }
+        XCTAssertEqual(history.map { $0.params["channel"] }, ["D1"], "a DM with nothing unread costs no history call")
+        XCTAssertEqual(history.first?.params["limit"], "2")
+        XCTAssertNil(history.first?.params["oldest"])
+    }
+
+    func testDMsSkippedForWithheldBookmarksLeaveTheBudgetToChannels() async {
+        grants.save(grant())
+        let dms = (1...60).map { ["id": "D\($0)", "is_im": true, "user": "U\($0)"] as [String: Any] }
+        _ = serve { call in
+            switch call.method {
+            case "users.conversations":
+                return (200, ["ok": true, "channels": dms + [["id": "C1", "name": "eng"]]])
+            case "conversations.info":
+                let id = call.params["channel"] ?? ""
+                return id == "C1"
+                    ? (200, ["ok": true, "channel": ["id": "C1", "name": "eng", "last_read": "100.000001"]])
+                    : (200, ["ok": true, "channel": ["id": id, "is_im": true, "last_read": "0000000000.000000"]])
+            case "conversations.history":
+                return (200, ["ok": true, "messages": [["user": "U9", "text": "ship it", "ts": "\(Date().timeIntervalSince1970)"]]])
+            default:
+                return (200, ["ok": false, "error": "unknown_method"])
+            }
+        }
+        let queue = await SlackSweep.buildQueue([SlackWorkspace(grant())], model: nil)
+        XCTAssertEqual(queue.items.map(\.channelId), ["C1"], "skipping DMs spends no probes, so the channel is reached")
+        XCTAssertEqual(queue.report.readStateUnknown, 60)
+        XCTAssertEqual(queue.report.unchecked, 0)
+    }
+
     func testAWorkspaceThatCannotBeListedIsNamedNotEmpty() async {
         grants.save(grant())
         _ = serve { _ in (200, ["ok": false, "error": "invalid_auth"]) }

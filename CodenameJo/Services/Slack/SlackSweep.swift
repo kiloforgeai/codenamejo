@@ -315,8 +315,9 @@ enum SlackSweep {
                 markUnavailable: !workspaces.isEmpty && !workspaces.contains(where: \.canMark) ? true : nil))
     }
 
-    /// Every conversation the user is in: group DMs, then channels, then DMs (whose read state
-    /// Slack mostly withholds). A token without `im:read` is retried without DMs.
+    /// Every conversation the user is in: DMs, then group DMs, then channels, so the probe budget
+    /// reaches the people writing to the user before it runs out on channels. A token without
+    /// `im:read` is retried without DMs.
     static func listConversations(_ ws: SlackWorkspace) async throws -> (conversations: [Conversation], dmsUnavailable: Bool) {
         var types = "public_channel,private_channel,im,mpim"
         var dmsUnavailable = false
@@ -339,7 +340,7 @@ enum SlackSweep {
             cursor = SlackWebAPI.nextCursor(json)
             if cursor.isEmpty { break }
         }
-        func rank(_ c: Conversation) -> Int { c.isMpim ? 0 : c.isIm ? 2 : 1 }
+        func rank(_ c: Conversation) -> Int { c.isIm ? 0 : c.isMpim ? 1 : 2 }
         return (out.enumerated().sorted { rank($0.element) != rank($1.element)
             ? rank($0.element) < rank($1.element) : $0.offset < $1.offset }.map(\.element), dmsUnavailable)
     }
@@ -350,24 +351,34 @@ enum SlackSweep {
         var unreachable = 0
         var dmUnknownRun = 0
         var rateLimited = false
+        var probed = 0
+        var overBudget = 0
         func add(_ finding: Finding) { findings.append(finding) }
         func countUnknown(dm: Bool) { unknown += 1; if dm { dmUnknownRun += 1 } }
         func dmAnswered() { dmUnknownRun = 0 }
         func countUnreachable(rateLimit: Bool) { unreachable += 1; if rateLimit { rateLimited = true } }
+        /// A probe is spent only on a conversation actually asked about, so DMs skipped after a
+        /// run of withheld bookmarks leave the budget to channels.
+        func takeProbe() -> Bool {
+            guard probed < maxProbes else { overBudget += 1; return false }
+            probed += 1
+            return true
+        }
     }
 
     static func sweep(_ ws: SlackWorkspace, book: SlackNameBook, deadline: TimeInterval = probeDeadline) async throws -> SweepResult {
         let (conversations, dmsUnavailable) = try await listConversations(ws)
-        let probes = Array(conversations.prefix(maxProbes))
         let state = SweepState()
         let stopAt = Date().addingTimeInterval(deadline)
-        let started = await eachWithConcurrency(probes, stop: {
-            await state.rateLimited || Date() > stopAt
+        let started = await eachWithConcurrency(conversations, stop: {
+            let (rateLimited, probed) = (await state.rateLimited, await state.probed)
+            return rateLimited || probed >= maxProbes || Date() > stopAt
         }) { c in
             if c.isIm, await state.dmUnknownRun >= dmUnknownStop {
                 await state.countUnknown(dm: false)
                 return
             }
+            guard await state.takeProbe() else { return }
             do {
                 let probe = try await unreadFor(ws, c)
                 guard let probe else {
@@ -387,11 +398,11 @@ enum SlackSweep {
         }
         var result = SweepResult(teamName: ws.teamName)
         result.findings = await state.findings
-        result.unchecked = max(0, conversations.count - started)
+        result.unchecked = max(0, conversations.count - started) + (await state.overBudget)
         result.unreachable = await state.unreachable
         result.unknown = await state.unknown
         result.dmsUnavailable = dmsUnavailable
-        RealtimeLog.log("slack sweep: \(ws.teamName) — \(result.findings.count) with unread, \(started)/\(conversations.count) probed, "
+        RealtimeLog.log("slack sweep: \(ws.teamName) — \(result.findings.count) with unread, \(await state.probed)/\(conversations.count) probed, "
             + "\(result.unchecked) unchecked, \(result.unreachable) unreachable, \(result.unknown) unknown")
         return result
     }
@@ -403,18 +414,28 @@ enum SlackSweep {
         let info: [String: SendableJSON]
     }
 
-    /// What sits after where the user stopped reading. Nil when Slack withholds the bookmark.
+    /// What sits after where the user stopped reading. A DM without a bookmark falls back to the
+    /// unread count Slack gives DMs alone, read off the newest messages. Nil when neither is there.
     static func unreadFor(_ ws: SlackWorkspace, _ c: Conversation) async throws -> Probe? {
         let info = try await SlackWebAPI.call(ws, "conversations.info", ["channel": c.id])["channel"] as? [String: Any] ?? [:]
         let lastRead = info["last_read"] as? String ?? ""
-        guard !lastRead.isEmpty, (Double(lastRead) ?? 0) != 0 else { return nil }
-        let history = try await SlackWebAPI.call(ws, "conversations.history", [
-            "channel": c.id, "oldest": lastRead, "inclusive": "false", "limit": "100",
-        ])
+        var params = ["channel": c.id, "limit": "100"]
+        var fallbackCount: Int?
+        if !lastRead.isEmpty, (Double(lastRead) ?? 0) != 0 {
+            params["oldest"] = lastRead
+            params["inclusive"] = "false"
+        } else if let count = (info["unread_count_display"] as? NSNumber)?.intValue {
+            guard count > 0 else { return Probe(unread: 0, more: false, messages: [], info: SendableJSON.wrap(info)) }
+            params["limit"] = String(min(count, 100))
+            fallbackCount = count
+        } else {
+            return nil
+        }
+        let history = try await SlackWebAPI.call(ws, "conversations.history", params)
         let messages = (history["messages"] as? [[String: Any]] ?? []).map(RawMessage.init)
             .filter { !($0.subtype.map(noiseSubtypes.contains) ?? false) }
         return Probe(unread: messages.filter { $0.user != ws.userId }.count,
-                     more: history["has_more"] as? Bool == true, messages: messages,
+                     more: fallbackCount.map { $0 > 100 } ?? (history["has_more"] as? Bool == true), messages: messages,
                      info: SendableJSON.wrap(info))
     }
 
