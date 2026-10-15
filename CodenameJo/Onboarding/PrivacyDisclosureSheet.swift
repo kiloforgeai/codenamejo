@@ -152,6 +152,12 @@ private struct PrivacyPoint: Identifiable {
             detail: "Encrypted in transit with TLS, and encrypted at rest with AES-256."
         ),
         PrivacyPoint(
+            symbol: "person.crop.circle",
+            label: "We keep your email address",
+            detail: "When you sign in, our sign-in server records your Google account's email "
+                + "and the date. Never your mail or your tokens."
+        ),
+        PrivacyPoint(
             symbol: "hand.raised.fill",
             label: "Never sold, never trained on",
             detail: "We don't sell your data. The AI models that power Jo process your "
@@ -172,8 +178,8 @@ private struct PrivacyPoint: Identifiable {
         PrivacyPoint(
             symbol: "trash.fill",
             label: "Delete your account and it's gone",
-            detail: "Deleting your account removes everything we hold about it. It can't "
-                + "be undone."
+            detail: "Deleting your account removes everything on this phone. It can't be "
+                + "undone. Ask us and we'll remove your email from our records too."
         )
     ] }
 }

@@ -11,8 +11,8 @@ you through your mail. It:
 
 **Fully client-executed.** Every tool, ranking, summary and decision runs on your phone, on
 your own OpenAI key. The only server is a thin, stateless Google connection shim that adds
-our verified client's secret to Google's token calls. It stores nothing and never sees your
-mail.
+our verified client's secret to Google's token calls. It records the email address of each
+Google account that signs in, and never sees your mail.
 
 This repository is the iOS app (SwiftUI), with a watchOS companion and a Live Activity.
 
@@ -25,7 +25,7 @@ This repository is the iOS app (SwiftUI), with a watchOS companion and a Live Ac
 | Ranking your mail by importance, email summaries, per-category playbooks | The phone, which asks OpenAI on your key |
 | The mail queue, profiles, history, settings | The phone's local database |
 | Your Google, Notion, Granola, Slack, GitHub and custom MCP credentials | The phone's Keychain |
-| Google sign-in and token refresh | Our hosted token shim, which adds the web client's secret to Google's token request and returns the result. It has no database and never logs tokens |
+| Google sign-in and token refresh | Our hosted token shim, which adds the web client's secret to Google's token request and returns the result. It records each signed-in account's email and first sign-in date, and never stores or logs tokens |
 
 What leaves your phone, and to whom:
 
@@ -35,11 +35,13 @@ What leaves your phone, and to whom:
 - **To Google, Notion, Granola, Slack, GitHub and any MCP server you add:** the API calls Jo
   makes for you, with your own tokens.
 - **To the token shim:** a Google sign-in code or refresh token, once at sign-in and about
-  once an hour per account after that. Nothing about your mail.
+  once an hour per account after that. At sign-in it records the account's email address and
+  the date. Nothing about your mail.
 - **To Hugging Face:** a one-time download of the local voice model and its pronunciation
   lexicon, the first time the local voice is used. Nothing about you goes with it.
 
-There is no analytics, telemetry, push, call recording or feedback upload.
+Apart from that sign-up email, there is no analytics, telemetry, push, call recording or
+feedback upload.
 
 ## Connectors
 

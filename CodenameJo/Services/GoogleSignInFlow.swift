@@ -5,7 +5,8 @@ import Foundation
 import UIKit
 
 /// The hosted token server: it adds the web client's secret to Google's token calls, which an
-/// open-source app cannot ship. It stores and logs nothing; every grant lives in this Keychain.
+/// open-source app cannot ship. It records each signed-in account's email and nothing else; every
+/// grant lives in this Keychain.
 enum GoogleTokenServer {
     static var baseURL: URL? {
         AppHosts.tokenServer.isEmpty ? nil : URL(string: "https://\(AppHosts.tokenServer)")
