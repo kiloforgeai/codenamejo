@@ -34,6 +34,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         if ProcessInfo.processInfo.environment["LOCAL_TOOL_EVAL"] != nil { Task { await LocalToolEval.run() } }
         #endif
 
+        // MARK: - The local call's model
+        // Same reason as the voice below: the tuned Gemma has to be on the phone before a call
+        // needs it, or the call falls back to Apple's model.
+        if #available(iOS 27.0, *) { Task.detached(priority: .utility) { await LocalModel.Tuned.download() } }
+
         // MARK: - The local call's voice and turn detector
         // Both download on first use, and the local call is what answers when there is no
         // connection — by which point it is too late to fetch them.

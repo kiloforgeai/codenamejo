@@ -20,6 +20,11 @@ xcrun devicectl device copy to --device <udid> --source fused-gemma4-e4b-jo \
   --domain-identifier <bundle id>
 ```
 
+The app downloads the E2B checkpoint from the Hugging Face repo in `LocalModel.Tuned.repo` at
+launch, on Wi-Fi, whenever neither checkpoint is on the phone. To ship a new one, upload the fused
+directory there (`hf upload raghavnaras/gemma-4-e2b-jo fused-gemma4-e2b-jo .`); the copy above is
+only for testing a checkpoint before it is uploaded.
+
 `train.py` wraps `mlx_lm.lora` so the chat template renders with thinking off, which is how the
 phone's bridge renders it. `gen_data.py` reads the live prompts from the repo and emits one row
 per model turn, so the prompt mask covers exactly what the model did not write. The sixteen
