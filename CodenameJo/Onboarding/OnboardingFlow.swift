@@ -4,7 +4,7 @@ import FactoryKit
 import Speech
 import SwiftUI
 
-// Onboarding coordinator on a `NavigationStack`: openAIKey, welcome, connectTools, drafts,
+// Onboarding coordinator on a `NavigationStack`: welcome, openAIKey, connectTools, drafts,
 // notifications, microphone, speech, preparing. Container view: NO #Preview.
 
 /// Moving between steps and finishing. Which steps exist depends on whether the user is signed in;
@@ -19,7 +19,7 @@ struct OnboardingFlow<Interactor: ViewWithModelLifecycleObserver<OnboardingFlowV
     @StateObject var interactor: Interactor
 
     /// `viewModel.steps[0]` is the root and `path` holds everything pushed on top, so depth is
-    /// `path.count`. The OpenAI key step is the root.
+    /// `path.count`. The welcome step is the root.
     var body: some View {
         NavigationStack(path: $viewModel.path) {
             stepView(for: viewModel.steps[0])
@@ -47,6 +47,8 @@ struct OnboardingFlow<Interactor: ViewWithModelLifecycleObserver<OnboardingFlowV
 
             case .openAIKey:
                 OpenAIKeyView(onContinue: { interactor.advance(viewModel: viewModel) })
+                    // Pushed on a finished Google sign-in; back would only reopen its consent.
+                    .navigationBarBackButtonHidden(true)
 
             case .drafts:
                 OnboardingDraftsViewComponent.make(
@@ -99,9 +101,10 @@ final class OnboardingFlowViewModel: ViewModel {
              notifications, drafts, preparing
 
         static let flowSteps: [Step] = [
-            // Before the welcome page's Google consent: connecting a mailbox starts AI mail
-            // preparation, which the broker refuses until the phone holds a key.
-            .openAIKey, .welcome, .microphone, .speech,
+            // The key straight after the welcome page's Google consent: nothing before it calls
+            // OpenAI, and the first call on `.preparing` can't start without one. Scoring that the
+            // connect started without a key is run again once it is saved.
+            .welcome, .openAIKey, .microphone, .speech,
             .connectTools,
             .notifications,
             // .drafts,
@@ -129,6 +132,7 @@ final class OnboardingFlowInteractor: ViewModelInteractor<OnboardingFlowViewMode
     @Injected(\.userProfile) private var userProfile
     @Injected(\.voiceLauncher) private var voiceLauncher
     @Injected(\.realtimeService) private var realtimeService
+    @Injected(\.mailStore) private var mailStore
 
     @CancellableBuilder
     override func onLoad(viewModel: OnboardingFlowViewModel) -> [AnyCancellable] {
@@ -186,6 +190,20 @@ extension OnboardingFlowInteractor: OnboardingFlowHandler {
         if SFSpeechRecognizer.authorizationStatus() != .notDetermined,
            !viewModel.path.contains(.speech) {
             viewModel.steps.removeAll { $0 == .speech }
+        }
+        // A key kept from an earlier install of a signed-in account: nothing to ask.
+        if OpenAIKeyService.current?.isEmpty == false, !viewModel.path.contains(.openAIKey) {
+            viewModel.steps.removeAll { $0 == .openAIKey }
+        }
+        // The mail the Google connect fetched was scored without a key and those batches failed;
+        // score it now, while the remaining steps are on screen, so the first call walks it banded.
+        if viewModel.step == .openAIKey {
+            let store = mailStore
+            Task.detached(priority: .utility) {
+                for account in ProfileRuntime.allowedMailAccounts(GoogleAccountStore.mailAccounts()) {
+                    await Container.shared.mailImportance().score(account: account, store: store)
+                }
+            }
         }
         // Depth, not an index: the root isn't in `path`, so the step after the current
         // one is `steps[path.count + 1]`.
