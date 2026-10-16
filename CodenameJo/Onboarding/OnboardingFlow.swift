@@ -132,7 +132,6 @@ final class OnboardingFlowInteractor: ViewModelInteractor<OnboardingFlowViewMode
     @Injected(\.userProfile) private var userProfile
     @Injected(\.voiceLauncher) private var voiceLauncher
     @Injected(\.realtimeService) private var realtimeService
-    @Injected(\.mailStore) private var mailStore
 
     @CancellableBuilder
     override func onLoad(viewModel: OnboardingFlowViewModel) -> [AnyCancellable] {
@@ -198,7 +197,9 @@ extension OnboardingFlowInteractor: OnboardingFlowHandler {
         // The mail the Google connect fetched was scored without a key and those batches failed;
         // score it now, while the remaining steps are on screen, so the first call walks it banded.
         if viewModel.step == .openAIKey {
-            let store = mailStore
+            // Resolved here, not injected: the store takes its user from the sign-in, which the
+            // interactor predates, and one built before it reads nothing.
+            let store = Container.shared.mailStore()
             Task.detached(priority: .utility) {
                 for account in ProfileRuntime.allowedMailAccounts(GoogleAccountStore.mailAccounts()) {
                     await Container.shared.mailImportance().score(account: account, store: store)
