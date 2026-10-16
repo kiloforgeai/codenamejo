@@ -520,17 +520,21 @@ final class LiveSessionAdapter {
     /// data channel. Earlier appends still in flight keep gating `flushSpeech`.
     /// - Parameter interruptsSpeech: false when what is audible is this same turn's acknowledgement
     ///   rather than an earlier email, so the speaker finishes it instead of being cut off.
-    func presentPreparedEmail(_ line: String, interruptsSpeech: Bool = true) {
+    func presentPreparedEmail(_ line: String, interruptsSpeech: Bool = true,
+                              request: String = emailPresentationRequest) {
         guard !closed, farewell == nil, line.utf8.count <= 450 else { return }
         if audible, interruptsSpeech {
             trace("presentation_superseded")
             append(Self.supersededPresentation, type: "session.instructions.append")
         }
         append(line, type: "session.thinking.append", awaitingAcknowledgement: false)
-        speechRequest = "Present the latest application-supplied email summary or cleanup offer now. Ask its supplied question and wait for the user. Do not delegate or repeat the archive or spam receipt."
+        speechRequest = request
         preparedSpeechPending = true
         flushSpeech()
     }
+
+    static let emailPresentationRequest = "Present the latest application-supplied email summary or cleanup offer now. Ask its supplied question and wait for the user. Do not delegate or repeat the archive or spam receipt."
+    static let slackPresentationRequest = "Present the latest application-supplied Slack line now, its receipt included. Ask its supplied question and wait for the user. Do not delegate."
 
     /// A scripted step too long for `presentPreparedEmail`'s single chunk: speech waits for
     /// every chunk to be acknowledged, then the speaker presents it without a backend turn.

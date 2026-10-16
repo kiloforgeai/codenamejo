@@ -36,6 +36,8 @@ enum SlackTools {
         let teamId: String
         let channelId: String
         let ts: String
+        /// The queue already knows what to call it, so a receipt costs no lookup.
+        let label: String
     }
 
     static func run(name: String, argumentsJSON: String, markTarget: MarkTarget? = nil,
@@ -47,6 +49,14 @@ enum SlackTools {
     static func run(name: String, input: [String: Any], markTarget: MarkTarget? = nil,
                     workspaces: [SlackWorkspace]) async -> Result {
         if let refusal = refusal(name, input, workspaces) { return Result(text: refusal) }
+        // On the queued conversation the resolved id and newest ts are already in hand, which
+        // saves the DM lookup and the history read a person id or a bare mark would cost.
+        var input = input
+        if let target = markTarget {
+            input["channel_id"] = target.channelId
+            if name == "slack_mark_read", string(input, "message_ts").isEmpty { input["message_ts"] = target.ts }
+        }
+        let label = markTarget?.label
         do {
             switch name {
             case "slack_read_channel":
@@ -66,18 +76,18 @@ enum SlackTools {
             case "slack_send_message", "slack_add_reaction", "slack_schedule_message":
                 let write = try await whichever(workspaces) { ws -> Write in
                     switch name {
-                    case "slack_send_message": return try await sendMessage(ws, input)
-                    case "slack_add_reaction": return try await addReaction(ws, input)
-                    default: return try await scheduleMessage(ws, input)
+                    case "slack_send_message": return try await sendMessage(ws, input, label: label)
+                    case "slack_add_reaction": return try await addReaction(ws, input, label: label)
+                    default: return try await scheduleMessage(ws, input, label: label)
                     }
                 }
                 return await finish(write, markTarget: markTarget, workspaces: workspaces)
             case "slack_mark_read":
-                let write = try await whichever(workspaces) { try await markRead($0, input) }
+                let write = try await whichever(workspaces) { try await markRead($0, input, label: label) }
                 return Result(text: write.text, written: write.ts != nil, channel: write.channel,
                               markedRead: write.ts != nil ? true : nil, ok: write.ts != nil)
             case "slack_mark_unread":
-                let write = try await whichever(workspaces) { try await markUnread($0, input) }
+                let write = try await whichever(workspaces) { try await markUnread($0, input, label: label) }
                 return Result(text: write.text, written: write.ts != nil, channel: write.channel,
                               markedRead: write.ts != nil ? false : nil, ok: write.ts != nil)
             default:
@@ -139,6 +149,10 @@ enum SlackTools {
             return "\(verb) — \"\(input["channel_id"] as? String ?? "")\" is not a Slack conversation id. "
                 + "Find the channel with slack_search_channels, or the person with slack_search_users, "
                 + "and pass the id from those results."
+        }
+        if name == "slack_send_message" || name == "slack_schedule_message", string(input, "message").isEmpty {
+            return name == "slack_send_message" ? "NOT SENT — there was no message text."
+                : "NOT SCHEDULED — there was no message text."
         }
         if name == "slack_mark_read" || name == "slack_mark_unread", !workspaces.contains(where: \.canMark) {
             return "NOT MARKED — this Slack connection does not have permission to change what is read. "
@@ -430,7 +444,7 @@ enum SlackTools {
         var channel: String? = nil
     }
 
-    static func sendMessage(_ ws: SlackWorkspace, _ input: [String: Any]) async throws -> Write {
+    static func sendMessage(_ ws: SlackWorkspace, _ input: [String: Any], label known: String? = nil) async throws -> Write {
         let channel = string(input, "channel_id")
         let message = string(input, "message")
         guard !message.isEmpty else { return Write(text: "NOT SENT — there was no message text.") }
@@ -441,13 +455,13 @@ enum SlackTools {
         if !thread.isEmpty && broadcast { body["reply_broadcast"] = true }
         let json = try await SlackWebAPI.post(ws, "chat.postMessage", body)
         let posted = json["channel"] as? String ?? channel
-        let label = await SlackSweep.channelFacts(ws, posted, book: SlackNameBook()).label
+        let label = await knownOrLooked(known, ws, posted)
         let where_ = thread.isEmpty ? "to \(label)"
             : broadcast ? "in the thread in \(label), and also to the whole channel" : "in the thread in \(label)"
         return Write(text: "Sent \(where_) on \(ws.teamName).", ts: json["ts"] as? String ?? "", channel: posted)
     }
 
-    static func addReaction(_ ws: SlackWorkspace, _ input: [String: Any]) async throws -> Write {
+    static func addReaction(_ ws: SlackWorkspace, _ input: [String: Any], label known: String? = nil) async throws -> Write {
         let channel = string(input, "channel_id")
         let ts = string(input, "message_ts")
         let emoji = string(input, "emoji").replacingOccurrences(of: ":", with: "")
@@ -457,11 +471,11 @@ enum SlackTools {
         } catch let error as SlackWebAPI.CallError where error.code == "already_reacted" {
             RealtimeLog.log("slack: reaction already present — treated as done")
         }
-        let label = await SlackSweep.channelFacts(ws, channel, book: SlackNameBook()).label
+        let label = await knownOrLooked(known, ws, channel)
         return Write(text: "Reacted :\(name): on the message in \(label).", ts: ts, channel: channel)
     }
 
-    static func scheduleMessage(_ ws: SlackWorkspace, _ input: [String: Any]) async throws -> Write {
+    static func scheduleMessage(_ ws: SlackWorkspace, _ input: [String: Any], label known: String? = nil) async throws -> Write {
         let channel = string(input, "channel_id")
         let message = string(input, "message")
         guard !message.isEmpty else { return Write(text: "NOT SCHEDULED — there was no message text.") }
@@ -473,11 +487,16 @@ enum SlackTools {
         if !thread.isEmpty && input["reply_broadcast"] as? Bool == true { body["reply_broadcast"] = true }
         let json = try await SlackWebAPI.post(ws, "chat.scheduleMessage", body)
         let posted = json["channel"] as? String ?? channel
-        let label = await SlackSweep.channelFacts(ws, posted, book: SlackNameBook()).label
+        let label = await knownOrLooked(known, ws, posted)
         let when = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: TimeInterval(at)))
         return Write(text: "Scheduled for \(label) on \(ws.teamName) at \(when) (epoch \(at)). It sits in Drafts and sent "
                         + "in Slack until it goes.",
                      ts: json["scheduled_message_id"] as? String ?? "", channel: posted)
+    }
+
+    private static func knownOrLooked(_ known: String?, _ ws: SlackWorkspace, _ channel: String) async -> String {
+        if let known { return known }
+        return await SlackSweep.channelFacts(ws, channel, book: SlackNameBook()).label
     }
 
     private static func newestTs(_ ws: SlackWorkspace, _ channel: String) async throws -> String {
@@ -485,20 +504,20 @@ enum SlackTools {
         return (json["messages"] as? [[String: Any]])?.first?["ts"] as? String ?? ""
     }
 
-    static func markRead(_ ws: SlackWorkspace, _ input: [String: Any]) async throws -> Write {
+    static func markRead(_ ws: SlackWorkspace, _ input: [String: Any], label known: String? = nil) async throws -> Write {
         let channel = try await channelFor(ws, string(input, "channel_id"))
         let given = string(input, "message_ts")
         let ts = given.isEmpty ? try await newestTs(ws, channel) : given
         guard !ts.isEmpty else { return Write(text: "NOT MARKED — there is nothing in that conversation to mark.") }
         _ = try await SlackWebAPI.post(ws, "conversations.mark", ["channel": channel, "ts": ts])
-        let label = await SlackSweep.channelFacts(ws, channel, book: SlackNameBook()).label
+        let label = await knownOrLooked(known, ws, channel)
         return Write(text: given.isEmpty ? "Marked \(label) read on \(ws.teamName)."
                         : "Marked \(label) read up to that message on \(ws.teamName). Anything after it is still unread.",
                      ts: ts, channel: channel)
     }
 
     /// Sets the cursor on the message before the one that should show unread; Slack names it.
-    static func markUnread(_ ws: SlackWorkspace, _ input: [String: Any]) async throws -> Write {
+    static func markUnread(_ ws: SlackWorkspace, _ input: [String: Any], label known: String? = nil) async throws -> Write {
         let channel = try await channelFor(ws, string(input, "channel_id"))
         let given = string(input, "message_ts")
         let from = given.isEmpty ? try await newestTs(ws, channel) : given
@@ -511,7 +530,7 @@ enum SlackTools {
                             + "for Slack to put the marker. It is already as unread as it can be.")
         }
         _ = try await SlackWebAPI.post(ws, "conversations.mark", ["channel": channel, "ts": ts])
-        let label = await SlackSweep.channelFacts(ws, channel, book: SlackNameBook()).label
+        let label = await knownOrLooked(known, ws, channel)
         return Write(text: "\(label) is showing unread again on \(ws.teamName), from that message on.", ts: from, channel: channel)
     }
 }

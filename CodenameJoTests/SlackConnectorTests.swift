@@ -400,12 +400,13 @@ final class SlackConnectorTests: XCTestCase {
         }
         let result = await SlackTools.run(
             name: "slack_send_message", input: ["channel_id": "C0ENG01", "message": "on it", "thread_ts": "150.0"],
-            markTarget: .init(teamId: "T1", channelId: "C0ENG01", ts: "199.0"), workspaces: [SlackWorkspace(grant())])
+            markTarget: .init(teamId: "T1", channelId: "C0ENG01", ts: "199.0", label: "the eng channel"), workspaces: [SlackWorkspace(grant())])
         XCTAssertTrue(result.written)
         XCTAssertEqual(result.markedRead, true)
         XCTAssertEqual(result.text, "Sent in the thread in the eng channel on Acme.")
         XCTAssertEqual(slack.calls.first { $0.method == "conversations.mark" }?.body["ts"], "199.0")
         XCTAssertEqual(slack.calls.first { $0.method == "chat.postMessage" }?.token, "xoxe.xoxp-old")
+        XCTAssertNil(slack.calls.first { $0.method == "conversations.info" }, "the queue's label needs no lookup")
     }
 
     func testRefusalsAreSpokenAndWriteNothing() async {
@@ -414,7 +415,9 @@ final class SlackConnectorTests: XCTestCase {
         let ws = SlackWorkspace(teamId: "T1", teamName: "Acme", userId: "U0", scopes: "chat:write")
         XCTAssertTrue(SlackTools.refusal("slack_add_reaction", ["channel_id": "#eng"], [ws])?.hasPrefix("NOT REACTED") == true)
         XCTAssertTrue(SlackTools.refusal("slack_mark_read", ["channel_id": "C123456"], [ws])?.contains("reconnect Slack") == true)
-        XCTAssertNil(SlackTools.refusal("slack_send_message", ["channel_id": "C123456"], [ws]))
+        XCTAssertNil(SlackTools.refusal("slack_send_message", ["channel_id": "C123456", "message": "hi"], [ws]))
+        XCTAssertEqual(SlackTools.refusal("slack_send_message", ["channel_id": "C123456"], [ws]),
+                       "NOT SENT — there was no message text.")
         let expired = SlackWebAPI.CallError(method: "chat.postMessage", code: "token_expired", status: 401, retryAfterSeconds: 0)
         XCTAssertTrue(SlackTools.explain(expired).contains("reconnect Slack in Settings"))
     }
