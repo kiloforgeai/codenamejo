@@ -16,6 +16,7 @@ final class LiveClientBrain {
     private var liveDelegation: String?
     private var generation = UUID()
     private var pendingCalls = Set<String>()
+    private var unclaimedCalls = Set<String>()
     private var results = Set<String>()
     private var completedTurns = Set<Int>()
     private var currentTurn = 0
@@ -39,6 +40,14 @@ final class LiveClientBrain {
     private var functionItems: [String: [String: Any]] = [:]
     private var pendingQuestion = ""
     private var queuedDelegation: (id: String, live: Bool, turn: Int)?
+    /// The tool whose own result survives the scope change it causes: that result is the new
+    /// scope's feed, and the switch would otherwise end in silence after "Switching to X."
+    static let scopeSwitchTool = "switch_profile"
+    private var scopeSwitchCalls = Set<String>()
+    /// Calls accepted by the adapter use its execution watchdog, including time spent queued.
+    /// This bound covers calls that never reached the adapter.
+    var toolCallBound: TimeInterval = LiveSessionAdapter.toolCallBound + 5
+    private var callWatchdog: Task<Void, Never>?
 
     init(request: @escaping Request, deliver: @escaping ([String: Any]) -> Void,
          speak: @escaping (String, String?) -> Void, failed: @escaping (String) -> Void) {
@@ -52,12 +61,19 @@ final class LiveClientBrain {
 
     func updateState(_ text: String, scope: String?) {
         if self.scope != scope {
-            scopeChanged = self.scope != nil
+            // A pending switch call caused this change: its result still belongs to this
+            // delegation, so the response is not cut short. Any other pending result is stale.
+            let switching = pendingCalls.filter { functionItems[$0]?["name"] as? String == Self.scopeSwitchTool }
+            scopeChanged = self.scope != nil && switching.isEmpty
+            scopeSwitchCalls = switching
             self.scope = scope
             scopeRevision += 1
             actionRecords.removeAll()
             functionItems.removeAll()
             pendingCalls.removeAll()
+            unclaimedCalls.removeAll()
+            callWatchdog?.cancel()
+            callWatchdog = nil
             input.removeAll()
             latestAssistant = ""
             latestUser = ""
@@ -118,8 +134,20 @@ final class LiveClientBrain {
         if let text = item["content"] as? String { item["content"] = LiveCompactContext.text(text) }
         if let output = item["output"] as? String { item["output"] = LiveCompactContext.text(output) }
         if item["type"] as? String == "function_call_output", let id = item["call_id"] as? String {
+            if scopeSwitchCalls.remove(id) != nil {
+                guard results.insert(id).inserted else { return }
+                // Its function_call item left with the old scope's input, so the result rides
+                // as a message the next step can still present.
+                let output = item["output"] as? String ?? "No result"
+                actionRecords.append(["call": ["type": "function_call", "name": Self.scopeSwitchTool, "call_id": id],
+                                      "result": output])
+                input.append(["type": "message", "role": "user", "content":
+                    "The \(Self.scopeSwitchTool) call completed; this is its result. Present it as the switch's own outcome and continue from it:\n" + output])
+                return
+            }
             guard pendingCalls.contains(id), results.insert(id).inserted else { return }
             pendingCalls.remove(id)
+            acceptToolCall(id)
         }
         if item["type"] as? String == "function_call_output", let id = item["call_id"] as? String,
            let call = functionItems[id] {
@@ -258,10 +286,12 @@ final class LiveClientBrain {
                     return
                 }
                 input += output
-                pendingCalls.formUnion(functions.compactMap { $0["call_id"] as? String })
+                let calls = Set(functions.compactMap { $0["call_id"] as? String })
+                pendingCalls.formUnion(calls)
                 for function in functions {
                     if let id = function["call_id"] as? String { functionItems[id] = function }
                 }
+                if !calls.isEmpty { armCallWatchdog(for: calls) }
                 for item in output {
                     deliver(["type": "response.event", "delegation_id": delegation,
                              "event": ["type": "response.output_item.done", "response_id": responseID, "item": item]])
@@ -309,19 +339,55 @@ final class LiveClientBrain {
     }
 
     private func fail(_ message: String) {
+        let live = liveDelegation
         input.removeAll()
         delegation = nil
         liveDelegation = nil
         pendingPresentation = nil
         presentationOnly = false
-        completedTurns.insert(currentTurn)
+        // The request's own turn is over, not whichever turn the user has since started:
+        // completing `currentTurn` here discarded a delegation queued for the newer turn.
+        completedTurns.insert(requestTurn)
+        speak(message, live)
         failed(message)
+        // A turn that began while the failed request ran is still owed its delegation.
+        startPresentationIfReady()
+        startSettledDelegation()
+    }
+
+    func acceptToolCall(_ id: String) {
+        unclaimedCalls.remove(id)
+        if unclaimedCalls.isEmpty { callWatchdog?.cancel(); callWatchdog = nil }
+    }
+
+    /// Release calls the adapter never answered, then let the response go on without them.
+    private func armCallWatchdog(for calls: Set<String>) {
+        callWatchdog?.cancel()
+        unclaimedCalls = calls
+        let bound = toolCallBound
+        callWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(bound))
+            guard let self, !Task.isCancelled else { return }
+            releaseUnansweredCalls(calls)
+        }
+    }
+
+    private func releaseUnansweredCalls(_ calls: Set<String>) {
+        let stuck = calls.intersection(unclaimedCalls).intersection(pendingCalls)
+        guard !stuck.isEmpty else { return }
+        RealtimeLog.log("liveBrain: \(stuck.count) tool call(s) unanswered after \(Int(toolCallBound))s; releasing")
+        for id in stuck.sorted() {
+            item(["type": "function_call_output", "call_id": id, "output": LiveSessionAdapter.toolCallUnfinished])
+        }
+        if delegation != nil { run() }
     }
 
     private func cancelRequest() {
         generation = UUID()
         task?.cancel()
         task = nil
+        callWatchdog?.cancel()
+        callWatchdog = nil
     }
 
     func close() { cancelRequest(); queuedDelegation = nil }

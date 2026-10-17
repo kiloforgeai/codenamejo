@@ -3244,8 +3244,18 @@ final class FullDuplexVoiceClient {
                         ? await Container.shared.liveEmailOpening().warmed(profileId: scope?.profileId, userId: Container.shared.backend().userId)
                         : []
                     mark("emails warmed (\(warmed.count))")
-                    guard self.isActive, self.dialGeneration == dial,
-                          ProfileRuntime.snapshot?.profileId == scope?.profileId else { return }
+                    guard self.isActive, self.dialGeneration == dial else { return }
+                    guard ProfileRuntime.snapshot?.profileId == scope?.profileId else {
+                        // The switch landed, then the profile moved again under it. The call
+                        // still answers, or the adapter waits on it for the rest of the dial.
+                        self.finishContextTool(callId: callId, tool: name,
+                            output: "Switched to \(destination.name), but the profile changed again before its feed opened. "
+                                + "Do not read a feed or advance any queue until the next instruction.",
+                            ms: Date().timeIntervalSince(started) * 1000, outcome: "refused", query: destination.name,
+                            detail: "profile changed again before the feed opened", failed: true, dial: dial)
+                        mark("result sent (profile changed again)")
+                        return
+                    }
                     self.applyStep(step.output, progress: progress, standing: standing,
                                    served: served, dial: dial,
                                    preparationAtArrival: ("profile_opening", warmed.first {
@@ -3694,6 +3704,18 @@ final class FullDuplexVoiceClient {
         RealtimeLog.log("\(subsystem): \(tool) — \(detail) [\(outcome)] in "
             + String(format: "%.0f ms", ms))
         continueAfterFunctionResult()
+    }
+
+    /// A cancelled handler still owes an output so later turns can proceed.
+    func finishSupersededTool(
+        callId: String, tool: String, result: String, ms: Double,
+        subsystem: String, dial: Int? = nil, alreadyStarted: Bool = false
+    ) {
+        finishContextTool(callId: callId, tool: tool,
+            output: result + " The application stopped handling this action before advancing. "
+                + "The result above stands; do not repeat the action and do not advance the queue.",
+            ms: ms, outcome: "cancelled", query: "", detail: "superseded before its result was handled",
+            subsystem: subsystem, failed: true, dial: dial, alreadyStarted: alreadyStarted)
     }
 
     /// Return the handoff immediately; the existing report queue speaks the final outcome.
@@ -5073,7 +5095,13 @@ final class FullDuplexVoiceClient {
         functionCallTask = Task { [weak self] in
             let result = await FullDuplexBroker.runTool(
                 name: name, argumentsJSON: argumentsJSON)
-            guard !Task.isCancelled, let self, self.isActive else { return }
+            guard let self, self.isActive else { return }
+            guard !Task.isCancelled else {
+                // `functionCallTask` now belongs to whoever cancelled this one; only the answer is owed.
+                self.finishSupersededTool(callId: callId, tool: name, result: result.text, ms: 0,
+                    subsystem: "tools", alreadyStarted: true)
+                return
+            }
             let output = result.text
             if let effects = result.effects {
                 let store = Container.shared.mailStore()

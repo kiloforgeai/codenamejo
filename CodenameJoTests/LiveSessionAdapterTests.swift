@@ -102,6 +102,41 @@ final class LiveSessionAdapterTests: XCTestCase {
     }
 
     @MainActor
+    func testUnansweredToolIsReleasedAndTheNextCallRuns() async throws {
+        let h = Harness()
+        h.adapter.toolCallBound = 0.2
+        try h.start()
+        try h.function("archive-a")
+        try h.function("second-call")
+        XCTAssertEqual(h.calls.map(\.id), ["archive-a"], "Local calls stay serial")
+        var waited = 0
+        while h.calls.count < 2, waited < 100 { try await Task.sleep(for: .milliseconds(20)); waited += 1 }
+        XCTAssertEqual(h.calls.map(\.id), ["archive-a", "second-call"],
+                       "The watchdog answers for the unanswered call and the next one runs")
+        // Answered well inside its own bound, so only the first call is ever answered for.
+        try h.lifecycle("response.completed")
+        h.result("second-call")
+        let outputs = h.sent.filter { $0["type"] as? String == "response.item.create" }
+            .compactMap { $0["item"] as? [String: Any] }
+        XCTAssertEqual(outputs.compactMap { $0["call_id"] as? String }, ["archive-a", "second-call"])
+        XCTAssertEqual(outputs.first?["output"] as? String, LiveSessionAdapter.toolCallUnfinished)
+        XCTAssertEqual(h.sent.last?["type"] as? String, "response.create")
+        // The real result arriving late is dropped, not reported as a mismatch or posted twice.
+        let before = h.sent.count
+        h.adapter.outbound(["type": "conversation.item.create", "item": [
+            "type": "function_call_output", "call_id": "archive-a", "output": "Archived after all."]])
+        XCTAssertEqual(h.sent.count, before)
+        // A call answered in time is never answered for.
+        try h.receive(["type": "session.delegation.created", "delegation": ["id": "d2", "response_id": "r2"]])
+        try h.lifecycle("response.created", response: "r2")
+        try h.function("third-call", response: "r2")
+        XCTAssertEqual(h.calls.map(\.id), ["archive-a", "second-call", "third-call"])
+        h.result("third-call")
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(h.sent.filter { (($0["item"] as? [String: Any])?["output"] as? String) == LiveSessionAdapter.toolCallUnfinished }.count, 1)
+    }
+
+    @MainActor
     func testRepeatedCallCannotExecuteTwiceAndLocalCallsStaySerial() async throws {
         let h = Harness()
         try h.start()

@@ -89,6 +89,96 @@ final class LiveClientBrainTests: XCTestCase {
         h.replies.removeFirst().resume(throwing: NSError(domain: "network", code: 1)); await drain()
         XCTAssertEqual(h.failures.count, 1); XCTAssertEqual(h.requests.count, 1)
         XCTAssertTrue(h.calls.isEmpty)
+        XCTAssertEqual(h.speech, h.failures, "The failure line reaches the speaker")
+    }
+
+    @MainActor func testFailureCompletesItsOwnTurnAndTheTurnStartedMeanwhileStillRuns() async throws {
+        let h = Harness(); h.start(); await drain()
+        XCTAssertEqual(h.requests.count, 1)
+        // The user moves on while turn 1's request is still in flight.
+        h.brain.user("read my calendar", turn: 2)
+        h.brain.begin("d2", live: true, turn: 2)
+        h.brain.settle(turn: 2); await drain()
+        XCTAssertEqual(h.requests.count, 1, "Turn 2 waits behind the in-flight request")
+        h.replies.removeFirst().resume(throwing: NSError(domain: "network", code: 1)); await drain()
+        XCTAssertEqual(h.failures.count, 1)
+        XCTAssertEqual(h.speech, h.failures)
+        XCTAssertEqual(h.requests.count, 2, "Turn 1's failure completes turn 1, not turn 2")
+        let input = try XCTUnwrap(h.requests.last?["input"] as? [[String: Any]])
+        XCTAssertEqual(input.last?["content"] as? String, "read my calendar")
+        h.reply([]); await drain()
+    }
+
+    @MainActor func testAcceptedSerialCallsOutliveTheBrainWatchdog() async throws {
+        let h = Harness(); h.brain.toolCallBound = 0.05; h.start(); await drain()
+        var second = Self.call; second["call_id"] = "c2"
+        h.reply([Self.call, second]); await drain()
+        h.brain.acceptToolCall("c1")
+        h.brain.acceptToolCall("c2")
+        for id in ["c1", "c2"] {
+            try await Task.sleep(for: .milliseconds(100)); await drain()
+            XCTAssertEqual(h.requests.count, 1, "Queued and executing calls remain adapter-owned")
+            XCTAssertTrue(h.brain.busy)
+            h.brain.item(["type": "function_call_output", "call_id": id, "output": "Completed " + id])
+        }
+        h.brain.continueResponse(delegation: "d1"); await drain()
+        XCTAssertEqual(h.requests.count, 2)
+        let input = try XCTUnwrap(h.requests.last?["input"] as? [[String: Any]])
+        XCTAssertEqual(input.filter { $0["type"] as? String == "function_call_output" }
+            .compactMap { $0["output"] as? String }, ["Completed c1", "Completed c2"])
+        h.reply([]); await drain()
+    }
+
+    @MainActor func testUnclaimedCallTimesOutWithoutReleasingAnAcceptedCall() async throws {
+        let h = Harness(); h.brain.toolCallBound = 0.05; h.start(); await drain()
+        var second = Self.call; second["call_id"] = "c2"
+        h.reply([Self.call, second]); await drain()
+        h.brain.acceptToolCall("c1")
+        try await Task.sleep(for: .milliseconds(150)); await drain()
+        XCTAssertEqual(h.requests.count, 1)
+        XCTAssertTrue(h.brain.busy)
+        h.brain.item(["type": "function_call_output", "call_id": "c1", "output": "Completed c1"])
+        h.brain.continueResponse(delegation: "d1"); await drain()
+        let input = try XCTUnwrap(h.requests.last?["input"] as? [[String: Any]])
+        let outputs = input.filter { $0["type"] as? String == "function_call_output" }
+        XCTAssertEqual(outputs.count, 2)
+        XCTAssertEqual(outputs.first { $0["call_id"] as? String == "c2" }?["output"] as? String,
+                       LiveSessionAdapter.toolCallUnfinished)
+        XCTAssertEqual(outputs.first { $0["call_id"] as? String == "c1" }?["output"] as? String, "Completed c1")
+        h.reply([]); await drain()
+    }
+
+    @MainActor func testUnansweredToolCallIsReleasedAndTheResponseContinues() async throws {
+        let h = Harness(); h.brain.toolCallBound = 0.05; h.start(); await drain()
+        h.reply([Self.call]); await drain()
+        XCTAssertEqual(h.calls.count, 1); XCTAssertTrue(h.brain.busy)
+        try await Task.sleep(for: .milliseconds(300)); await drain()
+        XCTAssertEqual(h.requests.count, 2, "The released call lets the response go on")
+        let input = try XCTUnwrap(h.requests.last?["input"] as? [[String: Any]])
+        let output = input.first { $0["type"] as? String == "function_call_output" }
+        XCTAssertEqual(output?["call_id"] as? String, "c1")
+        XCTAssertEqual(output?["output"] as? String, LiveSessionAdapter.toolCallUnfinished)
+        h.reply([["type": "message", "content": [["type": "output_text", "text": "That did not confirm."]]]]); await drain()
+        XCTAssertFalse(h.brain.busy)
+        XCTAssertEqual(h.speech, ["That did not confirm."])
+    }
+
+    @MainActor func testSwitchToolsOwnResultSurvivesTheScopeChangeItCaused() async throws {
+        let h = Harness(); h.start(); await drain()
+        let switchCall: [String: Any] = ["type": "function_call", "call_id": "s1",
+            "name": LiveClientBrain.scopeSwitchTool, "arguments": "{\"name\":\"Work\"}"]
+        h.reply([switchCall]); await drain()
+        XCTAssertEqual(h.calls.count, 1)
+        // The switch lands: the state refresh sees the new scope before the tool's result arrives.
+        h.brain.updateState("work email", scope: "work")
+        h.brain.item(["type": "function_call_output", "call_id": "s1", "output": "Switched to Work. First email: work email."])
+        h.brain.continueResponse(delegation: "d1"); await drain()
+        XCTAssertEqual(h.requests.count, 2, "The response is not cut short by the scope change")
+        let body = String(decoding: try JSONSerialization.data(withJSONObject: try XCTUnwrap(h.requests.last)), as: UTF8.self)
+        XCTAssertTrue(body.contains("Switched to Work"))
+        XCTAssertFalse(body.contains("email A"), "The old scope's private state still goes")
+        h.reply([["type": "message", "content": [["type": "output_text", "text": "Switched to Work. First up, work email."]]]]); await drain()
+        XCTAssertEqual(h.speech, ["Switched to Work. First up, work email."])
     }
 
     func testCompactChainKeepsSummaryLatestReplyTargetsAndContextMembers() throws {

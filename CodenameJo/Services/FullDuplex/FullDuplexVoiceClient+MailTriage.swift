@@ -756,8 +756,17 @@ extension FullDuplexVoiceClient {
                 switchedTo = ("mailbox_switch", ready)
                 RealtimeLog.log("mailboxSwitch: step done +\(Int(Date().timeIntervalSince(started) * 1000))ms"
                     + " \(step.served.rawValue), opening summary \(ready == nil ? "miss" : "ready") (\(warmed.count) warmed)")
-                guard self.isActive, dial == self.dialGeneration, self.endCueTask == nil,
-                      ProfileRuntime.snapshot?.profileId == profileScope?.profileId else { return }
+                guard self.isActive, dial == self.dialGeneration, self.endCueTask == nil else { return }
+                guard ProfileRuntime.snapshot?.profileId == profileScope?.profileId else {
+                    // The step ran under the old profile. Its result is stale, but the call
+                    // still answers; left unanswered it holds every later turn.
+                    self.finishContextTool(callId: callId, tool: "triage_next",
+                        output: "The profile changed while this mailbox switch ran, so its result no longer applies. "
+                            + "Do not advance the new profile's queue until asked.",
+                        ms: Date().timeIntervalSince(started) * 1000, outcome: "refused", query: account ?? "",
+                        detail: "profile changed during the mailbox switch", subsystem: "mailboxSwitch", failed: true, dial: dial)
+                    return
+                }
                 self.livePreparation.seed(warmed)
             }
             guard self.isActive, dial == self.dialGeneration,
@@ -1569,8 +1578,12 @@ extension FullDuplexVoiceClient {
                 conversationId: self?.conversationId(),
                 deferDraft: deferDraft && tool == "create_draft",
                 deferSend: deferDraft && tool != "create_draft")
-            guard !Task.isCancelled, let self, self.isActive,
-                  dial == self.dialGeneration else { return }
+            guard let self, self.isActive, dial == self.dialGeneration else { return }
+            guard !Task.isCancelled else {
+                self.finishSupersededTool(callId: callId, tool: tool, result: result.text,
+                    ms: Date().timeIntervalSince(started) * 1000, subsystem: "localMailWrite", dial: dial)
+                return
+            }
             self.functionCallTask = nil
             guard ProfileRuntime.snapshot?.profileId == profileId else {
                 self.finishContextTool(callId: callId, tool: tool,
@@ -1778,7 +1791,20 @@ extension FullDuplexVoiceClient {
             }
             failed = failed || accepted.count < targets.reduce(0) { $0 + $1.ids.count }
             let store = Container.shared.mailStore()
-            guard self.isActive, dial == self.dialGeneration, ProfileRuntime.snapshot?.profileId == profile else { return }
+            guard self.isActive, dial == self.dialGeneration else { return }
+            guard ProfileRuntime.snapshot?.profileId == profile else {
+                // Returning here left `functionCallTask` set for the rest of the dial, which
+                // closed every `functionCallTask == nil` gate, and left the call unanswered.
+                if !Task.isCancelled { self.functionCallTask = nil }
+                let total = targets.reduce(0) { $0 + $1.ids.count }
+                self.finishContextTool(callId: callId, tool: "archive_message",
+                    output: "The profile changed while the group archive ran. \(accepted.count) of \(total) emails were accepted before that; "
+                        + "the rest were not archived. Do not repeat it and do not advance the new profile's queue.",
+                    ms: Date().timeIntervalSince(started) * 1000, outcome: accepted.isEmpty ? "refused" : "partial",
+                    query: selection, detail: "profile changed during the topic archive",
+                    subsystem: "localArchive", failed: true, dial: dial)
+                return
+            }
             let advanced = await localTriage.finishTopicArchive(selection: selection, accepted: accepted,
                 pending: pending, effects: effects, store: store)
             self.functionCallTask = nil
@@ -1854,8 +1880,12 @@ extension FullDuplexVoiceClient {
                 name: tool, argumentsJSON: argumentsJSON,
                 conversationId: self?.conversationId(),
                 deferArchive: deferArchive, deferSpam: deferSpam, deferTrash: deferTrash, deferLabel: deferLabel)
-            guard !Task.isCancelled, let self, self.isActive,
-                  dial == self.dialGeneration else { return }
+            guard let self, self.isActive, dial == self.dialGeneration else { return }
+            guard !Task.isCancelled else {
+                self.finishSupersededTool(callId: callId, tool: tool, result: result.text,
+                    ms: Date().timeIntervalSince(started) * 1000, subsystem: subsystem, dial: dial)
+                return
+            }
             self.functionCallTask = nil
 
             guard ProfileRuntime.snapshot?.profileId == profileId else {
@@ -1958,8 +1988,12 @@ extension FullDuplexVoiceClient {
                 name: name, argumentsJSON: argumentsJSON,
                 conversationId: self?.conversationId(),
                 deferCalendar: deferCalendar)
-            guard !Task.isCancelled, let self, self.isActive,
-                  dial == self.dialGeneration else { return }
+            guard let self, self.isActive, dial == self.dialGeneration else { return }
+            guard !Task.isCancelled else {
+                self.finishSupersededTool(callId: callId, tool: name, result: result.text,
+                    ms: Date().timeIntervalSince(started) * 1000, subsystem: "localCalendarWrite", dial: dial)
+                return
+            }
             self.functionCallTask = nil
             let eventId = Self.stringArgument("event_id", in: argumentsJSON) ?? ""
             let succeeded = result.ok == true
