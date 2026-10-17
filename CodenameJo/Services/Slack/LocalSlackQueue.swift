@@ -16,6 +16,14 @@ actor LocalSlackQueue {
         "slack_schedule_message": "scheduled a reply", "slack_mark_read": "marked read",
         "slack_mark_unread": "left unread",
     ]
+    /// What the phone says for a finisher before it presents the next conversation itself.
+    static let receipts: [String: String] = [
+        "slack_send_message": "Sent.", "slack_add_reaction": "Done.",
+        "slack_schedule_message": "Scheduled.", "slack_mark_read": "Marked read.",
+        "slack_mark_unread": "Left unread.",
+    ]
+    /// `LiveSessionAdapter.presentPreparedEmail` drops anything longer.
+    static let speakerLineBudget = 440
     /// A snapshot older than this is rebuilt before the first step is served.
     static let servingFreshness: TimeInterval = 10 * 60
     /// A queue call this soon after an inline advance is an echo.
@@ -25,6 +33,10 @@ actor LocalSlackQueue {
         let text: String
         /// The queue closed with this answer — finished, stopped, or empty.
         let closed: Bool
+        /// The next conversation worded by the phone, for the speaker to say without a
+        /// backend turn. Nil whenever there is something only the model can word: a start,
+        /// a close, a notice, a step back.
+        var presentation: String? = nil
     }
 
     private var queue: SlackQueueSnapshot?
@@ -141,6 +153,8 @@ actor LocalSlackQueue {
         }
 
         guard let queue else { return Answer(text: Self.renderStop(remaining: nil), closed: true) }
+        let presentation = starting || direction == "back" || !notices.isEmpty ? nil
+            : current.flatMap { Self.speakerLine($0, lead: "Next, ") }
         var payload = stepObject()
         if !notices.isEmpty {
             payload["heardSince"] = notices.joined(separator: " ")
@@ -157,7 +171,7 @@ actor LocalSlackQueue {
             payload["workspaces"] = queue.workspaces
             payload["report"] = Self.reportObject(queue.report)
         }
-        return Answer(text: Self.json(payload), closed: false)
+        return Answer(text: Self.json(payload), closed: false, presentation: presentation)
     }
 
     /// The conversation the cursor is on, as a step payload, without moving it.
@@ -200,8 +214,10 @@ actor LocalSlackQueue {
         RealtimeLog.log("slackQueue: \(from) → \(done ? "closed" : "\(position)") inline after \(tool)")
         let text = Self.renderInlineAdvance(step, notices: said)
             + (done && importantStage ? Self.backToEmailNote : "")
+        let presentation = done || !said.isEmpty ? nil
+            : current.flatMap { Self.speakerLine($0, lead: (Self.receipts[tool] ?? "Done.") + " Next, ") }
         if done { end() }
-        return Answer(text: text, closed: done)
+        return Answer(text: text, closed: done, presentation: presentation)
     }
 
     /// A write accepted ahead of Slack did not land: the conversation goes back to untouched,
@@ -222,6 +238,41 @@ actor LocalSlackQueue {
 
     private func index(of target: SlackTools.MarkTarget) -> Int? {
         queue?.items.firstIndex { $0.teamId == target.teamId && $0.channelId == target.channelId }
+    }
+
+    // MARK: - Speaker line
+
+    /// "Next, the design channel — Sam: "…"; Ana: "…". Reply, react, or mark it read?"
+    /// The newest two messages in the order they were sent, cut to fit the speaker's budget.
+    static func speakerLine(_ item: SlackQueueSnapshot.Item, lead: String) -> String? {
+        let newest = Array(item.messages.prefix(2).reversed())
+        guard !newest.isEmpty else { return nil }
+        let place = item.kind == "dm" ? "a message from \(item.label)" : item.label
+        let ask = " Reply, react, or mark it read?"
+        func line(_ messages: [SlackQueueSnapshot.Message], cut: Int?) -> String {
+            let said = messages.map { message -> String in
+                var text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let cut, text.count > cut {
+                    text = String(text.prefix(cut)).trimmingCharacters(in: .whitespaces) + "…"
+                }
+                return item.kind == "dm" && message.from == item.label ? "\"\(text)\""
+                    : "\(message.from): \"\(text)\""
+            }
+            return lead + place + " — " + said.joined(separator: "; ") + "." + ask
+        }
+        for messages in [newest, [newest[newest.count - 1]]] {
+            let whole = line(messages, cut: nil)
+            if whole.utf8.count <= speakerLineBudget { return whole }
+        }
+        // One message, cut until it fits.
+        let last = [newest[newest.count - 1]]
+        var cut = last[0].text.count
+        while cut > 20 {
+            cut -= max(10, cut / 5)
+            let shortened = line(last, cut: cut)
+            if shortened.utf8.count <= speakerLineBudget { return shortened }
+        }
+        return nil
     }
 
     // MARK: - Feed

@@ -120,6 +120,57 @@ final class LocalSlackQueueTests: XCTestCase {
         XCTAssertFalse(advance?.text.contains("call triage_next in this same response") == true)
     }
 
+    func testForwardStepAndFinisherCarryAPhoneWordedLine() async {
+        let queue = LocalSlackQueue()
+        await queue.start(snapshot([item("C1"), item("C2"), item("C3")]))
+        let skipped = await queue.step(direction: nil, restart: false, stop: false)
+        XCTAssertEqual(skipped.presentation, "Next, #C2 — Sam: \"hi\". Reply, react, or mark it read?")
+        let sent = await queue.finish(tool: "slack_send_message", input: ["channel_id": "C2"],
+                                      written: true, channel: "C2", markedRead: true)
+        XCTAssertEqual(sent?.presentation, "Sent. Next, #C3 — Sam: \"hi\". Reply, react, or mark it read?")
+        let back = await queue.step(direction: "back", restart: false, stop: false,
+                                    now: Date().addingTimeInterval(10))
+        XCTAssertNil(back.presentation)
+    }
+
+    func testStartCloseAndNoticesAreLeftToTheModel() async {
+        let queue = LocalSlackQueue()
+        await queue.start(snapshot([item("C1"), item("C2"), item("C3")]))
+        let unmarked = await queue.finish(tool: "slack_send_message", input: ["channel_id": "C1"],
+                                          written: true, channel: "C1", markedRead: false)
+        XCTAssertNil(unmarked?.presentation)
+        let last = await queue.finish(tool: "slack_mark_read", input: ["channel_id": "C2"],
+                                      written: true, channel: "C2", markedRead: true)
+        XCTAssertNotNil(last?.presentation)
+        let closed = await queue.finish(tool: "slack_mark_read", input: ["channel_id": "C3"],
+                                        written: true, channel: "C3", markedRead: true)
+        XCTAssertEqual(closed?.closed, true)
+        XCTAssertNil(closed?.presentation)
+    }
+
+    func testDirectMessageLineNamesThePersonOnceAndOldestFirst() {
+        let dm = SlackQueueSnapshot.Item(teamId: "T1", teamName: "Acme", channelId: "D1", withUserId: "U5", label: "Sam",
+                   kind: "dm", unread: 2, more: false,
+                   messages: [.init(from: "Sam", fromId: "U5", ts: "2", text: "second", threadTs: nil, replies: nil),
+                              .init(from: "Sam", fromId: "U5", ts: "1", text: "first", threadTs: nil, replies: nil)],
+                   why: "")
+        XCTAssertEqual(LocalSlackQueue.speakerLine(dm, lead: "Next, "),
+                       "Next, a message from Sam — \"first\"; \"second\". Reply, react, or mark it read?")
+    }
+
+    func testLongMessageIsCutToTheSpeakerBudget() throws {
+        let long = String(repeating: "word ", count: 300)
+        let busy = SlackQueueSnapshot.Item(
+            teamId: "T1", teamName: "Acme", channelId: "C1", withUserId: nil, label: "the design channel",
+            kind: "channel", unread: 1, more: false,
+            messages: [.init(from: "Ana", fromId: "U2", ts: "1", text: long, threadTs: nil, replies: nil)],
+            why: "")
+        let line = try XCTUnwrap(LocalSlackQueue.speakerLine(busy, lead: "Next, "))
+        XCTAssertLessThanOrEqual(line.utf8.count, LocalSlackQueue.speakerLineBudget)
+        XCTAssertTrue(line.contains("…"))
+        XCTAssertTrue(line.hasSuffix("Reply, react, or mark it read?"))
+    }
+
     func testDeferredWriteThatFailsComesOffTheCloseCounts() async {
         let queue = LocalSlackQueue()
         await queue.start(snapshot([item("C1"), item("C2")]))
@@ -143,6 +194,7 @@ final class LocalSlackQueueTests: XCTestCase {
                                now: Date().addingTimeInterval(-10))
         await queue.markFailed(try! XCTUnwrap(target))
         let next = await queue.step(direction: nil, restart: false, stop: false)
+        XCTAssertNil(next.presentation)
         XCTAssertTrue((object(next.text)["heardSince"] as? String)?.contains("could not be marked read") == true)
     }
 
