@@ -204,21 +204,6 @@ enum CalendarSearch {
             + ["--- end untrusted content ---"]).joined(separator: "\n")
     }
 
-    /// The one invitation this result can identify without asking the user to choose.
-    /// Kept as an event rather than only an id so the queue can bind the calendar row back
-    /// to the email subject and account before it relays an RSVP.
-    static func singlePendingRSVP(_ result: Result) -> CalendarStore.Event? {
-        let pending = result.events.filter { event in
-            let ownResponse = result.attendees.first { attendee in
-                attendee.eventId == event.id
-                    && attendee.calendarId == event.calendarId
-                    && attendee.email.caseInsensitiveCompare(event.account) == .orderedSame
-            }?.responseStatus
-            return ownResponse?.caseInsensitiveCompare("needsAction") == .orderedSame
-        }
-        return pending.count == 1 ? pending[0] : nil
-    }
-
     /// The cached roster in a compact, deterministic shape. Email is the identity; display
     /// name is only a label.
     private static func attendeePhrase(

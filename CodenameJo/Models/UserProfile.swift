@@ -39,15 +39,6 @@ struct UserProfile: Codable, Equatable {
     /// matching the shipped default and allowing older profile rows to opt in without rewrite.
     var agentLedEmailSessions: Bool?
 
-    /// Whether Jo's dedicated broker may send the daily email-queue reminder.
-    /// Missing means disabled; only an explicit `true` opts the account in.
-    var dailyMailNotifications: Bool?
-
-    /// Local wall-clock minute for the daily reminder (`0...1439`) and its IANA time zone, paired
-    /// so 9 AM stays 9 AM across daylight-saving changes.
-    var dailyMailNotificationMinuteOfDay: Int?
-    var dailyMailNotificationTimeZone: String?
-
     /// Whether this person has been through onboarding. It travels, but only the flow may apply it
     /// — see `applyToLocalSettings(completingOnboarding:)`.
     var hasCompletedOnboarding: Bool?
@@ -71,9 +62,6 @@ struct UserProfile: Codable, Equatable {
             let stored = defaults.string(forKey: key)
             return (stored?.isEmpty ?? true) ? nil : stored
         }
-        func integer(_ key: String) -> Int? {
-            defaults.object(forKey: key) == nil ? nil : defaults.integer(forKey: key)
-        }
 
         var profile = UserProfile()
         profile.mailFooterEnabled = flag(MailFooter.storageKey)
@@ -92,11 +80,6 @@ struct UserProfile: Codable, Equatable {
         profile.triageScope = text(TriageScope.storageKey)
         profile.suggestedActions = flag(SuggestedActions.storageKey)
         profile.agentLedEmailSessions = flag(AgentLedEmailSettings.key)
-        profile.dailyMailNotifications = flag(DailyMailNotifications.storageKey)
-        profile.dailyMailNotificationMinuteOfDay = integer(
-            DailyMailNotifications.minuteOfDayStorageKey)
-        profile.dailyMailNotificationTimeZone = text(
-            DailyMailNotifications.timeZoneStorageKey)
         profile.hasCompletedOnboarding = flag(OnboardingState.storageKey)
         profile.appearance = text(AppearanceSetting.storageKey)
         return profile
@@ -132,9 +115,6 @@ struct UserProfile: Codable, Equatable {
         write(triageScope, TriageScope.storageKey)
         write(suggestedActions, SuggestedActions.storageKey)
         write(agentLedEmailSessions, AgentLedEmailSettings.key)
-        write(dailyMailNotifications, DailyMailNotifications.storageKey)
-        write(dailyMailNotificationMinuteOfDay, DailyMailNotifications.minuteOfDayStorageKey)
-        write(dailyMailNotificationTimeZone, DailyMailNotifications.timeZoneStorageKey)
         if completingOnboarding { write(hasCompletedOnboarding, OnboardingState.storageKey) }
         write(appearance, AppearanceSetting.storageKey)
     }
@@ -155,9 +135,6 @@ struct UserProfile: Codable, Equatable {
             TriageScope.storageKey,
             AgentLedEmailSettings.key,
             SuggestedActions.storageKey,
-            DailyMailNotifications.storageKey,
-            DailyMailNotifications.minuteOfDayStorageKey,
-            DailyMailNotifications.timeZoneStorageKey,
             AppearanceSetting.storageKey,
         ] {
             defaults.removeObject(forKey: key)

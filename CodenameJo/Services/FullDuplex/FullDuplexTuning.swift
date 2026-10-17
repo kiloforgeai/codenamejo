@@ -30,14 +30,6 @@ enum FullDuplexTuning {
     }
 
     static let voiceMode: VoiceMode = .voiceChat
-
-    /// How long after the assistant stops that a transcript can still be its echo.
-    ///
-    /// The strongest discriminator available and the one nothing used: echo can
-    /// only exist while the speaker is making noise or immediately after. Outside
-    /// this window a transcript is the user, whatever the words are — which is what
-    /// makes it safe to delete an item on the strength of a text match.
-    static let echoTail: Duration = .milliseconds(600)
 }
 
 enum FullDuplexConfig {

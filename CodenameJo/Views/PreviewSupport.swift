@@ -276,14 +276,12 @@ final class PreviewRealtimeService: RealtimeService {
         super.init()
         self.sessionState = .ready
         // Seed a finished exchange so the screenshot shows the product working, not its empty state.
-        self.mcpConnected = true
         self.lastCommandText = "What needs me in my inbox this morning?"
         self.responseText = """
             Three things. Nate needs Thursday confirmed, the Vercel invoice is \
             due Friday, and Priya replied about the contract — she's asking for \
             one change to clause 4.
             """
-        self.lastToolUsed = "search_messages"
         self.memoryTurns = 4
         self.feedFocus = .email(FeedFocus.Email(
             sender: "Priya Shah <priya@example.com>",

@@ -555,25 +555,6 @@ enum BackgroundMailRefresh {
         return all.count
     }
 
-    /// When the correspondent walk must stop, or nil to skip it on this trigger.
-    /// When the correspondent walk must stop, or nil to skip it on this trigger. Nil on a silent push:
-    /// `AppDelegate` gives it ~25 s, which belongs to the unread cache.
-    private static func contactsDeadline(
-        trigger: BackgroundRefreshLog.Trigger, startedAt: Date
-    ) -> Date? {
-        switch trigger {
-        case .silentPush: nil
-        // Not on sign-in: the walk owned Gmail's per-second quota and 429'd onboarding.
-        case .signIn: nil
-        // Generous: nobody is waiting, and this is someone watching Settings.
-        case .manual: startedAt.addingTimeInterval(90)
-        // Bounded: a foreground pass competes with a dial the user may be about to start.
-        case .launch: startedAt.addingTimeInterval(20)
-        // Mid-call: never spend a live call's Gmail quota on the directory.
-        case .toolWrite, .staleRead: nil
-        }
-    }
-
     // MARK: - Helpers
 
     /// Which mailbox this is.

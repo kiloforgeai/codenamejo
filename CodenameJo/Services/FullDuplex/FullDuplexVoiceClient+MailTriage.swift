@@ -1405,7 +1405,6 @@ extension FullDuplexVoiceClient {
                 role: "system")
         } else if Self.isFeedInterstitial(step.output) {
             terminalFeedReached = true
-            armFeedStages(from: step.output)
             transport?.sendContextItem(
                 "The automatic email walk has reached its terminal feed. Follow the "
                     + "coaching checkpoint below: ask its exact yes/no invitation "
@@ -1425,7 +1424,6 @@ extension FullDuplexVoiceClient {
             }
             RealtimeLog.log("localTriage: terminal feed delivered without a next message")
         } else if Self.isPageInterstitial(step.output) {
-            armFeedStages(from: step.output)
             transport?.sendContextItem(
                 "The automatic email walk has paused after twelve handled emails. Follow "
                     + "the coaching checkpoint below: ask its exact invitation "
@@ -1655,9 +1653,6 @@ extension FullDuplexVoiceClient {
             // The same two flags `deliverUnaskedStep` sets off a step it delivered itself. A
             // stage reached through this receipt is still the stage that was reached.
             if Self.isFeedInterstitial(step.output) { self.terminalFeedReached = true }
-            if Self.isFeedInterstitial(step.output) || Self.isPageInterstitial(step.output) {
-                self.armFeedStages(from: step.output)
-            }
             // **The draft's advance was the last per-email action still costing a whole
             // backend turn**, and the only reason was that this call site predates the two
             // that fixed the others: the archive speaks its next step through
@@ -1939,9 +1934,6 @@ extension FullDuplexVoiceClient {
             self.applyStep(step.output, progress: progress, standing: standing,
                            served: served, dial: dial)
             if Self.isFeedInterstitial(step.output) { self.terminalFeedReached = true }
-            if Self.isFeedInterstitial(step.output) || Self.isPageInterstitial(step.output) {
-                self.armFeedStages(from: step.output)
-            }
             if ["archive_message", "mark_spam"].contains(tool), await self.presentPreparedEmail(
                 callId: callId, tool: tool, step: step.output,
                 ms: Date().timeIntervalSince(started) * 1000,

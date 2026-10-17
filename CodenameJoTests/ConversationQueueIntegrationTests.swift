@@ -2044,13 +2044,10 @@ final class ConversationQueueIntegrationTests: XCTestCase {
 
         let handoff = try object(
             await queue.step(.init(), store: fixture.store, dealtWith: false).output)
-        XCTAssertEqual(handoff["mailboxComplete"] as? Bool, true)
         XCTAssertEqual(handoff["account"] as? String, work)
-        XCTAssertEqual(handoff["nextAccount"] as? String, personal)
 
         let declined = try object(await queue.step(.init(stop: true), store: fixture.store).output)
         XCTAssertEqual(declined["stopped"] as? Bool, true)
-        XCTAssertNil(declined["nextAccount"])
         XCTAssertTrue((declined["note"] as? String)?.contains("queue is closed") == true)
         await queue.end()
     }

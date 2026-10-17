@@ -50,19 +50,15 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
         XCTAssertNil(DispatchAnswerPresentation(step: #"{"presentedForOutcome":true,"item":{},"dispatchOutcome":{}}"#))
     }
 
-    func testReportWaitsForForegroundToolAndItsContinuation() {
+    func testReportWaitsForForegroundTool() {
         var inFlight = false
         XCTAssertFalse(FullDuplexVoiceClient.reserveDispatchReportTurn(
             responseInFlight: &inFlight, userSpeaking: false, assistantAudible: false,
-            foregroundToolPending: true, continuationPending: false))
-        XCTAssertFalse(inFlight)
-        XCTAssertFalse(FullDuplexVoiceClient.reserveDispatchReportTurn(
-            responseInFlight: &inFlight, userSpeaking: false, assistantAudible: false,
-            foregroundToolPending: false, continuationPending: true))
+            foregroundToolPending: true))
         XCTAssertFalse(inFlight)
         XCTAssertTrue(FullDuplexVoiceClient.reserveDispatchReportTurn(
             responseInFlight: &inFlight, userSpeaking: false, assistantAudible: false,
-            foregroundToolPending: false, continuationPending: false))
+            foregroundToolPending: false))
     }
 
     /// Requested speech is silent for a few seconds before Live plays it; a report there talks over it.
@@ -70,7 +66,7 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
         var inFlight = false
         XCTAssertFalse(FullDuplexVoiceClient.reserveDispatchReportTurn(
             responseInFlight: &inFlight, userSpeaking: false, assistantAudible: false,
-            foregroundToolPending: false, continuationPending: false, speechRequested: true))
+            foregroundToolPending: false, speechRequested: true))
         XCTAssertFalse(inFlight)
     }
 
@@ -126,7 +122,7 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
         var inFlight = false
         XCTAssertFalse(FullDuplexVoiceClient.reserveDispatchReportTurn(
             responseInFlight: &inFlight, userSpeaking: false, assistantAudible: false,
-            foregroundToolPending: false, continuationPending: false, answerPending: true))
+            foregroundToolPending: false, answerPending: true))
         XCTAssertFalse(inFlight)
         XCTAssertTrue(LiveSessionAdapter.endsOnQuestion("Yes, what's the feedback?"))
         XCTAssertFalse(LiveSessionAdapter.endsOnQuestion("Hmm, you'd like a brief confirmation."))
@@ -153,14 +149,14 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
         var inFlight = false
         XCTAssertTrue(FullDuplexVoiceClient.reserveDispatchReportTurn(
             responseInFlight: &inFlight, userSpeaking: false, assistantAudible: false,
-            foregroundToolPending: false, continuationPending: false))
+            foregroundToolPending: false))
         XCTAssertFalse(FullDuplexVoiceClient.reserveDispatchReportTurn(
             responseInFlight: &inFlight, userSpeaking: false, assistantAudible: false,
-            foregroundToolPending: false, continuationPending: false))
+            foregroundToolPending: false))
         inFlight = false // response.done or response.cancelled
         XCTAssertTrue(FullDuplexVoiceClient.reserveDispatchReportTurn(
             responseInFlight: &inFlight, userSpeaking: false, assistantAudible: false,
-            foregroundToolPending: false, continuationPending: false))
+            foregroundToolPending: false))
     }
 
     /// #989: a failure spoken at the first quiet beat landed on top of Jo's next question.

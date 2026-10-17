@@ -148,8 +148,6 @@ enum FullDuplexBroker {
         let calendarFeedOwners: [String]
         /// `dispatch` requires its `scope` argument.
         var dispatchScope: Bool = false
-        /// Whether any write on this session reports its outcome later. None does.
-        let asyncWrites: Bool
         /// Whether `search_calendar` was declared. Calendar reads use the calendar tools.
         let localCalendar: Bool
         /// `triage_next` is a client function on this session.
@@ -307,7 +305,6 @@ enum FullDuplexBroker {
             calendarFeedDue: setup.calendarFeedDue,
             calendarFeedOwners: cadenceOwners,
             dispatchScope: true,
-            asyncWrites: false,
             localCalendar: false,
             localTriage: true,
             coachingPlan: coachingPlan,

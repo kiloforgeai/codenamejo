@@ -1,9 +1,7 @@
 import Foundation
 
-/// Turns a clear RSVP request into a queue-owned action only when the calendar result and
-/// the email on screen describe the same invitation. This is deliberately narrower than
-/// conversational intent recognition: a false negative asks the user to clarify, while a
-/// false positive notifies an organizer.
+/// Recognises a clear accept or decline in what the user just said. Deliberately narrower than
+/// conversational intent recognition.
 enum CalendarRSVPQueuePolicy {
     static func response(in utterance: String) -> String? {
         let text = utterance.lowercased()
@@ -16,23 +14,6 @@ enum CalendarRSVPQueuePolicy {
             return response
         }
         return nil
-    }
-
-    static func matchesInvitation(
-        eventSummary: String?, eventAccount: String,
-        emailSubject: String, emailAccount: String
-    ) -> Bool {
-        guard eventAccount.caseInsensitiveCompare(emailAccount) == .orderedSame,
-              let summary = eventSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
-              summary.count >= 2 else { return false }
-        let subject = emailSubject.lowercased()
-        return subject.contains("invitation:") && subject.contains(summary.lowercased())
-    }
-
-    static func brokerAccepted(output: String, response: String, brokerVerdict: Bool?) -> Bool {
-        if let brokerVerdict { return brokerVerdict }
-        if output.hasPrefix("Accepted \"") || output.hasPrefix("Declined \"") { return true }
-        return output.contains(" was already \(response) on ")
     }
 
     /// `end_session` is model-selected, so keep calendar decision words from becoming an

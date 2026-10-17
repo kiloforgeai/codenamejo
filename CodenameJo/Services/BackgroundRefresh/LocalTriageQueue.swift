@@ -560,7 +560,6 @@ actor LocalTriageQueue {
     private var confirmedEffectsRevision = 0
     /// Mailbox owning the checkpoint. Set from the cache state even for an empty queue.
     private var snapshotAccount: String?
-    private var restoredForLastStep = false
     private var restoredServedForLastStep: Served?
     /// A restore is a presentation, not an advance. The opening's first no-argument call
     /// must return the unresolved current message before any cursor mutation occurs.
@@ -1294,7 +1293,6 @@ actor LocalTriageQueue {
                 return (await current(store: store), .hit)
             }
         }
-        restoredForLastStep = false
         restoredServedForLastStep = nil
         if let requested = input.account?.trimmingCharacters(in: .whitespaces), !requested.isEmpty {
             let connected = await mailAccounts()
@@ -1336,8 +1334,6 @@ actor LocalTriageQueue {
         if let offeredAccount, input.account == nil, !input.stop {
             return (Self.json([
                 "account": activeAccount ?? snapshotAccount ?? "mailbox",
-                "nextAccount": offeredAccount,
-                "mailboxComplete": true,
                 "note": "That mailbox is finished and no new queue has been selected. Ask "
                     + "again whether they want to switch to \(offeredAccount). If they agree, "
                     + "call triage_next with that exact account; if they decline, use stop true.",
@@ -1745,7 +1741,6 @@ actor LocalTriageQueue {
         snapshotAccount = account
         stalled = head.stalled
         generation &+= 1
-        restoredForLastStep = true
         restoredNeedsCurrent = true
         RealtimeLog.log("localTriage: restored \(scope.rawValue) for \(day) at "
             + "\(messageOrdinal) with \(fresh.count) new message(s) after current")
@@ -3963,13 +3958,11 @@ actor LocalTriageQueue {
             && CalendarFeedCadence.isDue(owners: SlackFeedCadence.owners(teams: slackTeams))
         if slackDue {
             payload["slackDue"] = true
-            payload["slackConversations"] = slackCount
             payload["slackTeams"] = slackTeams
         }
         if let nextProfile {
             payload["currentProfile"] = profileHandoff.currentName
             payload["nextProfile"] = nextProfile.name
-            payload["profileComplete"] = true
         }
         payload["feedNote"] = "This is the terminal automatic feed. "
             + "When coaching is present, ask its exact yes/no invitation and wait. Fetch "
@@ -4092,8 +4085,6 @@ actor LocalTriageQueue {
         offeredAccount = next
         var payload = base
         payload["account"] = current
-        payload["nextAccount"] = next
-        payload["mailboxComplete"] = true
         let prior = (payload["note"] as? String).map { $0 + " " } ?? ""
         payload["note"] = prior
             + "Say they are done with the selected queue in \(current). Then ask exactly "
@@ -4726,7 +4717,6 @@ actor LocalTriageQueue {
         }
         if item.isTopicGroup {
             itemPayload["groupKind"] = "topic"
-            itemPayload["topicId"] = item.topicId
             itemPayload["archiveGroupId"] = Self.topicSelectionID(item)
             itemPayload["conversations"] = item.unwrappedTopics.map { part -> [String: Any] in
                 let context = part.summaryMessages ?? part.exchangeContext ?? []
@@ -4744,7 +4734,6 @@ actor LocalTriageQueue {
         // passing, rather than a band label it would announce.
         if let why = item.importanceWhy, !why.isEmpty { itemPayload["why"] = why }
         if let decision {
-            itemPayload["gmailCategory"] = decision.category.rawValue
             itemPayload["senderInboxCount"] = decision.senderInboxCount
         }
         // Unconditional: a cleanup offer changes what to say about the item, not who it is from.
