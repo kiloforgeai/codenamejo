@@ -104,7 +104,7 @@ final class CustomCommandsInteractor: ViewModelInteractor<CustomCommandsViewMode
     @CancellableBuilder
     override func onViewAppear(viewModel: CustomCommandsViewModel) -> [AnyCancellable] {
         super.onViewAppear(viewModel: viewModel)
-        store.refresh()
+        Task { await store.refresh() }
     }
 
     func setCommand(_ command: CustomCommand, enabled: Bool, viewModel: CustomCommandsViewModel) {
@@ -119,7 +119,7 @@ final class CustomCommandsInteractor: ViewModelInteractor<CustomCommandsViewMode
     func confirmDelete(viewModel: CustomCommandsViewModel) {
         guard let command = viewModel.pendingDelete else { return }
         viewModel.pendingDelete = nil
-        _ = store.delete(keyword: command.keyword)
+        Task { _ = await store.delete(keyword: command.keyword) }
     }
 }
 

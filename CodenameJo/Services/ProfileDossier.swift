@@ -248,7 +248,7 @@ actor ProfileDossierLearner {
         let spoken = turns.filter { !$0.commandText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !spoken.isEmpty else { return }
         let profiles: [WorkspaceProfile]
-        do { profiles = try rows.list(userId: owner) } catch {
+        do { profiles = try await rows.list(userId: owner) } catch {
             RealtimeLog.log("profileDossier: profiles unreadable — \(error.localizedDescription)")
             return
         }
@@ -258,7 +258,7 @@ actor ProfileDossierLearner {
         }
         for (profileId, turns) in grouped {
             do {
-                guard try rows.dossierEnabled(userId: owner, profileId: profileId) else { continue }
+                guard try await rows.dossierEnabled(userId: owner, profileId: profileId) else { continue }
                 try await fold(turns.sorted { $0.issuedAt < $1.issuedAt }.map(ProfileDossier.source(turn:)),
                                owner: owner, profileId: profileId)
             } catch {
@@ -268,7 +268,7 @@ actor ProfileDossierLearner {
     }
 
     func fold(_ sources: [ProfileDossier.Source], owner: String, profileId: String, now: Date = Date()) async throws {
-        let existing = try rows.dossier(userId: owner, profileId: profileId)
+        let existing = try await rows.dossier(userId: owner, profileId: profileId)
         var facts = try existing.map {
             Dictionary(uniqueKeysWithValues: try JSONDecoder().decode([ProfileDossier.Claim].self, from: Data($0.facts.utf8)).map { ($0.key, $0) })
         } ?? [:]
@@ -281,16 +281,16 @@ actor ProfileDossierLearner {
         let encodedContent = String(decoding: try ProfileDossier.encoder.encode(content), as: UTF8.self)
         let changed = existing?.content != encodedContent
         let sortedFacts = facts.values.sorted { $0.key < $1.key }
-        try rows.saveDossier(.init(user_id: owner, profile_id: profileId,
+        try await rows.saveDossier(.init(user_id: owner, profile_id: profileId,
             facts: String(decoding: try ProfileDossier.encoder.encode(sortedFacts), as: UTF8.self),
             content: encodedContent, version: (existing?.version ?? 0) + (changed ? 1 : 0), updated_at: now))
     }
 
     /// The overview a call may carry for this profile, or nil when it does not learn or knows nothing yet.
-    nonisolated func context(owner: String, profileId: String, now: Date = Date()) -> ProfileDossierContext? {
+    nonisolated func context(owner: String, profileId: String, now: Date = Date()) async -> ProfileDossierContext? {
         do {
-            guard try rows.dossierEnabled(userId: owner, profileId: profileId),
-                  let stored = try rows.dossier(userId: owner, profileId: profileId) else { return nil }
+            guard try await rows.dossierEnabled(userId: owner, profileId: profileId),
+                  let stored = try await rows.dossier(userId: owner, profileId: profileId) else { return nil }
             var content = try JSONDecoder().decode(ProfileDossier.Content.self, from: Data(stored.content.utf8))
             let claims = content.sections.values.flatMap { $0 }
             if claims.contains(where: { $0.expiresAt.flatMap(ProfileDossier.date).map { $0 <= now } ?? false }) {

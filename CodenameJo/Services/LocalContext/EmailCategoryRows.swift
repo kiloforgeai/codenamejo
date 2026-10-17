@@ -38,8 +38,8 @@ struct EmailCategoryRows: Sendable {
     }
 
     /// The mailbox's categories, most recently seen first.
-    func known(userId: String, account: String) throws -> [Row] {
-        try pool().read { db in
+    func known(userId: String, account: String) async throws -> [Row] {
+        try await pool().read { db in
             try Row.fetchAll(db, sql: """
                 SELECT * FROM email_category WHERE user_id = ? AND account = ?
                 ORDER BY last_seen DESC LIMIT \(Self.maxCategories)
@@ -47,16 +47,16 @@ struct EmailCategoryRows: Sendable {
         }
     }
 
-    func category(userId: String, account: String, name: String) throws -> Row? {
-        try pool().read { db in
+    func category(userId: String, account: String, name: String) async throws -> Row? {
+        try await pool().read { db in
             try Row.fetchOne(db, key: ["user_id": userId, "account": account.lowercased(), "name": name])
         }
     }
 
     /// Marks a category seen, creating it when new. Beyond the cap the least recently seen drops off.
-    func touch(userId: String, account: String, name: String, description: String, now: Date = Date()) throws {
+    func touch(userId: String, account: String, name: String, description: String, now: Date = Date()) async throws {
         let account = account.lowercased()
-        try pool().write { db in
+        try await pool().write { db in
             try db.execute(sql: """
                 INSERT INTO email_category (user_id, account, name, description, last_seen) VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT (user_id, account, name) DO UPDATE SET last_seen = excluded.last_seen
@@ -69,15 +69,15 @@ struct EmailCategoryRows: Sendable {
         }
     }
 
-    func setPlaybook(userId: String, account: String, name: String, playbook: String) throws {
-        try pool().write { db in
+    func setPlaybook(userId: String, account: String, name: String, playbook: String) async throws {
+        try await pool().write { db in
             try db.execute(sql: "UPDATE email_category SET playbook = ? WHERE user_id = ? AND account = ? AND name = ?",
                            arguments: [playbook, userId, account.lowercased(), name])
         }
     }
 
     /// Playbooks are learned from transcripts, so they leave with the account at sign-out.
-    func purge(userId: String) throws {
-        try pool().write { db in try db.execute(sql: "DELETE FROM email_category WHERE user_id = ?", arguments: [userId]) }
+    func purge(userId: String) async throws {
+        try await pool().write { db in try db.execute(sql: "DELETE FROM email_category WHERE user_id = ?", arguments: [userId]) }
     }
 }

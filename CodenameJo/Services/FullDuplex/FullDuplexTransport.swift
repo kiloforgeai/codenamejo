@@ -39,10 +39,13 @@ final class FullDuplexTransport: NSObject {
 
     private static let sslOnce: Void = { _ = RTCInitializeSSL() }()
 
-    /// Records both sides of the call; both audio taps attach here.
+#if DEBUG
+    /// Records both sides of the call; both audio taps attach here. Only a validation run can
+    /// record, and only a DEBUG build can start one, so Release never resamples the call for nothing.
     let recorder = SessionRecorder()
+#endif
 
-    /// Transcribes the user's half on device, from the same capture tap.
+    /// Inactive on the live path; retained for mute and suppression wiring.
     let localTranscriber = LocalTranscriber()
 
     /// Meters the user's half before WebRTC's `media-source` level exists. See `MicLevelTap`.
@@ -66,8 +69,9 @@ final class FullDuplexTransport: NSObject {
         // The slot is single, so the fanout is registered; see `CaptureTapFanout`.
         inputDriver.install(on: captureTap)
 
+#if DEBUG
         captureTap.add(recorder)
-        captureTap.add(localTranscriber)
+#endif
         captureTap.add(micMeter)
         apm.capturePostProcessingDelegate = captureTap
         return apm
@@ -155,14 +159,13 @@ final class FullDuplexTransport: NSObject {
         peerConnection = pc
         RealtimeLog.log("webrtc: peer connection created")
 
+#if DEBUG
         // Before the mic, or the first buffers land behind the write head and are dropped.
         // Only validation runs record; this gates the file, not the audio graph.
         if validationEvidence.runID != nil {
             recorder.start(conversationId: conversationId)
         }
-
-        // Unconditional: this produces on-screen words, not a file.
-        localTranscriber.start()
+#endif
 
         // Mic in. libwebrtc captures automatically once the track is attached.
         let source = factory.audioSource(with: FullDuplexAudioSession.audioSourceConstraints)
@@ -379,11 +382,14 @@ final class FullDuplexTransport: NSObject {
         if let liveAdapter { Task { @MainActor in liveAdapter.close() } }
         RealtimeLog.log("webrtc: closing — \(reason)")
 
+#if DEBUG
         // Detach and finish the recording before teardown, while its timeline is still coherent.
         remoteAudioTrack?.remove(recorder)
+#endif
         if let remoteAudioTrack { inputDriver.detach(from: remoteAudioTrack) }
 
         remoteAudioTrack = nil
+#if DEBUG
         // `stop()` finalises the file; validation copies it out, then the original goes.
         if let finished = recorder.stop() {
             validationEvidence.record("call.closed", ["reason": reason, "recording": finished.lastPathComponent])
@@ -391,7 +397,7 @@ final class FullDuplexTransport: NSObject {
                 try? FileManager.default.removeItem(at: finished)
             }
         }
-        localTranscriber.stop()
+#endif
 
         dataChannel?.close()
         peerConnection?.close()
@@ -482,10 +488,12 @@ extension FullDuplexTransport: RTCPeerConnectionDelegate {
         guard remoteAudioTrack !== track else { return }
         remoteAudioTrack = track
         track.source.volume = assistantVolume
+#if DEBUG
         track.add(recorder)
+#endif
         inputDriver.attach(to: track)
 
-        RealtimeLog.log("webrtc: assistant track \(track.trackId) at \(assistantVolume)x; recorder attached")
+        RealtimeLog.log("webrtc: assistant track \(track.trackId) at \(assistantVolume)x")
     }
 
 

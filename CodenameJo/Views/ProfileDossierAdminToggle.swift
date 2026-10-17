@@ -72,12 +72,17 @@ final class ProfileDossierAdminInteractor: ViewModelInteractor<ProfileDossierAdm
         viewModel.busy = false
         guard let profile = profiles.selected else { return }
         viewModel.profileName = profile.name
-        do {
-            viewModel.enabled = try profiles.dossierEnabled(for: profile.id)
-            viewModel.loaded = true
-            loadedProfile = profile.id
-        } catch {
-            viewModel.error = "Could not load the dossier setting. Reopen Settings to retry."
+        Task { [weak self] in
+            do {
+                let enabled = try await self?.profiles.dossierEnabled(for: profile.id) ?? false
+                guard let self, version == generation else { return }
+                viewModel.enabled = enabled
+                viewModel.loaded = true
+                loadedProfile = profile.id
+            } catch {
+                guard let self, version == generation else { return }
+                viewModel.error = "Could not load the dossier setting. Reopen Settings to retry."
+            }
         }
     }
 
@@ -85,11 +90,15 @@ final class ProfileDossierAdminInteractor: ViewModelInteractor<ProfileDossierAdm
         guard !viewModel.busy, viewModel.loaded, let profileId = loadedProfile,
               profiles.selected?.id == profileId else { return }
         viewModel.error = nil
-        do {
-            try profiles.setDossierEnabled(enabled, for: profileId)
-            viewModel.enabled = enabled
-        } catch {
-            viewModel.error = "Could not save the dossier setting. Try again."
+        viewModel.busy = true
+        Task {
+            defer { viewModel.busy = false }
+            do {
+                try await profiles.setDossierEnabled(enabled, for: profileId)
+                viewModel.enabled = enabled
+            } catch {
+                viewModel.error = "Could not save the dossier setting. Try again."
+            }
         }
     }
 }

@@ -185,12 +185,6 @@ class RealtimeService: ObservableObject {
     /// known to belong together, and the save consumes the finished value.
     @Published private(set) var lastCompletedTurn: CommandRecord?
 
-    /// True once the session has confirmed its tools are attached and reachable —
-    /// the session reported them ready, or one of them has actually run.
-    @Published var mcpConnected: Bool = false
-    /// The most recent MCP tool the model invoked, for a visible confirmation.
-    @Published var lastToolUsed: String? = nil
-
     /// A tool that can have moved the email queue's cursor just returned.
     ///
     /// **Not `lastCompletedTurn`, which is what the chip used to watch.** The cursor
@@ -282,20 +276,16 @@ class RealtimeService: ObservableObject {
         liveDispatches.append(LiveDispatch(id: id, task: task, slot: slot))
     }
 
-    /// Mark a droplet as come home, and sweep the ones that have finished playing.
-    ///
-    /// The sweep is here rather than on a timer because this is the only thing that
-    /// adds to the finished set, so it is the only moment the set can need trimming.
+    /// Mark a droplet as come home, then sweep it once it has finished playing, so the last
+    /// droplet of a call does not keep the overlay mounted for the rest of it.
     private func finishLiveDispatch(_ id: UUID) {
-        if let index = liveDispatches.firstIndex(where: { $0.id == id }) {
-            liveDispatches[index].finishedAt = Date()
-        }
-        let now = Date()
-        liveDispatches.removeAll { job in
-            // Long enough for the merge to play out, and for a stale droplet to
-            // dissolve. Both are sub-second; two is slack, not a deadline.
-            guard let finishedAt = job.finishedAt else { return false }
-            return now.timeIntervalSince(finishedAt) > 2
+        guard let index = liveDispatches.firstIndex(where: { $0.id == id }) else { return }
+        liveDispatches[index].finishedAt = Date()
+        // Long enough for the merge to play out, and for a stale droplet to dissolve. Both are
+        // sub-second; two is slack, not a deadline.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            self?.liveDispatches.removeAll { $0.id == id }
         }
     }
 
@@ -342,10 +332,6 @@ class RealtimeService: ObservableObject {
     ///
     /// The model has been working long enough that silence needs explaining.
     @Published var isTakingLong: Bool = false
-    /// True when this session runs the echo-cancelling graph, i.e. the user can
-    /// interrupt by talking rather than only by tapping.
-    @Published var bargeInActive: Bool = false
-
     /// Fires `isTakingLong` a few seconds into `.processing`.
     private var thinkingTimer: Timer?
     /// Long enough that a fast answer never trips it, short enough that a slow
@@ -426,8 +412,6 @@ class RealtimeService: ObservableObject {
         sessionState = .connecting
         responseText = ""
         answerIsStale = false
-        mcpConnected = false
-        lastToolUsed = nil
         turnSteps = []
         RealtimeLog.log("connect() start")
 
@@ -461,15 +445,12 @@ class RealtimeService: ObservableObject {
         commandStartTime = nil
         isMuted = false
         clearMuteSettling()
-        mcpConnected = false
-        lastToolUsed = nil
         turnSteps = []
         // The card goes with the call. A queue position over a dead session is the same
         // dead control this file has spent its bug budget on.
         clearCard()
         clearFeedFocus()
         isConversing = false
-        bargeInActive = false
         memoryTurns = 0
         // No client, no call, so no conversation — same reasoning as `endConversation`.
         activeConversationId = nil
@@ -548,13 +529,6 @@ class RealtimeService: ObservableObject {
 
         client.onState = { [weak self] state in
             guard let self, self.isConversing else { return }
-            // **The first `.listening` of a dial is the call opening**, since that is
-            // what `.connected` publishes; every later one is a turn ending. Nothing is
-            // *counted* here — `voice_dial_completed` already files the connect, with
-            // the whole leg breakdown — this only records which side of the connect a
-            // later failure lands on, so `logDialFailed` can tell a dial that never
-            // happened from a call that broke.
-            if state == .listening { self.dialHasConnected = true }
             // `.listening` covers both "nobody is talking" and "the user is
             // mid-sentence"; server VAD owns that distinction and the UI doesn't
             // need it. What it does need is that a finished turn lands on
@@ -619,8 +593,6 @@ class RealtimeService: ObservableObject {
         }
         client.onToolUse = { [weak self] name in
             guard let self else { return }
-            self.mcpConnected = true
-            self.lastToolUsed = name
             self.beginStep(name)
         }
         client.onToolDone = { [weak self] name in
@@ -650,9 +622,6 @@ class RealtimeService: ObservableObject {
         }
         client.onToolFailed = { [weak self] name in
             self?.failStep(name)
-        }
-        client.onToolsReady = { [weak self] in
-            self?.mcpConnected = true
         }
         client.onCard = { [weak self] card in
             self?.showCard(card)
@@ -758,24 +727,7 @@ class RealtimeService: ObservableObject {
             // itself down, which is the common case.
             self.fullDuplex?.stop()
             self.isConversing = false
-            self.bargeInActive = false
             self.sessionState = .error(message)
-        }
-    }
-
-    // MARK: - Redial
-
-    /// Tear the call down and dial again. Needed for the audio mode, which is fixed
-    /// when the echo canceller is configured and so cannot be changed under a live call.
-    func reconnectFullDuplex() async {
-        guard let client = fullDuplex, isConversing else { return }
-        sessionState = .connecting
-        do {
-            try await client.reconnect()
-        } catch {
-            isConversing = false
-            bargeInActive = false
-            sessionState = .error(error.localizedDescription)
         }
     }
 
@@ -992,9 +944,8 @@ class RealtimeService: ObservableObject {
         guard fullDuplex != nil, isConversing else { return false }
         switch sessionState {
         case .disconnected, .error: return false
-        // `.connecting` is included on purpose: a call redialling after a dropped
-        // connection (`reconnectFullDuplex()`) is a live session the user should
-        // still be able to hang up from the Lock Screen.
+        // `.connecting` is included on purpose: a call still dialling is a live session
+        // the user should be able to hang up from the Lock Screen.
         case .connecting, .ready, .listening, .processing, .responding: break
         }
         return LiveVoiceActivity.isAvailable || CarPlayPresence.isConnected
@@ -1396,14 +1347,6 @@ class RealtimeService: ObservableObject {
     /// ready. See `FullDuplexVoiceClient.announceReady`.
     @Published var micIsLive: Bool = false
 
-    /// Whether the dial in flight ever opened, so a failure can be told apart from a
-    /// call that broke later. Reset per dial; read only by `logDialFailed`.
-    ///
-    /// Not `sessionState`-derived on purpose: a dial that stalls never leaves
-    /// `.connecting`, and one that fails goes to `.error` from either side of the
-    /// connect. Neither state says which side of it we are on.
-    private var dialHasConnected = false
-
     /// Dial the call.
     ///
     /// Everything expensive is here rather than in `connect()`: session setup, the
@@ -1439,11 +1382,6 @@ class RealtimeService: ObservableObject {
         isConversing = true
         isMuted = false
         clearMuteSettling()
-        // True the moment the call is wanted, not once it's up: this path is
-        // full-duplex by construction — there is no variant of it where the mic
-        // closes while the assistant talks — so the status line can promise
-        // "talk to interrupt" without waiting to find out.
-        bargeInActive = true
         // A memo posting mid-call would be a write-capable agent that `maxLiveDispatches`
         // cannot see — that cap counts only the dispatches this call started. Set before
         // anything can await, so there is no window where a Send tap slips through.
@@ -1452,7 +1390,6 @@ class RealtimeService: ObservableObject {
         responseText = ""
         answerIsStale = false
         turnSteps = []
-        dialHasConnected = false
         // Ahead of the queue step: a fully local call has no mail to prepare.
         if LocalVoiceSettings.allLocal {
             guard LocalVoiceBrain.onDeviceAvailable else {
@@ -1461,7 +1398,6 @@ class RealtimeService: ObservableObject {
                 isConversing = false
                 clearFeedFocus()
                 resumeMemoQueue()
-                bargeInActive = false
                 sessionState = .error(failure.localizedDescription)
                 return
             }
@@ -1508,7 +1444,6 @@ class RealtimeService: ObservableObject {
                 // well as resumes, which is free when the dial failed for want of a
                 // network: `drain()` returns at its own `isOnline` guard.
                 self?.resumeMemoQueue()
-                self?.bargeInActive = false
                 self?.sessionState = .error(error.localizedDescription)
             }
         }
@@ -1552,20 +1487,17 @@ class RealtimeService: ObservableObject {
         // next dial opens on the last call's card.
         clearCard()
         clearFeedFocus()
-        // Completed tool rows belong to the call too. `triage_next` renders its past
-        // tense as "Moved on"; leaving `turnSteps` intact here kept that status on
-        // screen after End even though the call and durable queue had both stopped.
-        // `disconnect()` already clears these two fields—an ordinary hang-up must do
-        // the same because it deliberately does not pass through `disconnect()`.
-        lastToolUsed = nil
+        // Clear completed tool status when the call and durable queue end.
         turnSteps = []
+        // The droplets go with the call: a job that outlives it reports through the next
+        // dial's digest, not a bead orbiting a dead session.
+        liveDispatches = []
         // The microphone and the dispatch budget are both free again — so anything that
         // arrived during the call, or was stopped part-way through a drain by it, goes
         // now rather than waiting for the next launch.
         resumeMemoQueue()
         isMuted = false
         clearMuteSettling()
-        bargeInActive = false
         responseText = ""
         answerIsStale = false
         sessionState = .ready
@@ -1814,7 +1746,6 @@ class RealtimeService: ObservableObject {
         answerIsStale = false
         lastCommandText = ""
         lastResponseText = ""
-        lastToolUsed = nil
         turnSteps = []
         // Before `startLiveActivity` asks for the resting card, so this can only clear a
         // card from a previous call and never the one this dial is about to draw.
@@ -1836,20 +1767,6 @@ class RealtimeService: ObservableObject {
     }
 
     // MARK: - The conversation's own row
-
-    /// When the live call was dialled, for the row written when it ends.
-    ///
-    /// **Not derivable from anything else, which is the point.** The first `command` row
-    /// is written when the first *turn* completes, so a call that connects and is ended
-    /// before anyone speaks has no start at all, and one where the user thinks for twenty
-    /// seconds has a start twenty seconds late.
-    private var conversationStartedAt: Date?
-
-    /// Turns and tool calls so far in this call, for `voice_session_ended`.
-    /// Counted in `finalizeTurn` and cleared in `finishConversation`, which is the one
-    /// method that runs exactly once per conversation.
-    private var sessionTurnCount = 0
-    private var sessionToolCallCount = 0
 
     /// Conversations already written as ended, so the second path to arrive is a no-op.
     ///
@@ -1875,7 +1792,6 @@ class RealtimeService: ObservableObject {
     /// derived from its turns in `Conversation`, and is unaffected.
     private func recordConversationStart(_ id: UUID) {
         let startedAt = Date()
-        conversationStartedAt = startedAt
         // The off-screen clock is per call, and it opens here rather than only on
         // `didEnterBackground` because a call dialled from a shortcut can start off-screen.
         backgroundSeconds = 0
@@ -1919,8 +1835,6 @@ class RealtimeService: ObservableObject {
             conversation: \(Int(backgroundSeconds))s off-screen, \(Int(lockedSeconds))s locked, \
             surface \(backgroundSurface ?? "none — on screen throughout"), carplay \(sawCarPlay)
             """)
-        sessionTurnCount = 0
-        sessionToolCallCount = 0
         pendingBrainSteps = []
         backgroundSeconds = 0
         backgroundSurface = nil
@@ -1974,10 +1888,6 @@ class RealtimeService: ObservableObject {
         // the exchange it belongs to and gets filed against the next one.
         let latency = lastTurnLatency
         lastTurnLatency = nil
-        // Counted here rather than at the end of the call: `turnSteps` is cleared per turn,
-        // so this is the only point that sees a turn's tools before they go.
-        sessionTurnCount += 1
-        sessionToolCallCount += lastTurnSteps.count
         commandStartTime = nil
 
         // A turn with nothing said back isn't a turn worth filing — the old save
@@ -2080,7 +1990,6 @@ extension RealtimeService {
         sessionState = .connecting
         call.onState = { [weak self] state in
             guard let self, self.isConversing, self.localVoice === call else { return }
-            if state == .listening { self.dialHasConnected = true }
             self.sessionState = state
         }
         call.onUserTranscript = { [weak self] text, _ in
@@ -2119,7 +2028,6 @@ extension RealtimeService {
                 self.isConversing = false
                 self.clearFeedFocus()
                 self.resumeMemoQueue()
-                self.bargeInActive = false
                 self.sessionState = .error(error.localizedDescription)
             }
         }

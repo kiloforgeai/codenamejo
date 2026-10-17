@@ -734,73 +734,36 @@ final class ProfileViewInteractor: ViewModelInteractor<ProfileViewModel> {
     override func onLoad(viewModel: ProfileViewModel) -> [AnyCancellable] {
         super.onLoad(viewModel: viewModel)
 
-        // Mirrored so the Connections section is drawn from fields, not from the service.
-        connections.$gmailAvailable
+        // Mirrored so the Connections section is drawn from fields, not from the service. One
+        // subscription: the service publishes its lists as one value, once per refresh.
+        connections.$status
             .receive(on: DispatchQueue.main)
-            .sink { viewModel.gmailAvailable = $0 }
-
-        connections.$gmailAccounts
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.gmailAccounts = $0 }
-
-        connections.$gmailNeedsReauth
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.gmailNeedsReauth = $0 }
-
-        connections.$githubAvailable
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.githubAvailable = $0 }
-
-        connections.$githubAccounts
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.githubAccounts = $0 }
-
-        connections.$githubNeedsReauth
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.githubNeedsReauth = $0 }
+            .sink { status in
+                viewModel.gmailAvailable = status.gmailAvailable
+                viewModel.gmailAccounts = status.gmailAccounts
+                viewModel.gmailNeedsReauth = status.gmailNeedsReauth
+                viewModel.githubAvailable = status.githubAvailable
+                viewModel.githubAccounts = status.githubAccounts
+                viewModel.githubNeedsReauth = status.githubNeedsReauth
+                viewModel.slackAvailable = status.slackAvailable
+                viewModel.slackAccounts = status.slackAccounts
+                viewModel.slackNeedsReauth = status.slackNeedsReauth
+                viewModel.notionMcpAvailable = status.notionMcpAvailable
+                viewModel.notionMcpAccounts = status.notionMcpAccounts
+                viewModel.notionMcpNeedsReauth = status.notionMcpNeedsReauth
+                viewModel.granolaAvailable = status.granolaAvailable
+                viewModel.granolaAccounts = status.granolaAccounts
+                viewModel.granolaNeedsReauth = status.granolaNeedsReauth
+                viewModel.customMCPAvailable = status.customMCPAvailable
+                viewModel.customMCPServers = status.customMCPServers
+                viewModel.hasLoadedConnections = status.hasLoadedStatus
+                viewModel.connectionStatusLoadFailed = status.statusLoadFailed
+            }
 
         connections.$githubPendingCode
             .receive(on: DispatchQueue.main)
             .sink { viewModel.githubPendingCode = $0 }
 
-        connections.$slackAvailable
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.slackAvailable = $0 }
-
-        connections.$slackAccounts
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.slackAccounts = $0 }
-
-        connections.$slackNeedsReauth
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.slackNeedsReauth = $0 }
-
-        connections.$notionMcpAvailable
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.notionMcpAvailable = $0 }
-
-        connections.$notionMcpAccounts
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.notionMcpAccounts = $0 }
-
-        connections.$notionMcpNeedsReauth
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.notionMcpNeedsReauth = $0 }
-        connections.$granolaAvailable
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.granolaAvailable = $0 }
-        connections.$granolaAccounts
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.granolaAccounts = $0 }
-        connections.$granolaNeedsReauth
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.granolaNeedsReauth = $0 }
-        connections.$customMCPAvailable
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.customMCPAvailable = $0 }
-        connections.$customMCPServers
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.customMCPServers = $0 }
         connections.$busyConnector
             .receive(on: DispatchQueue.main)
             .sink { viewModel.busyConnector = $0 }
@@ -813,14 +776,6 @@ final class ProfileViewInteractor: ViewModelInteractor<ProfileViewModel> {
         connections.$errorConnector
             .receive(on: DispatchQueue.main)
             .sink { viewModel.connectionErrorConnector = $0 }
-
-        connections.$hasLoadedStatus
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.hasLoadedConnections = $0 }
-
-        connections.$statusLoadFailed
-            .receive(on: DispatchQueue.main)
-            .sink { viewModel.connectionStatusLoadFailed = $0 }
 
         // Mirrored like the connector flags above, and for the same reason: the row is
         // drawn from view-model fields, not from a service the view holds.

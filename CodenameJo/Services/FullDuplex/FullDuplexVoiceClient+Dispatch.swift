@@ -254,22 +254,20 @@ extension FullDuplexVoiceClient {
     /// the calendar stage, so it completes here rather than on a lookup that never comes.
     func armFeedStages(from output: String) {
         updateSlackFeed(from: output)
-        calendarFeedPending = calendarFeedDue && Self.feedCalendarDue(output)
+        calendarFeedPending = Self.feedCalendarDue(output)
         guard calendarFeedPending,
               Self.interstitialPayload(in: output)?["calendarEvents"] != nil else { return }
-        if sequentialFeed {
-            Task { [weak self, localTriage] in
-                let events = await localTriage.inlinedCalendarEvents
-                guard let self else { return }
-                self.onFeedFocus?(self.feedFocusTracker.calendarResult(
-                    events: events.map(FeedFocusTracker.event), successful: true))
-            }
+        Task { [weak self, localTriage] in
+            let events = await localTriage.inlinedCalendarEvents
+            guard let self else { return }
+            self.onFeedFocus?(self.feedFocusTracker.calendarResult(
+                events: events.map(FeedFocusTracker.event), successful: true))
         }
         completeCalendarFeedIfPending(source: "inline agenda")
     }
 
     private func updateSlackFeed(from output: String) {
-        slackFeedPending = slackFeedDue && Self.feedSlackDue(output)
+        slackFeedPending = Self.feedSlackDue(output)
         if let teams = Self.interstitialPayload(in: output)?["slackTeams"] as? [String] {
             slackFeedOwners = SlackFeedCadence.owners(teams: teams)
         }
@@ -1045,35 +1043,6 @@ extension FullDuplexVoiceClient {
 
     // MARK: - Dispatch output and report delivery
 
-    /// Post a handoff's `function_call_output` and let the model speak about it.
-    ///
-    /// Every exit from `startDispatch` and `startBackgroundWrite` goes through here,
-    /// including the refusals, so that a refused handoff is as speakable as a started
-    /// one.
-    ///
-    /// **`startedWork` decides whether the stall backstop stands down, and a refusal
-    /// must not stand it down.** `unspokenHandoffThisTurn` exists because an
-    /// acknowledgement — "Running that now." — is *deliberately* an announcement, and
-    /// `autoContinueIfStalled` would read it as one and order the model to go and do
-    /// the thing it just said. Against a started handoff that order is a second run of
-    /// an irreversible job, so the flag is essential there.
-    ///
-    /// A refusal started nothing, so there is no second run to prevent — and the flag
-    /// costs a rescue that turn genuinely needs. `2026-08-06-checking-mail-is-never-a-dispatch`
-    /// named this and left it open: the mail refusal is "the first one that asks the
-    /// model to *do* something rather than to explain itself, so it is the first where
-    /// a stall would be visible as silence", and the very mechanism that would crank it
-    /// back out was being suppressed by the refusal itself. Narrowing
-    /// `isInlineMailRead` makes it likelier still, because what gets refused now is a
-    /// multi-step job the model has to carry out inline.
-    ///
-    /// Safe in both readings, which is the test `autoContinueIfStalled`'s own override
-    /// is written to pass: if the backstop fires on a refused turn it tells the model
-    /// to do the thing it said it would, and doing it is exactly what the refusal
-    /// asked for.
-    /// - Parameter queueAdvance: where the phone's email queue now stands — the dispatch
-    ///   finished the message the user was standing on, and this suffix carries the
-    ///   next one. `nil` falls back to the anchor note below.
     /// Turn a stored command into the worker's complete plan without asking the live
     /// model to restate it. A summary step is an output instruction, not a tool call.
     nonisolated static func dispatchTask(for command: CustomCommand) -> String {
@@ -1260,8 +1229,7 @@ extension FullDuplexVoiceClient {
         if !pendingReports.isEmpty, Self.reserveDispatchReportTurn(
             responseInFlight: &responseInFlight, userSpeaking: userSpeaking,
             assistantAudible: assistantAudible,
-            foregroundToolPending: functionCallTask != nil || awaitingToolResult || runningTool != nil,
-            continuationPending: continuation != nil,
+            foregroundToolPending: functionCallTask != nil || runningTool != nil,
             answerPending: holdsForAnswer(pendingReports[0], now: now),
             speechRequested: transport?.liveAdapter?.speechRequested == true) {
             injectDispatchReport(pendingReports.removeFirst(), speak: true)
@@ -1338,13 +1306,6 @@ extension FullDuplexVoiceClient {
         case .shortcut(let tool, _):
             label = "The requested \(tool) has returned. Report its actual result, without retrying the action.\n"
                 + report.text
-        case .write(let tool, _):
-            label = "The \(tool) you started in the background has finished"
-                + (report.ok == true ? " and it worked." : " and it did NOT do what you "
-                   + "said it would. You already told the user it was going, so they "
-                   + "believe something untrue until you correct it.")
-                + "\nYou called it with: \(report.task)"
-                + "\nIt came back with: \(report.text)"
         }
 
         // **The queue's place.** Without it this item would go in naming a message the
@@ -1475,11 +1436,11 @@ extension FullDuplexVoiceClient {
 
     static func reserveDispatchReportTurn(
         responseInFlight: inout Bool, userSpeaking: Bool, assistantAudible: Bool,
-        foregroundToolPending: Bool, continuationPending: Bool, answerPending: Bool = false,
+        foregroundToolPending: Bool, answerPending: Bool = false,
         speechRequested: Bool = false
     ) -> Bool {
         guard !responseInFlight, !userSpeaking, !assistantAudible, !speechRequested,
-              !foregroundToolPending, !continuationPending, !answerPending else { return false }
+              !foregroundToolPending, !answerPending else { return false }
         responseInFlight = true
         return true
     }

@@ -7,58 +7,85 @@ import Foundation
 /// One Google consent grants mail and calendar; calendar is a capability of an account, not a connector.
 @MainActor
 final class ConnectionsService: ObservableObject {
-    @Published var gmailAccounts: [String] = []   // connected Google account emails
-    /// Subset of `gmailAccounts` whose grant also covers Calendar. Not a separate
-    /// connector — see the type doc.
-    @Published var calendarAccounts: [String] = []
-    /// Subset of `gmailAccounts` whose grant also covers writing Gmail filters
-    /// (`gmail.settings.basic`, which `gmail.modify` does not cover).
-    @Published var filterAccounts: [String] = []
-    /// Connected accounts Google has stopped honouring; they stay in `gmailAccounts` so the row
-    /// can offer Reconnect. A refresh that failed on a Google 5xx is not here: it repairs itself.
-    @Published var gmailNeedsReauth: [String] = []
+    /// Publish one Keychain snapshot per refresh so observers update once.
+    struct Status {
+        var gmailAccounts: [String] = []   // connected Google account emails
+        /// Subset of `gmailAccounts` whose grant also covers Calendar. Not a separate
+        /// connector — see the type doc.
+        var calendarAccounts: [String] = []
+        /// Subset of `gmailAccounts` whose grant also covers writing Gmail filters
+        /// (`gmail.settings.basic`, which `gmail.modify` does not cover).
+        var filterAccounts: [String] = []
+        /// Connected accounts Google has stopped honouring; they stay in `gmailAccounts` so the row
+        /// can offer Reconnect. A refresh that failed on a Google 5xx is not here: it repairs itself.
+        var gmailNeedsReauth: [String] = []
+        /// Every account this phone holds a grant for, across profiles.
+        var deviceGrantAccounts: [String] = []
+        var gmailAvailable = false
+        /// Connected GitHub logins. What the token may do is `GitHubTools.allowedTools`.
+        var githubAccounts: [String] = []
+        var githubAvailable = false
+        /// Logins whose token GitHub answered 401 to. They stay in `githubAccounts` so the row can offer Reconnect.
+        var githubNeedsReauth: [String] = []
+        /// Connected Notion workspace names: one Notion connection is one workspace.
+        var notionMcpAccounts: [String] = []
+        var notionMcpAvailable = false
+        /// Workspaces whose MCP credential has been rejected. An expired access token is not here:
+        /// it renews on use.
+        var notionMcpNeedsReauth: [String] = []
+        /// The active profile's Granola accounts, by email, read from `RemoteMCPGrantStore`.
+        var granolaAccounts: [String] = []
+        var granolaAvailable = false
+        /// Accounts whose refresh Granola refused. An expired access token is not here: it renews on use.
+        var granolaNeedsReauth: [String] = []
+        /// The active profile's own MCP servers, from `CustomMCPServerStore`, each with whether its
+        /// credential still works. Always available: there is nothing to configure in the build.
+        var customMCPServers: [CustomMCPServerStatus] = []
+        var customMCPAvailable = false
+        /// The active profile's Slack workspaces, by name, from the Keychain. `slackAvailable` is
+        /// whether this build has a Slack app at all (`JO_SLACK_CLIENT_ID`).
+        var slackAccounts: [String] = []
+        var slackAvailable = false
+        /// Workspaces whose refresh Slack refused, or whose refresh token passed its 30 days.
+        var slackNeedsReauth: [String] = []
+        /// Whether the status has been read yet. Before it has, "nothing is connected" is unknown,
+        /// and must not gate the mic.
+        var hasLoadedStatus = false
+        /// A failed status read for this profile; switching clears the previous scope first.
+        var statusLoadFailed = false
+    }
+
+    @Published var status = Status()
+
+    // Forwarders, so readers and the previews keep their field names.
+    var gmailAccounts: [String] { get { status.gmailAccounts } set { status.gmailAccounts = newValue } }
+    var calendarAccounts: [String] { get { status.calendarAccounts } set { status.calendarAccounts = newValue } }
+    var filterAccounts: [String] { get { status.filterAccounts } set { status.filterAccounts = newValue } }
+    var gmailNeedsReauth: [String] { get { status.gmailNeedsReauth } set { status.gmailNeedsReauth = newValue } }
+    var deviceGrantAccounts: [String] { get { status.deviceGrantAccounts } set { status.deviceGrantAccounts = newValue } }
+    var gmailAvailable: Bool { get { status.gmailAvailable } set { status.gmailAvailable = newValue } }
+    var githubAccounts: [String] { get { status.githubAccounts } set { status.githubAccounts = newValue } }
+    var githubAvailable: Bool { get { status.githubAvailable } set { status.githubAvailable = newValue } }
+    var githubNeedsReauth: [String] { get { status.githubNeedsReauth } set { status.githubNeedsReauth = newValue } }
+    var notionMcpAccounts: [String] { get { status.notionMcpAccounts } set { status.notionMcpAccounts = newValue } }
+    var notionMcpAvailable: Bool { get { status.notionMcpAvailable } set { status.notionMcpAvailable = newValue } }
+    var notionMcpNeedsReauth: [String] { get { status.notionMcpNeedsReauth } set { status.notionMcpNeedsReauth = newValue } }
+    var granolaAccounts: [String] { get { status.granolaAccounts } set { status.granolaAccounts = newValue } }
+    var granolaAvailable: Bool { get { status.granolaAvailable } set { status.granolaAvailable = newValue } }
+    var granolaNeedsReauth: [String] { get { status.granolaNeedsReauth } set { status.granolaNeedsReauth = newValue } }
+    var customMCPServers: [CustomMCPServerStatus] { get { status.customMCPServers } set { status.customMCPServers = newValue } }
+    var customMCPAvailable: Bool { get { status.customMCPAvailable } set { status.customMCPAvailable = newValue } }
+    var slackAccounts: [String] { get { status.slackAccounts } set { status.slackAccounts = newValue } }
+    var slackAvailable: Bool { get { status.slackAvailable } set { status.slackAvailable = newValue } }
+    var slackNeedsReauth: [String] { get { status.slackNeedsReauth } set { status.slackNeedsReauth = newValue } }
+    var hasLoadedStatus: Bool { get { status.hasLoadedStatus } set { status.hasLoadedStatus = newValue } }
+    var statusLoadFailed: Bool { get { status.statusLoadFailed } set { status.statusLoadFailed = newValue } }
+
     /// `gmailNeedsReauth` across every profile; the lists above are the active profile's.
     var allNeedsReauth: [String] = []
-    /// Every account this phone holds a grant for, across profiles.
-    @Published var deviceGrantAccounts: [String] = []
-    @Published var gmailAvailable = false
-    /// Connected GitHub logins. What the token may do is `GitHubTools.allowedTools`.
-    @Published var githubAccounts: [String] = []
-    @Published var githubAvailable = false
-    /// Logins whose token GitHub answered 401 to. They stay in `githubAccounts` so the row can offer Reconnect.
-    @Published var githubNeedsReauth: [String] = []
     /// The code the user types at github.com/login/device while a sign-in waits on it.
     @Published var githubPendingCode: GitHubDeviceFlow.Code?
     private var githubSignIn: Task<Void, Never>?
-    /// Connected Notion workspace names: one Notion connection is one workspace.
-    @Published var notionMcpAccounts: [String] = []
-    @Published var notionMcpAvailable = false
-    /// Workspaces whose MCP credential has been rejected. An expired access token is not here:
-    /// it renews on use.
-    @Published var notionMcpNeedsReauth: [String] = []
-    /// The active profile's Granola accounts, by email, read from `RemoteMCPGrantStore`.
-    @Published var granolaAccounts: [String] = []
-    @Published var granolaAvailable = false
-    /// Accounts whose refresh Granola refused. An expired access token is not here: it renews on use.
-    @Published var granolaNeedsReauth: [String] = []
-    /// The active profile's own MCP servers, from `CustomMCPServerStore`, each with whether its
-    /// credential still works. Always available: there is nothing to configure in the build.
-    @Published var customMCPServers: [CustomMCPServerStatus] = []
-    @Published var customMCPAvailable = false
-    /// The active profile's Slack workspaces, by name, from the Keychain. `slackAvailable` is
-    /// whether this build has a Slack app at all (`JO_SLACK_CLIENT_ID`).
-    @Published var slackAccounts: [String] = []
-    @Published var slackAvailable = false
-    /// Workspaces whose refresh Slack refused, or whose refresh token passed its 30 days.
-    @Published var slackNeedsReauth: [String] = []
-
-    /// Whether the status has been read yet. Before it has, "nothing is connected" is unknown,
-    /// and must not gate the mic.
-    @Published var hasLoadedStatus = false
-    /// True only when the current profile's status read failed. A profile switch clears
-    /// the previous scope before requesting the new one, so account names and counts can
-    /// never bleed across profiles while this flag is shown.
-    @Published var statusLoadFailed = false
     /// Which connector is mid-request (`"gmail"`, `"github"`, `"notion"` or `"slack"`) — nil when idle.
     @Published var busyConnector: String?
     @Published var errorMessage: String?
@@ -134,7 +161,7 @@ final class ConnectionsService: ObservableObject {
 
     // MARK: - Status
 
-    /// Re-read every list from the Keychain.
+    /// Re-read every list from the Keychain. One `status` assignment at the end: observers fire once.
     func refresh() async {
         let grants = GoogleAccountStore.all()
         let everyMailbox = grants.map(\.email)
@@ -143,69 +170,47 @@ final class ConnectionsService: ObservableObject {
         let requestedProfile = ProfileRuntime.snapshot?.profileId
         let requestedOwner = backend.userId
         let requestedScope = (requestedOwner ?? "signed-out") + ":" + (requestedProfile ?? "legacy")
-        if requestedScope != loadedStatusScope {
-            clearPublishedStatus()
-        }
-        deviceGrantAccounts = everyMailbox
+        // A new scope starts from nothing, so another profile's names never show under this one.
+        var next = requestedScope == loadedStatusScope ? status : Status()
+        if requestedScope != loadedStatusScope { loadedStatusScope = nil }
+        next.deviceGrantAccounts = everyMailbox
         allNeedsReauth = grants.filter { $0.needsReauth == true }.map(\.email)
-        guard requestedProfile == ProfileRuntime.snapshot?.profileId, requestedOwner == backend.userId else { return }
-        gmailAccounts = ProfileRuntime.allowedMailAccounts(everyMailbox)
-        calendarAccounts = ProfileRuntime.allowedMailAccounts(grants.filter { grant in
+        guard requestedProfile == ProfileRuntime.snapshot?.profileId, requestedOwner == backend.userId else {
+            status = next
+            return
+        }
+        next.gmailAccounts = ProfileRuntime.allowedMailAccounts(everyMailbox)
+        next.calendarAccounts = ProfileRuntime.allowedMailAccounts(grants.filter { grant in
             grant.scopes.contains { $0.hasPrefix("https://www.googleapis.com/auth/calendar") }
         }.map(\.email))
-        filterAccounts = ProfileRuntime.allowedMailAccounts(grants.filter {
+        next.filterAccounts = ProfileRuntime.allowedMailAccounts(grants.filter {
             $0.scopes.contains(GmailManageTools.filterScope)
         }.map(\.email))
-        gmailNeedsReauth = ProfileRuntime.allowedMailAccounts(allNeedsReauth)
-        gmailAvailable = GoogleTokenServer.isConfigured
+        next.gmailNeedsReauth = ProfileRuntime.allowedMailAccounts(allNeedsReauth)
+        next.gmailAvailable = GoogleTokenServer.isConfigured
         let granola = GranolaConnector.grants(profileId: requestedProfile)
-        granolaAccounts = granola.map(\.label)
-        granolaNeedsReauth = granola.filter(\.needsReauth).map(\.label)
-        granolaAvailable = true
-        customMCPServers = CustomMCPConnector.servers(profileId: requestedProfile).map(CustomMCPConnector.status)
-        customMCPAvailable = true
-        refreshSlack()
+        next.granolaAccounts = granola.map(\.label)
+        next.granolaNeedsReauth = granola.filter(\.needsReauth).map(\.label)
+        next.granolaAvailable = true
+        next.customMCPServers = CustomMCPConnector.servers(profileId: requestedProfile).map(CustomMCPConnector.status)
+        next.customMCPAvailable = true
+        refreshSlack(into: &next)
         let notion = NotionTools.grants(profileId: requestedProfile)
-        notionMcpAccounts = notion.map(\.label)
-        notionMcpNeedsReauth = notion.filter(\.needsReauth).map(\.label)
-        notionMcpAvailable = true
+        next.notionMcpAccounts = notion.map(\.label)
+        next.notionMcpNeedsReauth = notion.filter(\.needsReauth).map(\.label)
+        next.notionMcpAvailable = true
         let github = GitHubAccountStore.all()
-        githubAccounts = github.map(\.login)
-        githubNeedsReauth = github.filter { $0.needsReauth == true }.map(\.login)
-        githubAvailable = !AppHosts.githubClientID.isEmpty
-        hasLoadedStatus = true
-        statusLoadFailed = false
+        next.githubAccounts = github.map(\.login)
+        next.githubNeedsReauth = github.filter { $0.needsReauth == true }.map(\.login)
+        next.githubAvailable = !AppHosts.githubClientID.isEmpty
+        next.hasLoadedStatus = true
+        next.statusLoadFailed = false
+        status = next
         loadedStatusScope = requestedScope
         RealtimeLog.log(
             "connections: refresh applied — \(connectedServices) · "
             + "inboxes \(gmailAccounts.joined(separator: ", "))"
             + (gmailNeedsReauth.isEmpty ? "" : " · needs reauth \(gmailNeedsReauth.joined(separator: ", "))"))
-    }
-
-    private func clearPublishedStatus() {
-        gmailAccounts = []
-        calendarAccounts = []
-        filterAccounts = []
-        gmailNeedsReauth = []
-        allNeedsReauth = []
-        gmailAvailable = false
-        notionMcpAccounts = []
-        notionMcpAvailable = false
-        notionMcpNeedsReauth = []
-        granolaAccounts = []
-        granolaAvailable = false
-        granolaNeedsReauth = []
-        customMCPServers = []
-        customMCPAvailable = false
-        slackAccounts = []
-        slackAvailable = false
-        slackNeedsReauth = []
-        githubAccounts = []
-        githubNeedsReauth = []
-        githubAvailable = false
-        hasLoadedStatus = false
-        statusLoadFailed = false
-        loadedStatusScope = nil
     }
 
     // MARK: - Disconnect (one account)
@@ -250,7 +255,7 @@ final class ConnectionsService: ObservableObject {
         RealtimeLog.log("disconnect: \(email) — purged \(purged) cached message(s)")
         // The send/draft answer goes too, so reconnecting the same address starts in Drafts.
         DraftsOnly.forget(email)
-        Container.shared.workspaceProfiles().forget(email)
+        await Container.shared.workspaceProfiles().forget(email)
         // Calendar is a capability of the same account; its cache goes with the mail cache.
         let calendarPurged = await CalendarStore(database: Container.shared.localContext().dbPool)
             .purge(account: email)
@@ -276,14 +281,14 @@ final class ConnectionsService: ObservableObject {
 
     /// The active profile's workspaces; one whose refresh token outlived its 30 days is marked now,
     /// so the reconnect shows before anything tries to use it.
-    private func refreshSlack() {
+    private func refreshSlack(into status: inout Status) {
         for grant in SlackGrantStore.all() where grant.needsReauth != true && grant.refreshExpired() {
             SlackGrantStore.markNeedsReauth(grant.teamId)
         }
         let grants = SlackGrantStore.inProfile()
-        slackAvailable = SlackConfig.isConfigured
-        slackAccounts = grants.map(\.teamName)
-        slackNeedsReauth = grants.filter { $0.needsReauth == true }.map(\.teamName)
+        status.slackAvailable = SlackConfig.isConfigured
+        status.slackAccounts = grants.map(\.teamName)
+        status.slackNeedsReauth = grants.filter { $0.needsReauth == true }.map(\.teamName)
     }
 
     /// Connect or reconnect a workspace: one PKCE consent straight to Slack. Bound to the active

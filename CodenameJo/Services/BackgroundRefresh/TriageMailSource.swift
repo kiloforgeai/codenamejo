@@ -272,15 +272,72 @@ enum TriageMailSource {
         return "branch:\(chain[0].utf8.count):\(chain[0])\(chain[1])"
     }
 
-    static func enrichThreadContext(_ items: [Item], store: MailStore, grouping: Bool) async -> [Item] {
+    /// Items whose thread context is already known, by `threadKey`: the buffer being walked plus
+    /// whatever today's row carried. Topic groups contribute their parts.
+    static func threadContextIndex(_ items: [Item]) -> [String: Item] {
+        var index: [String: Item] = [:]
+        for item in items.flatMap(\.unwrappedTopics) where item.exchangeContext != nil {
+            let key = LocalTriageQueue.threadKey(account: item.account, threadId: item.threadId)
+            guard !key.isEmpty else { continue }
+            // The fuller context wins when the same thread was held twice.
+            if let held = index[key], (held.exchangeContext?.count ?? 0) >= (item.exchangeContext?.count ?? 0) { continue }
+            index[key] = item
+        }
+        return index
+    }
+
+    /// `item` with `source`'s thread context, when that context still describes the thread: every
+    /// member of `item` must be in it, so a thread with a new message is fetched again. The read
+    /// verdict holds only while nothing in the item is unread.
+    static func reusingThreadContext(_ item: Item, from source: Item) -> Item? {
+        guard item.exchangeContext == nil, !item.isTopicGroup,
+              item.account.lowercased() == source.account.lowercased(), item.threadId == source.threadId,
+              let context = source.exchangeContext, !context.isEmpty else { return nil }
+        let known = Dictionary(context.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        guard item.conversation.allSatisfy({ known[$0.id] != nil }) else { return nil }
+        var item = item
+        let verified = source.threadReadVerified == true && !item.conversation.contains(where: \.unread)
+        item.threadReadVerified = verified
+        item.threadMessageCount = source.threadMessageCount ?? Set(context.map(\.id)).count
+        item.messages = item.conversation.map { selected in
+            var selected = selected
+            guard let fetched = known[selected.id] else { return selected }
+            selected.rfcMessageID = fetched.rfcMessageID
+            selected.inReplyTo = fetched.inReplyTo
+            selected.references = fetched.references
+            selected.ancestryCached = fetched.ancestryCached
+            selected.exchangeID = fetched.exchangeID
+            return selected
+        }
+        item.exchangeContext = context
+        item.summaryMessages = verified ? context : nil
+        return item
+    }
+
+    /// - Parameter known: thread context already in hand (`threadContextIndex`), reused for an item
+    ///   whose thread it still describes, so only threads the walk has never seen reach Gmail.
+    static func enrichThreadContext(
+        _ items: [Item], store: MailStore, grouping: Bool, known: [String: Item] = [:]
+    ) async -> [Item] {
         guard grouping else { return items }
         var result = items
-        for account in Set(items.filter { $0.exchangeContext == nil }.map(\.account)) {
+        if !known.isEmpty {
+            var reused = 0
+            for index in result.indices where result[index].exchangeContext == nil {
+                guard let source = known[LocalTriageQueue.threadKey(account: result[index].account, threadId: result[index].threadId)],
+                      let item = reusingThreadContext(result[index], from: source) else { continue }
+                result[index] = item
+                reused += 1
+            }
+            if reused > 0 { RealtimeLog.log("localTriage: thread context reused for \(reused) item(s) — no Gmail fetch") }
+        }
+        for account in Set(result.filter { $0.exchangeContext == nil }.map(\.account)) {
             guard case .success(let token) = await GoogleCredential.token(for: account) else {
                 RealtimeLog.log("localTriage: thread context unavailable for \(account)")
                 continue
             }
-            let threads = Set(items.filter { $0.account == account && $0.exchangeContext == nil }.map(\.threadId))
+            let threads = Set(result.filter { $0.account == account && $0.exchangeContext == nil }.map(\.threadId))
+            RealtimeLog.log("localTriage: thread context fetching \(threads.filter { !$0.isEmpty }.count) thread(s) for \(account)")
             let contexts = await threadContexts(ids: Array(threads.filter { !$0.isEmpty })) { threadID in
                 do {
                     let thread = try await GmailAPI.threadMetadata(token: token.accessToken, id: threadID)
@@ -466,6 +523,14 @@ extension LocalTriageQueue {
 
     static func withThreadContext(_ item: Item, thread: GmailAPI.ThreadMetadata, verified: Bool) -> Item {
         TriageMailSource.withThreadContext(item, thread: thread, verified: verified)
+    }
+
+    static func threadContextIndex(_ items: [Item]) -> [String: Item] {
+        TriageMailSource.threadContextIndex(items)
+    }
+
+    static func reusingThreadContext(_ item: Item, from source: Item) -> Item? {
+        TriageMailSource.reusingThreadContext(item, from: source)
     }
 
     static func groupByConversation(_ items: [Item], grouping: Bool = ThreadQueue.isOn, preserveOrder: Bool = false) -> [Item] {

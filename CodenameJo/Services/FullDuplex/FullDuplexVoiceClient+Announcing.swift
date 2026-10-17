@@ -48,8 +48,7 @@ extension FullDuplexVoiceClient {
     /// everywhere else.
     func announceReady() {
         // A speak-first opening is deliberately not an invitation to talk. Claim the cue so
-        // `announceConnect()` cannot play it a second later; that method still closes the
-        // empty pre-connect handoff when the session connects.
+        // `announceConnect()` cannot play it a second later.
         guard !openingHold, !flowHold else {
             if announcesConnect {
                 hasAnnouncedConnect = true
@@ -68,10 +67,7 @@ extension FullDuplexVoiceClient {
             guard let self else { return }
             try? await Task.sleep(for: FullDuplexAudioSession.vpioPreRoll)
             guard self.isActive else { return }
-            // Suppressed across the cue and released after, so the chime never becomes
-            // words in `preConnectText`. `setSuppressed` rather than `setMuted`: the
-            // words are kept and flushed on release, because this window *is* the
-            // invitation to talk and mute discards what it hears.
+            // Suppression holds recognized words until the cue ends; mute would discard them.
             self.transport?.localTranscriber.setSuppressed(true)
             // And the meter with it, for the same reason: the cue is rendered by our own
             // `AVAudioEngine`, so it is absent from libwebrtc's reference signal and
@@ -105,63 +101,10 @@ extension FullDuplexVoiceClient {
     }
 
     func announceConnect() {
-        // **A dial with no cue still has to hand off.** `reconnect()` passes
-        // `playingCue: false`, and the hand-off lives at the end of the cue task below —
-        // so without this a redial would leave the gate open forever, quietly collecting
-        // every later sentence as "pre-connect" speech and injecting none of it. There is
-        // no deaf window on that path, so the uplink is already open and now is the edge.
-        // **A dial that plays no cue here still has to hand off**, and there are now two
-        // ways to reach that. `reconnect()` passes `playingCue: false`; and
-        // `announceReady` has already sounded the cue at mic-live and
-        // claimed `hasAnnouncedConnect`, so this would return with the words still held.
-        // Either way the uplink is open from here, so this is the edge to hand off on.
-        //
-        // **The deaf window is skipped on that path, and that is the point.** It exists so
-        // server VAD cannot hear the chime — and the chime already played, seconds ago,
-        // into a session that did not exist. Nothing is left to hide from VAD, so the 750 ms
-        // of zero gain (which measurement shows leaks anyway, `mic 0.400 at gain 0`) buys
-        // nothing and costs the user the start of their sentence.
-        //
-        // **And it is the path that answered without tools in the reported case.** No deaf
-        // window means the uplink is open and server VAD is live from this instant — so the
-        // sentence was committed and answered at T+2.5 s, 3.4 s before `tools/list` landed,
-        // and the model reported the mailbox unreachable. Holding the *injection* alone
-        // would have changed nothing, because the injection was not what answered: the turn
-        // has no `latency` row, which is the signature of the `sendContextItem` branch where
-        // VAD owns the reply. The uplink itself is what has to wait.
-        //
-        // Waiting here is free of the cost the paragraph above objects to. Zero gain stops
-        // the *uplink*, and `LocalTranscriber` sits on the capture tap upstream of it — the
-        // words keep accumulating in `preConnectText` and go up in the hand-off, which is
-        // the same property `handOffWhenUtteranceEnds` has always relied on. So the start of
-        // the sentence is not lost; it arrives as text instead of audio.
-        guard announcesConnect, !hasAnnouncedConnect else {
-            // The common case, and it stays byte-identical: `tools/list` normally completes
-            // before the dial does, so there is nothing to wait for and no gain to touch.
-            // `preConnectText.isEmpty` takes the same exit for a different reason — with
-            // nothing captured there is no text to protect, and ducking a microphone the
-            // user has not spoken into would swallow words that no transcriber is holding.
-            guard !toolsReachable, !preConnectText.isEmpty else {
-                handOffPreConnectSpeech()
-                return
-            }
-            RealtimeLog.log("talk-early: the call is up but its tools are not — holding the "
-                + "uplink rather than answering without them")
-            cueTask = Task { [weak self] in
-                guard let self else { return }
-                self.setMicGain(0)
-                await self.handOffWhenUtteranceEnds()
-                // Same reasoning as the cue path below: a late restore is a no-op on End
-                // and on a redial, so this is deliberately not guarded on cancellation.
-                self.setMicGain(1)
-                RealtimeLog.log("talk-early: mic gain restored")
-            }
-            return
-        }
+        guard announcesConnect, !hasAnnouncedConnect else { return }
         hasAnnouncedConnect = true
         cueTask = Task { [weak self] in
             guard let self else { return }
-            self.isAnnouncingConnect = true
             self.setMicGain(0)
             // Logged here rather than in `setMicGain`, which runs on every reply and
             // would drown the console. This is the window the
@@ -174,155 +117,12 @@ extension FullDuplexVoiceClient {
             // the cheapest read there is on whether the gain reaches the uplink at
             // all. A `mic` that hasn't collapsed here says it doesn't.
             RealtimeLog.log(String(format: "connect cue: mic %.3f at gain 0", self.levels.mic))
-            self.isAnnouncingConnect = false
-            // **The hand-off comes before the gain is restored, and it waits for the
-            // sentence to finish. Both of those were learned on device.**
-            //
-            // The cue window is a clean cut in *time* and the first version treated that
-            // as good enough — inject whatever had been said, restore the gain, let audio
-            // take over. It is not good enough, because a person does not stop talking
-            // when the network becomes ready. Measured on an iPhone 17 Pro against a
-            // preview broker: `handing off "Can you check my"` and `handing off "Let's
-            // start my"`, two sentences cut where the 750 ms happened to land. The model
-            // got a fragment as text and the rest of the sentence arrived seconds later
-            // as a separate audio turn.
-            //
-            // So the microphone stays shut until the *speaker* stops, not until the
-            // network is ready. `handOffWhenUtteranceEnds` waits for a gap in the local
-            // transcript, injects the whole utterance, and only then does the gain come
-            // back — which is why the restore moved below this line rather than above
-            // it. Whatever is said after that gap is a new turn and goes as audio, which
-            // is exactly what it should be.
-            await self.handOffWhenUtteranceEnds()
             // Deliberately not guarded on cancellation. On End the transport is
             // already nil; on a redial it is a fresh object whose gain is 1.0
             // regardless. A late restore is a no-op in both cases rather than
             // something to defend against.
             self.setMicGain(1)
             RealtimeLog.log("connect cue: mic gain restored")
-        }
-    }
-
-    /// Hold the uplink closed until the user finishes the sentence they started during
-    /// the dial, then hand the whole of it over.
-    ///
-    /// **The end-of-utterance signal has to be local, because there is no other one.**
-    /// Server VAD draws turn boundaries everywhere else in this class, and by definition
-    /// it has not heard a word of this — the audio never reached it. `LocalTranscriber`
-    /// publishes continuously while someone is talking and stops when they stop, so a gap
-    /// in its output is the only evidence available that a sentence ended.
-    ///
-    /// Nothing captured means nothing to wait for: that path closes the gate immediately
-    /// and the call behaves exactly as it did before this feature existed.
-    ///
-    /// The poll is 50 ms against a 400 ms window, on the main actor, doing a comparison —
-    /// a `CheckedContinuation` woken from the transcript callback would be tidier and is
-    /// not worth the extra state on a path that runs once per call and is bounded by
-    /// `preConnectMaxHold`.
-    private func handOffWhenUtteranceEnds() async {
-        guard !hasHandedOffPreConnect, !preConnectText.isEmpty else {
-            handOffPreConnectSpeech()
-            return
-        }
-        let started = ContinuousClock.now
-        while ContinuousClock.now - started < Self.preConnectMaxHold {
-            if let last = preConnectLastChangeAt,
-               ContinuousClock.now - last >= Self.preConnectSettle {
-                break
-            }
-            try? await Task.sleep(for: .milliseconds(50))
-            // End, a redial or a transport failure while we were waiting. The call this
-            // was holding the microphone for no longer exists.
-            guard isActive else { return }
-        }
-        let held = ContinuousClock.now - started
-        RealtimeLog.log("talk-early: held the uplink \(held) waiting for the sentence to end")
-        // **The sentence first, then the tools, and that order is not arbitrary.** Waiting
-        // for the tools while the user is still mid-sentence would spend the same wall
-        // clock twice — the transcript is still moving, so the settle loop above has not
-        // finished deciding what to hand over. By here the utterance is whole and the only
-        // thing left to wait on is the server.
-        await awaitToolsReachable()
-        handOffPreConnectSpeech()
-    }
-
-    /// Give the model what the user said while the call was still coming up.
-    ///
-    /// **This is the answer to a wait that is mostly not ours to shorten.** A cold dial
-    /// is ~2.6 s before OpenAI can hear anything, and measurement put 62% of it
-    /// inside two OpenAI round trips, against ~500 ms that this
-    /// codebase executes across the entire dial. Shaving our half harder has a floor;
-    /// removing the *experience* of the wait does not.
-    ///
-    /// Route A of that document's §3: the words go up as `input_text`, because they
-    /// already exist for free — `LocalTranscriber` has been running on-device for the
-    /// whole dial and nothing consumed it. Route B (buffering the PCM and replaying it
-    /// as `input_audio_buffer.append`) keeps prosody and OpenAI's own transcription, and
-    /// is deliberately not attempted here: it is unverified over the WebRTC data channel,
-    /// its interaction with server VAD is unknown, and that channel is where a stray
-    /// frame can wipe the session's MCP tools.
-    ///
-    /// **Whether to ask for a response is decided per dial, and getting it wrong is
-    /// audible in both directions.** The words injected here never passed through server
-    /// VAD, so if nothing else is coming, nothing will ever decide the turn is over and
-    /// the call opens in silence after the user has already spoken — that is the case
-    /// `response.create` exists for. But measured on device, the cue's zero-gain window
-    /// does not reliably silence the uplink, so OpenAI often *has* heard the tail of the
-    /// sentence, committed it and started answering. Asking again there is a straight
-    /// `conversation_already_has_active_response`, and the injected item is wasted.
-    ///
-    /// So the item always goes — it is the part of the sentence the session genuinely
-    /// missed, and it lands in the conversation where the model can use it — and the
-    /// response is requested only when no server turn is in flight. When one is, its
-    /// answer covers both halves, which is the outcome we wanted anyway.
-    ///
-    /// Idempotent by the flag rather than by emptiness: a dial where the user said
-    /// nothing must still close the gate, or the first thing they say *after* connecting
-    /// would be collected as pre-connect speech and injected on top of the audio the
-    /// session is already hearing.
-    private func handOffPreConnectSpeech() {
-        guard !hasHandedOffPreConnect else { return }
-        hasHandedOffPreConnect = true
-        let spoken = preConnectText.trimmingCharacters(in: .whitespacesAndNewlines)
-        preConnectText = ""
-        guard !spoken.isEmpty else { return }
-        // **Whether to ask for a reply depends on whether the sentence is finished**, and
-        // with the cue moved to mic-live there is a clean way to tell. The deaf window is
-        // gone from this path, so audio flows normally from the moment the call is up:
-        // anything said from here reaches OpenAI on its own and server VAD will close the
-        // turn and answer it. What it never heard is the *head* of the sentence, spoken
-        // while the session was still being built — that is what goes up here.
-        //
-        // So: if the user is still mid-sentence, this is context and VAD owns the reply,
-        // which is how the two halves end up in one answer instead of two. If they have
-        // stopped, no VAD turn is coming and nothing else will ever decide the turn is
-        // over — so this has to ask, or the call opens in silence after they have spoken.
-        //
-        // Freshness of the local transcript is the test, and it is the same signal
-        // `handOffWhenUtteranceEnds` waits on. Note this replaced a cancel-and-replace
-        // against the server's turn, which existed only because the old deaf window leaked
-        // audio to VAD and produced a garbage turn to take back. No deaf window, no leak,
-        // nothing to cancel.
-        let stillSpeaking = preConnectLastChangeAt.map {
-            ContinuousClock.now - $0 < Self.preConnectSettle
-        } ?? false
-        RealtimeLog.log("talk-early: handing off \"\(spoken)\""
-            + (stillSpeaking ? " — still talking, context only" : " — asking for a reply"))
-        if stillSpeaking {
-            transport?.sendContextItem(spoken, role: "user")
-        } else {
-            // **Timed from here, and it never used to be.** `beginLatencyTurn` has one
-            // other caller, on `speech_stopped` — an event an injected turn by
-            // definition never produces. So the talk-early first turn, on the most
-            // common dial in the app, was the one turn with no instrumentation at all:
-            // it emitted no row, so every turn-1 figure measured before this silently
-            // described ordinary VAD turns only. `preConnectLastChangeAt` is the honest
-            // mark — the hand-off
-            // waited out `preConnectSettle` before deciding, and counting that wait
-            // against the model would flatter it.
-            latencyUtterance = spoken
-            beginLatencyTurn(localEndOfUtterance: preConnectLastChangeAt)
-            transport?.sendUserText(spoken)
         }
     }
 
@@ -363,34 +163,5 @@ extension FullDuplexVoiceClient {
                 + "already asked for, without making them repeat it.",
             role: "system",
         )
-    }
-
-    /// Hold until the session's tools can actually be called, or until waiting stops being
-    /// worth it.
-    ///
-    /// **The measurement is what makes this cheap.** `tools/list` completes at ~1,833 ms
-    /// against a dial that finishes at 1,546 ms warm and 2,751 ms cold, so on
-    /// a healthy dial the tools are already there when this is reached and it returns
-    /// without sleeping. It only ever costs anything on the dial that would otherwise
-    /// produce a wrong answer — 3.4 s in the one measured failure, where the alternative
-    /// was a refusal and a redial.
-    ///
-    /// Bounded because a wait with no ceiling is a call that never opens its microphone,
-    /// which is the same reason `preConnectMaxHold` has one. Past the bound the words go up
-    /// regardless: a late answer is recoverable and a swallowed sentence is not.
-    private func awaitToolsReachable() async {
-        guard !toolsReachable else { return }
-        let started = ContinuousClock.now
-        while ContinuousClock.now - started < Self.toolsMaxHold {
-            try? await Task.sleep(for: .milliseconds(50))
-            // End, a redial or a transport failure while we were waiting. Same guard
-            // `handOffWhenUtteranceEnds` makes, for the same reason: the call this was
-            // holding the microphone for no longer exists.
-            guard isActive else { return }
-            if toolsReachable { break }
-        }
-        let held = ContinuousClock.now - started
-        RealtimeLog.log("talk-early: held the uplink \(held) waiting for the tool list"
-            + (toolsReachable ? "" : " — gave up, handing off without it"))
     }
 }

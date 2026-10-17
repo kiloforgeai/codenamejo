@@ -1235,7 +1235,9 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         let ledger = await queue.dealtWith
         XCTAssertFalse(ledger.contains(LocalTriageQueue.messageKey(account: account, id: "b")))
         await queue.checkpoint(store: fixture.store)
-        let key = [account, LocalTriageQueue.localDay(), "all", ""].joined(separator: "|")
+        // The ledger moves with the cursor row, not the item buffer.
+        let key = TriageQueueSnapshotStore.key(account: account, day: LocalTriageQueue.localDay(), scope: .all,
+                                               split: TriageQueueSnapshotStore.cursorSplit)
         let record = try await fixture.database.read { db in try DailyEmailQueueSnapshotRecord.fetchOne(db, key: key) }
         let payload = try XCTUnwrap(record?.payload)
         let snapshot = try XCTUnwrap(JSONSerialization.jsonObject(with: payload) as? [String: Any])
@@ -1246,6 +1248,74 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         _ = await resumed.step(.init(scope: .all), store: fixture.store)
         let next = await resumed.step(.init(), store: fixture.store, dealtWith: false)
         XCTAssertEqual(try current(next.output)["id"] as? String, "b")
+        await resumed.end()
+    }
+
+    func testStopAndResumeRebasesTheSavedBufferBeforeWritingTheCursor() async throws {
+        let fixture = try StoreFixture()
+        defer { fixture.close() }
+        let rows = [row("a", thread: "a", date: 30, sender: "Sam"),
+                    row("b", thread: "b", date: 20, sender: "Dana"),
+                    row("c", thread: "c", date: 10, sender: "Lee")]
+        try await fixture.seed(rows, unread: Set(rows.map(\.id)))
+        let queue = makeQueue()
+        _ = await queue.step(.init(scope: .unread), store: fixture.store)
+        let second = await queue.step(.init(), store: fixture.store, dealtWith: false)
+        XCTAssertEqual(try current(second.output)["id"] as? String, "b")
+        _ = await queue.step(.init(stop: true), store: fixture.store)
+        let resumed = await queue.step(.init(scope: .unread), store: fixture.store)
+        XCTAssertEqual(try current(resumed.output)["id"] as? String, "b")
+        let snapshots = try await TriageQueueSnapshotStore.savedToday(
+            account: account, userId: fixture.store.userId, database: fixture.database)
+        let saved = try XCTUnwrap(snapshots.first)
+        XCTAssertEqual(saved.items[saved.position - 1].id, "b")
+        await queue.end()
+        let reopened = makeQueue()
+        let restored = await reopened.step(.init(scope: .unread), store: fixture.store)
+        XCTAssertEqual(try current(restored.output)["id"] as? String, "b")
+        await reopened.end()
+    }
+
+    func testAPlainAdvanceRewritesTheCursorRowAndNotTheItemBuffer() async throws {
+        let fixture = try StoreFixture()
+        defer { fixture.close() }
+        let rows = [row("a", thread: "a", date: 30, sender: "Sam"),
+                    row("b", thread: "b", date: 20, sender: "Dana"),
+                    row("c", thread: "c", date: 10, sender: "Lee")]
+        try await fixture.seed(rows, unread: Set(rows.map(\.id)))
+        let queue = makeQueue()
+        _ = await queue.step(.init(scope: .unread), store: fixture.store)
+        let day = LocalTriageQueue.localDay()
+        let bufferKey = TriageQueueSnapshotStore.key(account: account, day: day, scope: .unread, split: "")
+        let cursorKey = TriageQueueSnapshotStore.key(account: account, day: day, scope: .unread,
+                                                     split: TriageQueueSnapshotStore.cursorSplit)
+        func savedRows() async throws -> (buffer: DailyEmailQueueSnapshotRecord, cursor: DailyEmailQueueSnapshotRecord) {
+            try await fixture.database.read { db in
+                (try XCTUnwrap(DailyEmailQueueSnapshotRecord.fetchOne(db, key: bufferKey)),
+                 try XCTUnwrap(DailyEmailQueueSnapshotRecord.fetchOne(db, key: cursorKey)))
+            }
+        }
+        let built = try await savedRows()
+        XCTAssertEqual(try JSONDecoder().decode(TriageQueueSnapshotStore.Cursor.self, from: built.cursor.payload).position, 1)
+
+        _ = await queue.step(.init(), store: fixture.store, dealtWith: false)
+        let advanced = try await savedRows()
+        XCTAssertEqual(advanced.buffer.payload, built.buffer.payload, "A plain advance encodes no item")
+        XCTAssertEqual(advanced.buffer.updatedAt, built.buffer.updatedAt, "A plain advance writes no item buffer")
+        XCTAssertNotEqual(advanced.cursor.payload, built.cursor.payload)
+        XCTAssertEqual(try JSONDecoder().decode(TriageQueueSnapshotStore.Cursor.self, from: advanced.cursor.payload).position, 2)
+        // What a restore reads is the two rows together: the second message is current.
+        let merged = try await TriageQueueSnapshotStore.savedToday(
+            account: account, userId: fixture.store.userId, database: fixture.database)
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged.first?.position, 2)
+        XCTAssertEqual(merged.first?.items.map(\.id), ["a", "b", "c"])
+        await queue.end()
+
+        // And the walk resumes on it.
+        let resumed = makeQueue()
+        let first = await resumed.step(.init(scope: .unread), store: fixture.store)
+        XCTAssertEqual(try current(first.output)["id"] as? String, "b")
         await resumed.end()
     }
 
@@ -1974,13 +2044,10 @@ final class ConversationQueueIntegrationTests: XCTestCase {
 
         let handoff = try object(
             await queue.step(.init(), store: fixture.store, dealtWith: false).output)
-        XCTAssertEqual(handoff["mailboxComplete"] as? Bool, true)
         XCTAssertEqual(handoff["account"] as? String, work)
-        XCTAssertEqual(handoff["nextAccount"] as? String, personal)
 
         let declined = try object(await queue.step(.init(stop: true), store: fixture.store).output)
         XCTAssertEqual(declined["stopped"] as? Bool, true)
-        XCTAssertNil(declined["nextAccount"])
         XCTAssertTrue((declined["note"] as? String)?.contains("queue is closed") == true)
         await queue.end()
     }

@@ -45,8 +45,6 @@ struct CommandView<Interactor: ViewWithModelLifecycleObserver<CommandViewModel> 
     @ObservedObject private var realtimeService = Container.shared.realtimeService()
     @ObservedObject private var connections = Container.shared.connections()
     @ObservedObject private var backend = Container.shared.backend()
-    /// Queue position for the chip; presentation data, observed for the same reason.
-    @ObservedObject private var triageQueue = Container.shared.triageQueue()
     /// The offline note path: whether the mic is open and how many notes wait to be read back.
     @ObservedObject private var memoRecorder = Container.shared.memoRecorder()
     @ObservedObject private var memoQueue = Container.shared.memoQueue()
@@ -232,30 +230,6 @@ struct CommandView<Interactor: ViewWithModelLifecycleObserver<CommandViewModel> 
         .animation(.easeInOut(duration: 0.35), value: micHasTheFloor)
     }
 
-    /// How far through the queue the assistant has got: the one number a spoken queue
-    /// can't give cheaply. Not a button — the queue moves by voice.
-    private func queueChip(_ queue: TriageQueueStore.QueueProgress) -> some View {
-        let mailbox = queue.account?.split(separator: "@").first.map(String.init) ?? "Inbox"
-        return HStack(spacing: 6) {
-            Image(systemName: "tray.full.fill")
-                .font(.system(size: 12, weight: .bold))
-            Text("\(mailbox) · \(queue.position) of \(queue.queued)")
-                .font(.system(size: 14, weight: .semibold))
-                // Keeps the capsule from re-laying-out as the count changes.
-                .monospacedDigit()
-        }
-        .foregroundStyle(Theme.accent)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        // Glass to match the system glass buttons beside it in the bar; `.regular` keeps the
-        // number legible over scrolling text.
-        .glassEffect(.regular, in: .capsule)
-        .accessibilityIdentifier("triageQueueChip")
-        .accessibilityLabel(
-            "Email queue\(queue.account.map { " for \($0)" } ?? ""), message "
-                + "\(queue.position) of \(queue.queued), \(queue.remaining) still to go")
-    }
-
     // MARK: - Transcript (the middle)
 
     /// The answer, auto-scrolling as text streams so a reply past the fold doesn't look stalled.
@@ -436,15 +410,19 @@ struct CommandView<Interactor: ViewWithModelLifecycleObserver<CommandViewModel> 
                     // An overlay, not a ZStack sibling: overlay content never reports its size upward,
                     // so the droplets can't grow the dock and move the orb.
                     .overlay {
-                        DispatchDroplets(
-                            jobs: realtimeService.liveDispatches,
-                            orbDiameter: CommandLayout.orbDiameter,
-                            // The bead's own colour via `mood`, so a droplet matches the bead in every state.
-                            tint: VoiceOrb.mood(
-                                state: realtimeService.sessionState,
-                                muted: realtimeService.isMuted
-                            ).tint
-                        )
+                        // Mounted only while a job is live: the droplets' 30 fps timeline otherwise
+                        // ran for the whole call with nothing to draw.
+                        if !realtimeService.liveDispatches.isEmpty {
+                            DispatchDroplets(
+                                jobs: realtimeService.liveDispatches,
+                                orbDiameter: CommandLayout.orbDiameter,
+                                // The bead's own colour via `mood`, so a droplet matches the bead in every state.
+                                tint: VoiceOrb.mood(
+                                    state: realtimeService.sessionState,
+                                    muted: realtimeService.isMuted
+                                ).tint
+                            )
+                        }
                     }
             }
             .accessibilityElement(children: .combine)
@@ -471,13 +449,6 @@ struct CommandView<Interactor: ViewWithModelLifecycleObserver<CommandViewModel> 
     /// can't land on the other. End is the only way out of a call; the orb doesn't hang up.
     @ToolbarContentBuilder
     private var callControls: some ToolbarContent {
-        // Unwired: the Feed focus card carries the queue position now.
-        // if let queue = triageQueue.progress {
-        //     ToolbarItem(placement: .principal) {
-        //         queueChip(queue)
-        //             .animation(.easeInOut(duration: 0.2), value: triageQueue.progress)
-        //     }
-        // }
 
         ToolbarItemGroup(placement: .bottomBar) {
             // Hidden through the onboarding call's opening, which Jo owns; scoped to

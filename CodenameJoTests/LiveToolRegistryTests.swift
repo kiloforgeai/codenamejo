@@ -5,8 +5,8 @@ import XCTest
 final class LiveToolRegistryTests: XCTestCase {
     private let catalog = LiveSessionSetup.Catalog.bundled
     private let registry = LiveSessionSetup.tools
-    /// Still answered for an old or local-only name, and declared by nothing.
-    private let undeclared: Set<String> = ["search_unread", "search_calendar"]
+    /// Still answered for an old name, and declared by nothing.
+    private let undeclared: Set<String> = ["search_unread"]
 
     private func names(_ tools: [[String: Any]]) -> Set<String> { Set(tools.compactMap { $0["name"] as? String }) }
 

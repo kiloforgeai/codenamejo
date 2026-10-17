@@ -17,8 +17,7 @@ final class UserProfileSettingsTests: XCTestCase {
         DraftsOnly.storageKey, DraftsOnly.byAccountStorageKey,
         EmailOnboardingContract.mailModeAccountKey, ThreadQueue.storageKey,
         TriageScope.storageKey,
-        AgentLedEmailSettings.key, DailyMailNotifications.storageKey,
-        DailyMailNotifications.minuteOfDayStorageKey, DailyMailNotifications.timeZoneStorageKey,
+        AgentLedEmailSettings.key,
         OnboardingState.storageKey,
         AppearanceSetting.storageKey,
     ]

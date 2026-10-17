@@ -28,9 +28,9 @@ class CustomCommandStore: ObservableObject {
         return scope.profileId
     }
 
-    func refresh() {
+    func refresh() async {
         guard let owner = backend.userId else { commands = []; return }
-        do { commands = try rows.all(userId: owner, profileId: Self.profileKey) }
+        do { commands = try await rows.all(userId: owner, profileId: Self.profileKey) }
         catch { RealtimeLog.log("commands: could not read list — \(error.localizedDescription)") }
     }
 
@@ -45,14 +45,14 @@ class CustomCommandStore: ObservableObject {
     }
 
     /// Save a command, or change what an existing keyword does.
-    func save(keyword: String, label: String, actions: [CommandAction]) -> Outcome {
+    func save(keyword: String, label: String, actions: [CommandAction]) async -> Outcome {
         let checked: (keyword: String, actions: [CommandAction])
         switch CustomCommandRules.validateSave(keyword: keyword, actions: actions) {
         case .failure(let refusal): return .refused(refusal.sentence)
         case .success(let value): checked = value
         }
-        return write { owner, profile in
-            .saved(try rows.save(userId: owner, profileId: profile, keyword: checked.keyword,
+        return await write { owner, profile in
+            .saved(try await rows.save(userId: owner, profileId: profile, keyword: checked.keyword,
                                  spoken: keyword.trimmingCharacters(in: .whitespacesAndNewlines),
                                  label: label.trimmingCharacters(in: .whitespacesAndNewlines),
                                  actions: checked.actions))
@@ -61,11 +61,11 @@ class CustomCommandStore: ObservableObject {
 
     /// Delete one command, by exact keyword. A keyword that matches nothing is refused by name
     /// rather than reported done: losing a dictated command is the one unrecoverable thing here.
-    func delete(keyword raw: String) -> Outcome {
+    func delete(keyword raw: String) async -> Outcome {
         let keyword = CustomCommandRules.normalise(raw)
         guard !keyword.isEmpty else { return .refused("Say which command to delete.") }
-        return write { owner, profile in
-            guard let gone = try rows.delete(userId: owner, profileId: profile, keyword: keyword) else {
+        return await write { owner, profile in
+            guard let gone = try await rows.delete(userId: owner, profileId: profile, keyword: keyword) else {
                 return .refused("There is no command called \"\(keyword)\". Nothing was deleted — read the "
                     + "list back before trying again.")
             }
@@ -74,11 +74,11 @@ class CustomCommandStore: ObservableObject {
     }
 
     /// Switch one command on or off, by exact keyword.
-    func setEnabled(keyword raw: String, to enabled: Bool) -> Outcome {
+    func setEnabled(keyword raw: String, to enabled: Bool) async -> Outcome {
         let keyword = CustomCommandRules.normalise(raw)
         guard !keyword.isEmpty else { return .refused("Say which command to switch.") }
-        return write { owner, profile in
-            guard let row = try rows.setEnabled(userId: owner, profileId: profile, keyword: keyword, enabled: enabled)
+        return await write { owner, profile in
+            guard let row = try await rows.setEnabled(userId: owner, profileId: profile, keyword: keyword, enabled: enabled)
             else { return .refused("There is no command called \"\(keyword)\".") }
             return .saved(row)
         }
@@ -86,15 +86,15 @@ class CustomCommandStore: ObservableObject {
 
     /// The Settings toggle. Same path as the voice tool.
     func toggle(_ command: CustomCommand, to enabled: Bool) {
-        _ = setEnabled(keyword: command.keyword, to: enabled)
+        Task { _ = await setEnabled(keyword: command.keyword, to: enabled) }
     }
 
     /// One write, then the whole list re-read, so the array cannot drift from the table.
-    private func write(_ body: (_ owner: String, _ profile: String) throws -> Outcome) -> Outcome {
+    private func write(_ body: (_ owner: String, _ profile: String) async throws -> Outcome) async -> Outcome {
         guard let owner = backend.userId else { return .failed("Not signed in.") }
         do {
-            let outcome = try body(owner, Self.profileKey)
-            refresh()
+            let outcome = try await body(owner, Self.profileKey)
+            await refresh()
             return outcome
         } catch {
             RealtimeLog.log("commands: write failed — \(error.localizedDescription)")

@@ -95,7 +95,7 @@ final class LiveSessionSetupParityTests: XCTestCase {
                 "localMail": setup.localMail, "localDrafts": setup.localMail, "localCalendar": false,
                 "localTriage": true, "localClock": true, "endSession": true, "stopListening": true,
                 "shortcutText": shortcutText, "shortcutRead": shortcutRead, "phoneContacts": true,
-                "asyncWrites": false, "model": LivePrompt.speakerModel,
+                "model": LivePrompt.speakerModel,
             ]
             XCTAssertEqual(try json(phone), try json(echoes), "\(name): capability answers")
             XCTAssertEqual(scenario["emailPreparation"] as? Bool, true)
