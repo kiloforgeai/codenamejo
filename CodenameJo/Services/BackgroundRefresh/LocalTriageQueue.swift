@@ -130,8 +130,18 @@ actor LocalTriageQueue {
     private var completedAccounts: Set<String> = []
     private var offeredAccount: String?
 
+    /// The connected mailboxes as read when this walk began. Every step asked the Keychain again;
+    /// `end` drops the cache, and a connect or disconnect ends the queue.
+    private var walkAccounts: [String]?
+
     private func queueAccounts() async -> [String] {
-        let connected = await mailAccounts()
+        let connected: [String]
+        if running, let walkAccounts {
+            connected = walkAccounts
+        } else {
+            connected = await mailAccounts()
+            if running { walkAccounts = connected }
+        }
         guard !connected.isEmpty else { return [] }
         if let activeAccount,
            let match = connected.first(where: {
@@ -542,6 +552,9 @@ actor LocalTriageQueue {
     /// Which walk the state belongs to, bumped by everything that replaces or clears a queue, so a
     /// page in flight cannot append into or stall a newer queue.
     private var generation = 0
+    /// Saved buffer and its cursor offsets; unchanged tails need only a cursor write.
+    private var savedBuffer: (key: String, items: [Item], trimmedItems: Int, trimmedOrdinals: Int,
+                              itemCount: Int, ordinalOffset: Int)?
     private var reconciliationLifetime = 0
     private var queueBuildsInFlight = 0
     private var confirmedEffectsRevision = 0
@@ -702,6 +715,7 @@ actor LocalTriageQueue {
     }
 
     private func restoreNavigationStage(_ stage: NavigationStage) {
+        savedBuffer = nil
         items = stage.items
         grouping = stage.grouping
         topicGrouping = stage.topicGrouping
@@ -1649,7 +1663,7 @@ actor LocalTriageQueue {
         let (heldRows, eligibleSaved) = await eligibleSavedTail(remainingSaved, scope: saved.scope, store: store)
 
         var head = await restoredHead(for: saved, account: account, store: store)
-        let known = Self.messageKeys(saved.items).union(suppressed)
+        let known = Self.messageKeys(saved.items).union(saved.trimmedKeys ?? []).union(suppressed)
         let fresh = Self.gmailEligible(head.fresh, dealtWithThisWalk: known)
         let refreshed = Self.excludingSummarizedReadThreads(
             await Self.refreshFacts(eligibleSaved, store: store), keys: summarizedReadThreads)
@@ -1697,6 +1711,7 @@ actor LocalTriageQueue {
                                                store: store, excluding: Self.messageKeys(merged))
             merged = Array(merged.prefix(frozen)) + grouped(tail)
         }
+        savedBuffer = nil
         items = merged
         position = 1
         scope = saved.scope
@@ -1932,8 +1947,7 @@ actor LocalTriageQueue {
         return excluded
     }
 
-    /// Save the unresolved cursor without ending it. Safe to call on every tool result; GRDB
-    /// serialises this small blob with the cache writes already using the same pool.
+    /// Save the cursor, rewriting the buffer only when its remaining items change.
     func checkpoint(store: MailStore) async {
         if !liveFeatures && !pendingArchives.isEmpty {
             await discardToday(store: store)
@@ -1948,35 +1962,86 @@ actor LocalTriageQueue {
         }
         guard let account = snapshotAccount else { return }
         let day = Self.localDay()
-        let itemAccounts = Set(items.map { $0.account.lowercased() })
-        let coveredAccounts = itemAccounts.isEmpty
-            ? connectedAccounts.map { $0.lowercased() }.sorted()
-            : itemAccounts.sorted()
-        let payload = SnapshotPayload(
-            items: items,
-            grouping: grouping,
-            accounts: coveredAccounts.isEmpty ? [account.lowercased()] : coveredAccounts,
+        let key = TriageQueueSnapshotStore.key(account: account, day: day, scope: scope, split: "")
+        let tail = items.dropFirst(max(0, position - 1))
+        var buffer: SnapshotPayload?
+        var trimmed = (items: savedBuffer?.trimmedItems ?? 0, ordinals: savedBuffer?.trimmedOrdinals ?? 0)
+        let bufferHolds = savedBuffer.map { saved in
+            saved.key == key && saved.itemCount == items.count && saved.ordinalOffset == ordinalOffset
+                && saved.items.count >= tail.count && saved.items.suffix(tail.count).elementsEqual(tail)
+        } ?? false
+        if !bufferHolds {
+            // Items behind the cursor leave the row, except a pending write still unresolved there;
+            // their keys stay so a restore does not take that mail for new.
+            var kept: [Item] = []
+            var droppedKeys: [String] = []
+            trimmed = (0, 0)
+            for (index, item) in items.enumerated() {
+                let pendingWrite = liveFeatures && pendingArchives.contains {
+                    $0.matches(account: item.account, ids: item.ids, threadId: item.threadId)
+                }
+                if index >= position - 1 || pendingWrite {
+                    kept.append(item)
+                } else {
+                    trimmed.items += 1
+                    trimmed.ordinals += count(item)
+                    droppedKeys.append(contentsOf: Self.messageKeys([item]).sorted())
+                }
+            }
+            let itemAccounts = Set(items.map { $0.account.lowercased() })
+            let coveredAccounts = itemAccounts.isEmpty
+                ? connectedAccounts.map { $0.lowercased() }.sorted()
+                : itemAccounts.sorted()
+            buffer = SnapshotPayload(
+                items: kept,
+                grouping: grouping,
+                accounts: coveredAccounts.isEmpty ? [account.lowercased()] : coveredAccounts,
+                position: max(0, position - trimmed.items),
+                ordinalOffset: max(0, ordinalOffset) + trimmed.ordinals,
+                before: before,
+                more: more,
+                total: total,
+                mailboxUnreadAtStart: mailboxUnreadAtStart,
+                scope: scope,
+                scopeUnsaid: scopeUnsaid,
+                scopePlan: scopePlan,
+                adopted: adopted,
+                completed: !running && (items.isEmpty || position > items.count) && !more,
+                gmailWalkDealtWith: gmailWalkDealtWith.sorted(),
+                summarizedReadThreads: summarizedReadThreads.sorted(),
+                pendingArchives: liveFeatures ? pendingArchives : nil,
+                dispatchSweepIDs: liveFeatures ? dispatchSweepIDs.sorted() : nil,
+                band: band,
+                beforeScore: beforeScore,
+                beforeID: beforeID, topicGrouping: topicGrouping,
+                presentedTopicKeys: presentedTopicKeys.sorted(),
+                trimmedItems: trimmed.items, trimmedOrdinals: trimmed.ordinals, trimmedKeys: droppedKeys)
+        }
+        let cursor = TriageQueueSnapshotStore.Cursor(
             position: max(0, position),
             ordinalOffset: max(0, ordinalOffset),
             before: before,
             more: more,
             total: total,
-            mailboxUnreadAtStart: mailboxUnreadAtStart,
-            scope: scope,
-            scopeUnsaid: scopeUnsaid,
-            scopePlan: scopePlan,
-            adopted: adopted,
             completed: !running && (items.isEmpty || position > items.count) && !more,
+            scopeUnsaid: scopeUnsaid,
             gmailWalkDealtWith: gmailWalkDealtWith.sorted(),
             summarizedReadThreads: summarizedReadThreads.sorted(),
             pendingArchives: liveFeatures ? pendingArchives : nil,
             dispatchSweepIDs: liveFeatures ? dispatchSweepIDs.sorted() : nil,
             band: band,
             beforeScore: beforeScore,
-            beforeID: beforeID, topicGrouping: topicGrouping,
+            beforeID: beforeID,
             presentedTopicKeys: presentedTopicKeys.sorted())
-        await TriageQueueSnapshotStore.save(payload, account: account, day: day, scope: scope,
-                                            store: store, database: database)
+        let written = await TriageQueueSnapshotStore.save(
+            cursor: cursor, buffer: buffer, account: account, day: day, scope: scope,
+            store: store, database: database)
+        if let buffer, written {
+            savedBuffer = (key, buffer.items, trimmed.items, trimmed.ordinals,
+                           buffer.items.count + trimmed.items, cursor.ordinalOffset)
+        } else if !written {
+            savedBuffer = nil
+        }
     }
 
     private func discardToday(store: MailStore) async {
@@ -1986,6 +2051,7 @@ actor LocalTriageQueue {
                                                store: store, database: database)
         ordinalOffset = 0
         snapshotAccount = nil
+        savedBuffer = nil
     }
 
     /// End the in-memory conversation view only after its durable cursor has landed. This is
@@ -2688,6 +2754,7 @@ actor LocalTriageQueue {
             ])
         }
         let left = max(0, total - cleared)
+        savedBuffer = nil
         running = false
         actionOutcome = nil
         items = []
@@ -2784,6 +2851,8 @@ actor LocalTriageQueue {
         releasePrefetch()
         restoredThreadContexts = [:]
         offeredAccount = nil
+        walkAccounts = nil
+        savedBuffer = nil
         if !preservingMailboxState {
             pausedOutcomes = [:]
             completedAccounts = []

@@ -2359,11 +2359,6 @@ final class FullDuplexVoiceClient {
     private var pendingFirstTranscriptMs: Int?
 
     /// Whether the phone is producing the transcript.
-    ///
-    /// False on a device without the language model installed yet, and false on
-    /// hardware that can't run it at all — in both cases the server's transcript
-    /// keeps drawing the screen, which is why that path is left attached rather
-    /// than removed from the mint.
     private var localTranscriptLive: Bool { transport?.localTranscriber.isLive ?? false }
 
     /// Whether a tool ran during the current response.
@@ -3618,24 +3613,27 @@ final class FullDuplexVoiceClient {
         let keyword = Self.stringArgument("keyword", in: argumentsJSON) ?? ""
         FullDuplexTrace.note("!! commands \(action) \"\(keyword)\"")
         let started = Date()
-        let outcome: CustomCommandStore.Outcome
-        switch action {
-        case "save":
-            outcome = customCommands.save(
-                keyword: keyword, label: Self.stringArgument("label", in: argumentsJSON) ?? "",
-                actions: Self.actionsArgument(in: argumentsJSON))
-        case "delete":
-            outcome = customCommands.delete(keyword: keyword)
-        case "enable", "disable":
-            outcome = customCommands.setEnabled(keyword: keyword, to: action == "enable")
-        default:
-            // A schema `enum` is a strong hint, not a guarantee.
-            outcome = .refused("\"\(action)\" is not something you can do to a command. Use run, list, "
-                + "save, delete, enable or disable.")
+        Task { [weak self] in
+            guard let self else { return }
+            let outcome: CustomCommandStore.Outcome
+            switch action {
+            case "save":
+                outcome = await customCommands.save(
+                    keyword: keyword, label: Self.stringArgument("label", in: argumentsJSON) ?? "",
+                    actions: Self.actionsArgument(in: argumentsJSON))
+            case "delete":
+                outcome = await customCommands.delete(keyword: keyword)
+            case "enable", "disable":
+                outcome = await customCommands.setEnabled(keyword: keyword, to: action == "enable")
+            default:
+                // A schema `enum` is a strong hint, not a guarantee.
+                outcome = .refused("\"\(action)\" is not something you can do to a command. Use run, list, "
+                    + "save, delete, enable or disable.")
+            }
+            if case .saved = outcome { refreshCommandTools() }
+            finishCommandWrite(callId: callId, action: action, keyword: keyword, outcome: outcome,
+                               ms: Date().timeIntervalSince(started) * 1000)
         }
-        if case .saved = outcome { refreshCommandTools() }
-        finishCommandWrite(callId: callId, action: action, keyword: keyword, outcome: outcome,
-                           ms: Date().timeIntervalSince(started) * 1000)
     }
 
     /// A write's result as something the model can say. A refusal and a failure both mean it

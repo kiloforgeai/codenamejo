@@ -39,7 +39,7 @@ final class MailboxSwitchPreparationTests: XCTestCase {
         await queue.prepareDailySnapshot(store: fixture.store)
 
         let rows = try await fixture.database.read { db in
-            try DailyEmailQueueSnapshotRecord.order(Column("account")).fetchAll(db)
+            try DailyEmailQueueSnapshotRecord.filter(Column("split") == "").order(Column("account")).fetchAll(db)
         }
         XCTAssertEqual(rows.map(\.account), [personal, work], "One row per mailbox, not only the first")
         for row in rows {
@@ -94,7 +94,7 @@ final class MailboxSwitchPreparationTests: XCTestCase {
         await queue.awaitMailboxAhead()
 
         let rows = try await fixture.database.read { db in
-            try DailyEmailQueueSnapshotRecord.order(Column("account")).fetchAll(db)
+            try DailyEmailQueueSnapshotRecord.filter(Column("split") == "").order(Column("account")).fetchAll(db)
         }
         XCTAssertEqual(rows.map(\.account), [personal, work],
                        "The other mailbox's row is written while the first is walked")
@@ -117,7 +117,9 @@ final class MailboxSwitchPreparationTests: XCTestCase {
         let scratch = LocalTriageQueue(mailAccounts: { [self.personal] }, unreadOpeningLoader: { _ in [] })
         let served = await scratch.prepareMailboxAhead(store: fixture.store)
         XCTAssertNotNil(served)
-        let rows = try await fixture.database.read { db in try DailyEmailQueueSnapshotRecord.fetchAll(db) }
+        let rows = try await fixture.database.read { db in
+            try DailyEmailQueueSnapshotRecord.filter(Column("split") == "").fetchAll(db)
+        }
         XCTAssertEqual(rows.map(\.account), [personal])
         let mailbox = await scratch.currentMailbox
         XCTAssertNil(mailbox, "The scratch queue ends itself once the row has landed")

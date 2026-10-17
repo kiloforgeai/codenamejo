@@ -436,15 +436,19 @@ struct CommandView<Interactor: ViewWithModelLifecycleObserver<CommandViewModel> 
                     // An overlay, not a ZStack sibling: overlay content never reports its size upward,
                     // so the droplets can't grow the dock and move the orb.
                     .overlay {
-                        DispatchDroplets(
-                            jobs: realtimeService.liveDispatches,
-                            orbDiameter: CommandLayout.orbDiameter,
-                            // The bead's own colour via `mood`, so a droplet matches the bead in every state.
-                            tint: VoiceOrb.mood(
-                                state: realtimeService.sessionState,
-                                muted: realtimeService.isMuted
-                            ).tint
-                        )
+                        // Mounted only while a job is live: the droplets' 30 fps timeline otherwise
+                        // ran for the whole call with nothing to draw.
+                        if !realtimeService.liveDispatches.isEmpty {
+                            DispatchDroplets(
+                                jobs: realtimeService.liveDispatches,
+                                orbDiameter: CommandLayout.orbDiameter,
+                                // The bead's own colour via `mood`, so a droplet matches the bead in every state.
+                                tint: VoiceOrb.mood(
+                                    state: realtimeService.sessionState,
+                                    muted: realtimeService.isMuted
+                                ).tint
+                            )
+                        }
                     }
             }
             .accessibilityElement(children: .combine)

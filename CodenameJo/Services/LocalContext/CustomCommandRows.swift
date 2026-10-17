@@ -51,8 +51,8 @@ struct CustomCommandRows: Sendable {
     }
 
     /// Every command in the profile, enabled or not, newest first.
-    func all(userId: String, profileId: String) throws -> [CustomCommand] {
-        try pool().read { db in
+    func all(userId: String, profileId: String) async throws -> [CustomCommand] {
+        try await pool().read { db in
             try Row.fetchAll(db, sql: """
                 SELECT * FROM custom_command WHERE user_id = ? AND profile_id = ? ORDER BY created_at DESC
                 """, arguments: [userId, profileId]).map(\.value)
@@ -64,9 +64,9 @@ struct CustomCommandRows: Sendable {
     /// merge would leave the old steps running beside the new. `id` and `enabled` are kept, so a
     /// command switched off stays off.
     func save(userId: String, profileId: String, keyword: String, spoken: String, label: String,
-              actions: [CommandAction], now: Date = Date()) throws -> CustomCommand {
+              actions: [CommandAction], now: Date = Date()) async throws -> CustomCommand {
         let json = String(decoding: try JSONEncoder().encode(actions), as: UTF8.self)
-        return try pool().write { db in
+        return try await pool().write { db in
             try db.execute(sql: """
                 INSERT INTO custom_command (user_id, profile_id, id, keyword, spoken, instruction, actions, enabled, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
@@ -81,8 +81,8 @@ struct CustomCommandRows: Sendable {
     }
 
     /// Exact keyword only. Nil when nothing matched — the caller refuses rather than reporting success.
-    func delete(userId: String, profileId: String, keyword: String) throws -> CustomCommand? {
-        try pool().write { db in
+    func delete(userId: String, profileId: String, keyword: String) async throws -> CustomCommand? {
+        try await pool().write { db in
             let row = try Row.fetchOne(db, sql: """
                 SELECT * FROM custom_command WHERE user_id = ? AND profile_id = ? AND keyword = ?
                 """, arguments: [userId, profileId, keyword])
@@ -92,8 +92,8 @@ struct CustomCommandRows: Sendable {
     }
 
     /// Exact keyword only. Nil when nothing matched.
-    func setEnabled(userId: String, profileId: String, keyword: String, enabled: Bool) throws -> CustomCommand? {
-        try pool().write { db in
+    func setEnabled(userId: String, profileId: String, keyword: String, enabled: Bool) async throws -> CustomCommand? {
+        try await pool().write { db in
             try db.execute(sql: """
                 UPDATE custom_command SET enabled = ? WHERE user_id = ? AND profile_id = ? AND keyword = ?
                 """, arguments: [enabled, userId, profileId, keyword])
@@ -104,14 +104,14 @@ struct CustomCommandRows: Sendable {
     }
 
     /// A deleted profile's commands have nowhere to run.
-    func purge(userId: String, profileId: String) throws {
-        try pool().write { db in
+    func purge(userId: String, profileId: String) async throws {
+        try await pool().write { db in
             try db.execute(sql: "DELETE FROM custom_command WHERE user_id = ? AND profile_id = ?",
                            arguments: [userId, profileId])
         }
     }
 
-    func purge(userId: String) throws {
-        try pool().write { db in try db.execute(sql: "DELETE FROM custom_command WHERE user_id = ?", arguments: [userId]) }
+    func purge(userId: String) async throws {
+        try await pool().write { db in try db.execute(sql: "DELETE FROM custom_command WHERE user_id = ?", arguments: [userId]) }
     }
 }

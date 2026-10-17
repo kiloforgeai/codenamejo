@@ -212,9 +212,10 @@ enum FullDuplexBroker {
         // Granola's grants for this profile; a refused refresh is flagged on use, never here.
         let granolaGrants = GranolaConnector.grants()
         let granola = granolaGrants.contains { !$0.needsReauth }
+        // Re-read first, off the main actor's writer wait, so the eligibility below sees the list.
+        await Container.shared.customCommands().refresh()
         let coachingEligibility = await MainActor.run {
             let commands = Container.shared.customCommands()
-            commands.refresh()
             return CoachingRotation.Eligibility(
                 slackConnectable: SlackConfig.isConfigured && SlackGrantStore.all().isEmpty,
                 multipleInboxes: GoogleAccountStore.mailAccounts().count > 1,
@@ -290,7 +291,7 @@ enum FullDuplexBroker {
         facts.commandKeywords = commandKeywords
         // The dossier is on this phone, so the active profile's overview is added here.
         if let owner = cadenceUserId, let profileId = ProfileRuntime.snapshot?.profileId {
-            facts.profileContext = Container.shared.profileDossier().context(owner: owner, profileId: profileId)?.overview
+            facts.profileContext = await Container.shared.profileDossier().context(owner: owner, profileId: profileId)?.overview
         }
         let prompt = try LivePrompt.configs(facts: facts,
             tools: tools, fastActions: !setup.fastActions.isEmpty, timeZone: TimeZone.current.identifier)

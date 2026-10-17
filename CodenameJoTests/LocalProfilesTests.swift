@@ -20,84 +20,100 @@ final class LocalProfilesTests: XCTestCase {
 
     private var rows: WorkspaceProfileRows { WorkspaceProfileRows(dbPool: context.dbPool) }
 
-    func testFirstListCreatesOnePersonalDefaultPerUser() throws {
-        let first = try rows.list(userId: "alice")
+    /// `XCTAssertThrowsError` takes no async body.
+    private func assertThrows<T>(_ expected: WorkspaceProfileError, file: StaticString = #filePath, line: UInt = #line,
+                                 _ body: () async throws -> T) async {
+        do {
+            _ = try await body()
+            XCTFail("expected \(expected)", file: file, line: line)
+        } catch {
+            XCTAssertEqual(error as? WorkspaceProfileError, expected, file: file, line: line)
+        }
+    }
+
+    func testFirstListCreatesOnePersonalDefaultPerUser() async throws {
+        let first = try await rows.list(userId: "alice")
         XCTAssertEqual(first.map(\.name), ["Personal"])
         XCTAssertTrue(first[0].isDefault)
-        XCTAssertEqual(try rows.list(userId: "alice").map(\.id), first.map(\.id))
-        XCTAssertNotEqual(try rows.list(userId: "bob").first?.id, first[0].id)
+        let again = try await rows.list(userId: "alice")
+        XCTAssertEqual(again.map(\.id), first.map(\.id))
+        let bob = try await rows.list(userId: "bob")
+        XCTAssertNotEqual(bob.first?.id, first[0].id)
     }
 
-    func testNamesAreValidatedAndUniqueIgnoringCase() throws {
-        _ = try rows.list(userId: "alice")
-        let work = try rows.create(userId: "alice", name: "  Work  ")
+    func testNamesAreValidatedAndUniqueIgnoringCase() async throws {
+        _ = try await rows.list(userId: "alice")
+        let work = try await rows.create(userId: "alice", name: "  Work  ")
         XCTAssertEqual(work.name, "Work")
         XCTAssertFalse(work.isDefault)
-        XCTAssertThrowsError(try rows.create(userId: "alice", name: "work")) {
-            XCTAssertEqual($0 as? WorkspaceProfileError, .nameTaken)
-        }
+        await assertThrows(.nameTaken) { try await rows.create(userId: "alice", name: "work") }
         for bad in ["", "   ", String(repeating: "a", count: 81), "Wo\u{0007}rk", "Wo\u{200B}rk"] {
-            XCTAssertThrowsError(try rows.create(userId: "alice", name: bad)) {
-                XCTAssertEqual($0 as? WorkspaceProfileError, .invalidName)
-            }
+            await assertThrows(.invalidName) { try await rows.create(userId: "alice", name: bad) }
         }
         // Another account may use the same name.
-        XCTAssertNoThrow(try rows.create(userId: "bob", name: "Work"))
-        XCTAssertEqual(try rows.list(userId: "alice").map(\.name), ["Personal", "Work"])
+        _ = try await rows.create(userId: "bob", name: "Work")
+        let alice = try await rows.list(userId: "alice")
+        XCTAssertEqual(alice.map(\.name), ["Personal", "Work"])
     }
 
-    func testRenameKeepsItsOwnNameAndRefusesAnother() throws {
-        let personal = try XCTUnwrap(rows.list(userId: "alice").first)
-        let work = try rows.create(userId: "alice", name: "Work")
-        XCTAssertEqual(try rows.rename(userId: "alice", id: work.id, name: "WORK").name, "WORK")
-        XCTAssertThrowsError(try rows.rename(userId: "alice", id: work.id, name: "personal")) {
-            XCTAssertEqual($0 as? WorkspaceProfileError, .nameTaken)
-        }
-        XCTAssertThrowsError(try rows.rename(userId: "bob", id: personal.id, name: "Mine")) {
-            XCTAssertEqual($0 as? WorkspaceProfileError, .notFound)
-        }
+    func testRenameKeepsItsOwnNameAndRefusesAnother() async throws {
+        let listed = try await rows.list(userId: "alice")
+        let personal = try XCTUnwrap(listed.first)
+        let work = try await rows.create(userId: "alice", name: "Work")
+        let renamed = try await rows.rename(userId: "alice", id: work.id, name: "WORK")
+        XCTAssertEqual(renamed.name, "WORK")
+        await assertThrows(.nameTaken) { try await rows.rename(userId: "alice", id: work.id, name: "personal") }
+        await assertThrows(.notFound) { try await rows.rename(userId: "bob", id: personal.id, name: "Mine") }
     }
 
-    func testMailboxesJoinOneProfileAndNeverMove() throws {
-        let personal = try XCTUnwrap(rows.list(userId: "alice").first)
-        let work = try rows.create(userId: "alice", name: "Work")
-        try rows.adopt(userId: "alice", emails: ["Me@Example.com"], into: personal.id)
-        try rows.adopt(userId: "alice", emails: ["me@example.com", "boss@corp.com"], into: work.id)
-        XCTAssertEqual(try rows.mailboxes(userId: "alice", profileId: personal.id), ["me@example.com"])
-        XCTAssertEqual(try rows.mailboxes(userId: "alice", profileId: work.id), ["boss@corp.com"])
-        XCTAssertEqual(try rows.mailboxes(userId: "bob", profileId: work.id), [])
-        try rows.forget(userId: "alice", email: "BOSS@corp.com")
-        XCTAssertEqual(try rows.mailboxes(userId: "alice", profileId: work.id), [])
+    func testMailboxesJoinOneProfileAndNeverMove() async throws {
+        let listed = try await rows.list(userId: "alice")
+        let personal = try XCTUnwrap(listed.first)
+        let work = try await rows.create(userId: "alice", name: "Work")
+        try await rows.adopt(userId: "alice", emails: ["Me@Example.com"], into: personal.id)
+        try await rows.adopt(userId: "alice", emails: ["me@example.com", "boss@corp.com"], into: work.id)
+        var mailboxes = try await rows.mailboxes(userId: "alice", profileId: personal.id)
+        XCTAssertEqual(mailboxes, ["me@example.com"])
+        mailboxes = try await rows.mailboxes(userId: "alice", profileId: work.id)
+        XCTAssertEqual(mailboxes, ["boss@corp.com"])
+        mailboxes = try await rows.mailboxes(userId: "bob", profileId: work.id)
+        XCTAssertEqual(mailboxes, [])
+        try await rows.forget(userId: "alice", email: "BOSS@corp.com")
+        mailboxes = try await rows.mailboxes(userId: "alice", profileId: work.id)
+        XCTAssertEqual(mailboxes, [])
     }
 
-    func testDeletingTakesSettingsDossierAndMappingButNeverTheDefault() throws {
-        let personal = try XCTUnwrap(rows.list(userId: "alice").first)
-        let work = try rows.create(userId: "alice", name: "Work")
-        try rows.adopt(userId: "alice", emails: ["boss@corp.com"], into: work.id)
-        try rows.saveDossier(.init(user_id: "alice", profile_id: work.id, facts: "[]", content: "{}", version: 1, updated_at: Date()))
-        XCTAssertThrowsError(try rows.delete(userId: "alice", id: personal.id)) {
-            XCTAssertEqual($0 as? WorkspaceProfileError, .cannotDeleteDefault)
-        }
-        XCTAssertEqual(try rows.delete(userId: "alice", id: work.id), ["boss@corp.com"])
-        XCTAssertNil(try rows.dossier(userId: "alice", profileId: work.id))
-        XCTAssertEqual(try rows.list(userId: "alice").map(\.name), ["Personal"])
-        try rows.adopt(userId: "alice", emails: ["boss@corp.com"], into: personal.id)
-        XCTAssertEqual(try rows.mailboxes(userId: "alice", profileId: personal.id), ["boss@corp.com"])
-        XCTAssertThrowsError(try rows.delete(userId: "alice", id: work.id)) {
-            XCTAssertEqual($0 as? WorkspaceProfileError, .notFound)
-        }
+    func testDeletingTakesSettingsDossierAndMappingButNeverTheDefault() async throws {
+        let listed = try await rows.list(userId: "alice")
+        let personal = try XCTUnwrap(listed.first)
+        let work = try await rows.create(userId: "alice", name: "Work")
+        try await rows.adopt(userId: "alice", emails: ["boss@corp.com"], into: work.id)
+        try await rows.saveDossier(.init(user_id: "alice", profile_id: work.id, facts: "[]", content: "{}", version: 1, updated_at: Date()))
+        await assertThrows(.cannotDeleteDefault) { try await rows.delete(userId: "alice", id: personal.id) }
+        let held = try await rows.delete(userId: "alice", id: work.id)
+        XCTAssertEqual(held, ["boss@corp.com"])
+        let dossier = try await rows.dossier(userId: "alice", profileId: work.id)
+        XCTAssertNil(dossier)
+        let remaining = try await rows.list(userId: "alice")
+        XCTAssertEqual(remaining.map(\.name), ["Personal"])
+        try await rows.adopt(userId: "alice", emails: ["boss@corp.com"], into: personal.id)
+        let mailboxes = try await rows.mailboxes(userId: "alice", profileId: personal.id)
+        XCTAssertEqual(mailboxes, ["boss@corp.com"])
+        await assertThrows(.notFound) { try await rows.delete(userId: "alice", id: work.id) }
     }
 
-    func testSettingsKeepOnlyWorkspaceFields() throws {
-        let work = try rows.create(userId: "alice", name: "Work")
-        XCTAssertNil(try rows.settings(userId: "alice", profileId: work.id))
+    func testSettingsKeepOnlyWorkspaceFields() async throws {
+        let work = try await rows.create(userId: "alice", name: "Work")
+        let none = try await rows.settings(userId: "alice", profileId: work.id)
+        XCTAssertNil(none)
         var settings = UserProfile()
         settings.triageScope = "all"
         settings.suggestedActions = false
         settings.archiveAfterReply = true
         settings.appearance = "dark"
-        try rows.saveSettings(settings, userId: "alice", profileId: work.id)
-        let saved = try XCTUnwrap(rows.settings(userId: "alice", profileId: work.id))
+        try await rows.saveSettings(settings, userId: "alice", profileId: work.id)
+        let stored = try await rows.settings(userId: "alice", profileId: work.id)
+        let saved = try XCTUnwrap(stored)
         XCTAssertEqual(saved.triageScope, "all")
         XCTAssertEqual(saved.suggestedActions, false)
         XCTAssertNil(saved.archiveAfterReply, "A filing rule is the account's")
@@ -168,10 +184,13 @@ final class LocalProfilesTests: XCTestCase {
         try await withStore { store in
             try await store.load()
             let work = try await store.createUnselected("Work")
-            XCTAssertFalse(try store.dossierEnabled(for: work.id))
-            try store.setDossierEnabled(true, for: work.id)
-            XCTAssertTrue(try store.dossierEnabled(for: work.id))
-            XCTAssertFalse(try store.dossierEnabled(for: XCTUnwrap(store.selected?.id)))
+            var enabled = try await store.dossierEnabled(for: work.id)
+            XCTAssertFalse(enabled)
+            try await store.setDossierEnabled(true, for: work.id)
+            enabled = try await store.dossierEnabled(for: work.id)
+            XCTAssertTrue(enabled)
+            enabled = try await store.dossierEnabled(for: XCTUnwrap(store.selected?.id))
+            XCTAssertFalse(enabled)
         }
     }
 }
@@ -254,9 +273,10 @@ final class ProfileDossierTests: XCTestCase {
         let context = LocalContextStore(url: path)
         defer { try? context.dbPool?.close(); try? FileManager.default.removeItem(at: path) }
         let rows = WorkspaceProfileRows(dbPool: context.dbPool)
-        let personal = try XCTUnwrap(rows.list(userId: "alice").first)
-        let work = try rows.create(userId: "alice", name: "Work")
-        try rows.setDossierEnabled(true, userId: "alice", profileId: work.id)
+        let listed = try await rows.list(userId: "alice")
+        let personal = try XCTUnwrap(listed.first)
+        let work = try await rows.create(userId: "alice", name: "Work")
+        try await rows.setDossierEnabled(true, userId: "alice", profileId: work.id)
         let calls = Calls()
         let learner = ProfileDossierLearner(rows: rows) { _, input in
             await calls.record(input)
@@ -272,11 +292,15 @@ final class ProfileDossierTests: XCTestCase {
         let inputs = await calls.inputs
         XCTAssertEqual(inputs.count, 1, "Only the learning profile is sent to the model")
         XCTAssertTrue(inputs[0].contains("payments") && !inputs[0].contains("jazz"))
-        XCTAssertTrue(learner.context(owner: "alice", profileId: work.id)?.overview.contains("Leads payments.") == true)
-        XCTAssertNil(learner.context(owner: "alice", profileId: personal.id))
-        XCTAssertNil(learner.context(owner: "bob", profileId: work.id))
-        try rows.setDossierEnabled(false, userId: "alice", profileId: work.id)
-        XCTAssertNil(learner.context(owner: "alice", profileId: work.id), "A profile that stopped learning carries nothing")
+        let workContext = await learner.context(owner: "alice", profileId: work.id)
+        XCTAssertTrue(workContext?.overview.contains("Leads payments.") == true)
+        let personalContext = await learner.context(owner: "alice", profileId: personal.id)
+        XCTAssertNil(personalContext)
+        let bobContext = await learner.context(owner: "bob", profileId: work.id)
+        XCTAssertNil(bobContext)
+        try await rows.setDossierEnabled(false, userId: "alice", profileId: work.id)
+        let stopped = await learner.context(owner: "alice", profileId: work.id)
+        XCTAssertNil(stopped, "A profile that stopped learning carries nothing")
     }
 }
 

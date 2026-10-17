@@ -101,11 +101,11 @@ class BackendService: ObservableObject {
         Task.detached(priority: .utility) {
             guard let signedOutOwner else { return }
             await outbox.purge(owner: signedOutOwner)
-            do { try profileRows.purgeDossiers(userId: signedOutOwner) }
+            do { try await profileRows.purgeDossiers(userId: signedOutOwner) }
             catch { print("profileDossier: sign-out purge failed: \(error.localizedDescription)") }
-            do { try categoryRows.purge(userId: signedOutOwner) }
+            do { try await categoryRows.purge(userId: signedOutOwner) }
             catch { print("emailCategory: sign-out purge failed: \(error.localizedDescription)") }
-            do { try commandRows.purge(userId: signedOutOwner) }
+            do { try await commandRows.purge(userId: signedOutOwner) }
             catch { print("customCommand: sign-out purge failed: \(error.localizedDescription)") }
         }
         Task.detached(priority: .utility) {

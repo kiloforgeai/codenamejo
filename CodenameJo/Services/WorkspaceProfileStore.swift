@@ -51,10 +51,10 @@ class WorkspaceProfileStore: ObservableObject {
     }
 
     /// One profile's mailboxes, spelled as connected, with the reconnect state Connections last read.
-    func connections(of profileId: String) throws -> [WorkspaceProfileConnection] {
+    func connections(of profileId: String) async throws -> [WorkspaceProfileConnection] {
         guard let owner = backend.userId else { throw BackendError.notSignedIn }
         let reauth = Set(Container.shared.connections().allNeedsReauth.map { $0.lowercased() })
-        return try rows.mailboxes(userId: owner, profileId: profileId).map { email in
+        return try await rows.mailboxes(userId: owner, profileId: profileId).map { email in
             let spelled = knownAccounts.first { $0.lowercased() == email } ?? email
             return WorkspaceProfileConnection(id: email, email: spelled, profileId: profileId, needsReauth: reauth.contains(email))
         }
@@ -62,9 +62,12 @@ class WorkspaceProfileStore: ObservableObject {
 
     /// Re-read the selected profile's mailboxes and republish the scope.
     func refreshConnections() async {
-        guard loaded, let selected else { return }
+        guard loaded, let selected, let owner = backend.userId else { return }
+        let version = revision
         do {
-            connections = try connections(of: selected.id)
+            let refreshed = try await connections(of: selected.id)
+            guard version == revision, backend.userId == owner, self.selected?.id == selected.id else { return }
+            connections = refreshed
             connectionsProfileId = selected.id
             publishScope()
         } catch {
@@ -80,7 +83,7 @@ class WorkspaceProfileStore: ObservableObject {
         do {
             if !loaded || self.owner != owner { try await load() }
             guard let destination = selected ?? profiles.first(where: \.isDefault) else { return }
-            try rows.adopt(userId: owner, emails: accounts, into: destination.id)
+            try await rows.adopt(userId: owner, emails: accounts, into: destination.id)
         } catch {
             RealtimeLog.log("profiles: mailbox adoption failed — \(error.localizedDescription)")
             return
@@ -89,9 +92,9 @@ class WorkspaceProfileStore: ObservableObject {
     }
 
     /// A removed mailbox leaves its profile.
-    func forget(_ email: String) {
+    func forget(_ email: String) async {
         guard let owner = backend.userId else { return }
-        do { try rows.forget(userId: owner, email: email) }
+        do { try await rows.forget(userId: owner, email: email) }
         catch { RealtimeLog.log("profiles: could not unmap \(email) — \(error.localizedDescription)") }
     }
 
@@ -105,7 +108,7 @@ class WorkspaceProfileStore: ObservableObject {
     func load() async throws {
         guard let owner = backend.userId else { throw BackendError.notSignedIn }
         let version = revision
-        let catalog = try rows.list(userId: owner)
+        let catalog = try await rows.list(userId: owner)
         guard version == revision, backend.userId == owner else { throw BackendError.notSignedIn }
         if self.owner != owner { selected = nil; connectionsProfileId = nil }
         self.owner = owner
@@ -116,10 +119,10 @@ class WorkspaceProfileStore: ObservableObject {
         loaded = true
         if let selected {
             // A profile with no saved settings yet keeps the ones in effect.
-            if try rows.settings(userId: owner, profileId: selected.id) == nil {
-                try rows.saveSettings(UserProfile.capturingLocalSettings(), userId: owner, profileId: selected.id)
+            if try await rows.settings(userId: owner, profileId: selected.id) == nil {
+                try await rows.saveSettings(UserProfile.capturingLocalSettings(), userId: owner, profileId: selected.id)
             }
-            connections = try connections(of: selected.id)
+            connections = try await connections(of: selected.id)
             connectionsProfileId = selected.id
         }
         publishScope()
@@ -149,9 +152,13 @@ class WorkspaceProfileStore: ObservableObject {
             for profile in destinations {
                 guard !Task.isCancelled, self.backend.userId == userId else { return }
                 do {
-                    let mailboxes = try self.connections(of: profile.id)
-                    let overrides = profile.id == activeId ? accountSettings
-                        : try self.rows.settings(userId: userId, profileId: profile.id) ?? UserProfile()
+                    let mailboxes = try await self.connections(of: profile.id)
+                    let overrides: UserProfile
+                    if profile.id == activeId {
+                        overrides = accountSettings
+                    } else {
+                        overrides = try await self.rows.settings(userId: userId, profileId: profile.id) ?? UserProfile()
+                    }
                     let preferences = try accountSettings.replacingWorkspaceSettings(with: overrides)
                     guard preferences.mailHeadersOnly != true else { continue }
                     let ownedMailboxes = mailboxes.filter { !$0.needsReauth }
@@ -191,11 +198,11 @@ class WorkspaceProfileStore: ObservableObject {
             guard let owner, profiles.contains(where: { $0.id == profile.id }) else { throw WorkspaceProfileError.notFound }
             // The outgoing profile keeps the settings it had; the destination brings its own.
             if let outgoing = selected {
-                try rows.saveSettings(UserProfile.capturingLocalSettings(), userId: owner, profileId: outgoing.id)
+                try await rows.saveSettings(UserProfile.capturingLocalSettings(), userId: owner, profileId: outgoing.id)
             }
-            let destination = try connections(of: profile.id)
-            let settings = try rows.settings(userId: owner, profileId: profile.id) ?? UserProfile()
-            let dossier = Container.shared.profileDossier().context(owner: owner, profileId: profile.id)
+            let destination = try await connections(of: profile.id)
+            let settings = try await rows.settings(userId: owner, profileId: profile.id) ?? UserProfile()
+            let dossier = await Container.shared.profileDossier().context(owner: owner, profileId: profile.id)
             mark("destination read")
             try Container.shared.userProfile().applyWorkspaceSettings(settings)
             selected = profile
@@ -204,8 +211,8 @@ class WorkspaceProfileStore: ObservableObject {
             needsConnection = destination.isEmpty
             publishScope()
             Container.shared.realtimeService().installProfileDossier(dossier, profileId: profile.id)
-            // Synchronous, so a call that reads them next sees the destination's commands.
-            Container.shared.customCommands().refresh()
+            // Awaited, so a call that reads them next sees the destination's commands.
+            await Container.shared.customCommands().refresh()
             UserDefaults.standard.set(profile.id, forKey: selectionKey)
             // The account's settings row mirrors the active profile, which the server still reads.
             Task {
@@ -252,17 +259,17 @@ class WorkspaceProfileStore: ObservableObject {
         }
         do {
             guard let owner = backend.userId else { throw BackendError.notSignedIn }
-            let held = try connections(of: profile.id)
+            let held = try await connections(of: profile.id)
             for mailbox in held { await Container.shared.connections().disconnectGmail(mailbox.email) }
             for grant in NotionTools.grants(profileId: profile.id) {
                 await RemoteMCPAuth.revoke(grant)
                 RemoteMCPGrantStore.remove(grant.id, .notion)
             }
-            do { try rows.delete(userId: owner, id: profile.id) }
+            do { try await rows.delete(userId: owner, id: profile.id) }
             catch WorkspaceProfileError.notFound { /* Already gone — deletion is idempotent. */ }
             // Queued voice notes attributed to the deleted profile have nowhere to run; drop them with it.
             Container.shared.memoQueue().purge(profileId: profile.id)
-            do { try Container.shared.customCommandRows().purge(userId: owner, profileId: profile.id) }
+            do { try await Container.shared.customCommandRows().purge(userId: owner, profileId: profile.id) }
             catch { RealtimeLog.log("commands: profile purge failed — \(error.localizedDescription)") }
             try await load()
         } catch { self.error = error.localizedDescription }
@@ -277,13 +284,13 @@ class WorkspaceProfileStore: ObservableObject {
 
     func create(_ name: String) async throws {
         guard let owner = backend.userId else { throw BackendError.notSignedIn }
-        let profile = try rows.create(userId: owner, name: name)
+        let profile = try await rows.create(userId: owner, name: name)
         try await load()
         await choose(profile)
     }
     func rename(_ profile: WorkspaceProfile, name: String) async throws {
         guard let owner = backend.userId else { throw BackendError.notSignedIn }
-        _ = try rows.rename(userId: owner, id: profile.id, name: name)
+        _ = try await rows.rename(userId: owner, id: profile.id, name: name)
         try await load()
     }
 
@@ -291,7 +298,7 @@ class WorkspaceProfileStore: ObservableObject {
     /// to the default. Used by the voice create.
     func createUnselected(_ name: String) async throws -> WorkspaceProfile {
         guard let owner = backend.userId else { throw BackendError.notSignedIn }
-        let profile = try rows.create(userId: owner, name: name)
+        let profile = try await rows.create(userId: owner, name: name)
         guard loaded, self.owner == owner, !profiles.contains(where: { $0.id == profile.id }) else { return profile }
         profiles.append(profile)
         publishScope()
@@ -303,7 +310,7 @@ class WorkspaceProfileStore: ObservableObject {
     /// `switch_profile` and the picker keep the old name.
     func renameInPlace(_ profile: WorkspaceProfile, name: String) async throws -> WorkspaceProfile {
         guard let owner = backend.userId else { throw BackendError.notSignedIn }
-        let renamed = try rows.rename(userId: owner, id: profile.id, name: name)
+        let renamed = try await rows.rename(userId: owner, id: profile.id, name: name)
         if let index = profiles.firstIndex(where: { $0.id == renamed.id }) { profiles[index] = renamed }
         if selected?.id == renamed.id { selected = renamed }
         publishScope()
@@ -311,14 +318,14 @@ class WorkspaceProfileStore: ObservableObject {
         return renamed
     }
 
-    func dossierEnabled(for profileId: String) throws -> Bool {
+    func dossierEnabled(for profileId: String) async throws -> Bool {
         guard let owner = backend.userId else { throw BackendError.notSignedIn }
-        return try rows.dossierEnabled(userId: owner, profileId: profileId)
+        return try await rows.dossierEnabled(userId: owner, profileId: profileId)
     }
 
-    func setDossierEnabled(_ enabled: Bool, for profileId: String) throws {
+    func setDossierEnabled(_ enabled: Bool, for profileId: String) async throws {
         guard let owner = backend.userId else { throw BackendError.notSignedIn }
-        try rows.setDossierEnabled(enabled, userId: owner, profileId: profileId)
+        try await rows.setDossierEnabled(enabled, userId: owner, profileId: profileId)
     }
 
     /// Resolve a spoken profile name. Exact but case-blind, after the punctuation a model

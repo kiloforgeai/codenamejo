@@ -114,7 +114,7 @@ enum LocalEmailPresentation {
         var categories: [EmailCategoryRows.Row]?
         if suggestions {
             if let userId {
-                do { categories = try deps.store.known(userId: userId, account: account) } catch {
+                do { categories = try await deps.store.known(userId: userId, account: account) } catch {
                     RealtimeLog.log("livePreparation: categories unavailable — \(error.localizedDescription)")
                 }
             } else {
@@ -174,7 +174,7 @@ enum LocalEmailPresentation {
                 : categorizing?.first { $0.name == chosen.category.name }?.description
                     ?? chosen.category.name.replacingOccurrences(of: "_", with: " ")
             do {
-                try deps.store.touch(userId: userId, account: account, name: chosen.category.name,
+                try await deps.store.touch(userId: userId, account: account, name: chosen.category.name,
                                      description: description, now: deps.now())
             } catch {
                 RealtimeLog.log("livePreparation: category write failed — \(error.localizedDescription)")
@@ -726,7 +726,7 @@ enum LocalEmailPresentation {
             return false
         }
         let row: EmailCategoryRows.Row?
-        do { row = try deps.store.category(userId: userId, account: account, name: category) } catch {
+        do { row = try await deps.store.category(userId: userId, account: account, name: category) } catch {
             RealtimeLog.log("playbook: \(category) read failed — \(error.localizedDescription)")
             return false
         }
@@ -745,7 +745,7 @@ enum LocalEmailPresentation {
             return false
         }
         guard let playbook else { return false }
-        do { try deps.store.setPlaybook(userId: userId, account: account, name: category, playbook: playbook) } catch {
+        do { try await deps.store.setPlaybook(userId: userId, account: account, name: category, playbook: playbook) } catch {
             RealtimeLog.log("playbook: \(category) write failed — \(error.localizedDescription)")
             return false
         }

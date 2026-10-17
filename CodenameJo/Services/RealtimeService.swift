@@ -282,20 +282,16 @@ class RealtimeService: ObservableObject {
         liveDispatches.append(LiveDispatch(id: id, task: task, slot: slot))
     }
 
-    /// Mark a droplet as come home, and sweep the ones that have finished playing.
-    ///
-    /// The sweep is here rather than on a timer because this is the only thing that
-    /// adds to the finished set, so it is the only moment the set can need trimming.
+    /// Mark a droplet as come home, then sweep it once it has finished playing, so the last
+    /// droplet of a call does not keep the overlay mounted for the rest of it.
     private func finishLiveDispatch(_ id: UUID) {
-        if let index = liveDispatches.firstIndex(where: { $0.id == id }) {
-            liveDispatches[index].finishedAt = Date()
-        }
-        let now = Date()
-        liveDispatches.removeAll { job in
-            // Long enough for the merge to play out, and for a stale droplet to
-            // dissolve. Both are sub-second; two is slack, not a deadline.
-            guard let finishedAt = job.finishedAt else { return false }
-            return now.timeIntervalSince(finishedAt) > 2
+        guard let index = liveDispatches.firstIndex(where: { $0.id == id }) else { return }
+        liveDispatches[index].finishedAt = Date()
+        // Long enough for the merge to play out, and for a stale droplet to dissolve. Both are
+        // sub-second; two is slack, not a deadline.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            self?.liveDispatches.removeAll { $0.id == id }
         }
     }
 
@@ -1559,6 +1555,9 @@ class RealtimeService: ObservableObject {
         // the same because it deliberately does not pass through `disconnect()`.
         lastToolUsed = nil
         turnSteps = []
+        // The droplets go with the call: a job that outlives it reports through the next
+        // dial's digest, not a bead orbiting a dead session.
+        liveDispatches = []
         // The microphone and the dispatch budget are both free again — so anything that
         // arrived during the call, or was stopped part-way through a drain by it, goes
         // now rather than waiting for the next launch.
