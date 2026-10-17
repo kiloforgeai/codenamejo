@@ -20,31 +20,7 @@ struct TurnLatency: Equatable, Codable, Hashable {
     var toFirstTokenMs: Int?
     var toFirstAudioMs: Int?
 
-    /// **The two transcript legs are timed from different marks, deliberately,
-    /// because they answer different questions and one alone misleads.**
-    ///
-    /// Both exist to settle whether transcribing on the phone is faster than the
-    /// round trip to `gpt-live-transcribe` — a claim that is structurally obvious
-    /// (a full RTT is deleted) and has never been measured, which in this
-    /// codebase is the state that precedes being wrong. They are directly
-    /// comparable across the two paths, so pointing a build at an old broker and
-    /// a new one gives the answer.
-    ///
-    /// - `toFirstTranscriptMs` runs from **speech started**: how long after you
-    ///   begin talking the first words appear. This is the live lag, and it is
-    ///   where the round trip is expected to show up.
-    /// - `toFinalTranscriptMs` runs from **speech stopped**, like every other leg
-    ///   here: how long after you finish the settled text exists. This is what
-    ///   History and the hang-up phrase wait on — and the one place the local
-    ///   path is knowingly *slower*, because `LocalTranscriber.settleGrace` holds
-    ///   it for 450 ms so Apple's finaliser can catch the last few words.
-    var toFirstTranscriptMs: Int?
-    var toFinalTranscriptMs: Int?
-
-    /// Which path produced the two numbers above. Without it they are a pair of
-    /// milliseconds with nothing to compare against — the whole point is the
-    /// difference between the phone and the round trip, and that is not
-    /// recoverable from the build number once both are in the field.
+    /// Whether the phone, rather than the server, produced this turn's transcript.
     var transcribedOnDevice: Bool?
 
     /// Where this turn sat in the call — 1 for the first ask, counting every turn
@@ -86,11 +62,6 @@ struct TurnLatency: Equatable, Codable, Hashable {
 
     /// Nothing was measured — the turn was echo, or was cut off before it spoke.
     /// A record with this is not worth storing, and `isEmpty` is what decides.
-    ///
-    /// **The transcript legs are deliberately not part of this test.** A turn that
-    /// produced words but no answer is still a turn nobody got a reply to, and
-    /// counting it as measured would start storing records this has always
-    /// dropped — a behaviour change smuggled in behind an instrumentation one.
     var isEmpty: Bool {
         toResponseCreatedMs == nil && toFirstTokenMs == nil && toFirstAudioMs == nil
     }

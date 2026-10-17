@@ -29,10 +29,10 @@ final class InstallIdentityMigrationTests: XCTestCase {
 
         // What the Better Auth build left behind.
         let profiles = WorkspaceProfileRows(dbPool: pool)
-        let work = try profiles.create(userId: old, name: "Work")
-        try profiles.adopt(userId: old, emails: ["me@example.test"], into: work.id)
-        try EmailCategoryRows(dbPool: pool).touch(userId: old, account: "me@example.test",
-                                                  name: "receipts", description: "Receipts")
+        let work = try await profiles.create(userId: old, name: "Work")
+        try await profiles.adopt(userId: old, emails: ["me@example.test"], into: work.id)
+        try await EmailCategoryRows(dbPool: pool).touch(userId: old, account: "me@example.test",
+                                                        name: "receipts", description: "Receipts")
         let turns = TurnStore(database: pool)
         await turns.record(TurnStore.Turn(id: "t1", userId: old, conversationId: "c", commandText: "hi",
             responseText: "hello", serviceName: "General", status: "success", issuedAt: Date()))
@@ -48,10 +48,12 @@ final class InstallIdentityMigrationTests: XCTestCase {
 
         try migrator.migrate(pool)
 
-        XCTAssertTrue(try profiles.list(userId: install).contains { $0.id == work.id && $0.name == "Work" })
-        XCTAssertEqual(try profiles.mailboxes(userId: install, profileId: work.id), ["me@example.test"])
-        XCTAssertEqual(try EmailCategoryRows(dbPool: pool).known(userId: install, account: "me@example.test").map(\.name),
-                       ["receipts"])
+        let listed = try await profiles.list(userId: install)
+        XCTAssertTrue(listed.contains { $0.id == work.id && $0.name == "Work" })
+        let mailboxes = try await profiles.mailboxes(userId: install, profileId: work.id)
+        XCTAssertEqual(mailboxes, ["me@example.test"])
+        let categories = try await EmailCategoryRows(dbPool: pool).known(userId: install, account: "me@example.test")
+        XCTAssertEqual(categories.map(\.name), ["receipts"])
         let owners = try await pool.read { db in
             try [String: String](uniqueKeysWithValues: Row.fetchAll(db, sql: "SELECT id, user_id FROM turn_row")
                 .map { ($0["id"] as String, $0["user_id"] as String) })

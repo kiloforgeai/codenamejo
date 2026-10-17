@@ -37,29 +37,36 @@ class CommandStore: ObservableObject {
         }
     }
 
-    /// Store a finished turn. Returns whether it was stored, so the caller can queue a retry.
+    /// Store and publish only the changed turn; false lets the caller queue a retry.
     @discardableResult
     func save(_ record: CommandRecord, expectedUserId: String? = nil) async -> Bool {
         if let expectedUserId, backend.userId != expectedUserId { return false }
         guard let accountOwner = backend.userId else { return false }
         let owner = accountOwner + (record.profile_id.map { ":profile:" + $0 } ?? "")
-        var saved = false
         do {
             try await turns.save(TurnStore.Turn(record, userId: owner))
-            saved = true
         } catch {
             RealtimeLog.log("history: turn \(record.id) not stored — \(error)")
+            return false
         }
-        await refresh()
-        return saved
+        // A turn of another profile, or of an account that signed out meanwhile, is not drawn here.
+        guard backend.isSignedIn, owner == Container.shared.workspaceProfiles().contextOwner else { return true }
+        if let index = commands.firstIndex(where: { $0.id == record.id }) {
+            commands[index] = record
+        } else {
+            // Newest first, as `TurnStore.history` orders them.
+            let index = commands.firstIndex { $0.issuedAt <= record.issuedAt } ?? commands.count
+            commands.insert(record, at: index)
+        }
+        return true
     }
 
     func delete(_ record: CommandRecord) async {
         do {
             try await turns.remove(id: record.id)
+            commands.removeAll { $0.id == record.id }
         } catch {
             RealtimeLog.log("history: turn \(record.id) not deleted — \(error)")
         }
-        await refresh()
     }
 }

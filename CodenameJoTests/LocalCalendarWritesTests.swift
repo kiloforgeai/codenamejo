@@ -80,7 +80,6 @@ final class LocalCalendarWritesTests: XCTestCase {
         let result = await run("respond_to_calendar_event", ["event_id": "e1", "response": "declined"])
         XCTAssertEqual(result.text, "Declined \"Planning\" (2026-10-12T10:00:00-07:00) as \(owner). The organizer was notified.")
         XCTAssertEqual(result.ok, true)
-        XCTAssertTrue(CalendarRSVPQueuePolicy.brokerAccepted(output: result.text, response: "declined", brokerVerdict: result.ok))
         let patch = try XCTUnwrap(writes(scripted).first)
         XCTAssertEqual(patch.method, "PATCH")
         XCTAssertEqual(patch.query["sendUpdates"], "all")

@@ -83,6 +83,77 @@ enum TriageQueueSnapshotStore {
         var beforeID: String? = nil
         var topicGrouping: Bool? = nil
         var presentedTopicKeys: [String]? = nil
+        /// Items, mail count and keys omitted before the cursor. Nil for legacy full-buffer rows.
+        var trimmedItems: Int? = nil
+        var trimmedOrdinals: Int? = nil
+        var trimmedKeys: [String]? = nil
+
+        /// This buffer row with its cursor row laid over it: the cursor's position is in the live
+        /// buffer's terms, so the items the row left out are taken off it and added to the ordinal.
+        func applying(_ cursor: Cursor) -> Payload {
+            Payload(
+                items: items, grouping: grouping, accounts: accounts,
+                position: cursor.position - (trimmedItems ?? 0),
+                ordinalOffset: cursor.ordinalOffset + (trimmedOrdinals ?? 0),
+                before: cursor.before, more: cursor.more, total: cursor.total,
+                mailboxUnreadAtStart: mailboxUnreadAtStart, scope: scope, scopeUnsaid: cursor.scopeUnsaid,
+                scopePlan: scopePlan, adopted: adopted, completed: cursor.completed,
+                gmailWalkDealtWith: cursor.gmailWalkDealtWith,
+                summarizedReadThreads: cursor.summarizedReadThreads,
+                pendingArchives: cursor.pendingArchives, dispatchSweepIDs: cursor.dispatchSweepIDs,
+                band: cursor.band, beforeScore: cursor.beforeScore, beforeID: cursor.beforeID,
+                topicGrouping: topicGrouping, presentedTopicKeys: cursor.presentedTopicKeys,
+                trimmedItems: trimmedItems, trimmedOrdinals: trimmedOrdinals, trimmedKeys: trimmedKeys)
+        }
+    }
+
+    /// The part of a checkpoint that moves on every step, in its own row (`split` = `cursorSplit`):
+    /// a step writes these few fields, and the item buffer only when the buffer itself changed.
+    struct Cursor: Codable, Sendable {
+        /// Position in the live buffer. `Payload.applying` translates it to the saved one.
+        let position: Int
+        let ordinalOffset: Int
+        let before: Int64?
+        let more: Bool
+        let total: Int
+        let completed: Bool
+        let scopeUnsaid: Bool
+        let gmailWalkDealtWith: [String]
+        let summarizedReadThreads: [String]
+        let pendingArchives: [PendingArchive]?
+        let dispatchSweepIDs: [String]?
+        let band: String?
+        let beforeScore: Int?
+        let beforeID: String?
+        let presentedTopicKeys: [String]
+    }
+
+    /// The `split` of a cursor row; the item buffer row's is `""`, as every row's was before the split.
+    static let cursorSplit = "cursor"
+
+    static func key(account: String, day: String, scope: Scope, split: String) -> String {
+        [account.lowercased(), day, scope.rawValue, split].joined(separator: "|")
+    }
+
+    /// Overlay cursors on their buffers, newest update first; legacy rows stand alone.
+    private static func payloads(
+        _ records: [DailyEmailQueueSnapshotRecord]
+    ) -> [(record: DailyEmailQueueSnapshotRecord, saved: Payload)] {
+        let decoder = JSONDecoder()
+        var cursors: [String: (cursor: Cursor, updatedAt: Date)] = [:]
+        for record in records where record.split == cursorSplit {
+            guard let cursor = try? decoder.decode(Cursor.self, from: record.payload),
+                  let scope = Scope(rawValue: record.scope) else { continue }
+            cursors[key(account: record.account, day: record.localDay, scope: scope, split: "")] = (cursor, record.updatedAt)
+        }
+        return records.filter { $0.split.isEmpty }
+            .compactMap { record -> (DailyEmailQueueSnapshotRecord, Payload, Date)? in
+                guard let saved = try? decoder.decode(Payload.self, from: record.payload) else { return nil }
+                guard let (cursor, movedAt) = cursors[record.key] else { return (record, saved, record.updatedAt) }
+                return (record, saved.applying(cursor), max(record.updatedAt, movedAt))
+            }
+            .sorted { $0.2 > $1.2 }
+            .map { ($0.0, $0.1) }
     }
 
     static func localDay(for date: Date = Date(), calendar: Calendar = .current) -> String {
@@ -225,10 +296,8 @@ enum TriageQueueSnapshotStore {
             if let wantedScope { request = request.filter(Column("scope") == wantedScope) }
             return try request.order(Column("updatedAt").desc).fetchAll(db)
         }) ?? []
-        let decoder = JSONDecoder()
-        for record in records {
-            guard let saved = try? decoder.decode(Payload.self, from: record.payload),
-                  !saved.completed else { continue }
+        for (record, saved) in payloads(records) {
+            guard !saved.completed else { continue }
             let savedAccounts = Set((saved.accounts ?? saved.items.map(\.account)).map {
                 $0.lowercased()
             })
@@ -257,30 +326,57 @@ enum TriageQueueSnapshotStore {
     /// Today's checkpoints for this account, newest first. Rows that no longer decode are skipped.
     static func savedToday(account: String, userId: String, database: DatabasePool) async throws -> [Payload] {
         let day = localDay()
+        // The row is keyed by the mailbox as it was connected; callers may spell it lowercased.
         let records = try await database.read { db in
             try DailyEmailQueueSnapshotRecord.filter(Column("user_id") == userId)
-                .filter(Column("account") == account)
                 .filter(Column("localDay") == day).order(Column("updatedAt").desc).fetchAll(db)
-        }
-        return records.compactMap { try? JSONDecoder().decode(Payload.self, from: $0.payload) }
+        }.filter { $0.account.caseInsensitiveCompare(account) == .orderedSame }
+        return payloads(records).map(\.saved)
     }
 
-    /// Save this account's checkpoint for today, replacing the one for its scope.
-    static func save(_ payload: Payload, account: String, day: String, scope: LocalTriageQueue.Scope,
-                     store: MailStore, database: DatabasePool) async {
-        guard let data = try? JSONEncoder().encode(payload) else { return }
-        let key = [account.lowercased(), day, scope.rawValue, ""].joined(separator: "|")
-        let record = DailyEmailQueueSnapshotRecord(
-            key: key, account: account, localDay: day, scope: scope.rawValue,
-            split: "", payload: data, updatedAt: Date(), userId: store.userId)
-        try? await database.write { db in
-            try record.save(db)
-            // Day rollover is destructive for this account by design; another account's
-            // checkpoint remains separate.
-            try DailyEmailQueueSnapshotRecord
-                .filter(Column("user_id") == store.userId)
-                .filter(Column("account") == account && Column("localDay") != day)
-                .deleteAll(db)
+    struct BufferMissing: Error {}
+
+    /// Atomically save a cursor and optional buffer. A cursor-only write requires an existing
+    /// buffer; false tells the caller to resend it.
+    @discardableResult
+    static func save(cursor: Cursor, buffer: Payload?, account: String, day: String, scope: Scope,
+                     store: MailStore, database: DatabasePool) async -> Bool {
+        let encoder = JSONEncoder()
+        guard let cursorData = try? encoder.encode(cursor) else { return false }
+        let bufferData: Data?
+        if let buffer {
+            guard let data = try? encoder.encode(buffer) else { return false }
+            bufferData = data
+        } else {
+            bufferData = nil
+        }
+        let now = Date()
+        let bufferKey = key(account: account, day: day, scope: scope, split: "")
+        let cursorRecord = DailyEmailQueueSnapshotRecord(
+            key: key(account: account, day: day, scope: scope, split: cursorSplit), account: account,
+            localDay: day, scope: scope.rawValue, split: cursorSplit, payload: cursorData, updatedAt: now,
+            userId: store.userId)
+        do {
+            try await database.write { db in
+                if let bufferData {
+                    try DailyEmailQueueSnapshotRecord(
+                        key: bufferKey, account: account, localDay: day, scope: scope.rawValue,
+                        split: "", payload: bufferData, updatedAt: now, userId: store.userId).save(db)
+                } else if try !DailyEmailQueueSnapshotRecord.exists(db, key: bufferKey) {
+                    throw BufferMissing()
+                }
+                try cursorRecord.save(db)
+                // Day rollover is destructive for this account by design; another account's
+                // checkpoint remains separate.
+                try DailyEmailQueueSnapshotRecord
+                    .filter(Column("user_id") == store.userId)
+                    .filter(Column("account") == account && Column("localDay") != day)
+                    .deleteAll(db)
+            }
+            return true
+        } catch {
+            RealtimeLog.log("localTriage: checkpoint not written — \(error)")
+            return false
         }
     }
 

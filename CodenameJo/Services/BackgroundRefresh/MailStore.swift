@@ -1303,26 +1303,6 @@ struct MailStore: Sendable {
         } ?? nil
     }
 
-    /// How much of the **cached** unread mail Gmail flags as important.
-    /// A floor, not a split: the cache holds about a day. Never present it as an exact share of `inboxUnread()`.
-    func unreadImportantCount() async -> Int {
-        guard let dbPool else { return 0 }
-        return (try? await dbPool.read { db in
-            try Int.fetchOne(
-                db,
-                sql: """
-                    SELECT COUNT(*) FROM \(Message.databaseTableName) m
-                     WHERE m.user_id = \(ownerSQL) AND EXISTS (SELECT 1 FROM \(Label.databaseTableName) l
-                                    WHERE l.user_id = m.user_id AND l.account = m.account AND l.messageId = m.id AND l.label = 'UNREAD')
-                       AND EXISTS (SELECT 1 FROM \(Label.databaseTableName) inbox
-                                    WHERE inbox.user_id = m.user_id AND inbox.account = m.account AND inbox.messageId = m.id AND inbox.label = 'INBOX')
-                       AND EXISTS (SELECT 1 FROM \(Label.databaseTableName) l2
-                                    WHERE l2.user_id = m.user_id AND l2.account = m.account AND l2.messageId = m.id AND l2.label = 'IMPORTANT')
-                    """
-            ) ?? 0
-        }) ?? 0
-    }
-
     /// Cached inbox messages carrying one Gmail label. Nil when there is no cache or the
     /// read failed, so a caller can tell "none" from "unknown".
     func inboxLabelCount(_ label: String) async -> Int? {

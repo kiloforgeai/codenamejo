@@ -67,6 +67,20 @@ final class LiveSessionAdapter {
     private var calls: [Call] = []
     private var seenCalls: Set<String> = []
     private var activeCall: Call?
+    /// Calls the watchdog answered on the phone's behalf; their real result, if it ever
+    /// arrives, is logged and dropped rather than reported as a mismatch.
+    private var releasedCalls: Set<String> = []
+    private var callWatchdog: Task<Void, Never>?
+    /// Maximum execution time before the adapter supplies an unfinished result.
+    /// A missing output must not block later user turns.
+    static let toolCallBound: TimeInterval = 30
+    /// Per instance so tests can shorten it.
+    var toolCallBound: TimeInterval = LiveSessionAdapter.toolCallBound
+    /// The output posted for a call the phone never answered. It names no outcome either way:
+    /// the write may have gone through, so a retry could double it.
+    static let toolCallUnfinished = "Not completed: the application did not confirm this action within its time limit. "
+        + "It may or may not have taken effect, so do not repeat it and do not advance the queue. "
+        + "Tell the user briefly that it did not confirm, then wait for their next instruction."
     private var runningResponses: Set<String> = []
     private var backendStarting = false
     private var backendRunning: Bool { backendStarting || !runningResponses.isEmpty }
@@ -575,6 +589,10 @@ final class LiveSessionAdapter {
             if item["type"] as? String == "function_call_output",
                let id = item["call_id"] as? String, let output = item["output"] as? String {
                 if finishFastAction(id: id, output: output) { return }
+                if releasedCalls.remove(id) != nil {
+                    RealtimeLog.log("liveTurn: late result for released call \(id) dropped")
+                    return
+                }
                 guard activeCall?.id == id else {
                     emit(.event(.error(message: "Unmatched Live tool result", code: "live_tool_result_mismatch")))
                     return
@@ -593,6 +611,8 @@ final class LiveSessionAdapter {
                 compacted["output"] = compactingNotes(output)
                 pendingFunctionOutputs.append(["type": "response.item.create", "event_id": UUID().uuidString, "item": compacted])
                 activeCall = nil
+                callWatchdog?.cancel()
+                callWatchdog = nil
                 continuationOwed = true
                 flushFunctionOutputs()
                 runNextCall()
@@ -703,6 +723,7 @@ final class LiveSessionAdapter {
                let arguments = item["arguments"] as? String,
                let delegation = event["delegation_id"] as? String ?? responseID.flatMap({ responseDelegations[$0] }),
                seenCalls.insert(id).inserted {
+                clientBrain?.acceptToolCall(id)
                 calls.append(Call(id: id, name: name, arguments: arguments, delegation: delegation,
                                   recoveryAnchor: delegationTurns[delegation].flatMap { recoveryAnchors[$0] }))
                 delegationStepTools[delegation, default: []].append(name)
@@ -949,7 +970,23 @@ final class LiveSessionAdapter {
         }
         if delegationTurns[call.delegation] == inputTurn { authorizationText = "" }
         trace("tool_started", call: call.id, delegation: call.delegation)
+        armCallWatchdog(for: call)
         emit(.liveFunction(call))
+    }
+
+    /// Answer for a phone tool that never posts, so the call cannot stay busy until hang-up.
+    private func armCallWatchdog(for call: Call) {
+        callWatchdog?.cancel()
+        let bound = toolCallBound
+        callWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(bound))
+            guard let self, !Task.isCancelled, !closed, activeCall?.id == call.id else { return }
+            RealtimeLog.log("liveTurn: \(call.name) \(call.id) unanswered after \(Int(bound))s; answering for it")
+            trace("tool_unanswered", call: call.id, delegation: call.delegation)
+            outbound(["type": "conversation.item.create", "item": ["type": "function_call_output",
+                "call_id": call.id, "output": Self.toolCallUnfinished]])
+            releasedCalls.insert(call.id)
+        }
     }
 
     private func continueBackendIfReady() {
@@ -1166,6 +1203,8 @@ final class LiveSessionAdapter {
         closed = true
         recoveryOutput.removeAll()
         clientBrain?.close()
+        callWatchdog?.cancel()
+        callWatchdog = nil
         inputFinalizer?.cancel()
         idlePending = false
         unworkedPending = false

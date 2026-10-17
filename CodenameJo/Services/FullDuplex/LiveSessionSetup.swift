@@ -149,11 +149,6 @@ enum LiveSessionSetup {
             // No `gmail_find_person` is declared beside this — same as `triage_next`. Two resolvers
             // over one mailbox would disagree, and the model would pick by name.
             PhoneTool(s.findPerson) { $0.answerFindPerson(callId: $1.id, argumentsJSON: $1.arguments) },
-            // The calendar window this phone already holds. **Distinctly named, not
-            // `list_calendar_events`** — that is `CalendarTools`' live Google read, for whatever this
-            // cache doesn't cover, and taking it over here would answer calls this phone cannot.
-            // Declared by nothing today: the queue names it only for a local calendar.
-            PhoneTool("search_calendar", nil) { $0.answerCalendarSearch(callId: $1.id, argumentsJSON: $1.arguments) },
             // The email queue, walked here. **The same name the old server's tool had**, and no
             // `gmail_triage_next` beside it: two queues would mean two cursors, and mail walked past twice.
             PhoneTool(s.triageNext) { $0.answerTriageNext(callId: $1.id, argumentsJSON: $1.arguments) },

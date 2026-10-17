@@ -91,8 +91,8 @@ struct WorkspaceProfileRows: Sendable {
     }
 
     /// Every profile, default first. A user with none gets "Personal" as the default.
-    func list(userId: String) throws -> [WorkspaceProfile] {
-        try pool().write { db in
+    func list(userId: String) async throws -> [WorkspaceProfile] {
+        try await pool().write { db in
             if try Profile.filter(Column("user_id") == userId).fetchCount(db) == 0 {
                 try Profile(user_id: userId, id: UUID().uuidString.lowercased(), name: "Personal", is_default: true,
                             created_at: Self.stamp.string(from: Date()), settings: nil, dossier_enabled: false).insert(db)
@@ -103,9 +103,9 @@ struct WorkspaceProfileRows: Sendable {
         }
     }
 
-    func create(userId: String, name raw: String) throws -> WorkspaceProfile {
+    func create(userId: String, name raw: String) async throws -> WorkspaceProfile {
         let name = try Self.validName(raw)
-        return try pool().write { db in
+        return try await pool().write { db in
             try Self.requireFreeName(name, userId: userId, except: nil, db: db)
             let row = Profile(user_id: userId, id: UUID().uuidString.lowercased(), name: name, is_default: false,
                               created_at: Self.stamp.string(from: Date()), settings: nil, dossier_enabled: false)
@@ -114,9 +114,9 @@ struct WorkspaceProfileRows: Sendable {
         }
     }
 
-    func rename(userId: String, id: String, name raw: String) throws -> WorkspaceProfile {
+    func rename(userId: String, id: String, name raw: String) async throws -> WorkspaceProfile {
         let name = try Self.validName(raw)
-        return try pool().write { db in
+        return try await pool().write { db in
             guard var row = try Profile.fetchOne(db, key: ["user_id": userId, "id": id]) else { throw WorkspaceProfileError.notFound }
             try Self.requireFreeName(name, userId: userId, except: id, db: db)
             row.name = name
@@ -133,8 +133,8 @@ struct WorkspaceProfileRows: Sendable {
 
     /// Removes a named profile with its settings, dossier and mailbox mapping. Returns the mailboxes it held.
     @discardableResult
-    func delete(userId: String, id: String) throws -> [String] {
-        try pool().write { db in
+    func delete(userId: String, id: String) async throws -> [String] {
+        try await pool().write { db in
             guard let row = try Profile.fetchOne(db, key: ["user_id": userId, "id": id]) else { throw WorkspaceProfileError.notFound }
             if row.is_default { throw WorkspaceProfileError.cannotDeleteDefault }
             let held = try String.fetchAll(db, sql: "SELECT email FROM workspace_profile_mailbox WHERE user_id = ? AND profile_id = ? ORDER BY email",
@@ -146,16 +146,16 @@ struct WorkspaceProfileRows: Sendable {
         }
     }
 
-    func mailboxes(userId: String, profileId: String) throws -> [String] {
-        try pool().read { db in
+    func mailboxes(userId: String, profileId: String) async throws -> [String] {
+        try await pool().read { db in
             try String.fetchAll(db, sql: "SELECT email FROM workspace_profile_mailbox WHERE user_id = ? AND profile_id = ? ORDER BY email",
                                 arguments: [userId, profileId])
         }
     }
 
     /// Places each mailbox no profile holds yet into `profileId`. Mapped mailboxes never move.
-    func adopt(userId: String, emails: [String], into profileId: String) throws {
-        try pool().write { db in
+    func adopt(userId: String, emails: [String], into profileId: String) async throws {
+        try await pool().write { db in
             for email in Set(emails.map { $0.lowercased() }) {
                 try db.execute(sql: "INSERT OR IGNORE INTO workspace_profile_mailbox(user_id, email, profile_id) VALUES (?, ?, ?)",
                                arguments: [userId, email, profileId])
@@ -164,57 +164,57 @@ struct WorkspaceProfileRows: Sendable {
     }
 
     /// A disconnected mailbox leaves its profile, so reconnecting it lands where the user is.
-    func forget(userId: String, email: String) throws {
-        try pool().write { db in
+    func forget(userId: String, email: String) async throws {
+        try await pool().write { db in
             try db.execute(sql: "DELETE FROM workspace_profile_mailbox WHERE user_id = ? AND email = ?", arguments: [userId, email.lowercased()])
         }
     }
 
-    func settings(userId: String, profileId: String) throws -> UserProfile? {
-        let json = try pool().read { db in
+    func settings(userId: String, profileId: String) async throws -> UserProfile? {
+        let json = try await pool().read { db in
             try String.fetchOne(db, sql: "SELECT settings FROM workspace_profile WHERE user_id = ? AND id = ?", arguments: [userId, profileId])
         }
         return try json.map { try JSONDecoder().decode(UserProfile.self, from: Data($0.utf8)) }
     }
 
     /// Keeps only the workspace fields of `settings`.
-    func saveSettings(_ settings: UserProfile, userId: String, profileId: String) throws {
+    func saveSettings(_ settings: UserProfile, userId: String, profileId: String) async throws {
         let scoped = try UserProfile().replacingWorkspaceSettings(with: settings)
         let json = String(decoding: try JSONEncoder().encode(scoped), as: UTF8.self)
-        try pool().write { db in
+        try await pool().write { db in
             try db.execute(sql: "UPDATE workspace_profile SET settings = ? WHERE user_id = ? AND id = ?", arguments: [json, userId, profileId])
         }
     }
 
-    func dossierEnabled(userId: String, profileId: String) throws -> Bool {
-        try pool().read { db in
+    func dossierEnabled(userId: String, profileId: String) async throws -> Bool {
+        try await pool().read { db in
             try Bool.fetchOne(db, sql: "SELECT dossier_enabled FROM workspace_profile WHERE user_id = ? AND id = ?",
                               arguments: [userId, profileId]) ?? false
         }
     }
 
-    func setDossierEnabled(_ enabled: Bool, userId: String, profileId: String) throws {
-        try pool().write { db in
+    func setDossierEnabled(_ enabled: Bool, userId: String, profileId: String) async throws {
+        try await pool().write { db in
             try db.execute(sql: "UPDATE workspace_profile SET dossier_enabled = ? WHERE user_id = ? AND id = ?",
                            arguments: [enabled, userId, profileId])
             if db.changesCount == 0 { throw WorkspaceProfileError.notFound }
         }
     }
 
-    func dossier(userId: String, profileId: String) throws -> Dossier? {
-        try pool().read { db in try Dossier.fetchOne(db, key: ["user_id": userId, "profile_id": profileId]) }
+    func dossier(userId: String, profileId: String) async throws -> Dossier? {
+        try await pool().read { db in try Dossier.fetchOne(db, key: ["user_id": userId, "profile_id": profileId]) }
     }
 
     /// Writes only while the profile still exists.
-    func saveDossier(_ dossier: Dossier) throws {
-        try pool().write { db in
+    func saveDossier(_ dossier: Dossier) async throws {
+        try await pool().write { db in
             guard try Profile.fetchOne(db, key: ["user_id": dossier.user_id, "id": dossier.profile_id]) != nil else { return }
             try dossier.save(db)
         }
     }
 
     /// Dossiers are built from transcripts, so they leave with the account's turns at sign-out.
-    func purgeDossiers(userId: String) throws {
-        try pool().write { db in try db.execute(sql: "DELETE FROM profile_dossier WHERE user_id = ?", arguments: [userId]) }
+    func purgeDossiers(userId: String) async throws {
+        try await pool().write { db in try db.execute(sql: "DELETE FROM profile_dossier WHERE user_id = ?", arguments: [userId]) }
     }
 }

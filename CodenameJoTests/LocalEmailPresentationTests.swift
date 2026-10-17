@@ -131,22 +131,26 @@ final class LocalEmailPresentationTests: XCTestCase {
         return EmailCategoryRows(dbPool: try XCTUnwrap(LocalContextStore(url: url).dbPool))
     }
 
-    func testStoreCapsOrdersAndScopesByUser() throws {
+    func testStoreCapsOrdersAndScopesByUser() async throws {
         let rows = try store()
         let start = Date(timeIntervalSince1970: 1_800_000_000)
         for index in 0..<22 {
-            try rows.touch(userId: "u1", account: "A@x.test", name: "c\(index)", description: "d",
-                           now: start.addingTimeInterval(Double(index)))
+            try await rows.touch(userId: "u1", account: "A@x.test", name: "c\(index)", description: "d",
+                                 now: start.addingTimeInterval(Double(index)))
         }
-        try rows.touch(userId: "u2", account: "a@x.test", name: "other", description: "d", now: start)
-        let known = try rows.known(userId: "u1", account: "a@x.test")
+        try await rows.touch(userId: "u2", account: "a@x.test", name: "other", description: "d", now: start)
+        let known = try await rows.known(userId: "u1", account: "a@x.test")
         XCTAssertEqual(known.count, EmailCategoryRows.maxCategories)
         XCTAssertEqual(known.first?.name, "c21")
-        XCTAssertNil(try rows.category(userId: "u1", account: "a@x.test", name: "c0"))
-        XCTAssertEqual(try rows.known(userId: "u2", account: "a@x.test").map(\.name), ["other"])
-        try rows.purge(userId: "u1")
-        XCTAssertTrue(try rows.known(userId: "u1", account: "a@x.test").isEmpty)
-        XCTAssertEqual(try rows.known(userId: "u2", account: "a@x.test").count, 1)
+        let dropped = try await rows.category(userId: "u1", account: "a@x.test", name: "c0")
+        XCTAssertNil(dropped)
+        var other = try await rows.known(userId: "u2", account: "a@x.test")
+        XCTAssertEqual(other.map(\.name), ["other"])
+        try await rows.purge(userId: "u1")
+        let purged = try await rows.known(userId: "u1", account: "a@x.test")
+        XCTAssertTrue(purged.isEmpty)
+        other = try await rows.known(userId: "u2", account: "a@x.test")
+        XCTAssertEqual(other.count, 1)
     }
 
     func testPrepareSummarizesStoresTheCategoryAndRewritesItsPlaybook() async throws {
@@ -178,13 +182,14 @@ final class LocalEmailPresentationTests: XCTestCase {
         let summary = try XCTUnwrap(first)
         XCTAssertNil(summary["service_tier"])
         XCTAssertEqual(summary["model"] as? String, "gpt-5.6-luna")
-        XCTAssertEqual(try rows.known(userId: "u1", account: "owner@example.test").map(\.description), ["Purchase receipts"])
+        let known = try await rows.known(userId: "u1", account: "owner@example.test")
+        XCTAssertEqual(known.map(\.description), ["Purchase receipts"])
 
         let changed = await P.reportPlaybook(account: " Owner@example.test ", category: "receipt",
             turns: [("user", "archive it"), ("assistant", "Done.")], tools: ["archive_message", "Bad-Name"], deps: deps)
         XCTAssertTrue(changed)
-        XCTAssertEqual(try rows.category(userId: "u1", account: "owner@example.test", name: "receipt")?.playbook,
-                       "They archive receipts.")
+        let receipt = try await rows.category(userId: "u1", account: "owner@example.test", name: "receipt")
+        XCTAssertEqual(receipt?.playbook, "They archive receipts.")
         let last = await requests.bodies.last
         let rewrite = try XCTUnwrap(last)
         XCTAssertNil(rewrite["service_tier"])

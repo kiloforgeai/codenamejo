@@ -348,8 +348,10 @@ final class WorkspaceProfilesInteractor: ViewModelInteractor<WorkspaceProfilesVi
     private func countConnections(of profile: WorkspaceProfile?, viewModel: WorkspaceProfilesViewModel) {
         guard let profile else { return }
         if profile.id == profiles.selected?.id { viewModel.deleteConnectionCount = profiles.connections.count; return }
-        do { viewModel.deleteConnectionCount = try profiles.connections(of: profile.id).count }
-        catch { viewModel.deleteConnectionCount = 0; viewModel.error = error.localizedDescription }
+        Task {
+            do { viewModel.deleteConnectionCount = try await profiles.connections(of: profile.id).count }
+            catch { viewModel.deleteConnectionCount = 0; viewModel.error = error.localizedDescription }
+        }
     }
 }
 

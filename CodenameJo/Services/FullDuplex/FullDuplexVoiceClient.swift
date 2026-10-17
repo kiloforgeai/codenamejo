@@ -202,15 +202,10 @@ final class FullDuplexVoiceClient {
     /// callbacks must not arm it again. Reset only for a new logical call, not a reconnect.
     private var openingAbandoned = false
     private var sessionReadyForOpening = false
-    private var toolsReadyForEmailOpening = false
-    /// Whether this session declared the device-owned `triage_next` function. A fresh email
-    /// opening can execute the same queue step directly and put its result into context before
-    /// asking the model to speak, collapsing the old tool-only response + continuation into one
-    /// model response. Kept separate from `toolsReadyForEmailOpening`, which also becomes true
-    /// when the remote MCP catalog lands.
+    /// Whether this session declared `triage_next`, allowing the opening to run the
+    /// queue step before asking the model to speak.
     private var localTriageForEmailOpening = false
     var onboardingFlow: EmailOnboardingFlow?
-    private var onboardingPreferenceOwnerId: String?
     var onboardingDispatches: Set<String> = []
     #if DEBUG
     /// Every dispatch function output by call id, for tests; the transport is nil there.
@@ -285,7 +280,6 @@ final class FullDuplexVoiceClient {
     var localCoachingDelivery = false
     private var interactiveCoaching = false
     var lastCoachingOfferId: String?
-    var calendarFeedDue = false
     private var calendarReadTool = "list_calendar_events"
     var calendarFeedPending = false
     private var calendarFeedOwners: [String] = []
@@ -301,7 +295,6 @@ final class FullDuplexVoiceClient {
     private(set) var slackOnDevice = false
     /// The Feed's Slack stage: accepted for this dial, then pending from the terminal feed
     /// that carries `slackDue` until the Slack queue closes.
-    var slackFeedDue = false
     var slackFeedPending = false
     var slackFeedOwners: [String] = []
     private var slackStageAsked = false
@@ -379,10 +372,6 @@ final class FullDuplexVoiceClient {
     /// replaced for.
     var hasAnnouncedConnect = false
     var cueTask: Task<Void, Never>?
-    /// True only while the cue is sounding and the mic is held at zero gain. Read by
-    /// `.speechStarted` to turn "did the duck work?" into a line in the log, which is
-    /// otherwise not answerable on device.
-    var isAnnouncingConnect = false
 
     /// Bounds the gap between the handshake landing and the call actually opening.
     /// See `armConnectWatchdog`.
@@ -394,66 +383,7 @@ final class FullDuplexVoiceClient {
     /// it already has a 15 s `URLSession` timeout, so anything still silent at ten
     /// seconds is not slow — it is not coming.
     ///
-    /// **Not `preConnectMaxHold`, which happens to carry the same number.** That one
-    /// bounds how long the *uplink* is held shut after the call opened, waiting for a
-    /// sentence to end; this one bounds whether the call opens at all. They are on
-    /// opposite sides of `.connected` and must not be collapsed into one constant.
     private static let connectDeadline: Duration = .seconds(10)
-
-    // MARK: - Talking before the call connects
-
-    /// What the user said while the session was still coming up, transcribed on the
-    /// phone. Handed to the model as a typed turn the moment the uplink opens; see
-    /// `handOffPreConnectSpeech`.
-    ///
-    /// **Replaced on every callback, never appended to, and that is not a shortcut.**
-    /// `LocalTranscriber.absorb` publishes `finalizedText + volatileText` — the whole
-    /// turn so far, not the newest fragment — so each callback supersedes the last and
-    /// appending would stack every intermediate reading of one sentence on itself.
-    ///
-    /// **And it must take partials, because no final can arrive here.** `LocalTranscriber`
-    /// never reports `isFinal: true`, so a version of this that waited for finals would
-    /// hand off an empty string on every call.
-    var preConnectText = ""
-
-    /// Whether the hand-off has happened. After this, speech goes over the wire as
-    /// audio like it always has, and nothing else is ever injected.
-    ///
-    /// It is the *cut* the design turns on: everything before it is text, everything
-    /// after is audio, and there is exactly one instant separating them. Without a
-    /// single clean boundary a sentence spoken across the connect lands half in the
-    /// buffer and half on the wire, and server VAD makes a turn out of the second half
-    /// while the first is still being injected.
-    var hasHandedOffPreConnect = false
-
-    /// When `preConnectText` last changed. The end-of-utterance signal.
-    var preConnectLastChangeAt: ContinuousClock.Instant?
-
-    /// Silence that ends the pre-connect utterance.
-    ///
-    /// Apple's transcriber publishes continuously while someone is talking and simply
-    /// stops when they stop, so "no new text for a while" is the only end-of-sentence
-    /// signal available here — server VAD, which normally draws turn boundaries, has by
-    /// definition not heard any of this. 400 ms sits above `LocalTranscriber`'s own
-    /// 150 ms settle grace and below the ~600 ms a person leaves between sentences.
-    static let preConnectSettle: Duration = .milliseconds(400)
-
-    /// The longest the uplink is held closed waiting for a sentence to end.
-    ///
-    /// Someone who talks continuously past this gets handed off mid-flow, which is the
-    /// old behaviour and is the right failure: the alternative is a call that never opens
-    /// its microphone because the user never paused.
-    static let preConnectMaxHold: Duration = .seconds(10)
-
-    /// The longest the uplink is held closed waiting for the tool list.
-    ///
-    /// **Shorter than `preConnectMaxHold`, and the two bound different things.** That one
-    /// waits on a person, who cannot be hurried and may talk for ten seconds. This waits on
-    /// a server that answers in 182 ms once it is asked, so anything past a few seconds is
-    /// a list that is not coming and the right move is to stop waiting. Five seconds clears
-    /// the worst dial measured (T+5.9 s from the tap, ~3.4 s from the point this is
-    /// reached) with room to spare.
-    static let toolsMaxHold: Duration = .seconds(5)
 
     /// Whether the session's server-side tools can be called yet.
     ///
@@ -504,9 +434,6 @@ final class FullDuplexVoiceClient {
     /// The last real, completed utterance, used exactly once to authorize a queue count.
     /// Keeping this in the transport makes the decision synchronous with the function call.
     var latestCompletedUserUtterance = ""
-    /// Set before the RSVP relay leaves the phone. A second calendar lookup from the same
-    /// model turn may still be in flight, but it must never notify the organizer twice.
-    private var calendarRSVPInFlight = false
 
     init(conversationId: @escaping () -> String? = { nil },
          queueStanding: @escaping () -> TriageQueueStore.QueueProgress? = { nil },
@@ -660,24 +587,18 @@ final class FullDuplexVoiceClient {
         dispatchRecoveryReady = false
         openingIncludesRecoveredAnswers = false
         latestCompletedUserUtterance = ""
-        calendarRSVPInFlight = false
         announcesConnect = playingCue
         hasAnnouncedConnect = false
         // Per dial, like everything else here. Left set, the second call of a session
         // would open by injecting whatever was said at the end of the first.
-        preConnectText = ""
-        preConnectLastChangeAt = nil
-        hasHandedOffPreConnect = false
         // Per dial, and a reconnect is a dial: `reconnect()` mints a fresh session, so
         // its tools are listed again from nothing. Left set, the redial that a tools
         // failure is *recovered* by would believe it already had them.
         toolsReachable = false
         sessionReadyForOpening = false
-        toolsReadyForEmailOpening = false
         localTriageForEmailOpening = false
         feedOfferStanding = false
         feedOfferAcceptedAt = nil
-        onboardingPreferenceOwnerId = nil
         onboardingOpeningSpoken = false
         sequentialFeed = false
         localCoachingDelivery = false
@@ -686,7 +607,6 @@ final class FullDuplexVoiceClient {
         pendingCoaching = nil
         pendingFeedCompletion = nil
         profileOfferAcceptedAt = nil
-        calendarFeedDue = false
         calendarReadTool = "list_calendar_events"
         calendarFeedPending = false
         calendarFeedOwners = []
@@ -695,7 +615,6 @@ final class FullDuplexVoiceClient {
         terminalFeedWrapUpPending = false
         terminalFeedWrapUpStage = "calendar"
         slackOnDevice = false
-        slackFeedDue = false
         slackFeedPending = false
         slackFeedOwners = []
         slackStageAsked = false
@@ -710,7 +629,6 @@ final class FullDuplexVoiceClient {
         turnsSoFar = 0
         turnCounted = false
         connectedAt = nil
-        lastLocalTranscriptAt = nil
         lastMicLoudAt = nil
         assistantTurns = [:]
         assistantAwaitsAnswer = false
@@ -723,7 +641,6 @@ final class FullDuplexVoiceClient {
         // hang-up before response.done must not carry that debt into the next dial.
         queueFinisherAwaitingAdvance = nil
         queueReceiptInstructionsPending = nil
-        lastAudibleEnd = nil
         onState?(.connecting)
 
         // Decide this dial's opening before the microphone comes up. A fresh email-led
@@ -902,11 +819,9 @@ final class FullDuplexVoiceClient {
             // the broker echoes `localTriage`. It does not depend on the remote MCP catalog,
             // so let Jo greet and call it as soon as the session exists. This overlaps the
             // on-device queue read with MCP import and removes roughly a second of dead dial.
-            toolsReadyForEmailOpening = session.localTriage
             localTriageForEmailOpening = session.localTriage
             onboardingFlow = session.onboardingFlow
             if isActive, dialGeneration == mintDial, Container.shared.backend().userId == mintOwner {
-                onboardingPreferenceOwnerId = mintOwner
                 if let preference = session.onboardingFlow?.mailPreference {
                     Task { [weak self] in
                         guard let self, self.isActive, self.dialGeneration == mintDial else { return }
@@ -920,19 +835,13 @@ final class FullDuplexVoiceClient {
             feedBriefingOwners = session.feedBriefingOwners
             localCoachingDelivery = session.localCoachingDelivery
             interactiveCoaching = session.interactiveCoaching
-            calendarFeedDue = session.calendarFeedDue
             calendarReadTool = LocalTriageQueue.calendarReadTool(
                 localCalendar: session.localCalendar)
             calendarFeedOwners = session.calendarFeedOwners
             slackOnDevice = session.localSlackTriage
-            slackFeedDue = session.localSlackTriage && session.profileSlackFeed
             greetPending = acceptedOpening != .none
             RealtimeLog.log("opening: requested \(opening.rawValue), accepted "
                 + acceptedOpening.rawValue)
-            // Captured at connect and read for the rest of the call, exactly like
-            // `RealtimeService.activeFullDuplex`: the answer has to be the one that
-            // matches the prompt this session was minted with.
-            asyncWritesConfirmed = session.asyncWrites
             // Awaited rather than spawned, so the queue is configured before any tool can run.
             await localTriage.configure(
                 liveFeatures: true,
@@ -1094,8 +1003,6 @@ final class FullDuplexVoiceClient {
         pump = nil
         queueFinisherAwaitingAdvance = nil
         queueReceiptInstructionsPending = nil
-        awaitingToolResult = false
-        cancelScheduledContinuation()
         // **Mic to zero before the cue, for the reason the connect cue holds it there.**
         // Our engine is not in libwebrtc's reference signal, so the canceller cannot
         // remove this tone; a cue that reaches server VAD is a last answer generated
@@ -1112,17 +1019,6 @@ final class FullDuplexVoiceClient {
             self.teardown(reason: reason)
             self.endCueTask = nil
         }
-    }
-
-    /// Tear down and dial again. Needed for audio mode, which is fixed at
-    /// session-activation time and can't be changed under a live call.
-    func reconnect() async throws {
-        guard isActive else { return }
-        let retryOpening = SessionOpening.afterReconnect(
-            requested: requestedOpening, wasAudible: openingWasAudible)
-        teardown(reason: "reconnect")
-        requestedOpening = retryOpening
-        try await start(playingCue: false)
     }
 
     /// `settled` fires once the microphone track has really changed — see
@@ -1180,8 +1076,6 @@ final class FullDuplexVoiceClient {
         // speaks it. Clearing the pending flag only covers a result that was
         // already posted; the item stays in the conversation either way, so the
         // next turn's response still sees it.
-        awaitingToolResult = false
-        cancelScheduledContinuation()
         // Dispatches and their unspoken answers are deliberately left alone. The
         // tap was aimed at the voice in the room, not at the inbox sweep the model
         // already said was running — and unlike the relay above, the argument
@@ -1284,19 +1178,16 @@ final class FullDuplexVoiceClient {
 
     private func teardown(reason: String) {
         logSuggestedAction(suggestedActions.ended())
-        if !reason.contains("reconnect") { reportPlaybook(leaving: standingStep) }
+        reportPlaybook(leaving: standingStep)
         resetLivePreparation()
         endAfterFarewell = false
         endWatchdog?.cancel()
         endWatchdog = nil
-        let isReconnect = reason.contains("reconnect")
-        if !isReconnect, let runId = onboardingFlow?.runId {
+        if let runId = onboardingFlow?.runId {
             onboardingFlow = nil
             onboardingDispatches = []
             Task { await localTriage.cancelOnboarding(runId: runId) }
         }
-        let retriesOpening = isReconnect && SessionOpening.afterReconnect(
-            requested: requestedOpening, wasAudible: openingWasAudible) != .none
         isActive = false
         feedFocusTracker.reset()
         onFeedFocus?(nil)
@@ -1316,25 +1207,16 @@ final class FullDuplexVoiceClient {
         cueTask?.cancel()
         cueTask = nil
         Task { await connectCue.stop() }
-        // The end cue is normally *finished* by the time teardown runs — it is what
-        // scheduled it. This covers the other order: a transport failure or a
-        // `reconnect()` tearing down while the cue is mid-note, where leaving it
-        // sounding would ring on over a call that no longer exists.
+        // Stop a cue still playing when transport failure triggers teardown.
         Task { await endCue.stop() }
         audio?.deactivate()
         audio = nil
-        // A deferral belongs to the prepared onboarding dial. If that dial fails, clear the
-        // stale *flow hold* so the replacement cannot stay muted, but retain first-call identity
-        // until Jo's introduction is actually audible. This covers failure both before and after
-        // `speakOpening()` lifts the deferral. An opening deliberately abandoned by its watchdog
-        // is spent instead of leaking first-run treatment into a later ordinary call. A tuning
-        // reconnect is the same logical call and retains both pieces of state.
-        if !isReconnect {
-            if openingWasAudible || openingAbandoned {
-                openingFollowsOnboarding = false
-            }
-            openingDeferred = false
+        // Clear a failed dial's flow hold, retaining first-call identity until the introduction
+        // is audible unless the opening watchdog already abandoned it.
+        if openingWasAudible || openingAbandoned {
+            openingFollowsOnboarding = false
         }
+        openingDeferred = false
         // The floor is open again on the next dial; a held mic must not outlive this one.
         // Publish the release too, or ending during the opening leaves the screen showing
         // an internal mute after this client has already cleared it.
@@ -1343,19 +1225,11 @@ final class FullDuplexVoiceClient {
         flowHold = false
         openingHoldWatchdog?.cancel()
         openingHoldWatchdog = nil
-        // Keep the published hold continuous only when this technical reconnect will retry
-        // the still-inaudible opening. Once the opening was audible, `afterReconnect` returns
-        // `.none`; publishing the release is what lets the replacement listening session
-        // restore its Mute and End controls while `isConversing` remains true.
-        if wasHoldingOpening, !retriesOpening { onOpeningHold?(false) }
+        if wasHoldingOpening { onOpeningHold?(false) }
         assistantAudible = false
         isMuted = false
-        audibleWatchdog?.cancel()
-        audibleWatchdog = nil
         greetPending = false
         emailFirstMessageReadyAt = nil
-        lastAudibleEnd = nil
-        cancelScheduledContinuation()
         functionCallTask?.cancel()
         functionCallTask = nil
         shortcutTask?.cancel()
@@ -1365,38 +1239,21 @@ final class FullDuplexVoiceClient {
         // the transport it would answer through is going away.
         localContextTasks.values.forEach { $0.cancel() }
         localContextTasks.removeAll()
-        awaitingToolResult = false
         responseInFlight = false
         responsesSeen = 0
         liveContextUsage = nil
         queueFinisherAwaitingAdvance = nil
         queueReceiptInstructionsPending = nil
-        // **Dispatches and background writes run on past teardown; they are let go, not
-        // cancelled.** The user asked for the work and heard it was underway, and hanging
-        // up is not taking that back. Cancelling used to abandon a write mid-flight that
-        // could still land on this phone's grant with nobody told. Each runs under
-        // `HangUpRunway`, which holds the process up off screen; a job records its own row,
-        // and a write that finishes with no call records one (`recordOrphanedWrite`), so
-        // the next call's opening reports either. The dial check after each `await` keeps
-        // a survivor out of whichever call is live by then.
-        //
-        // `teardown` is also the first half of `reconnect()`, so a job straddling a VAD
-        // change now finishes too — its answer arrives with the next call's opening rather
-        // than in this one.
+        // Dispatches survive hang-up and reconnect; dial checks keep their results out of a new call.
         if !dispatchTasks.isEmpty || !pendingReports.isEmpty || !heldOutcomes.isEmpty {
             RealtimeLog.log("dispatch: \(dispatchTasks.count) running continue past teardown, "
                 + "\(pendingReports.count) unspoken and \(heldOutcomes.count) queued dropped — \(reason)")
-        }
-        if !backgroundWrites.isEmpty {
-            RealtimeLog.log("write: \(backgroundWrites.count) in flight continue past "
-                + "teardown — \(reason)")
         }
         // A queued answer's deadline dies with the call: there is nobody left to speak it to,
         // and its row is still undelivered, so the next dial's opening digest carries it.
         for held in heldOutcomes.values { held.watchdog.cancel() }
         heldOutcomes = [:]
         dispatchTasks = [:]
-        backgroundWrites = [:]
         pendingReports = []
         reportDrain?.cancel()
         reportDrain = nil
@@ -1409,9 +1266,6 @@ final class FullDuplexVoiceClient {
         digestDrain?.cancel()
         digestDrain = nil
         unspokenHandoffThisTurn = false
-        // Back to blocking, which is the safe value: `teardown` is half of
-        // `reconnect()`, and the next mint's answer is what may raise it again.
-        asyncWritesConfirmed = false
     }
 
     // MARK: - Signals
@@ -1633,12 +1487,6 @@ final class FullDuplexVoiceClient {
             // user sat through rather than that wait plus whatever the UI does next.
             noteLatency(\.toFirstAudioMs)
             reportLatencyTurn()
-            // A response that called a tool ends and a continuation starts, so one
-            // turn can produce several audio segments — and the watchdog armed by
-            // the *previous* `response.done` is still ticking against this one. Left
-            // running it would lift the duck 20 s into a reply that is going fine.
-            // The next `response.done` re-arms it.
-            audibleWatchdog?.cancel()
             setMicGain(1)
             onState?(.responding)
             if let sent = greetingSentAt {
@@ -1676,9 +1524,7 @@ final class FullDuplexVoiceClient {
                 RealtimeLog.log(String(format: "audio: stopped after %.1fs", Self.seconds(since: since)))
             }
             audibleSince = nil
-            lastAudibleEnd = ContinuousClock.now
             assistantAudible = false
-            audibleWatchdog?.cancel()
             setMicGain(1)
             // The opening has finished speaking, so the floor is the user's now.
             releaseOpening()
@@ -1737,7 +1583,7 @@ final class FullDuplexVoiceClient {
         case .sessionCreated(let model):
             RealtimeLog.log("session: created (\(model ?? "unknown model"))")
             sessionReadyForOpening = true
-            if acceptedOpening == .emailQueue, !toolsReadyForEmailOpening {
+            if acceptedOpening == .emailQueue, !localTriageForEmailOpening, !toolsReachable {
                 holdOpeningForToolReadiness()
             }
             fireGreetingIfPending()
@@ -1757,7 +1603,6 @@ final class FullDuplexVoiceClient {
                 return
             }
             if code == "live_client_brain_failed" {
-                awaitingToolResult = false
                 onTurnFailed?(message)
                 if !assistantAudible { onState?(.listening) }
                 return
@@ -1771,7 +1616,6 @@ final class FullDuplexVoiceClient {
             // post-onboarding greeting below it is what the first word waits for.
             DialTiming.toolsListed()
             toolsReachable = true
-            toolsReadyForEmailOpening = true
             fireGreetingIfPending()
             announceToolsArrived()
             onToolsReady?()
@@ -1801,7 +1645,7 @@ final class FullDuplexVoiceClient {
             // twice was one call reported twice or two real calls — a question that cost
             // several rounds of guessing before the id was there to answer it.
             RealtimeLog.log("tools: calling \(name) [item \(itemId ?? "nil")]")
-            if sequentialFeed, calendarFeedPending,
+            if calendarFeedPending,
                name.hasSuffix("list_calendar_events") {
                 onFeedFocus?(feedFocusTracker.calendarLoading())
             }
@@ -1815,7 +1659,7 @@ final class FullDuplexVoiceClient {
         case .mcpCallFailed(let message):
             RealtimeLog.log("tools: call FAILED — \(message ?? "no detail")")
             if let name = runningTool {
-                if sequentialFeed, calendarFeedPending,
+                if calendarFeedPending,
                    name.hasSuffix("list_calendar_events") {
                     onFeedFocus?(feedFocusTracker.calendarResult(
                         events: [], successful: false,
@@ -2013,7 +1857,7 @@ final class FullDuplexVoiceClient {
         }
         guard sessionReadyForOpening else { return }
         if acceptedOpening == .emailQueue,
-           !toolsReadyForEmailOpening || !dispatchRecoveryReady {
+           (!localTriageForEmailOpening && !toolsReachable) || !dispatchRecoveryReady {
             // This method has already passed the `openingDeferred` gate above, so the
             // onboarding flow has handed the hold to the automatic opening. Its tool wait
             // is bounded from this point, never while the user is still in onboarding.
@@ -2255,17 +2099,7 @@ final class FullDuplexVoiceClient {
         // We asked for a response while one was already running. The running one
         // is fine; the request was simply redundant.
         "conversation_already_has_active_response",
-        // A `function_call_output` we posted didn't match a call the server is
-        // holding — a duplicate, or a call id that had already been answered.
-        //
-        // Here because of what an *unlisted* code costs, not because this one is
-        // expected: everything not in this set reaches `onError?`, which ends the
-        // call. Background writes put more of this bookkeeping on the client — two
-        // handoff mechanisms now post outputs off the main tool path, each on its own
-        // schedule — and a slip in it should be a log line, not a dropped call in the
-        // middle of a conversation. The invariant it guards is written above
-        // `startBackgroundWrite`: one output per call id, and the outcome goes in as a
-        // separate `system` item that carries no call id at all.
+        // An unmatched or duplicate output is recoverable; it must not disconnect the call.
         "item_not_found",
         "invalid_call_id",
     ]
@@ -2320,20 +2154,8 @@ final class FullDuplexVoiceClient {
     /// near it — so nothing real is being thrown away.
     private static let vadWaitSanityMs = 2_000
 
-    /// The last time the on-device transcriber produced anything, for the whole call.
-    /// Kept as a fallback and for the side-by-side in the log — see `lastMicLoudAt`
-    /// for why it is no longer the primary.
-    private var lastLocalTranscriptAt: ContinuousClock.Instant?
-
     /// When the speaker last started making noise, for the audible-seconds tally.
     private var audibleSince: ContinuousClock.Instant?
-    /// When it last stopped. The room keeps ringing after that instant, so this is
-    /// what makes "could this transcript be echo?" answerable — see `withinEchoWindow`.
-    private var lastAudibleEnd: ContinuousClock.Instant?
-
-    /// Forces the duck up if `output_audio_buffer.stopped` never arrives. Without
-    /// it a single lost event leaves the mic at 0.15× for the rest of the call.
-    private var audibleWatchdog: Task<Void, Never>?
 
     /// The tool currently running, so its completion can be matched to a name —
     /// `response.mcp_call.completed` doesn't carry one.
@@ -2356,14 +2178,7 @@ final class FullDuplexVoiceClient {
     /// Server VAD says the user is mid-utterance.
     var userSpeaking = false
 
-    private var pendingFirstTranscriptMs: Int?
-
     /// Whether the phone is producing the transcript.
-    ///
-    /// False on a device without the language model installed yet, and false on
-    /// hardware that can't run it at all — in both cases the server's transcript
-    /// keeps drawing the screen, which is why that path is left attached rather
-    /// than removed from the mint.
     private var localTranscriptLive: Bool { transport?.localTranscriber.isLive ?? false }
 
     /// Whether a tool ran during the current response.
@@ -2378,10 +2193,6 @@ final class FullDuplexVoiceClient {
     private var responsesSeen = 0
     private var liveContextUsage: Double?
 
-    /// A response ended having emitted a tool call whose result hasn't arrived.
-    var awaitingToolResult = false
-    /// The deferred continuation, cancellable if the server continues on its own.
-    var continuation: Task<Void, Never>?
     /// The in-flight relay of a client-executed function tool. Non-nil is what
     /// keeps the stall backstop from firing a second response — and for
     /// `send_email`, a second *send* — while the broker call runs.
@@ -2424,17 +2235,6 @@ final class FullDuplexVoiceClient {
     /// it runs, and that second thing is allowed to be slow too.
     var dispatchTasks: [String: Task<Void, Never>] = [:]
 
-    /// Writes running in the background, keyed by call id.
-    ///
-    /// Separate from `functionCallTask` rather than reusing it, because that is a
-    /// single cancel-then-replace slot: a second write arriving would cancel the
-    /// first, which is a `URLSession` request abandoned mid-flight for an
-    /// irreversible action the model already said was happening. Separate from
-    /// `dispatchTasks` too, so the two caps don't fight — a send refused because
-    /// three inbox sweeps are running would be the worst possible reading of "the
-    /// conversation shouldn't wait".
-    var backgroundWrites: [String: Task<Void, Never>] = [:]
-
     /// Answers and outcomes that have come back and are waiting for a gap.
     ///
     /// An array because two handoffs can land during one response.
@@ -2453,54 +2253,9 @@ final class FullDuplexVoiceClient {
     /// One per job, because two dispatches can be in flight.
     var heldOutcomes: [UUID: HeldOutcome] = [:]
 
-    /// Work was handed off, or reported on, during this user turn.
-    ///
-    /// **The suppressor without which every handoff runs twice.** The
-    /// acknowledgement lands in the *continuation* response — the one after the call
-    /// — which carries no tool call of its own, leaves `toolCalledThisResponse`
-    /// false, and never occupies `functionCallTask`. So it walks straight past both
-    /// of `response.done`'s existing stand-downs and into `autoContinueIfStalled`,
-    /// whose whole job is to look at words like "checking now" and order the model to
-    /// run the lookup it just said it would.
-    ///
-    /// Against a dispatch acknowledgement that order is a *second* dispatch: another
-    /// minute-long agent run, and the same answer spoken twice. **Against a
-    /// backgrounded write it is a second send**, and that is why this covers both.
-    /// The phrase list includes `"i ll"`, so "on its way, I'll let you know when it
-    /// lands" matches — and the override the backstop then issues stands down only
-    /// for a model that was *waiting* to be told yes. This model already heard the
-    /// yes and already called the tool, so that sentence doesn't apply to it and the
-    /// next one does: run the thing you just said you would.
-    ///
-    /// **Those are no longer two costs of different sizes.** Since 2026-08-10 a
-    /// dispatched job can send mail, post to Slack and move a meeting, so a second
-    /// dispatch *is* a second send — with a second agent's worth of re-decided work
-    /// behind it. Read the paragraph above as one case rather than two: the cheap one
-    /// stopped being cheap.
-    ///
-    /// Per user turn rather than per response, precisely because the acknowledgement
-    /// is one response later than the call. Cleared with `didAutoContinue`.
-    ///
-    /// **Set only when a handoff actually started.** All four refusals in
-    /// `startDispatch` and `startBackgroundWrite` pass `startedWork: false`, because a
-    /// refusal began nothing and so has no second run to prevent — while suppressing
-    /// the backstop on a refused turn costs the rescue that turn is most likely to
-    /// need. See `postDispatchOutput`.
-    ///
-    /// The cost, stated because it is real: one handoff stands the backstop down for
-    /// the rest of that user turn, including a genuine stall three continuations
-    /// later. A missed stall is a turn the user has to prompt twice; a double send is
-    /// mail that cannot be recalled.
+    /// Suppress automatic retries after a handoff starts, preventing duplicate writes.
+    /// A refused handoff leaves the stall recovery enabled.
     var unspokenHandoffThisTurn = false
-
-    /// Whether this session's prompt was minted knowing writes report back.
-    ///
-    /// The mint answers it (`FullDuplexBroker.Session.asyncWrites`) and this is where
-    /// that answer lives for the length of the call, because the four writes are
-    /// declared by every broker: backgrounding one against a prompt that wasn't narrowed leaves the
-    /// model told never to say mail went until a tool said so, holding an
-    /// acknowledgement, whose way out is to send again.
-    private var asyncWritesConfirmed = false
 
     /// An answer or an outcome waiting to be spoken.
     struct DispatchReport {
@@ -2509,10 +2264,6 @@ final class FullDuplexVoiceClient {
         enum Kind {
             /// A dispatched lookup. The text is the answer, so it is worth speaking.
             case dispatch
-            /// A backgrounded write, named so the item can say which tool it was. Most
-            /// writes leave the queue in place; a deterministic queue RSVP commits the
-            /// user's decision immediately and therefore reports against the next item.
-            case write(tool: String, movedPast: Bool)
             case shortcut(tool: String, userID: String)
 
             /// Whether the queue moved on account of this. A dispatch counts as dealing
@@ -2524,7 +2275,6 @@ final class FullDuplexVoiceClient {
                 switch self {
                 case .dispatch: return true
                 case .shortcut: return false
-                case .write(_, let movedPast): return movedPast
                 }
             }
         }
@@ -2567,79 +2317,12 @@ final class FullDuplexVoiceClient {
         var deservesSpeaking: Bool {
             switch kind {
             case .dispatch, .shortcut: return true
-            case .write: return ok != true
             }
         }
     }
 
-    /// The most dispatches allowed to be running at once.
-    ///
-    /// Nothing else bounds them. A dispatch deliberately sits outside
-    /// `continuationsThisTurn` (see `injectDispatchReport`), so without this a model
-    /// that decides to dispatch everything buys an unbounded number of minute-long
-    /// agent runs on the user's account. Over the cap the call is refused as text like
-    /// any other failure, so the model can say so.
-    ///
-    /// **Three until 2026-08-10, and the number came down because the reason changed.**
-    /// Three was a *cost* ceiling — tokens and minutes on a read. A dispatched job can
-    /// now send mail, post to Slack and move a calendar, which is the argument
-    /// `maxLiveBackgroundWrites` was already making for its own 2: "a dispatch is a read
-    /// that costs time and tokens, and these are irreversible", citing the 2026-08-02
-    /// episode of six write calls and three real drafts. That argument now applies here,
-    /// and harder — a background write relayed the model's own arguments verbatim,
-    /// whereas a dispatch hands over a sentence a second agent re-decides. Three
-    /// concurrent write-capable agents, several minutes each, **with no cancel**, is the
-    /// largest unattended blast radius in this app.
-    ///
-    /// **One number rather than two.** A split cap — three reads, two writes — needs a
-    /// write detector, and that detector would fail *open* here (an unrecognised verb
-    /// counts as a read, so three are allowed), which is the opposite direction to the
-    /// one `isInlineMailRead` fails in. One list failing two ways is what rots. The cost
-    /// of a flat 2 is one refused concurrent sweep, spoken as text.
-    ///
-    /// **It does not bound what it looks like it bounds, and that matters more now.**
-    /// `dispatchTasks` is cleared in `teardown`, so hanging up and redialling resets
-    /// this to zero while the server-side agents keep running — `DispatchJob`'s own
-    /// header records one running 9,462 ms after teardown. With no cancel, redialling is
-    /// exactly what an impatient user does. `DispatchJobStore.recover` logs the count of
-    /// still-running jobs at connect: it makes the hole visible rather than closing it.
+    /// Bound concurrent write-capable dispatches; excess calls receive a spoken refusal.
     static let maxLiveDispatches = 2
-
-    /// The writes this build is willing to run in the background.
-    ///
-    /// **An allowlist, not a denylist, and that direction is the safety property.**
-    /// A build that backgrounded anything it didn't recognise would defer a tool nobody decided to
-    /// defer, and the model's description of it would say nothing about reporting
-    /// later. An unknown name falls through to the blocking relay, which is only ever
-    /// slower, never wrong.
-    ///
-    /// The three are the writes whose output is a receipt. Every other relayed tool is
-    /// absent because of what it *returns*, not how slow it is: `read_attachment`
-    /// hands back content the model has to speak, and no Notion tools are declared on
-    /// the session at all.
-    ///
-    /// `append_to_note` was the fourth member of this set until 2026-08-05. It was
-    /// the old Notion REST connector's write tool and was removed when that connector
-    /// was deleted. Keeping a dead name here is harmless (it can never match because
-    /// the mint no longer declares it), but misleading: a name in this set promises
-    /// that the corresponding tool goes to background, and `append_to_note` does not
-    /// exist anywhere in the current stack.
-    private static let asyncRelayTools: Set<String> = [
-        "send_email", "create_draft", "create_calendar_event",
-    ]
-
-    /// The most background writes allowed to be in flight at once.
-    ///
-    /// Two, where dispatch gets three, and lower on purpose: a dispatch is a read
-    /// that costs time and tokens, and these are irreversible. The bound matters more
-    /// than it looks — `continueAfterFunctionResult` does *not* increment
-    /// `continuationsThisTurn` when a response is already in flight, which is always
-    /// the case for an acknowledgement, and `injectDispatchReport` deliberately never
-    /// counts either. So the turn cap does not bound these, and the 2026-08-02 field
-    /// incident is what that costs when nothing does: six write calls in one episode,
-    /// three real drafts, limited only by the model being blocked on each relay. This
-    /// change removes exactly that limiter, so it has to put one back.
-    static let maxLiveBackgroundWrites = 2
 
     /// How long a landed answer keeps looking for a gap to be spoken in.
     ///
@@ -2769,12 +2452,7 @@ final class FullDuplexVoiceClient {
     /// canceller letting our own voice through, which nobody waited on at all.
     /// Timing either would quietly poison the average with numbers no user ever
     /// experienced.
-    ///
-    /// - Parameter localEndOfUtterance: the phone's own idea of when the user stopped,
-    ///   when there is one. Passed in rather than read here so the talk-early injection
-    ///   path — which never sees `speech_stopped` and was therefore never timed at all
-    ///   — can hand over the mark it already waited on.
-    func beginLatencyTurn(localEndOfUtterance: ContinuousClock.Instant? = nil) {
+    func beginLatencyTurn() {
         guard !assistantAudible else { return }
         latencyMark = ContinuousClock.now
         latency = TurnLatency()
@@ -2788,7 +2466,7 @@ final class FullDuplexVoiceClient {
         // Negative readings are possible in principle — a late local revision landing
         // after `speech_stopped` — and are dropped rather than clamped, because a
         // negative means the baseline was wrong and a zero would hide that.
-        if let quietFrom = localEndOfUtterance ?? lastMicLoudAt {
+        if let quietFrom = lastMicLoudAt {
             let wait = Int(Self.seconds(since: quietFrom) * 1000)
             // **Nil rather than a number, past the sanity bound.** The stamp is only
             // taken while the assistant is quiet — the duck leaks (0.486 measured at
@@ -2803,15 +2481,6 @@ final class FullDuplexVoiceClient {
             // follows: absent beats fabricated.
             latency.vadWaitMs = (wait >= 0 && wait <= Self.vadWaitSanityMs) ? wait : nil
         }
-        // The old ruler, kept alongside only so the bias between them is visible in
-        // the log rather than argued about. Not stored and not sent anywhere.
-        vadWaitByTranscriptMs = lastLocalTranscriptAt.map { Int(Self.seconds(since: $0) * 1000) }
-        // Carried across the reset rather than measured after it. The first words
-        // of a turn arrive *while the user is still talking*, which is before this
-        // mark exists — stamping it into `latency` at the time would be wiped by
-        // the line above, and stamping it after would measure the wrong thing (on
-        // the local path the text is already on screen, so it would read ~0).
-        latency.toFirstTranscriptMs = pendingFirstTranscriptMs
         latency.transcribedOnDevice = localTranscriptLive
     }
 
@@ -2833,14 +2502,11 @@ final class FullDuplexVoiceClient {
             + " \"\(latencyUtterance ?? "—")\" — "
             // First, because it is the leg every other number here excludes.
             + "vad waited \(latency.vadWaitMs.map { "\($0)ms" } ?? "—")"
-            + " (by transcript \(vadWaitByTranscriptMs.map { "\($0)ms" } ?? "—")) · "
+            + " · "
             + "spoke after \(latency.toFirstAudioMs.map { "\($0)ms" } ?? "—")"
             + " · response \(latency.toResponseCreatedMs.map { "\($0)ms" } ?? "—")"
             + " · first word \(latency.toFirstTokenMs.map { "\($0)ms" } ?? "—")"
-            // Tagged with where the words came from, because the pair of numbers
-            // means nothing without it — this line is the A/B.
-            + " · transcript \(latency.toFirstTranscriptMs.map { "\($0)ms" } ?? "—")"
-            + "/\(latency.toFinalTranscriptMs.map { "\($0)ms" } ?? "—")"
+            // Tagged with where the words came from.
             + " (\(localTranscriptLive ? "on device" : "server"))")
         onTurnLatency?(latency)
         latencyMark = nil
@@ -2855,9 +2521,6 @@ final class FullDuplexVoiceClient {
     /// the *right* tool depends entirely on the words, which were not.
     var latencyUtterance: String?
 
-    /// The same wait measured the old way, for the log line only. See `lastMicLoudAt`.
-    private var vadWaitByTranscriptMs: Int?
-
     /// Abandon the turn in flight without reporting it. For the cases where what was
     /// being timed turns out not to have been a question: an echo turn taken back, or
     /// a call ending mid-wait.
@@ -2870,13 +2533,6 @@ final class FullDuplexVoiceClient {
     static func seconds(since instant: ContinuousClock.Instant) -> Double {
         let elapsed = ContinuousClock.now - instant
         return Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-    }
-
-    /// Is the speaker making noise, or has it only just stopped?
-    private var withinEchoWindow: Bool {
-        if assistantAudible { return true }
-        guard let end = lastAudibleEnd else { return false }
-        return ContinuousClock.now - end <= FullDuplexTuning.echoTail
     }
 
     /// Lowercase, punctuation stripped, whitespace collapsed — so "What's on your
@@ -2896,35 +2552,9 @@ final class FullDuplexVoiceClient {
         }
     }
 
-    // MARK: - Continuation
-
-    private func cancelScheduledContinuation() {
-        continuation?.cancel()
-        continuation = nil
-    }
-
     // MARK: - Client-executed function tools
 
-    /// Route one function call: handed off, backgrounded, or waited on.
-    ///
-    /// Three exits, in the order they are tested. `dispatch` gives a whole job to a
-    /// second agent. The three writes in `asyncRelayTools` run in the background and
-    /// report back. Everything else — `read_attachment` and any other relayed tool
-    /// whose output is the answer — is waited on.
-    ///
-    /// Notion tools do not appear here at all: the session declares none.
-    ///
-    /// Why these tools exist here at all: every tool on the session is a client-executed
-    /// function (`LiveSessionSetup`, `GmailReadTools`, `GmailManageTools`, `CalendarTools`).
-    /// The model's call arrives on the
-    /// phone, because the phone is the only client connected to the session, and runs
-    /// there on the phone's own grant (`LocalCompose`, `LocalForward`, `LocalMailWrites`).
-    ///
-    /// `FullDuplexBroker.runTool` never throws: failures come back as text and go
-    /// into the conversation like any result, so the model *says* the send didn't
-    /// go through instead of the turn ending in silence.
-    /// Experiment: classify each partial with the on-device model while the user is still
-    /// talking, so the result is ready by the time the input settles.
+    /// Classify each partial on-device while the user is talking, before the input settles.
     private func routeWithModel(_ text: String) {
         LiveIntentRouter.prewarm()
         modelRoute?.task.cancel()
@@ -3156,12 +2786,6 @@ final class FullDuplexVoiceClient {
     /// A connector's tool, or any name `LiveSessionSetup.tools` has no entry for, relayed to
     /// `FullDuplexBroker.runTool`.
     func runUnregisteredTool(_ call: LiveToolCall) {
-        // Gated on the mint's answer (`Session.asyncWrites`, false today) — see
-        // `asyncWritesConfirmed`.
-        if asyncWritesConfirmed, Self.asyncRelayTools.contains(call.name) {
-            startBackgroundWrite(callId: call.id, name: call.name, argumentsJSON: call.arguments)
-            return
-        }
         runFunctionToolBlocking(callId: call.id, name: call.name, argumentsJSON: call.arguments)
     }
 
@@ -3244,8 +2868,18 @@ final class FullDuplexVoiceClient {
                         ? await Container.shared.liveEmailOpening().warmed(profileId: scope?.profileId, userId: Container.shared.backend().userId)
                         : []
                     mark("emails warmed (\(warmed.count))")
-                    guard self.isActive, self.dialGeneration == dial,
-                          ProfileRuntime.snapshot?.profileId == scope?.profileId else { return }
+                    guard self.isActive, self.dialGeneration == dial else { return }
+                    guard ProfileRuntime.snapshot?.profileId == scope?.profileId else {
+                        // The switch landed, then the profile moved again under it. The call
+                        // still answers, or the adapter waits on it for the rest of the dial.
+                        self.finishContextTool(callId: callId, tool: name,
+                            output: "Switched to \(destination.name), but the profile changed again before its feed opened. "
+                                + "Do not read a feed or advance any queue until the next instruction.",
+                            ms: Date().timeIntervalSince(started) * 1000, outcome: "refused", query: destination.name,
+                            detail: "profile changed again before the feed opened", failed: true, dial: dial)
+                        mark("result sent (profile changed again)")
+                        return
+                    }
                     self.applyStep(step.output, progress: progress, standing: standing,
                                    served: served, dial: dial,
                                    preparationAtArrival: ("profile_opening", warmed.first {
@@ -3608,24 +3242,27 @@ final class FullDuplexVoiceClient {
         let keyword = Self.stringArgument("keyword", in: argumentsJSON) ?? ""
         FullDuplexTrace.note("!! commands \(action) \"\(keyword)\"")
         let started = Date()
-        let outcome: CustomCommandStore.Outcome
-        switch action {
-        case "save":
-            outcome = customCommands.save(
-                keyword: keyword, label: Self.stringArgument("label", in: argumentsJSON) ?? "",
-                actions: Self.actionsArgument(in: argumentsJSON))
-        case "delete":
-            outcome = customCommands.delete(keyword: keyword)
-        case "enable", "disable":
-            outcome = customCommands.setEnabled(keyword: keyword, to: action == "enable")
-        default:
-            // A schema `enum` is a strong hint, not a guarantee.
-            outcome = .refused("\"\(action)\" is not something you can do to a command. Use run, list, "
-                + "save, delete, enable or disable.")
+        Task { [weak self] in
+            guard let self else { return }
+            let outcome: CustomCommandStore.Outcome
+            switch action {
+            case "save":
+                outcome = await customCommands.save(
+                    keyword: keyword, label: Self.stringArgument("label", in: argumentsJSON) ?? "",
+                    actions: Self.actionsArgument(in: argumentsJSON))
+            case "delete":
+                outcome = await customCommands.delete(keyword: keyword)
+            case "enable", "disable":
+                outcome = await customCommands.setEnabled(keyword: keyword, to: action == "enable")
+            default:
+                // A schema `enum` is a strong hint, not a guarantee.
+                outcome = .refused("\"\(action)\" is not something you can do to a command. Use run, list, "
+                    + "save, delete, enable or disable.")
+            }
+            if case .saved = outcome { refreshCommandTools() }
+            finishCommandWrite(callId: callId, action: action, keyword: keyword, outcome: outcome,
+                               ms: Date().timeIntervalSince(started) * 1000)
         }
-        if case .saved = outcome { refreshCommandTools() }
-        finishCommandWrite(callId: callId, action: action, keyword: keyword, outcome: outcome,
-                           ms: Date().timeIntervalSince(started) * 1000)
     }
 
     /// A write's result as something the model can say. A refusal and a failure both mean it
@@ -3694,6 +3331,18 @@ final class FullDuplexVoiceClient {
         RealtimeLog.log("\(subsystem): \(tool) — \(detail) [\(outcome)] in "
             + String(format: "%.0f ms", ms))
         continueAfterFunctionResult()
+    }
+
+    /// A cancelled handler still owes an output so later turns can proceed.
+    func finishSupersededTool(
+        callId: String, tool: String, result: String, ms: Double,
+        subsystem: String, dial: Int? = nil, alreadyStarted: Bool = false
+    ) {
+        finishContextTool(callId: callId, tool: tool,
+            output: result + " The application stopped handling this action before advancing. "
+                + "The result above stands; do not repeat the action and do not advance the queue.",
+            ms: ms, outcome: "cancelled", query: "", detail: "superseded before its result was handled",
+            subsystem: subsystem, failed: true, dial: dial, alreadyStarted: alreadyStarted)
     }
 
     /// Return the handoff immediately; the existing report queue speaks the final outcome.
@@ -4158,239 +3807,6 @@ final class FullDuplexVoiceClient {
         }
     }
 
-    // MARK: - Calendar search
-
-    /// `search_calendar`, answered on this phone out of its own calendar cache
-    /// (`CalendarSearch`), mirroring `answerRecentSearch`'s structure.
-    ///
-    /// **`time_min`/`time_max` are RFC3339, the same shape `list_calendar_events`
-    /// takes** — deliberately, so a coverage miss and a fallback to that tool are a
-    /// same-arguments swap for the model rather than a re-derivation.
-    func answerCalendarSearch(callId: String, argumentsJSON: String) {
-        let timeMinRaw = Self.stringArgument("time_min", in: argumentsJSON) ?? ""
-        let timeMaxRaw = Self.stringArgument("time_max", in: argumentsJSON) ?? ""
-        let query = Self.stringArgument("query", in: argumentsJSON) ?? ""
-        let account = Self.stringArgument("account", in: argumentsJSON)
-        FullDuplexTrace.note(
-            "!! search_calendar \(timeMinRaw)..\(timeMaxRaw) \"\(query)\"")
-        if sequentialFeed, calendarFeedPending {
-            onFeedFocus?(feedFocusTracker.calendarLoading())
-        }
-
-        guard let timeMinMs = Self.parseRFC3339(timeMinRaw),
-              let timeMaxMs = Self.parseRFC3339(timeMaxRaw) else {
-            // A malformed argument is answered as data, not left to hang — the same
-            // discipline every other handler in this file follows.
-            finishContextTool(
-                callId: callId,
-                tool: "search_calendar",
-                output: "time_min and time_max must both be RFC3339 timestamps.",
-                ms: 0,
-                outcome: "local_miss_live",
-                query: query,
-                detail: "bad arguments",
-                subsystem: "calendarSearch",
-                failed: true
-            )
-            if sequentialFeed, calendarFeedPending {
-                onFeedFocus?(feedFocusTracker.calendarResult(
-                    events: [], successful: false,
-                    merging: calendarFeedOwners.count > 1
-                        || feedFocusTracker.hasCalendarResult))
-            }
-            return
-        }
-
-        // Outside the `Task` — see `answerContextSearch`. `@MainActor` queueing is not free.
-        let started = Date()
-        Task { [weak self, localContext] in
-            // The queue item owns the calendar while a feed is running. Outside one it is the
-            // active profile's own mailbox — `CalendarSearch`'s bare primary spans profiles.
-            let queueAccount = await Container.shared.localTriage().currentMailbox
-            let account = queueAccount ?? account
-                ?? ProfileRuntime.allowedMailAccounts(GoogleAccountStore.mailAccounts()).first
-            let store = CalendarStore(database: localContext.dbPool)
-            let result = await CalendarSearch.run(
-                timeMinMs: timeMinMs, timeMaxMs: timeMaxMs, query: query, account: account,
-                store: store)
-            guard let self, self.isActive else { return }
-
-            if self.sequentialFeed, self.calendarFeedPending {
-                self.onFeedFocus?(self.feedFocusTracker.calendarResult(
-                    events: result.events.map(FeedFocusTracker.event),
-                    successful: result.successful,
-                    merging: self.calendarFeedOwners.count > 1
-                        || self.feedFocusTracker.hasCalendarResult))
-            }
-
-            // Arm the terminal response before `finishContextTool` asks for it. Reversing
-            // these two steps is the device failure this ordering fixes: the continuation
-            // had already been created with the generic opening override by the time the
-            // client learned calendar was complete, so Jo returned the floor without ever
-            // announcing Feed completion.
-            if result.successful {
-                if let account, self.calendarFeedOwners.count > 1 {
-                    self.completeCalendarFeedAccounts(
-                        [account], source: "search_calendar account")
-                } else {
-                    self.completeCalendarFeedIfPending(source: "search_calendar")
-                }
-            } else if self.calendarFeedPending {
-                RealtimeLog.log(
-                    "feed: local calendar lookup failed; cadence remains due")
-            }
-
-            // The model is useful for finding the calendar row, but it is not the owner of
-            // the final state transition. Once a live email queue, the user's own words and
-            // one pending event all agree, relay the RSVP here and return the next queue item
-            // in this same function result. That removes the open-ended search/tool loop
-            // without turning an ordinary calendar lookup into a write.
-            if !self.calendarRSVPInFlight,
-               let response = CalendarRSVPQueuePolicy.response(
-                    in: self.latestCompletedUserUtterance),
-               let event = CalendarSearch.singlePendingRSVP(result),
-               let standing = await localTriage.standingOnAbout,
-               CalendarRSVPQueuePolicy.matchesInvitation(
-                    eventSummary: event.summary, eventAccount: event.account,
-                    emailSubject: standing.subject, emailAccount: standing.account) {
-                self.calendarRSVPInFlight = true
-                self.latestCompletedUserUtterance = ""
-                await self.answerResolvedCalendarRSVP(
-                    callId: callId, response: response, event: event,
-                    standing: standing, started: started)
-                return
-            }
-            self.finishContextTool(
-                callId: callId,
-                tool: "search_calendar",
-                output: CalendarSearch.formatted(result, query: query),
-                ms: Date().timeIntervalSince(started) * 1000,
-                // Reusing `search_recent`'s outcome vocabulary — `local_hit` means the
-                // synced window covered the request, `local_miss_live` means Google was
-                // asked directly (either the window wasn't covered, or it was covered
-                // and simply empty falls under `local_hit` — see `CalendarSearch.Result`).
-                outcome: result.servedLive ? "local_miss_live" : "local_hit",
-                query: query.isEmpty ? "(window)" : query,
-                detail: "\(result.events.count) event(s), covered=\(result.covered)",
-                subsystem: "calendarSearch"
-            )
-        }
-    }
-
-    /// Start a queue-bound invitation response and move without holding the conversation
-    /// open on Google. The event, account and explicit user intent were all resolved before
-    /// this point, so the queue can commit the user's decision immediately; the event read and
-    /// the PATCH run behind it in `backgroundWrites` (`LocalCalendarWrites`).
-    ///
-    /// The `search_calendar` call id is intentionally retained: this output completes the
-    /// function call the Realtime model actually made, while the telemetry names the action
-    /// that the queue controller performed. A kickoff refusal returns later through the
-    /// background-report path and is spoken at a quiet beat instead of silently turning an
-    /// acknowledgement into a false claim.
-    private func answerResolvedCalendarRSVP(
-        callId: String, response: String, event: CalendarStore.Event,
-        standing: LocalTriageQueue.Outcome.About, started: Date
-    ) async {
-        let dial = dialGeneration
-        let input: [String: Any] = [
-            "event_id": event.id, "response": response, "account": event.account,
-        ]
-        let data = try? JSONSerialization.data(withJSONObject: input)
-        let arguments = data.map { String(decoding: $0, as: UTF8.self) } ?? "{}"
-        let eventTitle = event.summary ?? standing.subject
-        guard !callId.isEmpty,
-              backgroundWrites.count < Self.maxLiveBackgroundWrites,
-              await localTriage.currentId == standing.id,
-              endCueTask == nil else {
-            calendarRSVPInFlight = false
-            finishContextTool(
-                callId: callId, tool: "respond_to_calendar_event",
-                output: "Not started — the invitation response could not be handed to "
-                    + "the background safely. Tell the user plainly and do not say it was answered.",
-                ms: Date().timeIntervalSince(started) * 1000,
-                outcome: "refused", query: response,
-                detail: "background handoff refused", subsystem: "localRSVP",
-                failed: true, dial: dial)
-            return
-        }
-
-        await localTriage.markActed(id: standing.id, as: "respond_to_calendar_event")
-        let store = Container.shared.mailStore()
-        let step = await localTriage.step(LocalTriageQueue.Input(), store: store)
-        let progress = await localTriage.progress
-        let nextStanding = await localTriage.standing
-        let served = await localTriage.takeServedOutcomes()
-        guard isActive, dial == dialGeneration else { return }
-        applyStep(step.output, progress: progress, standing: nextStanding,
-                  served: served, dial: dial)
-        if Self.isFeedInterstitial(step.output) { terminalFeedReached = true }
-        if Self.isFeedInterstitial(step.output) || Self.isPageInterstitial(step.output) {
-            armFeedStages(from: step.output)
-        }
-
-        let conversation = conversationId()
-        let profileId = ProfileRuntime.snapshot?.profileId
-        RealtimeLog.log(
-            "localRSVP: \(response) — advancing now; Google write deferred")
-        FullDuplexTrace.note("!! respond_to_calendar_event deferred on device")
-        backgroundWrites[callId] = Task { [weak self] in
-            let result = await HangUpRunway.run("Finishing a write") {
-                await FullDuplexBroker.runTool(
-                    name: "respond_to_calendar_event", argumentsJSON: arguments, conversationId: conversation)
-            }
-            if let self, let effects = result.effects {
-                let store = Container.shared.mailStore()
-                _ = await self.localTriage.applyConfirmedEffects(effects, store: store)
-            }
-            guard let self else { return }
-            self.backgroundWrites[callId] = nil
-            self.calendarRSVPInFlight = false
-            guard !Task.isCancelled else { return }
-
-            let accepted = CalendarRSVPQueuePolicy.brokerAccepted(
-                output: result.text, response: response, brokerVerdict: result.ok)
-            if accepted {
-                let changed = await CalendarStore(database: self.localContext.dbPool)
-                    .setOwnResponse(response, eventId: event.id, account: event.account)
-                RealtimeLog.log(
-                    "localRSVP: accepted deferred \(response) — "
-                        + "cache updated for \(changed) event(s); \(result.text.prefix(80))")
-                return
-            }
-            RealtimeLog.log(
-                "localRSVP: deferred \(response) was not accepted — "
-                    + "\(result.text.prefix(80))")
-            guard self.isActive, dial == self.dialGeneration else {
-                self.recordOrphanedWrite(
-                    tool: "respond_to_calendar_event",
-                    summary: "response: \(response), event: \(eventTitle.prefix(80))",
-                    text: result.text, ok: false, profileId: profileId)
-                return
-            }
-            self.pendingReports.append(DispatchReport(
-                kind: .write(tool: "respond_to_calendar_event", movedPast: true),
-                jobId: nil,
-                task: "response: \(response), event: \(eventTitle.prefix(80))",
-                text: result.text, ok: false, landedAt: .now,
-                delivery: .nextQuietBeat, origin: nil))
-            self.drainDispatchReports()
-        }
-
-        let action = response == "accepted" ? "accepting" : "declining"
-        finishContextTool(
-            callId: callId, tool: "respond_to_calendar_event",
-            output: "Started — \(action) \"\(eventTitle)\" in the background. "
-                + "This acknowledges the deferred action, not Google's final result."
-                + Self.renderLocalDispatchAdvance(
-                stepOutput: step.output, done: progress?.done ?? true,
-                deed: "recording that RSVP decision",
-                say: "Say the invitation response is underway"),
-            ms: Date().timeIntervalSince(started) * 1000,
-            outcome: step.served.rawValue, query: response,
-            detail: "deferred and advanced to \(progress?.position ?? 0)",
-            subsystem: "localRSVP", dial: dial)
-    }
-
     // MARK: - Slack queue on the device
 
     func answerSlackTriageNext(callId: String, argumentsJSON: String) {
@@ -4583,19 +3999,6 @@ final class FullDuplexVoiceClient {
             role: "system",
             speakerBrief: pendingFeedCompletion.map { Self.liveCompletionInstruction($0, after: stage) })
         RealtimeLog.log("feed: wrap-up prompt armed after \(source)")
-    }
-
-    /// RFC3339 → epoch milliseconds, accepting both fractional and plain forms — the same
-    /// two-formatter fallback `BackgroundCalendarRefresh.epochMs` uses for the timestamps
-    /// Google itself sends.
-    private static func parseRFC3339(_ value: String) -> Int64? {
-        guard !value.isEmpty else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: value) { return Int64(date.timeIntervalSince1970 * 1000) }
-        let plain = ISO8601DateFormatter()
-        if let date = plain.date(from: value) { return Int64(date.timeIntervalSince1970 * 1000) }
-        return nil
     }
 
     // MARK: - People
@@ -5073,7 +4476,13 @@ final class FullDuplexVoiceClient {
         functionCallTask = Task { [weak self] in
             let result = await FullDuplexBroker.runTool(
                 name: name, argumentsJSON: argumentsJSON)
-            guard !Task.isCancelled, let self, self.isActive else { return }
+            guard let self, self.isActive else { return }
+            guard !Task.isCancelled else {
+                // `functionCallTask` now belongs to whoever cancelled this one; only the answer is owed.
+                self.finishSupersededTool(callId: callId, tool: name, result: result.text, ms: 0,
+                    subsystem: "tools", alreadyStarted: true)
+                return
+            }
             let output = result.text
             if let effects = result.effects {
                 let store = Container.shared.mailStore()

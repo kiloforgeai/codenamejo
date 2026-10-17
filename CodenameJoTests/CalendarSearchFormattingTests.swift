@@ -119,20 +119,4 @@ final class CalendarSearchFormattingTests: XCTestCase {
         XCTAssertFalse(rendered.contains("wrong@x.test"))
         XCTAssertFalse(rendered.contains("attendees:"))
     }
-
-    func testOnlyTheAccountsOwnNeedsActionRowMakesAnInvitationUnambiguous() {
-        let owner = "me@x.test"
-        let events = [event(id: "e1", account: owner), event(id: "e2", account: owner)]
-        let one = result(events: events, attendees: [
-            attendee(eventId: "e1", email: "ME@X.test", response: "NeedsAction"),
-            // Somebody else not having replied is not this user's invitation.
-            attendee(eventId: "e2", email: "them@x.test", response: "needsAction"),
-            attendee(eventId: "e2", email: owner, response: "accepted")])
-        XCTAssertEqual(CalendarSearch.singlePendingRSVP(one)?.id, "e1")
-        let ambiguous = result(events: events, attendees: [
-            attendee(eventId: "e1", email: owner, response: "needsAction"),
-            attendee(eventId: "e2", email: owner, response: "needsAction")])
-        XCTAssertNil(CalendarSearch.singlePendingRSVP(ambiguous))
-        XCTAssertNil(CalendarSearch.singlePendingRSVP(result(events: [])))
-    }
 }
