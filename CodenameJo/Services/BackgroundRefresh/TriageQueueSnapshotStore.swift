@@ -257,11 +257,11 @@ enum TriageQueueSnapshotStore {
     /// Today's checkpoints for this account, newest first. Rows that no longer decode are skipped.
     static func savedToday(account: String, userId: String, database: DatabasePool) async throws -> [Payload] {
         let day = localDay()
+        // The row is keyed by the mailbox as it was connected; callers may spell it lowercased.
         let records = try await database.read { db in
             try DailyEmailQueueSnapshotRecord.filter(Column("user_id") == userId)
-                .filter(Column("account") == account)
                 .filter(Column("localDay") == day).order(Column("updatedAt").desc).fetchAll(db)
-        }
+        }.filter { $0.account.caseInsensitiveCompare(account) == .orderedSame }
         return records.compactMap { try? JSONDecoder().decode(Payload.self, from: $0.payload) }
     }
 

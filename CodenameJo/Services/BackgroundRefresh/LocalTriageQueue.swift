@@ -622,6 +622,17 @@ actor LocalTriageQueue {
     private typealias InboxAhead = TriageQueueBuilder.InboxAhead
     private var inboxAheadTask: Task<Void, Never>?
     private var inboxAhead: InboxAhead?
+    /// The other mailboxes of this profile being prepared on scratch queues — see `prefetchOtherMailboxes`.
+    private var mailboxAheadTask: Task<Void, Never>?
+    /// Lowercased mailboxes prepared ahead in this conversation; once per call is enough.
+    private var mailboxesPreparedAhead: Set<String> = []
+    /// Every other mailbox is prepared (or there is none), so a step need not look again this call.
+    private var mailboxAheadSettled = false
+    /// Off on a scratch queue, which prepares one mailbox and must not prepare the others in turn.
+    private var prefetchesOtherMailboxes = true
+    /// Thread context carried by today's row, keyed by `threadKey`, so a page rebuilt from the cache
+    /// reuses it instead of asking Gmail for each thread again — see `enrichThreadContext`.
+    private var restoredThreadContexts: [String: Item] = [:]
     /// The pages the crossing build may still read; nil once one missed, so the row says live.
     private var inboxAheadPages: [Int64?: LivePageResult]?
 
@@ -1037,6 +1048,44 @@ actor LocalTriageQueue {
         slackFeedPrefetched = nil
         await loadDealtWith()
 
+        // Every mailbox the profile may walk, not only the first: a switch mid-call restores the
+        // other mailbox's row from disc instead of building it in front of the user.
+        let mailboxes = await mailAccounts()
+        var prepared = 0
+        for (index, mailbox) in mailboxes.enumerated() {
+            if index > 0 {
+                // A call that began while the first mailbox was being prepared owns the actor
+                // from here; its own checkpoints are fresher than anything prepared beside it.
+                let callActive = await MainActor.run { Container.shared.realtimeService().isConversing }
+                guard !callActive else {
+                    RealtimeLog.log("localTriage: daily preparation stopped before \(mailbox) — call active")
+                    break
+                }
+                await end(preservingMailboxState: true)
+            }
+            let result = await prepareSnapshot(for: mailbox, store: store)
+            prepared += 1
+            RealtimeLog.log(
+                "localTriage: daily snapshot prepared \(result.served.rawValue) for \(mailbox)"
+                    + String(format: " in %.0f ms", result.ms))
+        }
+        // After the last row has landed, so every mailbox's opening candidates come off its own snapshot.
+        if prepared > 0 { await warmOpeningSummary(store: store, restart: true) }
+        let ms = Date().timeIntervalSince(started) * 1_000
+        RealtimeLog.log(
+            "localTriage: daily snapshot prepared \(prepared) of \(mailboxes.count) mailbox(es)"
+                + String(format: " in %.0f ms", ms))
+        // The durable row is the product of this work. The in-memory cursor still belongs to a
+        // conversation, and leaving it running would make the first call advance past item one.
+        await end()
+    }
+
+    /// Build or refresh today's row for one mailbox through `step`, and warm the cleanup decisions
+    /// for its first few items. Leaves the queue running on that mailbox; the caller ends it.
+    private func prepareSnapshot(for mailbox: String, store: MailStore) async -> (served: Served, ms: Double) {
+        let started = Date()
+        activeAccount = mailbox
+        snapshotAccount = mailbox
         let result = await stepWithoutWaitingForPreparation(
             Input(), store: store, startsNewSession: true)
         if running, !items.isEmpty {
@@ -1045,22 +1094,77 @@ actor LocalTriageQueue {
             let userId = await MainActor.run { Container.shared.backend().userId ?? "" }
             await Container.shared.emailCleanup().prefetch(
                 inputs, userId: userId, store: store)
-            RealtimeLog.log("emailCleanup: warming \(inputs.count) prepared queue item(s)")
-            await warmOpeningSummary(store: store)
+            RealtimeLog.log("emailCleanup: warming \(inputs.count) prepared queue item(s) for \(mailbox)")
         }
-        let ms = Date().timeIntervalSince(started) * 1_000
-        RealtimeLog.log(
-            "localTriage: daily snapshot prepared \(result.served.rawValue)"
-                + String(format: " in %.0f ms", ms))
-        // The durable row is the product of this work. The in-memory cursor still belongs to a
-        // conversation, and leaving it running would make the first call advance past item one.
-        await end()
+        return (result.served, Date().timeIntervalSince(started) * 1_000)
     }
 
-    private func warmOpeningSummary(store: MailStore) async {
+    /// Prepare the other mailboxes of this profile on a scratch queue, so a switch mid-call restores
+    /// a row written minutes ago. Modelled on `prefetchInboxStage`: one mailbox at a time, so the
+    /// Gmail quota is shared with the walk in front of the user rather than contended for.
+    private func prefetchOtherMailboxes(store: MailStore) {
+        guard prefetchesOtherMailboxes, !mailboxAheadSettled, running, position >= 1, onboardingFlow == nil,
+              !preparingDailySnapshot, mailboxAheadTask == nil else { return }
+        let current = (activeAccount ?? snapshotAccount ?? items.first?.account)?.lowercased()
+        let lifetime = reconciliationLifetime
+        mailboxAheadTask = Task { [weak self] in
+            await self?.prepareOtherMailboxes(current: current, lifetime: lifetime, store: store)
+        }
+    }
+
+    private func prepareOtherMailboxes(current: String?, lifetime: Int, store: MailStore) async {
+        defer { mailboxAheadTask = nil }
+        let others = await mailAccounts().filter {
+            $0.lowercased() != current && !mailboxesPreparedAhead.contains($0.lowercased())
+        }
+        guard !others.isEmpty else {
+            mailboxAheadSettled = true
+            return
+        }
+        for mailbox in others {
+            guard !Task.isCancelled, reconciliationLifetime == lifetime else { return }
+            let started = Date()
+            let scratch = LocalTriageQueue(
+                liveFeatures: liveFeatures, mailAccounts: { [mailbox] },
+                unreadOpeningLoader: unreadOpeningLoader)
+            let served = await scratch.prepareMailboxAhead(store: store)
+            // A profile switch or disconnect ends this queue and drops the prefetch with it; a row
+            // written for a mailbox that is no longer ours is harmless, but nothing is warmed for it.
+            guard !Task.isCancelled, reconciliationLifetime == lifetime,
+                  await mailAccounts().contains(where: { $0.lowercased() == mailbox.lowercased() })
+            else { return }
+            mailboxesPreparedAhead.insert(mailbox.lowercased())
+            RealtimeLog.log(
+                "mailboxAhead: prepared \(mailbox) \(served?.rawValue ?? "nothing") in "
+                    + String(format: "%.0f", Date().timeIntervalSince(started) * 1000) + "ms")
+        }
+        // The first three summaries of each prepared mailbox, off their fresh rows.
+        await warmOpeningSummary(store: store, restart: true)
+    }
+
+    /// Today's row for this queue's one mailbox, built on a scratch instance while another queue
+    /// walks in front of the user. No call-active guard: the call is the reason this runs.
+    func prepareMailboxAhead(store: MailStore) async -> Served? {
+        guard !running, preparationTask == nil else { return nil }
+        prefetchesOtherMailboxes = false
+        preparingDailySnapshot = true
+        defer { preparingDailySnapshot = false }
+        await loadDealtWith()
+        guard let mailbox = await mailAccounts().first else { return nil }
+        let result = await prepareSnapshot(for: mailbox, store: store)
+        await end()
+        return result.served
+    }
+
+    /// Tests await the prefetch they started; nothing in production ever waits on it.
+    func awaitMailboxAhead() async {
+        await mailboxAheadTask?.value
+    }
+
+    private func warmOpeningSummary(store: MailStore, restart: Bool = false) async {
         guard liveFeatures, onboardingFlow == nil else { return }
         let profiles = await MainActor.run { Container.shared.workspaceProfiles() }
-        await profiles.prepareProfileOpenings(store: store)
+        await profiles.prepareProfileOpenings(store: store, restart: restart)
     }
 
     // Messages, not items: a conversation dealt with is worth however much mail it held,
@@ -1191,13 +1295,17 @@ actor LocalTriageQueue {
             if activeAccount?.caseInsensitiveCompare(selected) != .orderedSame {
                 let previous = activeAccount ?? snapshotAccount ?? items.first?.account
                 let wasRunning = running
+                // Phase timings like `profileSwitch`, so the switch's cost can be read off the log.
+                mailboxSwitch = (Date(), selected)
                 if wasRunning { await checkpoint(store: store) }
+                markMailboxSwitch("checkpoint")
                 // An unrelated answer belongs to no mailbox, so it follows the user across.
                 let unrelated = outcomes.filter(\.independent)
                 if wasRunning, let previous {
                     pausedOutcomes[previous.lowercased()] = outcomes.filter { !$0.independent }
                 }
                 await end(preservingMailboxState: true)
+                markMailboxSwitch("end")
                 activeAccount = selected
                 snapshotAccount = selected
                 outcomes = unrelated + (pausedOutcomes.removeValue(forKey: selected.lowercased()) ?? [])
@@ -1229,15 +1337,30 @@ actor LocalTriageQueue {
             await discardToday(store: store)
         }
         if !running, !input.restart, !input.stop {
-            _ = await restoreIfAvailable(
+            let restored = await restoreIfAvailable(
                 for: input, store: store, startsNewSession: startsNewSession)
+            markMailboxSwitch(restored ? "restored from disc" : "no row to restore")
         }
         let performed = await performStep(input, store: store, dealtWith: finishesCurrent)
         let result = (
             output: performed.output,
             served: restoredServedForLastStep ?? performed.served)
+        markMailboxSwitch("first card \(result.served.rawValue)"
+            + (currentMailbox.map { " for \($0)" } ?? ""))
+        mailboxSwitch = nil
         if !input.stop { await checkpoint(store: store) }
+        // Behind the card, never in front of it: the other mailboxes' rows for a later switch.
+        prefetchOtherMailboxes(store: store)
         return result
+    }
+
+    /// The mailbox switch in progress, for its phase log. Cleared once the first card is served.
+    private var mailboxSwitch: (started: Date, to: String)?
+
+    private func markMailboxSwitch(_ phase: String) {
+        guard let mailboxSwitch else { return }
+        RealtimeLog.log("mailboxSwitch: \(phase) +\(Int(Date().timeIntervalSince(mailboxSwitch.started) * 1000))ms"
+            + " → \(mailboxSwitch.to)")
     }
 
     private func prepareOnboardingTail() async {
@@ -1492,6 +1615,9 @@ actor LocalTriageQueue {
         guard await snapshotStillResumes(saved, account: account, selectedAccount: selectedAccount,
                                          input: input, store: store, startsNewSession: startsNewSession)
         else { return false }
+        // Kept whether or not the cursor is resumed below: the thread context the row carries is
+        // today's, and a rebuilt page would otherwise ask Gmail for every thread again.
+        restoredThreadContexts = TriageMailSource.threadContextIndex(saved.items)
 
         grouping = saved.grouping ?? false
         topicGrouping = saved.topicGrouping ?? false
@@ -2656,10 +2782,17 @@ actor LocalTriageQueue {
         generation &+= 1
         // A new conversation must not inherit a page.
         releasePrefetch()
+        restoredThreadContexts = [:]
         offeredAccount = nil
         if !preservingMailboxState {
             pausedOutcomes = [:]
             completedAccounts = []
+            // The prefetch was for this profile's other mailboxes; a profile switch or disconnect
+            // changes which those are.
+            mailboxAheadTask?.cancel()
+            mailboxAheadTask = nil
+            mailboxesPreparedAhead = []
+            mailboxAheadSettled = false
             // A profile switch or disconnect changes which inboxes this queue may walk, so the
             // selection must not outlive it.
             activeAccount = nil
@@ -3250,9 +3383,12 @@ actor LocalTriageQueue {
             do {
                 if let saved = try await TriageQueueSnapshotStore.savedToday(
                     account: account, userId: store.userId, database: database)
-                    .first(where: { !$0.completed && $0.items.allSatisfy { $0.account == account } }) {
+                    .first(where: { !$0.completed && $0.items.allSatisfy { $0.account.caseInsensitiveCompare(account) == .orderedSame } }) {
+                    // The item the switch or opening serves first, and the two behind it — its own
+                    // snapshot's order, not the cache's guess at it.
                     savedKeys = saved.items.dropFirst(max(0, saved.position - 1)).prefix(3)
                         .compactMap(LiveEmailPresentation.Key.item)
+                    RealtimeLog.log("openingSummary: \(savedKeys.count) candidate(s) from today's row for \(account)")
                 }
             } catch { RealtimeLog.log("openingSummary: snapshot lookup failed — \(error)") }
         }
@@ -4787,7 +4923,8 @@ actor LocalTriageQueue {
                 // LIMIT applied to, not the grouped item count: a folded page is not a short one.
                 let more = cached.count >= Self.pageSize || nextBand() != nil
                 let enriched = await TriageMailSource.enrichThreadContext(
-                    await Self.refreshFacts(await expandedTopicPage(page, store: store), store: store), store: store, grouping: grouping)
+                    await Self.refreshFacts(await expandedTopicPage(page, store: store), store: store), store: store, grouping: grouping,
+                    known: knownThreadContexts())
                 return (grouped(enriched), cursor, more, false, false)
             }
             let cached = await store.unreadPage(
@@ -4832,8 +4969,15 @@ actor LocalTriageQueue {
 
         // The cache answered without Gmail. `hasMore` is false only when the count says the cache holds
         // all of it; a short page with no count means unknown, which must mean "keep going".
-        let enriched = await TriageMailSource.enrichThreadContext(await Self.refreshFacts(await expandedTopicPage(page, store: store), store: store), store: store, grouping: grouping)
+        let enriched = await TriageMailSource.enrichThreadContext(await Self.refreshFacts(await expandedTopicPage(page, store: store), store: store), store: store, grouping: grouping,
+            known: knownThreadContexts())
         return (grouped(enriched), TriageMailSource.watermark(page), !cacheHoldsItAll, false, false)
+    }
+
+    /// What `enrichThreadContext` may reuse: the buffer in hand over today's row, since a page already
+    /// walked is the newer of the two.
+    private func knownThreadContexts() -> [String: Item] {
+        restoredThreadContexts.merging(TriageMailSource.threadContextIndex(items)) { _, held in held }
     }
 
     private typealias LivePageResult = TriageMailSource.LivePageResult

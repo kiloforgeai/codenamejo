@@ -127,7 +127,15 @@ class WorkspaceProfileStore: ObservableObject {
         prepareProfileOpenings(store: Container.shared.mailStore())
     }
 
-    func prepareProfileOpenings(store: MailStore) {
+    /// - Parameter restart: begin again even while a pass is running, because the snapshots the
+    ///   candidates are read from have just been written; a pass started before them chose from the
+    ///   cache alone. Summaries already warm or in flight are kept — `warm` skips them.
+    func prepareProfileOpenings(store: MailStore, restart: Bool = false) {
+        if restart, openingPreparation != nil {
+            openingPreparationID = UUID()
+            openingPreparation?.cancel()
+            openingPreparation = nil
+        }
         guard openingPreparation == nil, loaded, let userId = backend.userId else { return }
         let destinations = profiles
         guard !destinations.isEmpty else { return }

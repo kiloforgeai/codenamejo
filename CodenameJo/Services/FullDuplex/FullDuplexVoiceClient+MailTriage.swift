@@ -736,6 +736,7 @@ extension FullDuplexVoiceClient {
             guard let self, self.isActive, dial == self.dialGeneration,
                   self.endCueTask == nil else { return }
             let store = Container.shared.mailStore()
+            let profileScope = ProfileRuntime.snapshot
             let step = await localTriage.step(input, store: store)
             let progress = await localTriage.progress
             let standing = await localTriage.standing
@@ -743,10 +744,26 @@ extension FullDuplexVoiceClient {
             // handed over. Without it the row stays undelivered and the next dial's opening
             // digest reads out an answer the user has already heard.
             let served = await localTriage.takeServedOutcomes()
+            // A mailbox switch opens on a card the launch preparation (or the prefetch behind
+            // the walk) already summarised, under the same profile. The profile switch seeds
+            // the per-dial cache from that store; without the same here the first card waited
+            // on a live body read and summary.
+            var switchedTo: (source: String, value: LiveEmailPresentation?)?
+            if account != nil, self.liveConfiguration?.emailPreparation == true, !MailHeadersOnly.withholdsBodies {
+                let warmed = await Container.shared.liveEmailOpening().warmed(
+                    profileId: profileScope?.profileId, userId: Container.shared.backend().userId)
+                let ready = warmed.first { $0.key.identity == LiveEmailPresentation.Key.step(step.output)?.identity }
+                switchedTo = ("mailbox_switch", ready)
+                RealtimeLog.log("mailboxSwitch: step done +\(Int(Date().timeIntervalSince(started) * 1000))ms"
+                    + " \(step.served.rawValue), opening summary \(ready == nil ? "miss" : "ready") (\(warmed.count) warmed)")
+                guard self.isActive, dial == self.dialGeneration, self.endCueTask == nil,
+                      ProfileRuntime.snapshot?.profileId == profileScope?.profileId else { return }
+                self.livePreparation.seed(warmed)
+            }
             guard self.isActive, dial == self.dialGeneration,
                   self.endCueTask == nil else { return }
             self.applyStep(step.output, progress: progress, standing: standing,
-                           served: served, dial: dial)
+                           served: served, dial: dial, preparationAtArrival: switchedTo)
             if self.acceptedOpening == .emailQueue,
                !self.emailFirstMessageMeasured,
                self.emailFirstMessageReadyAt == nil,
