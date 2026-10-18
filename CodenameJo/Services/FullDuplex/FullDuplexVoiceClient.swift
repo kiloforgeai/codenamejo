@@ -1254,6 +1254,8 @@ final class FullDuplexVoiceClient {
         for held in heldOutcomes.values { held.watchdog.cancel() }
         heldOutcomes = [:]
         dispatchTasks = [:]
+        // Dropping the handles leaves accepted Slack writes running after hang-up.
+        backgroundWrites = [:]
         pendingReports = []
         reportDrain?.cancel()
         reportDrain = nil
@@ -2264,6 +2266,7 @@ final class FullDuplexVoiceClient {
         enum Kind {
             /// A dispatched lookup. The text is the answer, so it is worth speaking.
             case dispatch
+            case write(tool: String, movedPast: Bool)
             case shortcut(tool: String, userID: String)
 
             /// Whether the queue moved on account of this. A dispatch counts as dealing
@@ -2275,6 +2278,7 @@ final class FullDuplexVoiceClient {
                 switch self {
                 case .dispatch: return true
                 case .shortcut: return false
+                case .write(_, let movedPast): return movedPast
                 }
             }
         }
@@ -2317,6 +2321,7 @@ final class FullDuplexVoiceClient {
         var deservesSpeaking: Bool {
             switch kind {
             case .dispatch, .shortcut: return true
+            case .write: return ok != true
             }
         }
     }
@@ -3808,6 +3813,20 @@ final class FullDuplexVoiceClient {
     }
 
     // MARK: - Slack queue on the device
+
+    /// Accepted Slack writes keep running while the next conversation is presented.
+    private var backgroundWrites: [String: Task<Void, Never>] = [:]
+    private static let maxLiveBackgroundWrites = 2
+
+    /// Preserve a deferred write's failure for the next call if its original call ended.
+    private func recordOrphanedWrite(tool: String, summary: String, text: String, ok: Bool?,
+                                     profileId: String?) {
+        let id = UUID()
+        dispatchJobs.begin(id: id, task: "\(tool) — \(summary)", profileId: profileId)
+        dispatchJobs.finish(id, state: ok == false ? "failed" : "done", result: text, reportBack: ok != true)
+        RealtimeLog.log("write: \(tool) came back after its call ended "
+            + "(ok=\(ok.map(String.init(describing:)) ?? "unclassified")) — recorded for the next call")
+    }
 
     func answerSlackTriageNext(callId: String, argumentsJSON: String) {
         let arguments = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8)))
