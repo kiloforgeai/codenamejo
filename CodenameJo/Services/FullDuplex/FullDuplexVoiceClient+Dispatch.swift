@@ -1306,6 +1306,13 @@ extension FullDuplexVoiceClient {
         case .shortcut(let tool, _):
             label = "The requested \(tool) has returned. Report its actual result, without retrying the action.\n"
                 + report.text
+        case .write(let tool, _):
+            label = "The \(tool) you started in the background has finished"
+                + (report.ok == true ? " and it worked." : " and it did NOT do what you "
+                   + "said it would. You already told the user it was going, so they "
+                   + "believe something untrue until you correct it.")
+                + "\nYou called it with: \(report.task)"
+                + "\nIt came back with: \(report.text)"
         }
 
         // **The queue's place.** Without it this item would go in naming a message the
