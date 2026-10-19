@@ -30,8 +30,7 @@ enum OnboardingResume {
         guard runId == self.runId else { return }
         UserDefaults.standard.set(step, forKey: stepKey)
     }
-    /// The mail-mode question is on the floor: a resumed call opens on it instead of asking for
-    /// the Nate reply again, which drafted it twice.
+    /// The question is on the floor, so a resumed call opens on it rather than drafting again.
     static func asked(runId: String) {
         guard var flow, flow.runId == runId, let choice = flow.mailModeChoice, choice.status == "welcome" else { return }
         flow.mailModeChoice = .init(account: choice.account, status: "pending", mode: nil)
@@ -445,12 +444,8 @@ enum EmailOnboardingContract {
     static func welcomeInstruction(line: String) -> String {
         "Say exactly \"\(line)\" Say that line even though you would not normally invite them to speak: telling them the words is what teaches them how this works. Do not ask what they want to do with it, do not ask how they want to answer him, and do not end this turn on a question. An answer can pause mid-thought: while what they have said so far trails off, keep listening without prompting them. Once they have finished, turn everything they said into a short reply, save it with create_draft to this exact thread, and say where the draft was saved in one clause. The draft's result carries the next onboarding stage; if it does not, call triage_next in the same turn. Never send this reply. Do not read it back first and do not ask permission. You already have everything you need: the thread id is in this payload and the question is in the snippet. Do not read, search for or look up this email, and do not look for another one from Nate — reply on the thread id you were given. Archive or skip if requested. Reads and reply edits do not advance onboarding."
     }
-    /// The Nate reply, steered onto his thread as a draft. The stage advances only when the draft
-    /// lands on the welcome thread, and the reply must never be sent; both were left to the model,
-    /// and a draft addressed to Nate as new mail left the stage standing. A write aimed at Nate's
-    /// thread or address is that reply for as long as onboarding runs; one with no address and no
-    /// thread is that reply while the welcome stage is up. Nil leaves any other write alone, so a
-    /// side request to someone else stays a side request.
+    /// The Nate reply steered onto his thread as a draft: a write aimed at his thread or address,
+    /// or an unaddressed one while the welcome stage is up. Nil leaves any other write alone.
     static func welcomeReplyArguments(_ arguments: String, welcome: EmailOnboardingItem,
                                       onWelcomeStage: Bool) -> String? {
         guard let data = arguments.data(using: .utf8),
@@ -482,10 +477,8 @@ enum EmailOnboardingContract {
         try text("onboarding/reply", ["question": question])
     }
 
-    /// The Nate reply, written on the phone from what they said. A one-shot call on a prompt a
-    /// few hundred tokens long, where the brain turn it replaces read forty thousand and took ten
-    /// seconds. Nil when the words are not an answer to Nate, when there is no key, or when the
-    /// call fails: the brain keeps the turn, as before.
+    /// The Nate reply, written on the phone with a one-shot call. Nil when the words are not an
+    /// answer, there is no key, or the call fails; the brain then keeps the turn.
     static func composeWelcomeReply(words: String, question: String? = WelcomeEmail.copy?.question,
                                     text: LivePrompt.Text = .bundled) async -> String? {
         guard let question, let prompt = try? replyPrompt(question: question, text: text) else {
@@ -493,8 +486,7 @@ enum EmailOnboardingContract {
             return nil
         }
         do {
-            // One user message holding the prompt and their words, the shape the about step's
-            // call already takes; the prompt carries the "JSON" that json_object mode requires.
+            // Prompt and words in one input message: json_object mode needs the word JSON there.
             let answer = try await LiveOpenAI.read([["type": "input_text", "text": prompt + "\n\nTheir words:\n" + words]],
                                                    json: true, timeout: 8)
             guard let reply = parseReply(answer) else {
@@ -517,9 +509,8 @@ enum EmailOnboardingContract {
         return reply
     }
 
-    /// The mail-mode answer as the phone reads it: "send" or "drafts" when exactly one of them is
-    /// named and nothing negates it, "skip" on its own, nil for anything else. Nil hands the
-    /// turn to the brain, whose note already says a bare yes or no needs clarifying.
+    /// "send" or "drafts" when exactly one is named and nothing negates it, "skip" alone, else nil
+    /// and the brain clarifies.
     static func mailModeAnswer(_ transcript: String) -> String? {
         let spoken = transcript.lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init)
         let words = Set(spoken)

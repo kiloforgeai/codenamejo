@@ -1575,8 +1575,7 @@ final class FullDuplexVoiceClient {
             noteFeedQuestionSpoken(in: text)
             noteSuggestionSpoken(in: text)
             assistantTurns[itemId] = text
-            // What Jo actually said, for a console reader: two device runs could not tell whether
-            // a scripted line was spoken, cut short or doubled.
+            // What Jo actually said, for a console reader.
             RealtimeLog.log("spoke: \(text.prefix(200))")
             assistantAwaitsAnswer = itemId != stoppedAssistantItem && LiveSessionAdapter.endsOnQuestion(text)
             if assistantAwaitsAnswer {
@@ -1967,8 +1966,7 @@ final class FullDuplexVoiceClient {
             // its dedicated local-tool analytics event below; it needs no activity row.
             self.openingRankedLead = Self.rankedLead(step.output)
             let lead = (self.openingRankedLead ?? "") + "First up, "
-            // Onboarding's welcome line rides the opening instructions behind the greeting
-            // instead, so the speaker is not briefed to stop before it has greeted.
+            // Onboarding's line rides the opening instructions, behind the greeting.
             let stageScript = Self.stepScript(step.output)
             let script = self.onboardingFlow != nil ? nil
                 : stageScript.map { "Say exactly this, then stop: \"\($0)\"" }

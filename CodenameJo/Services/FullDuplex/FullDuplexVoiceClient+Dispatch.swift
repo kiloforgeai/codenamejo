@@ -425,10 +425,8 @@ extension FullDuplexVoiceClient {
             + stepOutput
     }
 
-    /// `renderPresentedDispatchAdvance`'s onboarding twin: the application is speaking the
-    /// receipt and the stage's own question, so the backend adds nothing and waits for the answer.
-    /// "The application is presenting" is what `LiveSessionAdapter.finishFastAction` reads to
-    /// skip its presentation step when the phone took the whole turn.
+    /// `renderPresentedDispatchAdvance`'s onboarding twin. "The application is presenting" is what
+    /// `LiveSessionAdapter.finishFastAction` reads to skip its own presentation step.
     static func renderPresentedOnboardingAdvance(stepOutput: String) -> String {
         "\n\nQueue: saving that draft completed the onboarding stage, and the stage has ALREADY "
             + "advanced. The application is presenting this stage directly: it is speaking the "

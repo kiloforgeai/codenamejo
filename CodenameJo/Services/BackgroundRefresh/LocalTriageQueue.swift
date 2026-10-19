@@ -1429,10 +1429,7 @@ actor LocalTriageQueue {
         let kind = onboardingMailModePending ? "mail_mode" : stage.kind(in: config)
         var payload: [String: Any] = ["done": false, "position": position,
             "onboarding": ["step": config == nil ? stage.onboardingStep : position, "kind": kind, "note": note], "note": note]
-        // The two handoff lines are the speaker's to recite, as the about step's script already
-        // is. Left inside the note, the welcome line came out as an ordinary email summary ending
-        // on "What would you like to do with it?", and the question after the draft depended on
-        // the model finding it under "say nothing else".
+        // The handoff lines are recited by the phone, as the about step's script already is.
         if onboardingMailModePending {
             payload["script"] = config?.mailModeQuestion ?? EmailOnboardingContract.mailModeQuestion
         } else if stage.kind(in: config) == "welcome" {
@@ -3569,9 +3566,7 @@ actor LocalTriageQueue {
         Self.draftRelayArguments(arguments, in: items)
     }
 
-    /// The Nate reply, steered onto his thread as a draft; nil for any other write. Aimed at Nate
-    /// it is steered for as long as onboarding runs, so a saved send preference never sends it;
-    /// unaddressed, only while the welcome stage is up and its question has not been put. See
+    /// The Nate reply steered onto his thread as a draft, nil for any other write; see
     /// `EmailOnboardingContract.welcomeReplyArguments`.
     func onboardingWelcomeReply(_ arguments: String) -> String? {
         guard let welcome = onboardingFlow?.welcome else { return nil }

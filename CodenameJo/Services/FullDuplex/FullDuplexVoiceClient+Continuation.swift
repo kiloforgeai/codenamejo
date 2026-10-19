@@ -43,8 +43,7 @@ extension FullDuplexVoiceClient {
             return
         }
         if onboardingFlow != nil {
-            // A stage with its own line is said word for word. Left to its note, the welcome
-            // line came out as an email summary ending on "What would you like to do with it?".
+            // A stage with its own line is said word for word.
             let stage = stageScript.map { line in
                 """
                 The immediately preceding queue result is authoritative. Say exactly "\(line)" \
