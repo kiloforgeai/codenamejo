@@ -16,11 +16,11 @@ enum LocalCompose {
 
     /// - Parameter defer: the caller advances on the receipt, so the Gmail call may land after it.
     static func run(name: String, argumentsJSON: String, defer deferred: Bool,
-                    conversationId: String? = nil) async -> FullDuplexBroker.ToolResult {
+                    conversationId: String? = nil, onboardingReply: Bool = false) async -> FullDuplexBroker.ToolResult {
         let args = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8))) as? [String: Any] ?? [:]
         let started = Date()
         do {
-            let result = try await compose(name, args, deferred: deferred, conversationId: conversationId)
+            let result = try await compose(name, args, deferred: deferred, conversationId: conversationId, onboardingReply: onboardingReply)
             RealtimeLog.log("localCompose: \(name)\(GmailReadTools.string(args, "thread_id") == nil ? "" : " on a thread") "
                 + "\(result.ok == true ? "ok" : "not ok") in \(Int(Date().timeIntervalSince(started) * 1000))ms — "
                 + "\(result.text.prefix(80))")
@@ -37,7 +37,7 @@ enum LocalCompose {
     // MARK: - The write
 
     private static func compose(_ name: String, _ given: [String: Any], deferred: Bool,
-                                conversationId: String?) async throws -> FullDuplexBroker.ToolResult {
+                                conversationId: String?, onboardingReply: Bool) async throws -> FullDuplexBroker.ToolResult {
         let threadId = GmailReadTools.string(given, "thread_id")
         // The route's guard: a fresh message's `to` must at least parse. A reply's comes off the thread.
         if threadId == nil, !looksLikeAddress(given["to"]) {
@@ -146,7 +146,7 @@ enum LocalCompose {
         let files = threadId != nil && StandingRule.archiveAfterReply.isOn
         let copies = copiesFor(message)
 
-        if name == "create_draft" || DraftsOnly.isOn(for: account) {
+        if name == "create_draft" || (!onboardingReply && DraftsOnly.isOn(for: account)) {
             var receipt = "Draft to \(to) saved in \(account)\(copies)." + (files ? archivedByRule : "")
             if name == "send_email" { receipt += " Nothing was sent because this inbox is set to drafts only." }
             return try await finishDraft(name, message, receipt: receipt, account: account, token: token, files: files,

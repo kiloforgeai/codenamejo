@@ -1097,7 +1097,7 @@ extension FullDuplexVoiceClient {
               let step = standingStep, let kind = Self.onboardingKind(step) else { return false }
         switch kind {
         case "welcome":
-            composeWelcomeReplyAndDraft(transcript, step: step)
+            composeWelcomeReplyAndSend(transcript, step: step)
             return false
         case "mail_mode":
             guard let mode = EmailOnboardingContract.mailModeAnswer(transcript) else { return false }
@@ -1129,17 +1129,17 @@ extension FullDuplexVoiceClient {
         toolCalledThisResponse = true
         RealtimeLog.log("onboarding: \(detail) — handled on the phone without a brain turn")
         let argumentsJSON = String(decoding: data, as: UTF8.self)
-        if tool == "create_draft" {
-            answerLocalMailWrite(callId: id, argumentsJSON: argumentsJSON)
+        if tool == "send_email" {
+            answerLocalMailWrite(callId: id, argumentsJSON: argumentsJSON, tool: tool)
         } else {
             answerTriageNext(callId: id, argumentsJSON: argumentsJSON)
         }
         return true
     }
 
-    /// Compose the Nate reply from their words, then draft it as this turn's action if the
+    /// Compose the Nate reply from their words, then send it as this turn's action if the
     /// composer says the words were an answer and nothing has moved on meanwhile.
-    private func composeWelcomeReplyAndDraft(_ words: String, step: String) {
+    private func composeWelcomeReplyAndSend(_ words: String, step: String) {
         let dial = dialGeneration
         let started = Date()
         Task { [weak self] in
@@ -1156,7 +1156,7 @@ extension FullDuplexVoiceClient {
                 return
             }
             RealtimeLog.log("onboarding: reply composed on the phone in \(ms) ms")
-            _ = self.beginOnboardingTurn(tool: "create_draft", arguments: ["body": reply, "user_request": words],
+            _ = self.beginOnboardingTurn(tool: "send_email", arguments: ["body": reply, "user_request": words],
                                          detail: "Nate reply")
         }
     }
@@ -1658,12 +1658,14 @@ extension FullDuplexVoiceClient {
                 return
             }
             var relayArguments = tool == "forward_email" ? argumentsJSON : await localTriage.draftRelayArguments(argumentsJSON)
-            // The Nate reply goes on his thread as a draft whatever the inbox mode says.
+            // Only the welcome-stage reply bypasses the mailbox's draft preference.
             var runAs = tool
+            var onboardingReply = false
             if tool != "forward_email", let welcomeReply = await localTriage.onboardingWelcomeReply(relayArguments) {
                 relayArguments = welcomeReply
-                runAs = "create_draft"
-                RealtimeLog.log("onboarding: \(tool) steered onto the welcome thread as a draft")
+                runAs = "send_email"
+                onboardingReply = true
+                RealtimeLog.log("onboarding: \(tool) steered onto the welcome thread to send")
             }
             let account = Self.stringArgument("account", in: relayArguments)
             let selectedMessage = Self.stringArgument("reply_message_id", in: relayArguments)
@@ -1677,7 +1679,8 @@ extension FullDuplexVoiceClient {
                 name: runAs, argumentsJSON: relayArguments,
                 conversationId: self?.conversationId(),
                 deferDraft: deferDraft && runAs == "create_draft",
-                deferSend: deferDraft && runAs != "create_draft")
+                deferSend: deferDraft && runAs != "create_draft" && !onboardingReply,
+                onboardingReply: onboardingReply)
             guard let self, self.isActive, dial == self.dialGeneration else { return }
             guard !Task.isCancelled else {
                 self.finishSupersededTool(callId: callId, tool: tool, result: result.text,
@@ -1705,7 +1708,7 @@ extension FullDuplexVoiceClient {
             // A throttled draft finishes without having been written: this phone holds it
             // as durable work (`PendingDraft`). Same trade `archive_message` makes.
             let pendingDraft = result.pendingDraft
-            let completedTool = tool == "send_email" && result.performedTool == "create_draft" ? "create_draft" : tool
+            let completedTool = result.performedTool ?? runAs
             let saved = result.ok == true || pendingDraft != nil
             // A standalone draft about the circled-back email has no `thread_id` by design:
             // adding one would turn it into a reply. When the report-back item is still the

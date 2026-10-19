@@ -30,7 +30,7 @@ enum OnboardingResume {
         guard runId == self.runId else { return }
         UserDefaults.standard.set(step, forKey: stepKey)
     }
-    /// The question is on the floor, so a resumed call opens on it rather than drafting again.
+    /// The question is on the floor, so a resumed call opens on it rather than replying again.
     static func asked(runId: String) {
         guard var flow, flow.runId == runId, let choice = flow.mailModeChoice, choice.status == "welcome" else { return }
         flow.mailModeChoice = .init(account: choice.account, status: "pending", mode: nil)
@@ -205,7 +205,7 @@ struct EmailOnboardingConfig: Codable, Sendable {
         let id: String
         let kind: String
         let line: String?
-        /// What the phone says once the welcome reply is drafted, ahead of the next question.
+        /// What the phone says once the welcome reply is sent, ahead of the next question.
         let receipt: String?
         let question: String?
         let query: String?
@@ -331,7 +331,7 @@ enum EmailOnboardingContract {
     static let beatPrefix = "onboarding-beat:"
     static let importantLead = "Summarize this recent important email in one sentence and ask what they would like to do with it."
     static let mailModeQuestion = "Going forward, should I send your emails, or keep them in Drafts?"
-    static let welcomeDraftReceipt = "Your reply is saved as a draft."
+    static let welcomeSendReceipt = "Your reply has been sent."
     static let mailModeNote = mailModeInstruction(question: mailModeQuestion)
     static func mailModeInstruction(question: String) -> String {
         "Ask \"\(question)\" Wait for an explicit choice of send or drafts. A bare yes/no is ambiguous: clarify. Call triage_next with onboarding_mail_mode \"send\" or \"drafts\" only after that choice; use \"skip\" only if they explicitly skip this preference. Do not draft or send another Nate reply. Reads, questions, silence, and ordinary next calls do not save a preference or advance. Never claim it is saved before the tool succeeds."
@@ -441,17 +441,17 @@ enum EmailOnboardingContract {
     /// Scripted, and says "an email" rather than pointing at "this": nothing is on a screen.
     /// Ported from the old server's `ONBOARDING_WELCOME_LINE` and `ONBOARDING_RESUME_OPENING`.
     static let resumeLine = "Welcome back! Let's pick up where we left off."
-    static let welcomeLine = "Nate, the founder of Codename Jo, sent you an email asking where you found us. Say a friend told me about you, and I'll draft your reply."
-    /// Drafts on the answer, and makes that the turn's only call.
+    static let welcomeLine = "Nate, the founder of Codename Jo, sent you an email asking where you found us. Say a friend told me about you, and I'll send your reply."
+    /// Sends on the answer, and makes that the turn's only call.
     /// "to this exact thread" is what `isOnboardingWelcomeReply` matches on — don't reword it.
     static func welcomeInstruction(line: String) -> String {
-        "Say exactly \"\(line)\" Say that line even though you would not normally invite them to speak: telling them the words is what teaches them how this works. Do not ask what they want to do with it, do not ask how they want to answer him, and do not end this turn on a question. An answer can pause mid-thought: while what they have said so far trails off, keep listening without prompting them. Once they have finished, turn everything they said into a short reply, save it with create_draft to this exact thread, and say where the draft was saved in one clause. The draft's result carries the next onboarding stage; if it does not, call triage_next in the same turn. Never send this reply. Do not read it back first and do not ask permission. You already have everything you need: the thread id is in this payload and the question is in the snippet. Do not read, search for or look up this email, and do not look for another one from Nate — reply on the thread id you were given. Archive or skip if requested. Reads and reply edits do not advance onboarding."
+        "Say exactly \"\(line)\" Say that line even though you would not normally invite them to speak: telling them the words is what teaches them how this works. Do not ask what they want to do with it, do not ask how they want to answer him, and do not end this turn on a question. An answer can pause mid-thought: while what they have said so far trails off, keep listening without prompting them. Once they have finished, turn everything they said into a short reply, send it with send_email to this exact thread, and confirm it was sent in one clause. The send's result carries the next onboarding stage; if it does not, call triage_next in the same turn. This onboarding reply is sent regardless of the mailbox's draft/send preference. Do not read it back first and do not ask permission. You already have everything you need: the thread id is in this payload and the question is in the snippet. Do not read, search for or look up this email, and do not look for another one from Nate — reply on the thread id you were given. Archive or skip if requested. Reads and reply edits do not advance onboarding."
     }
-    /// The Nate reply steered onto his thread as a draft: a write aimed at his thread or address,
-    /// or an unaddressed one while the welcome stage is up. Nil leaves any other write alone.
+    /// The onboarding reply steered onto Nate's thread: a write aimed at his thread or address,
+    /// or an unaddressed one, only while the welcome stage is up. Nil leaves other writes alone.
     static func welcomeReplyArguments(_ arguments: String, welcome: EmailOnboardingItem,
                                       onWelcomeStage: Bool) -> String? {
-        guard let data = arguments.data(using: .utf8),
+        guard onWelcomeStage, let data = arguments.data(using: .utf8),
               var json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
         func field(_ key: String) -> String? {
             let value = (json[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -462,7 +462,7 @@ enum EmailOnboardingContract {
         let founder = LocalCompose.bareAddress(welcome.from).lowercased()
         let onNatesThread = thread.map { $0 == welcome.threadId || $0 == welcome.id } ?? false
         let toNate = to.map { LocalCompose.looksLikeAddress(founder) && LocalCompose.bareAddress($0).lowercased() == founder } ?? false
-        guard onNatesThread || toNate || (onWelcomeStage && thread == nil && to == nil) else { return nil }
+        guard onNatesThread || toNate || (thread == nil && to == nil) else { return nil }
         json["thread_id"] = welcome.threadId
         json["account"] = welcome.account
         json.removeValue(forKey: "to")

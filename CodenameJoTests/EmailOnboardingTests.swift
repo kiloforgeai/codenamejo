@@ -105,7 +105,7 @@ final class EmailOnboardingTests: XCTestCase {
         await second.end()
     }
 
-    func testHangUpAfterTheNateDraftResumesOnTheMailModeQuestion() async throws {
+    func testHangUpAfterTheNateSendResumesOnTheMailModeQuestion() async throws {
         OnboardingResume.finish()
         defer { OnboardingResume.finish() }
         let all = [1,2,3,4].map(item)
@@ -124,7 +124,7 @@ final class EmailOnboardingTests: XCTestCase {
         let first = await dial(flow)
         let welcome = await first.openingStep(store: store)
         XCTAssertTrue(welcome.output.contains("to this exact thread"))
-        // The draft landed on Nate's thread, so the question is on the floor when the call drops.
+        // The reply was sent on Nate's thread, so the question is on the floor when the call drops.
         let asked = await first.step(.init(), store: store, dealtWith: true)
         XCTAssertTrue(asked.output.contains("Going forward"))
         await first.end()
@@ -134,7 +134,7 @@ final class EmailOnboardingTests: XCTestCase {
         XCTAssertEqual(resumed.resume, true)
         let second = await dial(resumed)
         let opening = await second.openingStep(store: store)
-        XCTAssertTrue(opening.output.contains("Going forward"), "the question again, not a second Nate draft")
+        XCTAssertTrue(opening.output.contains("Going forward"), "the question again, not a second Nate send")
         XCTAssertFalse(opening.output.contains("to this exact thread"))
         var choice = LocalTriageQueue.Input()
         choice.onboardingMailMode = "drafts"
@@ -160,11 +160,13 @@ final class EmailOnboardingTests: XCTestCase {
         let store = MailStore(database: nil, userId: "test-user")
         let welcome = await queue.openingStep(store: store)
         XCTAssertEqual(try script(welcome.output), config.steps[0].line)
-        XCTAssertTrue(welcome.output.contains("to this exact thread"), "the note still drives the draft")
+        XCTAssertTrue(welcome.output.contains("to this exact thread"), "the note still drives the send")
         let question = await queue.step(.init(), store: store, dealtWith: true)
         XCTAssertEqual(try script(question.output),
                        [config.steps[0].receipt, config.mailModeQuestion].compactMap { $0 }.joined(separator: " "))
-        XCTAssertEqual(config.steps[0].receipt, "Your reply is saved as a draft.")
+        XCTAssertEqual(config.steps[0].receipt, "Your reply has been sent.")
+        XCTAssertTrue(welcome.output.contains("send_email"))
+        XCTAssertEqual(config.mailModeQuestion, "Going forward, should I send your emails, or keep them in Drafts?")
         XCTAssertEqual(try stage(question.output), 1, "the question shares the welcome stage")
         await queue.end()
     }
@@ -218,7 +220,7 @@ final class EmailOnboardingTests: XCTestCase {
         XCTAssertTrue(prompt.contains("Return JSON"))
     }
 
-    func testTheNateReplyIsSteeredOntoHisThreadAsADraft() throws {
+    func testTheNateReplyIsSteeredOntoHisThreadOnlyDuringTheWelcomeStage() throws {
         let welcome = EmailOnboardingItem(account: "owner@example.test", id: "welcome-id", threadId: "welcome-thread",
             from: "Nate from Codename Jo <nate@kiloforge.com>", subject: "don't type your reply", date: "2026-10-19",
             snippet: "How did your onboarding go?", internalDate: 1, onboardingStep: 1, cleanup: nil)
@@ -252,8 +254,8 @@ final class EmailOnboardingTests: XCTestCase {
                      "a name is not an address: the route refuses it and asks for the thread, as for anyone")
         XCTAssertNil(try steered(#"{"thread_id":"another-thread","body":"x","user_request":"x"}"#))
         XCTAssertNil(try steered(#"{"body":"x","user_request":"x"}"#, onStage: false))
-        // Aimed at Nate after the stage has moved on, it is still a draft: that reply is never sent.
-        XCTAssertNotNil(try steered(#"{"thread_id":"welcome-thread","body":"x","user_request":"x"}"#, onStage: false))
+        // Later replies to Nate use the saved preference, just like any other email.
+        XCTAssertNil(try steered(#"{"thread_id":"welcome-thread","body":"x","user_request":"x"}"#, onStage: false))
     }
 
     func testTheQueueSteersTheNateReplyOnlyWhileTheWelcomeStageIsUp() async throws {
@@ -274,7 +276,7 @@ final class EmailOnboardingTests: XCTestCase {
         let afterQuestion = await queue.onboardingWelcomeReply(bare)
         XCTAssertNil(afterQuestion, "the question is up; an unaddressed write is not Nate's")
         let aimedAtNate = await queue.onboardingWelcomeReply(#"{"thread_id":"thread-1","body":"x","user_request":"x"}"#)
-        XCTAssertNotNil(aimedAtNate)
+        XCTAssertNil(aimedAtNate, "the onboarding send exception ends when the question is up")
         await queue.end()
     }
 

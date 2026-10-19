@@ -409,7 +409,7 @@ enum FullDuplexBroker {
     static func runTool(
         name: String, argumentsJSON: String,
         conversationId: String? = nil, deferArchive: Bool = false, deferDraft: Bool = false, deferSpam: Bool = false, deferTrash: Bool = false, deferSend: Bool = false, deferCalendar: Bool = false, deferLabel: Bool = false,
-        profileId: String? = ProfileRuntime.snapshot?.profileId
+        profileId: String? = ProfileRuntime.snapshot?.profileId, onboardingReply: Bool = false
     ) async -> ToolResult {
         // Notion's MCP, called from this phone with the profile's own grant.
         if NotionTools.names.contains(name) {
@@ -425,7 +425,8 @@ enum FullDuplexBroker {
         let inCall = deferSend && !(conversationId ?? "").isEmpty
         if LocalCompose.names.contains(name) {
             return await LocalCompose.run(name: name, argumentsJSON: argumentsJSON,
-                                          defer: name == "create_draft" ? deferDraft : inCall, conversationId: conversationId)
+                                          defer: name == "create_draft" ? deferDraft : inCall, conversationId: conversationId,
+                                          onboardingReply: onboardingReply)
         }
         if name == LocalForward.name {
             return await LocalForward.run(argumentsJSON: argumentsJSON, defer: inCall, conversationId: conversationId)

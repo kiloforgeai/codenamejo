@@ -145,10 +145,11 @@ final class LocalComposeTests: XCTestCase {
         return scripted
     }
 
-    private func run(_ name: String, _ args: [String: Any], defer deferred: Bool = false) async -> FullDuplexBroker.ToolResult {
+    private func run(_ name: String, _ args: [String: Any], defer deferred: Bool = false,
+                     onboardingReply: Bool = false) async -> FullDuplexBroker.ToolResult {
         let data = try! JSONSerialization.data(withJSONObject: args)
         return await LocalCompose.run(name: name, argumentsJSON: String(decoding: data, as: UTF8.self),
-                                      defer: deferred, conversationId: "call")
+                                      defer: deferred, conversationId: "call", onboardingReply: onboardingReply)
     }
 
     private func posts(_ scripted: ScriptedGmail) -> [String] {
@@ -366,6 +367,20 @@ final class LocalComposeTests: XCTestCase {
     }
 
     // MARK: - Drafts only, and the first-time check
+
+    func testOnboardingReplySendsWithoutChangingTheDraftPreference() async throws {
+        DraftsOnly.set(true, for: owner)
+        let scripted = gmail(dealt(Mail(id: "m1", from: dana, to: owner)))
+        let result = await run("send_email", ["thread_id": "T1", "body": "Loved it."], onboardingReply: true)
+        XCTAssertEqual(result.ok, true)
+        XCTAssertEqual(result.text, "Sent to \(dana) from \(owner).")
+        XCTAssertEqual(posts(scripted), ["messages/send"])
+        XCTAssertTrue(DraftsOnly.isOn(for: owner))
+
+        let later = gmail(dealt(Mail(id: "m1", from: dana, to: owner)))
+        _ = await run("send_email", ["thread_id": "T1", "body": "One more thing."])
+        XCTAssertEqual(posts(later), ["drafts"], "later replies still obey the saved preference")
+    }
 
     func testADraftsOnlyInboxSavesTheSendAsADraftAndSaysNothingWent() async throws {
         UserDefaults.standard.set(true, forKey: DraftsOnly.storageKey)
