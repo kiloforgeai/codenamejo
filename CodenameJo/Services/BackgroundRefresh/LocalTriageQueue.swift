@@ -647,6 +647,11 @@ actor LocalTriageQueue {
     private var restoredThreadContexts: [String: Item] = [:]
     /// The pages the crossing build may still read; nil once one missed, so the row says live.
     private var inboxAheadPages: [Int64?: LivePageResult]?
+    /// Every mailbox's newest unread, in `accounts` order; `batches` is nil when any read failed.
+    private typealias UnreadArrivals = (accounts: [String], batches: [[MailStore.Ingest]]?)
+    /// The unread re-check read while the user is on unread's last message — see `prefetchUnreadArrivals`.
+    /// `at` is when the read started, so mail newer than that is what it can miss.
+    private var unreadArrivalsAhead: (task: Task<UnreadArrivals, Never>, generation: Int, at: Date)?
 
     /// How long a step waits for an uncached cleanup lookup before presenting without it.
     static let cleanupWait: Duration = .milliseconds(400)
@@ -2098,6 +2103,7 @@ actor LocalTriageQueue {
         running = true
         // A page already in flight belongs to the queue this one replaces — see `generation`.
         generation &+= 1
+        unreadArrivalsAhead = nil
 
         // Counted before the page is fetched, and only for scopes that need it: `important` cannot
         // settle its first page without a mailbox count (see `cacheHoldsItAll`).
@@ -2178,6 +2184,9 @@ actor LocalTriageQueue {
         RealtimeLog.log(
             "localTriage: built \(items.count) of \(total) (\(asked.rawValue))"
                 + (more ? ", more from \(before ?? 0)" : ", all of it"))
+        // A stage already near its end looks ahead now; no advance may come before the crossing.
+        prefetchInboxStage(store: store)
+        prefetchUnreadArrivals(store: store)
         return (await current(store: store), served)
     }
 
@@ -2193,8 +2202,10 @@ actor LocalTriageQueue {
     /// Fetch the `all` stage behind unread's last few messages, only once `more` is false so it never
     /// shares the wire with a top-up. The unread re-check at the crossing stays live to catch new mail.
     private func prefetchInboxStage(store: MailStore) {
-        guard scope == .unread, !more, nextScopeInPlan() == .all,
-              items.count - position < Self.topUpAt, inboxAheadTask == nil, inboxAhead == nil
+        // A stale fetch is fetched again rather than left for the crossing to drop.
+        guard scope == .unread, !more, nextScopeInPlan() == .all, !preparingDailySnapshot,
+              items.count - position < Self.topUpAt, inboxAheadTask == nil,
+              inboxAhead.map({ !Self.isFresh($0.at) }) ?? true
         else { return }
         let gen = generation
         RealtimeLog.log("localTriage: prefetching all behind unread")
@@ -2238,17 +2249,46 @@ actor LocalTriageQueue {
     private func takeInboxAhead(crossing: Bool) async -> InboxAhead? {
         if crossing, let task = inboxAheadTask { await task.value }
         defer { inboxAhead = nil; inboxAheadTask = nil }
-        guard crossing, let ahead = inboxAhead,
-              Date().timeIntervalSince(ahead.at) < Self.prefetchFreshness,
+        guard crossing, let ahead = inboxAhead, Self.isFresh(ahead.at),
               await queueAccounts() == ahead.accounts
         else { return nil }
         return ahead
+    }
+
+    /// Read the re-check `collectUnreadArrivalsBeforeLeaving` makes once the user is on unread's
+    /// last message, so the crossing does not wait on Gmail for it. Mail landing after this read
+    /// starts waits for the next call rather than joining this walk.
+    private func prefetchUnreadArrivals(store: MailStore) {
+        guard liveFeatures, scope == .unread, !more, position == items.count, !preparingDailySnapshot
+        else { return }
+        if let ahead = unreadArrivalsAhead, ahead.generation == generation, Self.isFresh(ahead.at) { return }
+        RealtimeLog.log("localTriage: re-checking unread behind its last message")
+        unreadArrivalsAhead = (
+            Task { [weak self] in await self?.readUnreadArrivals(store: store) ?? ([], nil) },
+            generation, Date())
+    }
+
+    /// The re-check `prefetchUnreadArrivals` read, waiting for it if still in flight. Nil when there
+    /// is none for this walk, it is stale, it failed, or the mailboxes changed: the crossing reads live.
+    private func takeUnreadArrivalsAhead() async -> UnreadArrivals? {
+        guard let ahead = unreadArrivalsAhead else { return nil }
+        unreadArrivalsAhead = nil
+        let read = await ahead.task.value
+        guard ahead.generation == generation, Self.isFresh(ahead.at), read.batches != nil,
+              read.accounts == (await queueAccounts())
+        else { return nil }
+        return read
+    }
+
+    static func isFresh(_ at: Date) -> Bool {
+        Date().timeIntervalSince(at) < prefetchFreshness
     }
 
     /// Retire the walk's handles; in-flight reads may still update the account-scoped cache.
     private func releasePrefetch() {
         inboxAhead = nil
         inboxAheadTask = nil
+        unreadArrivalsAhead = nil
     }
 
     // MARK: - Advancing
@@ -2259,6 +2299,9 @@ actor LocalTriageQueue {
     ) async -> (String, Served) {
         if restoredNeedsCurrent, input.direction == nil {
             restoredNeedsCurrent = false
+            // A walk restored near its end looks ahead now, as a build does.
+            prefetchInboxStage(store: store)
+            prefetchUnreadArrivals(store: store)
             return (await current(store: store), .hit)
         }
         restoredNeedsCurrent = false
@@ -2362,9 +2405,11 @@ actor LocalTriageQueue {
         }
 
         if position > items.count, scope == .unread, liveFeatures {
-            switch await collectUnreadArrivalsBeforeLeaving(store: store) {
-            case true?: return (await current(store: store), .live)
-            case nil: return (gmailPending(.retryUnavailable), .live)
+            let arrivals = await collectUnreadArrivalsBeforeLeaving(store: store)
+            if arrivals.live { served = .live }
+            switch arrivals.kept {
+            case true?: return (await current(store: store), served)
+            case nil: return (gmailPending(.retryUnavailable), served)
             case false?: break
             }
         }
@@ -2374,20 +2419,29 @@ actor LocalTriageQueue {
             // hand back its first message, rather than closing and waiting to be asked for it.
             if let next = nextScopeInPlan() {
                 retainStageBeforeCrossing()
-                return await build(
+                let crossed = await build(
                     scope: next,
                     store: store,
                     walking: scopePlan,
                     crossedFromScope: scope)
+                // A refill or unread re-check above was awaited in front of this build too.
+                return (crossed.0, served == .live ? .live : crossed.1)
             }
             return (await close(), served)
         }
 
         // Behind the answer the user is about to hear, so deliberately not `.live`: they waited for none of it.
+        // The last page landing can bring the stage's end close, so the look ahead is checked again then.
         if more, items.count - position < Self.topUpAt, refillTask == nil {
-            Task { [weak self] in _ = await self?.refill(store: store) }
+            Task { [weak self] in
+                guard let self else { return }
+                await self.refill(store: store)
+                await self.prefetchInboxStage(store: store)
+                await self.prefetchUnreadArrivals(store: store)
+            }
         }
         prefetchInboxStage(store: store)
+        prefetchUnreadArrivals(store: store)
 
         // A landed job's answer rides this step rather than replacing it, which would consume the
         // continuation the cursor advances in. Excluded on "back".
@@ -5110,29 +5164,27 @@ actor LocalTriageQueue {
     }
 
     /// A complete cached page is not evidence that no new unread mail arrived during this walk.
-    private func collectUnreadArrivalsBeforeLeaving(store: MailStore) async -> Bool? {
+    /// `kept` is whether new unread joined the stage (nil when Gmail could not say); `live` is whether
+    /// the user waited on Gmail for it rather than on `prefetchUnreadArrivals`.
+    private func collectUnreadArrivalsBeforeLeaving(store: MailStore) async -> (kept: Bool?, live: Bool) {
         let gen = generation
-        let accounts = await queueAccounts()
-        guard !accounts.isEmpty else { return nil }
-        var incoming: [Item] = []
-        var fullPage = false
-        for account in accounts {
-            guard let batch = await unreadOpeningLoader(account) else { return nil }
-            guard gen == generation, scope == .unread else { return nil }
-            await store.cache(batch)
-            if !batch.isEmpty { scheduleEnrichment(account: account, store: store) }
-            incoming += batch.map(Self.liveItem(from:))
-            fullPage = fullPage || batch.count >= Self.pageSize
-        }
+        guard !(await queueAccounts()).isEmpty else { return (nil, false) }
+        let ahead = await takeUnreadArrivalsAhead()
+        let live = ahead == nil
+        let read: UnreadArrivals
+        if let ahead { read = ahead } else { read = await readUnreadArrivals(store: store) }
+        guard gen == generation, scope == .unread, let batches = read.batches else { return (nil, live) }
+        let incoming = batches.flatMap { $0.map(Self.liveItem(from:)) }
+        let fullPage = batches.contains { $0.count >= Self.pageSize }
         let held = Self.messageKeys(items).union(gmailWalkDealtWith)
             .union(dispatchSweepIDs).union(navigationExcludedIDs)
         let eligible = Self.gmailEligible(incoming, dealtWithThisWalk: held).filter { item in
             !pendingArchives.contains { $0.matches(account: item.account, ids: item.ids, threadId: item.threadId) }
         }
         let expanded = await expandedTopicPage(eligible, store: store)
-        guard gen == generation, scope == .unread else { return nil }
+        guard gen == generation, scope == .unread else { return (nil, live) }
         let fresh = grouped(expanded)
-        guard !fresh.isEmpty else { return fullPage ? nil : false }
+        guard !fresh.isEmpty else { return (fullPage ? nil : false, live) }
         items += fresh
         total = max(total, items.reduce(0) { $0 + count($1) })
         if fullPage {
@@ -5143,7 +5195,27 @@ actor LocalTriageQueue {
             more = true
         }
         RealtimeLog.log("localTriage: kept \(fresh.count) newly discovered stops in unread before all-mail")
-        return true
+        return (true, live)
+    }
+
+    /// Every mailbox's newest unread, read side by side and cached as each lands.
+    private func readUnreadArrivals(store: MailStore) async -> UnreadArrivals {
+        let accounts = await queueAccounts()
+        let loader = unreadOpeningLoader
+        let read = await withTaskGroup(of: (Int, [MailStore.Ingest]?).self) { group in
+            for (index, account) in accounts.enumerated() {
+                group.addTask { (index, await loader(account)) }
+            }
+            var read = [[MailStore.Ingest]?](repeating: nil, count: accounts.count)
+            for await (index, batch) in group { read[index] = batch }
+            return read
+        }
+        for (account, batch) in zip(accounts, read) {
+            guard let batch else { continue }
+            await store.cache(batch)
+            if !batch.isEmpty { scheduleEnrichment(account: account, store: store) }
+        }
+        return (accounts, read.contains { $0 == nil } ? nil : read.compactMap { $0 })
     }
 
     private func reconcileUnreadOpening(account: String, store: MailStore) async -> Bool? {
