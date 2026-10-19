@@ -30,6 +30,13 @@ enum OnboardingResume {
         guard runId == self.runId else { return }
         UserDefaults.standard.set(step, forKey: stepKey)
     }
+    /// The mail-mode question is on the floor: a resumed call opens on it instead of asking for
+    /// the Nate reply again, which drafted it twice.
+    static func asked(runId: String) {
+        guard var flow, flow.runId == runId, let choice = flow.mailModeChoice, choice.status == "welcome" else { return }
+        flow.mailModeChoice = .init(account: choice.account, status: "pending", mode: nil)
+        save(flow)
+    }
     /// The saved answer rides the run, so a resumed call skips the founder email and the question.
     static func saved(_ receipt: OnboardingMailModeReceipt, mode: String, runId: String) {
         guard var flow, flow.runId == runId, let choice = flow.mailModeChoice else { return }

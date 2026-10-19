@@ -1533,6 +1533,7 @@ actor LocalTriageQueue {
         if let flow = onboardingFlow, flow.mailModeChoice != nil, flow.mailPreference == nil,
            onboardingMailModeReceipt == nil, onboardingOnWelcome {
             onboardingMailModePending = true
+            OnboardingResume.asked(runId: flow.runId)
             return (onboardingCurrent(), .hit)
         }
         await prepareOnboardingTail()

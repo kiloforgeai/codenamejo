@@ -105,6 +105,45 @@ final class EmailOnboardingTests: XCTestCase {
         await second.end()
     }
 
+    func testHangUpAfterTheNateDraftResumesOnTheMailModeQuestion() async throws {
+        OnboardingResume.finish()
+        defer { OnboardingResume.finish() }
+        let all = [1,2,3,4].map(item)
+        let flow = EmailOnboardingFlow(version: 1, runId: UUID().uuidString, welcome: all[0],
+            mailModeChoice: .init(account: "owner@example.test", status: "welcome", mode: nil))
+        let store = MailStore(database: nil, userId: "test-user")
+        let dial = { (flow: EmailOnboardingFlow) async -> LocalTriageQueue in
+            let queue = LocalTriageQueue()
+            await queue.configure(coachingPlan: nil,
+                forceOnboardingFeedLesson: false,
+                sequentialFeed: false, calendarFeedDue: false, localCalendar: false,
+                onboardingFlow: flow, onboardingLoader: { .init(items: all, failures: []) })
+            return queue
+        }
+        OnboardingResume.begin(flow)
+        let first = await dial(flow)
+        let welcome = await first.openingStep(store: store)
+        XCTAssertTrue(welcome.output.contains("to this exact thread"))
+        // The draft landed on Nate's thread, so the question is on the floor when the call drops.
+        let asked = await first.step(.init(), store: store, dealtWith: true)
+        XCTAssertTrue(asked.output.contains("Going forward"))
+        await first.end()
+        XCTAssertEqual(OnboardingResume.flow?.mailModeChoice?.status, "pending")
+
+        let resumed = try XCTUnwrap(LocalOnboardingRun.resumed())
+        XCTAssertEqual(resumed.resume, true)
+        let second = await dial(resumed)
+        let opening = await second.openingStep(store: store)
+        XCTAssertTrue(opening.output.contains("Going forward"), "the question again, not a second Nate draft")
+        XCTAssertFalse(opening.output.contains("to this exact thread"))
+        var choice = LocalTriageQueue.Input()
+        choice.onboardingMailMode = "drafts"
+        let saved = await second.step(choice, store: store, dealtWith: false)
+        XCTAssertEqual(try stage(saved.output), 2)
+        XCTAssertEqual(OnboardingResume.flow?.mailModeChoice?.status, "saved")
+        await second.end()
+    }
+
     private func script(_ output: String) throws -> String? {
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any])
         return object["script"] as? String
