@@ -1405,7 +1405,7 @@ actor LocalTriageQueue {
     /// v2 numbers the walk; v1 keeps its fixed 5.
     private var onboardingFinishStage: [String: Any] {
         let finish = onboardingFlow?.config?.finish
-        return ["step": onboardingFlow?.config == nil ? 5 : items.count + 1,
+        return ["step": onboardingFlow?.config == nil ? 5 : items.count + 1, "kind": "finish",
                 "note": EmailOnboardingContract.finishInstruction(
                     tip: finish?.tip ?? EmailOnboardingContract.tip,
                     question: finish?.question ?? EmailOnboardingContract.question)]
@@ -1425,8 +1425,18 @@ actor LocalTriageQueue {
         let note = onboardingMailModePending
             ? config?.mailModeQuestion.map(EmailOnboardingContract.mailModeInstruction(question:)) ?? EmailOnboardingContract.mailModeNote
             : stage.about.map { EmailOnboardingContract.aboutInstruction($0, question: aboutQuestion) } ?? stage.note(config: config)
+        // `kind` is what the phone reads to answer a stage itself; see `tryOnboardingAnswer`.
+        let kind = onboardingMailModePending ? "mail_mode" : stage.kind(in: config)
         var payload: [String: Any] = ["done": false, "position": position,
-            "onboarding": ["step": config == nil ? stage.onboardingStep : position, "note": note], "note": note]
+            "onboarding": ["step": config == nil ? stage.onboardingStep : position, "kind": kind, "note": note], "note": note]
+        // The handoff lines are recited by the phone, as the about step's script already is.
+        if onboardingMailModePending {
+            // The receipt is a full sentence: "Draft saved." was dropped as a repeated receipt.
+            let receipt = config?.steps.first { $0.kind == "welcome" }?.receipt ?? EmailOnboardingContract.welcomeDraftReceipt
+            payload["script"] = receipt + " " + (config?.mailModeQuestion ?? EmailOnboardingContract.mailModeQuestion)
+        } else if stage.kind(in: config) == "welcome" {
+            payload["script"] = config?.step(stage.onboardingStep)?.line ?? EmailOnboardingContract.welcomeLine
+        }
         // A beat has a placeholder item so the cursor can stand on it; it is never shown as mail.
         if let about = stage.about {
             payload["about"] = ["items": about.items]
@@ -1524,6 +1534,7 @@ actor LocalTriageQueue {
         if let flow = onboardingFlow, flow.mailModeChoice != nil, flow.mailPreference == nil,
            onboardingMailModeReceipt == nil, onboardingOnWelcome {
             onboardingMailModePending = true
+            OnboardingResume.asked(runId: flow.runId)
             return (onboardingCurrent(), .hit)
         }
         await prepareOnboardingTail()
@@ -3555,6 +3566,14 @@ actor LocalTriageQueue {
 
     func draftRelayArguments(_ arguments: String) -> String {
         Self.draftRelayArguments(arguments, in: items)
+    }
+
+    /// The Nate reply steered onto his thread as a draft, nil for any other write; see
+    /// `EmailOnboardingContract.welcomeReplyArguments`.
+    func onboardingWelcomeReply(_ arguments: String) -> String? {
+        guard let welcome = onboardingFlow?.welcome else { return nil }
+        return EmailOnboardingContract.welcomeReplyArguments(
+            arguments, welcome: welcome, onWelcomeStage: onboardingOnWelcome && !onboardingMailModePending)
     }
 
     static func draftRelayArguments(_ arguments: String, in items: [Item]) -> String {

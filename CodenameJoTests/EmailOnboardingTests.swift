@@ -105,6 +105,179 @@ final class EmailOnboardingTests: XCTestCase {
         await second.end()
     }
 
+    func testHangUpAfterTheNateDraftResumesOnTheMailModeQuestion() async throws {
+        OnboardingResume.finish()
+        defer { OnboardingResume.finish() }
+        let all = [1,2,3,4].map(item)
+        let flow = EmailOnboardingFlow(version: 1, runId: UUID().uuidString, welcome: all[0],
+            mailModeChoice: .init(account: "owner@example.test", status: "welcome", mode: nil))
+        let store = MailStore(database: nil, userId: "test-user")
+        let dial = { (flow: EmailOnboardingFlow) async -> LocalTriageQueue in
+            let queue = LocalTriageQueue()
+            await queue.configure(coachingPlan: nil,
+                forceOnboardingFeedLesson: false,
+                sequentialFeed: false, calendarFeedDue: false, localCalendar: false,
+                onboardingFlow: flow, onboardingLoader: { .init(items: all, failures: []) })
+            return queue
+        }
+        OnboardingResume.begin(flow)
+        let first = await dial(flow)
+        let welcome = await first.openingStep(store: store)
+        XCTAssertTrue(welcome.output.contains("to this exact thread"))
+        // The draft landed on Nate's thread, so the question is on the floor when the call drops.
+        let asked = await first.step(.init(), store: store, dealtWith: true)
+        XCTAssertTrue(asked.output.contains("Going forward"))
+        await first.end()
+        XCTAssertEqual(OnboardingResume.flow?.mailModeChoice?.status, "pending")
+
+        let resumed = try XCTUnwrap(LocalOnboardingRun.resumed())
+        XCTAssertEqual(resumed.resume, true)
+        let second = await dial(resumed)
+        let opening = await second.openingStep(store: store)
+        XCTAssertTrue(opening.output.contains("Going forward"), "the question again, not a second Nate draft")
+        XCTAssertFalse(opening.output.contains("to this exact thread"))
+        var choice = LocalTriageQueue.Input()
+        choice.onboardingMailMode = "drafts"
+        let saved = await second.step(choice, store: store, dealtWith: false)
+        XCTAssertEqual(try stage(saved.output), 2)
+        XCTAssertEqual(OnboardingResume.flow?.mailModeChoice?.status, "saved")
+        await second.end()
+    }
+
+    private func script(_ output: String) throws -> String? {
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any])
+        return object["script"] as? String
+    }
+
+    func testTheWelcomeAndMailModeStagesCarryTheirOwnLines() async throws {
+        let config = try XCTUnwrap(LocalOnboardingRun.config())
+        let flow = EmailOnboardingFlow(version: 2, runId: UUID().uuidString, welcome: item(1),
+            mailModeChoice: .init(account: "owner@example.test", status: "welcome", mode: nil), config: config)
+        let queue = LocalTriageQueue()
+        await queue.configure(coachingPlan: nil,
+            forceOnboardingFeedLesson: false, sequentialFeed: false, calendarFeedDue: false,
+            localCalendar: false, onboardingFlow: flow, onboardingLoader: { .init(items: [], failures: []) })
+        let store = MailStore(database: nil, userId: "test-user")
+        let welcome = await queue.openingStep(store: store)
+        XCTAssertEqual(try script(welcome.output), config.steps[0].line)
+        XCTAssertTrue(welcome.output.contains("to this exact thread"), "the note still drives the draft")
+        let question = await queue.step(.init(), store: store, dealtWith: true)
+        XCTAssertEqual(try script(question.output),
+                       [config.steps[0].receipt, config.mailModeQuestion].compactMap { $0 }.joined(separator: " "))
+        XCTAssertEqual(config.steps[0].receipt, "Your reply is saved as a draft.")
+        XCTAssertEqual(try stage(question.output), 1, "the question shares the welcome stage")
+        await queue.end()
+    }
+
+    private func kind(_ output: String) throws -> String? {
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any])
+        return (object["onboarding"] as? [String: Any])?["kind"] as? String
+    }
+
+    func testStagesNameTheirKindForThePhone() async throws {
+        let config = try XCTUnwrap(LocalOnboardingRun.config())
+        let flow = EmailOnboardingFlow(version: 2, runId: UUID().uuidString, welcome: item(1),
+            mailModeChoice: .init(account: "owner@example.test", status: "welcome", mode: nil), config: config)
+        let queue = LocalTriageQueue()
+        await queue.configure(coachingPlan: nil,
+            forceOnboardingFeedLesson: false, sequentialFeed: false, calendarFeedDue: false,
+            localCalendar: false, onboardingFlow: flow, onboardingLoader: { .init(items: [], failures: []) })
+        let store = MailStore(database: nil, userId: "test-user")
+        let welcome = await queue.openingStep(store: store)
+        XCTAssertEqual(try kind(welcome.output), "welcome")
+        let question = await queue.step(.init(), store: store, dealtWith: true)
+        XCTAssertEqual(try kind(question.output), "mail_mode")
+        var choice = LocalTriageQueue.Input()
+        choice.onboardingMailMode = "drafts"
+        let finish = await queue.step(choice, store: store, dealtWith: false)
+        XCTAssertEqual(try kind(finish.output), "finish")
+        await queue.end()
+    }
+
+    func testTheMailModeAnswerIsReadOnThePhone() {
+        XCTAssertEqual(EmailOnboardingContract.mailModeAnswer("You can send my emails."), "send")
+        XCTAssertEqual(EmailOnboardingContract.mailModeAnswer("Keep them in drafts please"), "drafts")
+        XCTAssertEqual(EmailOnboardingContract.mailModeAnswer("Just draft them."), "drafts")
+        XCTAssertEqual(EmailOnboardingContract.mailModeAnswer("skip"), "skip")
+        XCTAssertNil(EmailOnboardingContract.mailModeAnswer("Yes"), "a bare yes is the brain's to clarify")
+        XCTAssertNil(EmailOnboardingContract.mailModeAnswer("Don't send them, keep drafts"), "both named")
+        XCTAssertNil(EmailOnboardingContract.mailModeAnswer("No, not send"), "negated")
+        XCTAssertNil(EmailOnboardingContract.mailModeAnswer("I'd rather you send them"), "hedged")
+        XCTAssertNil(EmailOnboardingContract.mailModeAnswer("What does drafts mean?"))
+    }
+
+    func testTheComposedReplyIsKeptOnlyWhenItAnswersNate() throws {
+        XCTAssertEqual(EmailOnboardingContract.parseReply(#"{"answers":true,"reply":" Hey Nate, it went really well. "}"#),
+                       "Hey Nate, it went really well.")
+        XCTAssertNil(EmailOnboardingContract.parseReply(#"{"answers":false,"reply":""}"#))
+        XCTAssertNil(EmailOnboardingContract.parseReply(#"{"answers":false,"reply":"Hey Nate, skip this"}"#))
+        XCTAssertNil(EmailOnboardingContract.parseReply(#"{"answers":true,"reply":"   "}"#))
+        XCTAssertNil(EmailOnboardingContract.parseReply("not json"))
+        let prompt = try EmailOnboardingContract.replyPrompt(question: "How did your onboarding go?")
+        XCTAssertTrue(prompt.contains("\"How did your onboarding go?\""))
+        XCTAssertTrue(prompt.contains("Return JSON"))
+    }
+
+    func testTheNateReplyIsSteeredOntoHisThreadAsADraft() throws {
+        let welcome = EmailOnboardingItem(account: "owner@example.test", id: "welcome-id", threadId: "welcome-thread",
+            from: "Nate from Codename Jo <nate@kiloforge.com>", subject: "don't type your reply", date: "2026-10-19",
+            snippet: "How did your onboarding go?", internalDate: 1, onboardingStep: 1, cleanup: nil)
+        func steered(_ arguments: String, onStage: Bool = true) throws -> [String: Any]? {
+            try EmailOnboardingContract.welcomeReplyArguments(arguments, welcome: welcome, onWelcomeStage: onStage)
+                .map { try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]) }
+        }
+        // Unaddressed while the stage is up: this is the reply.
+        let bare = try XCTUnwrap(steered(#"{"body":"Loved it.","user_request":"I loved it"}"#))
+        XCTAssertEqual(bare["thread_id"] as? String, "welcome-thread")
+        XCTAssertEqual(bare["account"] as? String, "owner@example.test")
+        XCTAssertEqual(bare["body"] as? String, "Loved it.")
+        // Addressed to Nate as new mail: onto the thread, without the address or subject.
+        let addressed = try XCTUnwrap(steered(
+            #"{"to":"Nate <nate@kiloforge.com>","subject":"Re: hi","body":"x","user_request":"x"}"#))
+        XCTAssertEqual(addressed["thread_id"] as? String, "welcome-thread")
+        XCTAssertNil(addressed["to"])
+        XCTAssertNil(addressed["subject"])
+        // The message id passed as the thread, with a selected message that is not on it.
+        let byId = try XCTUnwrap(steered(
+            #"{"thread_id":"welcome-id","reply_message_id":"elsewhere","body":"x","user_request":"x"}"#))
+        XCTAssertEqual(byId["thread_id"] as? String, "welcome-thread")
+        XCTAssertNil(byId["reply_message_id"])
+        let selected = try XCTUnwrap(steered(
+            #"{"thread_id":"welcome-thread","reply_message_id":"welcome-id","body":"x","user_request":"x"}"#))
+        XCTAssertEqual(selected["reply_message_id"] as? String, "welcome-id")
+        // A side request to someone else is left alone, as is an unaddressed write once the stage has moved on.
+        XCTAssertNil(try steered(#"{"to":"josh@kiloforge.com","body":"x","user_request":"x"}"#))
+        XCTAssertNil(try steered(#"{"to":"Josh","body":"x","user_request":"x"}"#))
+        XCTAssertNil(try steered(#"{"to":"Nate","body":"x","user_request":"x"}"#),
+                     "a name is not an address: the route refuses it and asks for the thread, as for anyone")
+        XCTAssertNil(try steered(#"{"thread_id":"another-thread","body":"x","user_request":"x"}"#))
+        XCTAssertNil(try steered(#"{"body":"x","user_request":"x"}"#, onStage: false))
+        // Aimed at Nate after the stage has moved on, it is still a draft: that reply is never sent.
+        XCTAssertNotNil(try steered(#"{"thread_id":"welcome-thread","body":"x","user_request":"x"}"#, onStage: false))
+    }
+
+    func testTheQueueSteersTheNateReplyOnlyWhileTheWelcomeStageIsUp() async throws {
+        let all = [1,2,3,4].map(item)
+        let flow = EmailOnboardingFlow(version: 1, runId: UUID().uuidString, welcome: all[0],
+            mailModeChoice: .init(account: "owner@example.test", status: "welcome", mode: nil))
+        let queue = LocalTriageQueue()
+        await queue.configure(coachingPlan: nil,
+            forceOnboardingFeedLesson: false,
+            sequentialFeed: false, calendarFeedDue: false, localCalendar: false,
+            onboardingFlow: flow, onboardingLoader: { .init(items: all, failures: []) })
+        let store = MailStore(database: nil, userId: "test-user")
+        _ = await queue.openingStep(store: store)
+        let bare = #"{"body":"Loved it.","user_request":"I loved it"}"#
+        let onStage = await queue.onboardingWelcomeReply(bare)
+        XCTAssertTrue(onStage?.contains("thread-1") == true)
+        _ = await queue.step(.init(), store: store, dealtWith: true)
+        let afterQuestion = await queue.onboardingWelcomeReply(bare)
+        XCTAssertNil(afterQuestion, "the question is up; an unaddressed write is not Nate's")
+        let aimedAtNate = await queue.onboardingWelcomeReply(#"{"thread_id":"thread-1","body":"x","user_request":"x"}"#)
+        XCTAssertNotNil(aimedAtNate)
+        await queue.end()
+    }
+
     func testMissingMailSkipsStraightToTip() async throws {
         let queue = await configured([])
         let first = await queue.openingStep(store: MailStore(database: nil, userId: "test-user"))

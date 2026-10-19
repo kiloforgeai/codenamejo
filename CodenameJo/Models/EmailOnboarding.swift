@@ -30,6 +30,12 @@ enum OnboardingResume {
         guard runId == self.runId else { return }
         UserDefaults.standard.set(step, forKey: stepKey)
     }
+    /// The question is on the floor, so a resumed call opens on it rather than drafting again.
+    static func asked(runId: String) {
+        guard var flow, flow.runId == runId, let choice = flow.mailModeChoice, choice.status == "welcome" else { return }
+        flow.mailModeChoice = .init(account: choice.account, status: "pending", mode: nil)
+        save(flow)
+    }
     /// The saved answer rides the run, so a resumed call skips the founder email and the question.
     static func saved(_ receipt: OnboardingMailModeReceipt, mode: String, runId: String) {
         guard var flow, flow.runId == runId, let choice = flow.mailModeChoice else { return }
@@ -199,6 +205,8 @@ struct EmailOnboardingConfig: Codable, Sendable {
         let id: String
         let kind: String
         let line: String?
+        /// What the phone says once the welcome reply is drafted, ahead of the next question.
+        let receipt: String?
         let question: String?
         let query: String?
         let count: Int?
@@ -322,7 +330,9 @@ enum EmailOnboardingContract {
 
     static let beatPrefix = "onboarding-beat:"
     static let importantLead = "Summarize this recent important email in one sentence and ask what they would like to do with it."
-    static let mailModeNote = mailModeInstruction(question: "Going forward, should I send your emails, or keep them in Drafts?")
+    static let mailModeQuestion = "Going forward, should I send your emails, or keep them in Drafts?"
+    static let welcomeDraftReceipt = "Your reply is saved as a draft."
+    static let mailModeNote = mailModeInstruction(question: mailModeQuestion)
     static func mailModeInstruction(question: String) -> String {
         "Ask \"\(question)\" Wait for an explicit choice of send or drafts. A bare yes/no is ambiguous: clarify. Call triage_next with onboarding_mail_mode \"send\" or \"drafts\" only after that choice; use \"skip\" only if they explicitly skip this preference. Do not draft or send another Nate reply. Reads, questions, silence, and ordinary next calls do not save a preference or advance. Never claim it is saved before the tool succeeds."
     }
@@ -435,8 +445,90 @@ enum EmailOnboardingContract {
     /// Drafts on the answer, and makes that the turn's only call.
     /// "to this exact thread" is what `isOnboardingWelcomeReply` matches on — don't reword it.
     static func welcomeInstruction(line: String) -> String {
-        "Say exactly \"\(line)\" Say that line even though you would not normally invite them to speak: telling them the words is what teaches them how this works. Do not ask what they want to do with it, do not ask how they want to answer him, and do not end this turn on a question. An answer can pause mid-thought: while what they have said so far trails off, keep listening without prompting them. Once they have finished, turn everything they said into a short reply, save it with create_draft to this exact thread, and say where the draft was saved in one clause. Never send this reply. Do not read it back first and do not ask permission. You already have everything you need: the thread id is in this payload and the question is in the snippet. Do not read, search for or look up this email, and do not look for another one from Nate — reply on the thread id you were given. Archive or skip if requested. Reads and reply edits do not advance onboarding."
+        "Say exactly \"\(line)\" Say that line even though you would not normally invite them to speak: telling them the words is what teaches them how this works. Do not ask what they want to do with it, do not ask how they want to answer him, and do not end this turn on a question. An answer can pause mid-thought: while what they have said so far trails off, keep listening without prompting them. Once they have finished, turn everything they said into a short reply, save it with create_draft to this exact thread, and say where the draft was saved in one clause. The draft's result carries the next onboarding stage; if it does not, call triage_next in the same turn. Never send this reply. Do not read it back first and do not ask permission. You already have everything you need: the thread id is in this payload and the question is in the snippet. Do not read, search for or look up this email, and do not look for another one from Nate — reply on the thread id you were given. Archive or skip if requested. Reads and reply edits do not advance onboarding."
     }
+    /// The Nate reply steered onto his thread as a draft: a write aimed at his thread or address,
+    /// or an unaddressed one while the welcome stage is up. Nil leaves any other write alone.
+    static func welcomeReplyArguments(_ arguments: String, welcome: EmailOnboardingItem,
+                                      onWelcomeStage: Bool) -> String? {
+        guard let data = arguments.data(using: .utf8),
+              var json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        func field(_ key: String) -> String? {
+            let value = (json[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return value.isEmpty ? nil : value
+        }
+        let thread = field("thread_id")
+        let to = field("to")
+        let founder = LocalCompose.bareAddress(welcome.from).lowercased()
+        let onNatesThread = thread.map { $0 == welcome.threadId || $0 == welcome.id } ?? false
+        let toNate = to.map { LocalCompose.looksLikeAddress(founder) && LocalCompose.bareAddress($0).lowercased() == founder } ?? false
+        guard onNatesThread || toNate || (onWelcomeStage && thread == nil && to == nil) else { return nil }
+        json["thread_id"] = welcome.threadId
+        json["account"] = welcome.account
+        json.removeValue(forKey: "to")
+        json.removeValue(forKey: "subject")
+        if let selected = field("reply_message_id"), selected != welcome.id {
+            json.removeValue(forKey: "reply_message_id")
+        }
+        guard let encoded = try? JSONSerialization.data(withJSONObject: json),
+              let result = String(data: encoded, encoding: .utf8) else { return nil }
+        return result
+    }
+
+    /// The composer's instructions for the Nate reply: `prompts/onboarding/reply.md` with his question in it.
+    static func replyPrompt(question: String, text: LivePrompt.Text = .bundled) throws -> String {
+        try text("onboarding/reply", ["question": question])
+    }
+
+    /// The Nate reply, written on the phone with a one-shot call. Nil when the words are not an
+    /// answer, there is no key, or the call fails; the brain then keeps the turn.
+    static func composeWelcomeReply(words: String, question: String? = WelcomeEmail.copy?.question,
+                                    text: LivePrompt.Text = .bundled) async -> String? {
+        guard let question, let prompt = try? replyPrompt(question: question, text: text) else {
+            RealtimeLog.log("onboarding: reply composer has no prompt or question")
+            return nil
+        }
+        do {
+            // Prompt and words in one input message: json_object mode needs the word JSON there.
+            let answer = try await LiveOpenAI.read([["type": "input_text", "text": prompt + "\n\nTheir words:\n" + words]],
+                                                   json: true, timeout: 8)
+            guard let reply = parseReply(answer) else {
+                RealtimeLog.log("onboarding: reply composer declined — \(answer.prefix(160))")
+                return nil
+            }
+            return reply
+        } catch {
+            RealtimeLog.log("onboarding: reply composer failed — \(error)")
+            return nil
+        }
+    }
+
+    /// The reply out of the composer's JSON, only when it says the words were an answer.
+    static func parseReply(_ text: String) -> String? {
+        guard let raw = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any],
+              raw["answers"] as? Bool == true,
+              let reply = (raw["reply"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !reply.isEmpty, reply.count <= 600 else { return nil }
+        return reply
+    }
+
+    /// "send" or "drafts" when exactly one is named and nothing negates it, "skip" alone, else nil
+    /// and the brain clarifies.
+    static func mailModeAnswer(_ transcript: String) -> String? {
+        let spoken = transcript.lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init)
+        let words = Set(spoken)
+        // A question about the choice is not the choice.
+        guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?"),
+              !["what", "which", "how", "why", "does", "do", "is", "can", "could", "should", "would", "will", "are"]
+                .contains(spoken.first ?? ""),
+              words.isDisjoint(with: ["not", "don", "dont", "never", "no", "nope", "rather", "instead"]) else { return nil }
+        let send = !words.isDisjoint(with: ["send", "sending", "sent"])
+        let drafts = !words.isDisjoint(with: ["draft", "drafts", "drafting"])
+        if send != drafts { return send ? "send" : "drafts" }
+        if !send, words.contains("skip") { return "skip" }
+        return nil
+    }
+
     static let tip = "You're in your Feed. I bring forward emails that need your attention and help you handle them by voice. Whenever you need something, just ask."
     static let question = "Congrats on finishing onboarding! Want to keep going through your inbox?"
     static let finish = finishInstruction(tip: tip, question: question)
