@@ -633,8 +633,6 @@ struct CommandView<Interactor: ViewWithModelLifecycleObserver<CommandViewModel> 
     private var statusNotice: String? {
         guard canTalk else { return "Connect a service to start" }
         if realtimeService.isConversing {
-            // First: a turn that produced nothing is the one fact the screen can't otherwise show.
-            if let failure = realtimeService.turnFailure { return failure }
             if realtimeService.micHeldForOpening { return nil }
             if realtimeService.isMuted { return "Muted · tap Mute to talk" }
             if realtimeService.sessionState == .listening, let engine = realtimeService.localVoiceEngine {

@@ -440,7 +440,6 @@ class RealtimeService: ObservableObject {
         endBackgroundSession(reason: "session disconnected", endingCall: true)
         fullDuplex?.stop()
         fullDuplex = nil
-        turnFailure = nil
         metering.levels = AudioLevels()
         commandStartTime = nil
         isMuted = false
@@ -468,13 +467,6 @@ class RealtimeService: ObservableObject {
     /// `VoiceMetering` for what that cost the Mute button. `let`, so the reference
     /// never changes and observing the service never means observing these.
     let metering = VoiceMetering()
-
-    /// A single turn failed while the call stayed up — a rate limit, a refusal.
-    ///
-    /// Separate from `sessionState = .error`, which ends the session: this is
-    /// recoverable and usually clears within seconds, and dropping a working call
-    /// over it would be a far worse answer than a line of text.
-    @Published var turnFailure: String?
 
     /// `activeFullDuplex` and `handsFreeSetting` stood here. Both existed to answer
     /// "which of the two clients is this session", which is no longer a question
@@ -541,8 +533,6 @@ class RealtimeService: ObservableObject {
             if !text.isEmpty, self.feedFocus?.isSettled == true {
                 self.fullDuplex?.dismissSettledFeedFocus()
             }
-            // Any new words mean the user has moved on; whatever failed is history.
-            self.turnFailure = nil
             // Timed from the first word rather than the last, and definitely not
             // from the completed transcript — transcription lands after the user
             // has stopped talking, so timing from there would report every turn as
@@ -684,15 +674,8 @@ class RealtimeService: ObservableObject {
         client.onLevels = { [weak self] levels in
             self?.metering.levels = levels
         }
-        client.onTurnFailed = { [weak self] message in
-            guard let self else { return }
-            // The call is fine; this one turn produced nothing. Say so and go back
-            // to listening, rather than leaving the orb spinning on "Thinking…"
-            // over a response that will never speak.
-            self.turnFailure = message
-            self.turnSteps = []
-            // The first time a mid-call failure has left the device. `voice_dial_failed`
-            // cannot cover this: it is gated on the call not yet having connected.
+        client.onTurnFailed = { [weak self] _ in
+            self?.turnSteps = []
         }
         client.onDispatchStarted = { [weak self] jobId, task in
             self?.addLiveDispatch(id: jobId, task: task)
@@ -1986,7 +1969,6 @@ extension RealtimeService {
         }
         localVoice = call
         localVoiceEngine = engine
-        turnFailure = nil
         sessionState = .connecting
         call.onState = { [weak self] state in
             guard let self, self.isConversing, self.localVoice === call else { return }
@@ -1994,7 +1976,6 @@ extension RealtimeService {
         }
         call.onUserTranscript = { [weak self] text, _ in
             guard let self else { return }
-            self.turnFailure = nil
             if self.commandStartTime == nil { self.commandStartTime = Date() }
             if !text.isEmpty { self.lastCommandText = text }
         }
@@ -2004,8 +1985,7 @@ extension RealtimeService {
             self.answerIsStale = false
             if isFinal { self.finalizeTurn() }
         }
-        call.onTurnFailed = { [weak self] message in
-            self?.turnFailure = message
+        call.onTurnFailed = { [weak self] _ in
             self?.turnSteps = []
         }
         call.onEndRequested = { [weak self] in
