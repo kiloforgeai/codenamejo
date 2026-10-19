@@ -1579,7 +1579,17 @@ extension FullDuplexVoiceClient {
                 self?.continueAfterFunctionResult()
                 return
             }
-            let relayArguments = tool == "forward_email" ? argumentsJSON : await localTriage.draftRelayArguments(argumentsJSON)
+            var relayArguments = tool == "forward_email" ? argumentsJSON : await localTriage.draftRelayArguments(argumentsJSON)
+            // Onboarding's reply to Nate goes on his thread, as a draft, whatever the inbox mode
+            // says. Advancing to the mail-mode question hangs on the first and never sending it on
+            // the second; both were the model's to get right, and a draft addressed to Nate as new
+            // mail left the stage standing.
+            var runAs = tool
+            if tool != "forward_email", let welcomeReply = await localTriage.onboardingWelcomeReply(relayArguments) {
+                relayArguments = welcomeReply
+                runAs = "create_draft"
+                RealtimeLog.log("onboarding: \(tool) steered onto the welcome thread as a draft")
+            }
             let account = Self.stringArgument("account", in: relayArguments)
             let selectedMessage = Self.stringArgument("reply_message_id", in: relayArguments)
             let thread = Self.stringArgument("thread_id", in: relayArguments)
@@ -1589,10 +1599,10 @@ extension FullDuplexVoiceClient {
             // p50 1019 ms against a deferred `archive_message`'s 193 ms, with 17% of drafts
             // spending p50 11.3 s — a Gmail throttle's in-band wait — in front of the user.
             let result = await FullDuplexBroker.runTool(
-                name: tool, argumentsJSON: relayArguments,
+                name: runAs, argumentsJSON: relayArguments,
                 conversationId: self?.conversationId(),
-                deferDraft: deferDraft && tool == "create_draft",
-                deferSend: deferDraft && tool != "create_draft")
+                deferDraft: deferDraft && runAs == "create_draft",
+                deferSend: deferDraft && runAs != "create_draft")
             guard let self, self.isActive, dial == self.dialGeneration else { return }
             guard !Task.isCancelled else {
                 self.finishSupersededTool(callId: callId, tool: tool, result: result.text,

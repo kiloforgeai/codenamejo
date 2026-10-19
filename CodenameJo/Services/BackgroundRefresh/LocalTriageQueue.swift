@@ -3566,6 +3566,16 @@ actor LocalTriageQueue {
         Self.draftRelayArguments(arguments, in: items)
     }
 
+    /// The Nate reply, steered onto his thread as a draft; nil for any other write. Aimed at Nate
+    /// it is steered for as long as onboarding runs, so a saved send preference never sends it;
+    /// unaddressed, only while the welcome stage is up and its question has not been put. See
+    /// `EmailOnboardingContract.welcomeReplyArguments`.
+    func onboardingWelcomeReply(_ arguments: String) -> String? {
+        guard let welcome = onboardingFlow?.welcome else { return nil }
+        return EmailOnboardingContract.welcomeReplyArguments(
+            arguments, welcome: welcome, onWelcomeStage: onboardingOnWelcome && !onboardingMailModePending)
+    }
+
     static func draftRelayArguments(_ arguments: String, in items: [Item]) -> String {
         guard let data = arguments.data(using: .utf8),
               var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

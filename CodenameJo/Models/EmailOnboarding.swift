@@ -436,8 +436,40 @@ enum EmailOnboardingContract {
     /// Drafts on the answer, and makes that the turn's only call.
     /// "to this exact thread" is what `isOnboardingWelcomeReply` matches on — don't reword it.
     static func welcomeInstruction(line: String) -> String {
-        "Say exactly \"\(line)\" Say that line even though you would not normally invite them to speak: telling them the words is what teaches them how this works. Do not ask what they want to do with it, do not ask how they want to answer him, and do not end this turn on a question. An answer can pause mid-thought: while what they have said so far trails off, keep listening without prompting them. Once they have finished, turn everything they said into a short reply, save it with create_draft to this exact thread, and say where the draft was saved in one clause. Never send this reply. Do not read it back first and do not ask permission. You already have everything you need: the thread id is in this payload and the question is in the snippet. Do not read, search for or look up this email, and do not look for another one from Nate — reply on the thread id you were given. Archive or skip if requested. Reads and reply edits do not advance onboarding."
+        "Say exactly \"\(line)\" Say that line even though you would not normally invite them to speak: telling them the words is what teaches them how this works. Do not ask what they want to do with it, do not ask how they want to answer him, and do not end this turn on a question. An answer can pause mid-thought: while what they have said so far trails off, keep listening without prompting them. Once they have finished, turn everything they said into a short reply, save it with create_draft to this exact thread, and say where the draft was saved in one clause. The draft's result carries the next onboarding stage; if it does not, call triage_next in the same turn. Never send this reply. Do not read it back first and do not ask permission. You already have everything you need: the thread id is in this payload and the question is in the snippet. Do not read, search for or look up this email, and do not look for another one from Nate — reply on the thread id you were given. Archive or skip if requested. Reads and reply edits do not advance onboarding."
     }
+    /// The Nate reply, steered onto his thread as a draft. The stage advances only when the draft
+    /// lands on the welcome thread, and the reply must never be sent; both were left to the model,
+    /// and a draft addressed to Nate as new mail left the stage standing. A write aimed at Nate's
+    /// thread or address is that reply for as long as onboarding runs; one with no address and no
+    /// thread is that reply while the welcome stage is up. Nil leaves any other write alone, so a
+    /// side request to someone else stays a side request.
+    static func welcomeReplyArguments(_ arguments: String, welcome: EmailOnboardingItem,
+                                      onWelcomeStage: Bool) -> String? {
+        guard let data = arguments.data(using: .utf8),
+              var json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        func field(_ key: String) -> String? {
+            let value = (json[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return value.isEmpty ? nil : value
+        }
+        let thread = field("thread_id")
+        let to = field("to")
+        let founder = LocalCompose.bareAddress(welcome.from).lowercased()
+        let onNatesThread = thread.map { $0 == welcome.threadId || $0 == welcome.id } ?? false
+        let toNate = to.map { LocalCompose.looksLikeAddress(founder) && LocalCompose.bareAddress($0).lowercased() == founder } ?? false
+        guard onNatesThread || toNate || (onWelcomeStage && thread == nil && to == nil) else { return nil }
+        json["thread_id"] = welcome.threadId
+        json["account"] = welcome.account
+        json.removeValue(forKey: "to")
+        json.removeValue(forKey: "subject")
+        if let selected = field("reply_message_id"), selected != welcome.id {
+            json.removeValue(forKey: "reply_message_id")
+        }
+        guard let encoded = try? JSONSerialization.data(withJSONObject: json),
+              let result = String(data: encoded, encoding: .utf8) else { return nil }
+        return result
+    }
+
     static let tip = "You're in your Feed. I bring forward emails that need your attention and help you handle them by voice. Whenever you need something, just ask."
     static let question = "Congrats on finishing onboarding! Want to keep going through your inbox?"
     static let finish = finishInstruction(tip: tip, question: question)
