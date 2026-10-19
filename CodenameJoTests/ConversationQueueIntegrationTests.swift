@@ -88,6 +88,48 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         await queue.end()
     }
 
+    func testUnreadRecheckIsReadOnTheLastMessageSoLeavingUnreadDoesNotWaitOnGmail() async throws {
+        let fixture = try StoreFixture()
+        defer { fixture.close() }
+        UserDefaults.standard.set(false, forKey: ThreadQueue.storageKey)
+        let rows = [row("first", thread: "first", date: 2, sender: "Andrew"),
+                    row("last", thread: "last", date: 1, sender: "Beth")]
+        try await fixture.seed(rows, unread: ["first", "last"])
+        // The opening's own unread refresh is the first read.
+        let reads = LoaderCalls(results: [[], []])
+        let queue = LocalTriageQueue(liveFeatures: true, mailAccounts: { ["queue@example.test"] },
+                                    unreadOpeningLoader: { _ in reads.next() })
+        let opening = await queue.step(.init(restart: true, scope: .unread), store: fixture.store)
+        XCTAssertEqual(try current(opening.output)["id"] as? String, "first")
+        XCTAssertEqual(reads.count, 1, "Nothing is re-checked while unread has more than its last message")
+        let last = await queue.step(.init(), store: fixture.store, dealtWith: false)
+        XCTAssertEqual(try current(last.output)["id"] as? String, "last")
+        try await waitUntil { reads.count == 2 }
+        let leaving = await queue.step(.init(), store: fixture.store, dealtWith: false)
+        XCTAssertEqual(reads.count, 2, "The crossing uses the re-check read on the last message")
+        XCTAssertEqual(leaving.served, .hit)
+        await queue.end()
+    }
+
+    func testAFailedUnreadRecheckAheadIsReadAgainLiveAtTheCrossing() async throws {
+        let fixture = try StoreFixture()
+        defer { fixture.close() }
+        UserDefaults.standard.set(false, forKey: ThreadQueue.storageKey)
+        try await fixture.seed([row("only", thread: "only", date: 1, sender: "Andrew")], unread: ["only"])
+        // The opening's own unread refresh, the failed read ahead, then the crossing's live read.
+        let reads = LoaderCalls(results: [[], nil, []])
+        let queue = LocalTriageQueue(liveFeatures: true, mailAccounts: { ["queue@example.test"] },
+                                    unreadOpeningLoader: { _ in reads.next() })
+        let opening = await queue.step(.init(restart: true, scope: .unread), store: fixture.store)
+        XCTAssertEqual(try current(opening.output)["id"] as? String, "only")
+        try await waitUntil { reads.count == 2 }
+        let leaving = await queue.step(.init(), store: fixture.store, dealtWith: false)
+        XCTAssertEqual(reads.count, 3)
+        XCTAssertEqual(leaving.served, .live, "The user waited on the second read")
+        XCTAssertEqual(try object(leaving.output)["done"] as? Bool, true)
+        await queue.end()
+    }
+
     func testUnpresentedSnapshotCanGroupItsOpeningAfterClassification() async throws {
         let fixture = try StoreFixture()
         defer { fixture.close() }
@@ -2210,6 +2252,29 @@ final class ConversationQueueIntegrationTests: XCTestCase {
 
     private func current(_ output: String) throws -> [String: Any] {
         try XCTUnwrap(object(output)["item"] as? [String: Any])
+    }
+
+    /// Hands out `results` in order, then empty batches, counting each read.
+    private final class LoaderCalls: @unchecked Sendable {
+        private let lock = NSLock()
+        private var results: [[MailStore.Ingest]?]
+        private var calls = 0
+        init(results: [[MailStore.Ingest]?]) { self.results = results }
+        var count: Int { lock.withLock { calls } }
+        func next() -> [MailStore.Ingest]? {
+            lock.withLock {
+                calls += 1
+                return results.isEmpty ? [] : results.removeFirst()
+            }
+        }
+    }
+
+    private func waitUntil(_ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(2)
+        while !condition() {
+            guard Date() < deadline else { return XCTFail("Timed out waiting for the read ahead") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
     }
 
     private final class AccountsBox: @unchecked Sendable {
