@@ -4686,7 +4686,7 @@ actor LocalTriageQueue {
             if position > items.count, more { _ = await refill(store: store) }
         }
         if !items.indices.contains(position - 1), !more, !stalled, scope == .unread, liveFeatures {
-            switch await collectUnreadArrivalsBeforeLeaving(store: store) {
+            switch await collectUnreadArrivalsBeforeLeaving(store: store).kept {
             case true?: return await current(store: store)
             case nil: return gmailPending(.retryUnavailable)
             case false?: break
