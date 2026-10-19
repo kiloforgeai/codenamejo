@@ -322,7 +322,8 @@ enum EmailOnboardingContract {
 
     static let beatPrefix = "onboarding-beat:"
     static let importantLead = "Summarize this recent important email in one sentence and ask what they would like to do with it."
-    static let mailModeNote = mailModeInstruction(question: "Going forward, should I send your emails, or keep them in Drafts?")
+    static let mailModeQuestion = "Going forward, should I send your emails, or keep them in Drafts?"
+    static let mailModeNote = mailModeInstruction(question: mailModeQuestion)
     static func mailModeInstruction(question: String) -> String {
         "Ask \"\(question)\" Wait for an explicit choice of send or drafts. A bare yes/no is ambiguous: clarify. Call triage_next with onboarding_mail_mode \"send\" or \"drafts\" only after that choice; use \"skip\" only if they explicitly skip this preference. Do not draft or send another Nate reply. Reads, questions, silence, and ordinary next calls do not save a preference or advance. Never claim it is saved before the tool succeeds."
     }

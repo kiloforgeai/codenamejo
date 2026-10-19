@@ -1427,6 +1427,15 @@ actor LocalTriageQueue {
             : stage.about.map { EmailOnboardingContract.aboutInstruction($0, question: aboutQuestion) } ?? stage.note(config: config)
         var payload: [String: Any] = ["done": false, "position": position,
             "onboarding": ["step": config == nil ? stage.onboardingStep : position, "note": note], "note": note]
+        // The two handoff lines are the speaker's to recite, as the about step's script already
+        // is. Left inside the note, the welcome line came out as an ordinary email summary ending
+        // on "What would you like to do with it?", and the question after the draft depended on
+        // the model finding it under "say nothing else".
+        if onboardingMailModePending {
+            payload["script"] = config?.mailModeQuestion ?? EmailOnboardingContract.mailModeQuestion
+        } else if stage.kind(in: config) == "welcome" {
+            payload["script"] = config?.step(stage.onboardingStep)?.line ?? EmailOnboardingContract.welcomeLine
+        }
         // A beat has a placeholder item so the cursor can stand on it; it is never shown as mail.
         if let about = stage.about {
             payload["about"] = ["items": about.items]

@@ -1962,8 +1962,12 @@ final class FullDuplexVoiceClient {
             // its dedicated local-tool analytics event below; it needs no activity row.
             self.openingRankedLead = Self.rankedLead(step.output)
             let lead = (self.openingRankedLead ?? "") + "First up, "
-            let script = Self.stepScript(step.output).map { "Say exactly this, then stop: \"\($0)\"" }
-                ?? Self.presentableScript(step: step.output, lead: lead, prepared: prepared)
+            // Onboarding's welcome line rides the opening instructions behind the greeting
+            // instead, so the speaker is not briefed to stop before it has greeted.
+            let stageScript = Self.stepScript(step.output)
+            let script = self.onboardingFlow != nil ? nil
+                : stageScript.map { "Say exactly this, then stop: \"\($0)\"" }
+                    ?? Self.presentableScript(step: step.output, lead: lead, prepared: prepared)
             self.transport?.sendContextItem(
                 "This is the authoritative triage_next result for the automatic email "
                     + "opening. Address the user directly as you/your, never they/their. The "
@@ -1983,7 +1987,7 @@ final class FullDuplexVoiceClient {
                 RealtimeLog.log("feed: waiting for hosted tools before opening terminal feed")
                 return
             }
-            self.createOpeningAwareContinuationResponse(recitesSuppliedLine: script != nil)
+            self.createOpeningAwareContinuationResponse(recitesSuppliedLine: script != nil, stageScript: stageScript)
         }
     }
 

@@ -105,6 +105,29 @@ final class EmailOnboardingTests: XCTestCase {
         await second.end()
     }
 
+    private func script(_ output: String) throws -> String? {
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any])
+        return object["script"] as? String
+    }
+
+    func testTheWelcomeAndMailModeStagesCarryTheirOwnLines() async throws {
+        let config = try XCTUnwrap(LocalOnboardingRun.config())
+        let flow = EmailOnboardingFlow(version: 2, runId: UUID().uuidString, welcome: item(1),
+            mailModeChoice: .init(account: "owner@example.test", status: "welcome", mode: nil), config: config)
+        let queue = LocalTriageQueue()
+        await queue.configure(coachingPlan: nil,
+            forceOnboardingFeedLesson: false, sequentialFeed: false, calendarFeedDue: false,
+            localCalendar: false, onboardingFlow: flow, onboardingLoader: { .init(items: [], failures: []) })
+        let store = MailStore(database: nil, userId: "test-user")
+        let welcome = await queue.openingStep(store: store)
+        XCTAssertEqual(try script(welcome.output), config.steps[0].line)
+        XCTAssertTrue(welcome.output.contains("to this exact thread"), "the note still drives the draft")
+        let question = await queue.step(.init(), store: store, dealtWith: true)
+        XCTAssertEqual(try script(question.output), config.mailModeQuestion)
+        XCTAssertEqual(try stage(question.output), 1, "the question shares the welcome stage")
+        await queue.end()
+    }
+
     func testMissingMailSkipsStraightToTip() async throws {
         let queue = await configured([])
         let first = await queue.openingStep(store: MailStore(database: nil, userId: "test-user"))
