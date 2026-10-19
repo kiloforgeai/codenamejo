@@ -11,9 +11,6 @@ extension Container {
     var workspaceProfileRows: Factory<WorkspaceProfileRows> {
         self { WorkspaceProfileRows(dbPool: Container.shared.localContext().dbPool) }
     }
-    var emailCategoryRows: Factory<EmailCategoryRows> {
-        self { EmailCategoryRows(dbPool: Container.shared.localContext().dbPool) }
-    }
     var customCommandRows: Factory<CustomCommandRows> {
         self { CustomCommandRows(dbPool: Container.shared.localContext().dbPool) }
     }

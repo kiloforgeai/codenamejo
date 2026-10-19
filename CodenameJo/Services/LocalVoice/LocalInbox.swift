@@ -79,7 +79,7 @@ final class LocalInbox {
         return current == nil ? nil : line
     }
 
-    /// A spoken queue command — next, archive, delete, spam — acted on, with what to say. Nil
+    /// A spoken queue command — next, delete, spam — acted on, with what to say. Nil
     /// when the words are not one, so the turn goes to `answer` or the brain.
     func command(_ transcript: String) async -> String? {
         guard let current else { return nil }
@@ -95,7 +95,7 @@ final class LocalInbox {
             return await advance(dealtWith: true, lead: "Next, ")
         case .trash where !EmailQueueTrashPolicy.allows(utterance: transcript):
             return nil
-        case .archive, .trash, .spam:
+        case .trash, .spam:
             return await remove(current, with: action.rawValue)
         }
     }
@@ -216,7 +216,7 @@ final class LocalInbox {
         if engine == .openAI, let key = LiveEmailPresentation.Key.step(step),
            let prepared = await FullDuplexBroker.prepareEmail(key, scope: ProfileRuntime.snapshot),
            let body = prepared.spokenBody {
-            text = [body, prepared.suggestionForSpeech(enabled: true)].compactMap { $0 }.joined(separator: " ")
+            text = body
         }
         if text == nil, LocalVoiceBrain.onDeviceAvailable {
             let content = await Self.content(of: email)

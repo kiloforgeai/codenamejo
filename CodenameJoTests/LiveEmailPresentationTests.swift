@@ -2,31 +2,6 @@ import XCTest
 @testable import CodenameJo
 
 final class LiveEmailPresentationTests: XCTestCase {
-    private var savedSuggestionOverride: Any?
-    private var savedAccountDefault: Any?
-
-    override func setUp() {
-        super.setUp()
-        savedSuggestionOverride = UserDefaults.standard.object(forKey: SuggestedActions.storageKey)
-        savedAccountDefault = UserDefaults.standard.object(forKey: SuggestedActions.accountDefaultKey)
-        UserDefaults.standard.set(true, forKey: SuggestedActions.storageKey)
-    }
-
-    override func tearDown() {
-        UserDefaults.standard.set(savedSuggestionOverride, forKey: SuggestedActions.storageKey)
-        UserDefaults.standard.set(savedAccountDefault, forKey: SuggestedActions.accountDefaultKey)
-        super.tearDown()
-    }
-
-    func testBrainSuggestionIsSpokenAsWritten() throws {
-        let key = try XCTUnwrap(LiveEmailPresentation.Key.step(step))
-        let value = LiveEmailPresentation(key: key, summary: "Maya wants to meet Tuesday at 1.", from: "Maya",
-            to: key.account, sentAt: "2026-09-23T00:00:00Z",
-            suggestedQuestion: "Want me to find a time?")
-        XCTAssertEqual(value.suggestionForSpeech(enabled: true), value.suggestedQuestion)
-        XCTAssertNil(value.suggestionForSpeech(enabled: false))
-    }
-
     func testPreparationTimingPreservesOriginalReceiptAcrossCacheSeeding() throws {
         let key = try XCTUnwrap(LiveEmailPresentation.Key.step(step))
         let received = Date(timeIntervalSince1970: 1_000)
@@ -46,15 +21,6 @@ final class LiveEmailPresentationTests: XCTestCase {
         XCTAssertEqual(warmed.timing(at: received.addingTimeInterval(-1)).leadMs, -1_000)
     }
 
-    func testSuggestionTimingEligibilityUsesPresentationLengthAndFlagRules() throws {
-        let key = try XCTUnwrap(LiveEmailPresentation.Key.step(step))
-        var value = LiveEmailPresentation(key: key, summary: "Meeting request", from: "Alex",
-            to: key.account, sentAt: "2026-09-23T00:00:00Z", suggestedQuestion: "Should I book it?")
-        XCTAssertNotNil(value.suggestionForSpeech(enabled: true))
-        XCTAssertNil(value.suggestionForSpeech(enabled: false))
-        value.suggestedQuestion = String(repeating: "x", count: 311)
-        XCTAssertNil(value.suggestionForSpeech(enabled: true))
-    }
 
     func testNewCurrentInvitationIsPreparedEvenWithoutAnyReadAheadItems() throws {
         let current = try XCTUnwrap(LiveEmailPresentation.Key.step(step))
@@ -64,55 +30,10 @@ final class LiveEmailPresentationTests: XCTestCase {
         XCTAssertEqual(LiveEmailPreparationCache.candidates(current: #"{"done":true}"#, readAhead: []), [])
     }
 
-    func testAccountDefaultAndExplicitProfileOverride() {
-        UserDefaults.standard.removeObject(forKey: SuggestedActions.storageKey)
-        UserDefaults.standard.removeObject(forKey: SuggestedActions.accountDefaultKey)
-        XCTAssertTrue(SuggestedActions.isEnabled)
-        UserDefaults.standard.set(false, forKey: SuggestedActions.accountDefaultKey)
-        XCTAssertFalse(SuggestedActions.isEnabled)
-        UserDefaults.standard.set(true, forKey: SuggestedActions.accountDefaultKey)
-        XCTAssertTrue(SuggestedActions.isEnabled)
-        UserDefaults.standard.set(false, forKey: SuggestedActions.storageKey)
-        XCTAssertFalse(SuggestedActions.isEnabled)
-        XCTAssertEqual(UserProfile.capturingLocalSettings().suggestedActions, false)
-        UserDefaults.standard.removeObject(forKey: SuggestedActions.storageKey)
-        XCTAssertTrue(SuggestedActions.isEnabled)
-    }
 
-    func testDisablingHidesAlreadyPreparedSuggestion() throws {
-        let key = try XCTUnwrap(LiveEmailPresentation.Key.step(step))
-        let prepared = LiveEmailPresentation(key: key, summary: "Maya asks for a meeting.",
-            from: "Maya", to: key.account, sentAt: "2026-09-22T15:00:00Z",
-            suggestedQuestion: "Want me to find a time?")
-        XCTAssertTrue(try XCTUnwrap(prepared.annotating(step)).contains("find a time"))
-        UserDefaults.standard.set(false, forKey: SuggestedActions.storageKey)
-        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(prepared.annotating(step)).utf8)) as? [String: Any])
-        let item = try XCTUnwrap(payload["item"] as? [String: Any])
-        XCTAssertNil(item["suggestedQuestion"])
-        XCTAssertEqual(item["bodySummary"] as? String, prepared.summary)
-    }
 
     private let step = #"{"done":false,"item":{"account":"owner@example.test","id":"new","threadId":"thread","from":"Alex","subject":"Budget","identity":"Alex","date":"today","snippet":"preview"}}"#
 
-    @MainActor
-    func testSuggestedActionReceiptDoesNotTriggerGenericReofferAfterCacheExpiry() throws {
-        let key = try XCTUnwrap(LiveEmailPresentation.Key.step(step))
-        let prepared = LiveEmailPresentation(key: key, summary: "Josh asks to meet.",
-            from: "Josh", to: key.account, sentAt: "2026-09-22T15:00:00Z",
-            suggestedQuestion: "Wednesday at 10 is free. Should I reschedule it?")
-        var cache = LiveEmailPreparationCache(profileId: "work")
-        cache.seed([prepared], now: Date().addingTimeInterval(-600))
-        XCTAssertNil(cache.ready(for: step, profileId: "work"))
-        XCTAssertTrue(cache.hasSuggestion(for: step, profileId: "work"))
-        XCTAssertFalse(FullDuplexVoiceClient.asideInvitesReturnToFeed(
-            "Done, I rescheduled your meeting.",
-            hasSuggestion: cache.hasSuggestion(for: step, profileId: "work")))
-        XCTAssertFalse(cache.hasSuggestion(for: step, profileId: "personal"))
-        XCTAssertFalse(cache.hasSuggestion(for: step.replacingOccurrences(of: "new", with: "next"), profileId: "work"))
-        XCTAssertFalse(cache.hasSuggestion(for: step.replacingOccurrences(of: "owner@example.test", with: "other@example.test"), profileId: "work"))
-        UserDefaults.standard.set(false, forKey: SuggestedActions.storageKey)
-        XCTAssertFalse(cache.hasSuggestion(for: step, profileId: "work"))
-    }
 
     func testLocalHeadersOnlyVetoOverridesOlderServerPreference() async throws {
         let prior = UserDefaults.standard.object(forKey: MailHeadersOnly.storageKey)
@@ -222,17 +143,16 @@ final class LiveEmailPresentationTests: XCTestCase {
         let key = try XCTUnwrap(LiveEmailPresentation.Key.step(threaded))
         let prepared = LiveEmailPresentation(key: key,
             summary: "Alex revised the budget after your feedback and now needs approval.",
-            from: "Alex", to: "Owner", sentAt: "2026-09-15T15:00:00.000Z",
-            suggestedQuestion: "Tue Sep 29 at 2pm PT is free for 30 min. Should I book it?")
+            from: "Alex", to: "Owner", sentAt: "2026-09-15T15:00:00.000Z")
         let line = try XCTUnwrap(LiveSpokenStepContract.line(
             step: threaded, lead: "First up, ", prepared: prepared))
         XCTAssertTrue(line.contains(prepared.summary))
-        XCTAssertTrue(line.contains(try XCTUnwrap(prepared.suggestedQuestion)))
+        XCTAssertTrue(line.contains("What would you like to do with it?"))
         XCTAssertFalse(line.contains("preview"))
         let advance = try XCTUnwrap(LiveSpokenStepContract.line(
             step: threaded, lead: "Next, ", prepared: prepared))
         XCTAssertTrue(advance.contains(prepared.summary))
-        XCTAssertTrue(advance.contains(try XCTUnwrap(prepared.suggestedQuestion)))
+        XCTAssertTrue(advance.contains("What would you like to do with it?"))
         XCTAssertTrue(try XCTUnwrap(prepared.annotating(threaded)).contains("Requeued for a decision."))
     }
 
@@ -376,12 +296,11 @@ final class LiveEmailPresentationTests: XCTestCase {
         XCTAssertEqual(kept.map(\.key.messageId), ["second"])
     }
 
-    func testOversizedQuestionUsesTheSameGenericFallbackInSpeechAndContext() throws {
+    func testLongSummaryKeepsGenericQuestionWithinSpeechBudget() throws {
         let key = try XCTUnwrap(LiveEmailPresentation.Key.step(step))
         let prepared = LiveEmailPresentation(key: key,
             summary: String(repeating: "Summary ", count: 32),
-            from: "Alex", to: "Owner", sentAt: "2026-09-15T15:00:00.000Z",
-            suggestedQuestion: String(repeating: "Question ", count: 11) + "?")
+            from: "Alex", to: "Owner", sentAt: "2026-09-15T15:00:00.000Z")
         let line = try XCTUnwrap(prepared.speakerLine(for: step))
         XCTAssertTrue(line.contains(prepared.summary))
         XCTAssertTrue(line.contains("What would you like to do with it?"))
@@ -498,22 +417,21 @@ final class LiveEmailPresentationTests: XCTestCase {
                      "Never truncate the sender, action or approval question to fit")
     }
 
-    func testPreparedQuestionIsSpokenAndCarriedToTheBackendForTheSameEmail() throws {
+    func testGenericQuestionAndSummaryStayBoundToTheSameEmail() throws {
         let key = try XCTUnwrap(LiveEmailPresentation.Key.step(step))
         let prepared = LiveEmailPresentation(key: key, summary: "Alex wants a meeting next week.",
-            from: "Alex", to: "Owner", sentAt: "2026-09-21T15:00:00Z",
-            suggestedQuestion: "How do you want to respond?")
+            from: "Alex", to: "Owner", sentAt: "2026-09-21T15:00:00Z")
         for line in [prepared.speakerLine(for: step),
                      LiveSpokenStepContract.line(step: step, lead: "First up, ", prepared: prepared)] {
             let speech = try XCTUnwrap(line)
-            XCTAssertTrue(speech.contains(try XCTUnwrap(prepared.suggestedQuestion)))
-            XCTAssertFalse(speech.contains("What would you like to do with it?"))
+            XCTAssertTrue(speech.contains("What would you like to do with it?"))
+            XCTAssertFalse(speech.contains("How do you want to respond?"))
             XCTAssertLessThanOrEqual(speech.utf8.count, 450)
         }
         let annotated = try XCTUnwrap(prepared.annotating(step))
         let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(annotated.utf8)) as? [String: Any])
         let item = try XCTUnwrap(payload["item"] as? [String: Any])
-        XCTAssertEqual(item["suggestedQuestion"] as? String, prepared.suggestedQuestion)
+        XCTAssertNil(item["suggestedQuestion"])
         let otherAccount = step.replacingOccurrences(of: "owner@example.test", with: "other@example.test")
         XCTAssertNil(prepared.annotating(otherAccount))
         XCTAssertNil(prepared.speakerLine(for: otherAccount))
@@ -524,7 +442,6 @@ final class LiveEmailPresentationTests: XCTestCase {
         let legacy = LiveEmailPresentation(key: key, summary: "Alex needs approval.",
             from: "Alex", to: "Owner", sentAt: "2026-09-21T15:00:00Z")
         let decoded = try JSONDecoder().decode(LiveEmailPresentation.self, from: JSONEncoder().encode(legacy))
-        XCTAssertNil(decoded.suggestedQuestion)
         XCTAssertTrue(decoded.speakerLine(for: step)?.contains("What would you like to do with it?") == true)
     }
 

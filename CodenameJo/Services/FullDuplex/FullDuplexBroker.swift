@@ -100,7 +100,7 @@ enum FullDuplexBroker {
                 RealtimeLog.log("livePreparation: rejected mismatched email identity")
                 return nil
             }
-            RealtimeLog.log("livePreparation: email=\(key.messageId) category=\(prepared.category ?? "<none>") suggestion=\(prepared.suggestedQuestion ?? "<none>") summaryBytes=\(prepared.summary.utf8.count)")
+            RealtimeLog.log("livePreparation: email=\(key.messageId) summaryBytes=\(prepared.summary.utf8.count)")
             return prepared
         } catch {
             Container.shared.voiceEvidence().record("preparation.failure", [
@@ -110,14 +110,6 @@ enum FullDuplexBroker {
             RealtimeLog.log("preparation.failure: id=\(preparationId) elapsedMs=\(elapsedMs()) cancelled=\(Task.isCancelled) error=\(error)")
             return nil
         }
-    }
-
-    /// Whether the category's playbook changed. A lost report only means this email's category does not learn from it.
-    static func reportPlaybook(account: String, category: String,
-                               turns: [(role: String, text: String)], tools: [String]) async -> Bool {
-        let changed = await LocalEmailPresentation.reportPlaybook(account: account, category: category, turns: turns, tools: tools)
-        RealtimeLog.log("playbook: \(category) turns=\(turns.count) changed=\(changed)")
-        return changed
     }
 
     struct LiveConfiguration {

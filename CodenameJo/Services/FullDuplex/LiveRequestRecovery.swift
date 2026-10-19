@@ -88,8 +88,7 @@ enum LiveRequestRecovery {
         acknowledge an action. If no tool is needed, return ONLY a JSON object with request_id \
         "\(id)", disposition "no_action" or "clarification", and message containing a short \
         user-facing answer or clarification (empty for filler). When asked to present the email, \
-        use its supplied bodySummary and include its suggestedQuestion in the same message. \
-        Do not replace a supplied suggestedQuestion with a generic action question. \
+        use its supplied bodySummary and ask what the user would like to do with it. \
         Use clarification for incomplete \
         or ambiguous requests. The voice should speak only message, never the JSON metadata, \
         and should stay silent for an empty message. This instruction applies only to this request.

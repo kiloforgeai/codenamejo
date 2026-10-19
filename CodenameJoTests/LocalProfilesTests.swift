@@ -108,14 +108,12 @@ final class LocalProfilesTests: XCTestCase {
         XCTAssertNil(none)
         var settings = UserProfile()
         settings.triageScope = "all"
-        settings.suggestedActions = false
         settings.archiveAfterReply = true
         settings.appearance = "dark"
         try await rows.saveSettings(settings, userId: "alice", profileId: work.id)
         let stored = try await rows.settings(userId: "alice", profileId: work.id)
         let saved = try XCTUnwrap(stored)
         XCTAssertEqual(saved.triageScope, "all")
-        XCTAssertEqual(saved.suggestedActions, false)
         XCTAssertNil(saved.archiveAfterReply, "A filing rule is the account's")
         XCTAssertNil(saved.appearance)
     }

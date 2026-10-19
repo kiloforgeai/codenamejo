@@ -12,6 +12,9 @@ final class LiveClientBrain {
     private var context: [String] = []
     private var input: [[String: Any]] = []
     private var task: Task<Void, Never>?
+    private var activeRequest: (responseID: String, delegation: String)?
+    private var requestWatchdog: Task<Void, Never>?
+    var requestBound: TimeInterval = 20
     private var delegation: String?
     private var liveDelegation: String?
     private var generation = UUID()
@@ -110,7 +113,7 @@ final class LiveClientBrain {
             history[index]["content"] = text
         }
         latestUser = text
-        // The response handler rejects proposals for an older turn before emitting any tools.
+        if task != nil, requestTurn != turn { supersedeRequest() }
     }
 
     func assistant(_ delta: String) {
@@ -122,7 +125,7 @@ final class LiveClientBrain {
     }
 
     func observe(_ text: String) {
-        let compact = LiveCompactContext.text(text)
+        let compact = LiveCompactContext.text(text, includeEmailContent: false)
         guard context.last != compact else { return }
         context.append(compact)
         // Current selection and the latest question are retained separately from these presentation hints.
@@ -140,7 +143,7 @@ final class LiveClientBrain {
                 // as a message the next step can still present.
                 let output = item["output"] as? String ?? "No result"
                 actionRecords.append(["call": ["type": "function_call", "name": Self.scopeSwitchTool, "call_id": id],
-                                      "result": output])
+                                      "result": LiveCompactContext.text(output, includeEmailContent: false)])
                 input.append(["type": "message", "role": "user", "content":
                     "The \(Self.scopeSwitchTool) call completed; this is its result. Present it as the switch's own outcome and continue from it:\n" + output])
                 return
@@ -151,7 +154,7 @@ final class LiveClientBrain {
         }
         if item["type"] as? String == "function_call_output", let id = item["call_id"] as? String,
            let call = functionItems[id] {
-            actionRecords.append(["call": call, "result": item["output"] ?? "No result"])
+            actionRecords.append(["call": call, "result": LiveCompactContext.text(item["output"] as? String ?? "No result", includeEmailContent: false)])
             functionItems.removeValue(forKey: id)
             while actionRecords.count > 12 { actionRecords.removeFirst() }
         }
@@ -188,6 +191,15 @@ final class LiveClientBrain {
 
     func continueResponse(delegation id: String?) {
         guard !busy else { return }
+        if delegation != nil, requestTurn != currentTurn {
+            input.removeAll()
+            delegation = nil
+            liveDelegation = nil
+            presentationOnly = false
+            startPresentationIfReady()
+            startSettledDelegation()
+            return
+        }
         if delegation == nil {
             delegation = id ?? "application-" + UUID().uuidString
             requestTurn = currentTurn
@@ -200,8 +212,8 @@ final class LiveClientBrain {
     func recordFastResult(_ output: String, turn: Int) {
         completedTurns.insert(turn)
         observe("Application already handled user turn \(turn). Verified result: " + output)
-        // In-flight proposals are suppressed when they return, preserving response bookkeeping.
         if queuedDelegation?.turn == turn { queuedDelegation = nil }
+        if task != nil, requestTurn == turn, !presentationOnly { supersedeRequest() }
     }
 
     func presentResult(_ output: String, delegation: String, turn: Int) {
@@ -261,12 +273,22 @@ final class LiveClientBrain {
             "presentationOnly": presentationOnly]
         deliver(["type": "response.event", "delegation_id": delegation,
                  "event": ["type": "response.created", "response": ["id": responseID]]])
+        activeRequest = (responseID, delegation)
+        let bound = requestBound
+        requestWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(bound))
+            guard let self, !Task.isCancelled, generation == requestGeneration else { return }
+            expireRequest()
+        }
         task = Task { [weak self] in
-            guard let self else { return }
+            guard let self, !Task.isCancelled else { return }
             do {
                 let response = try await request(body)
                 guard !Task.isCancelled, generation == requestGeneration else { return }
                 task = nil
+                requestWatchdog?.cancel()
+                requestWatchdog = nil
+                activeRequest = nil
                 guard let output = response["output"] as? [[String: Any]] else {
                     throw NSError(domain: "LiveClientBrain", code: 1)
                 }
@@ -314,10 +336,13 @@ final class LiveClientBrain {
             } catch {
                 guard !Task.isCancelled, generation == requestGeneration else { return }
                 task = nil
+                requestWatchdog?.cancel()
+                requestWatchdog = nil
+                activeRequest = nil
                 input.removeAll()
-                self.delegation = nil
-                liveDelegation = nil
                 if !requestPresentation && completedTurns.contains(requestTurn) {
+                    self.delegation = nil
+                    liveDelegation = nil
                     finish(responseID: responseID, delegation: delegation, response: [:])
                     startPresentationIfReady()
                     startSettledDelegation()
@@ -330,6 +355,27 @@ final class LiveClientBrain {
                 fail("That task could not complete. The call is still connected; existing actions have not been repeated.")
             }
         }
+    }
+
+    private func supersedeRequest() {
+        guard let active = activeRequest else { return }
+        cancelRequest()
+        input.removeAll()
+        delegation = nil
+        liveDelegation = nil
+        presentationOnly = false
+        RealtimeLog.log("liveBrain: superseded request for turn \(requestTurn)")
+        finish(responseID: active.responseID, delegation: active.delegation, response: [:])
+    }
+
+    private func expireRequest() {
+        guard let active = activeRequest else { return }
+        cancelRequest()
+        RealtimeLog.log("liveBrain: request exceeded \(Int(requestBound))s; releasing turn \(requestTurn)")
+        deliver(["type": "response.event", "delegation_id": active.delegation,
+                 "event": ["type": "response.failed", "response": ["id": active.responseID,
+                    "status": "failed", "client_task": true]]])
+        fail("I couldn't finish that answer in time. You can ask again; I haven't repeated any email actions.")
     }
 
     private func finish(responseID: String, delegation: String, response: [String: Any]) {
@@ -386,6 +432,9 @@ final class LiveClientBrain {
         generation = UUID()
         task?.cancel()
         task = nil
+        activeRequest = nil
+        requestWatchdog?.cancel()
+        requestWatchdog = nil
         callWatchdog?.cancel()
         callWatchdog = nil
     }

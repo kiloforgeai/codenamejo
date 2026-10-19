@@ -31,11 +31,13 @@ struct UserProfile: Codable, Equatable {
     var triageScope: String?
 
     /// A profile override; absent uses the account's employee default.
-    var suggestedActions: Bool?
 
     /// Whether a fresh native-cache call should open by walking email. Missing means enabled,
     /// matching the shipped default and allowing older profile rows to opt in without rewrite.
     var agentLedEmailSessions: Bool?
+
+    /// Quick tips between emails; absent preserves the enabled default.
+    var joTipsEnabled: Bool?
 
     /// Whether this person has been through onboarding. It travels, but only the flow may apply it
     /// — see `applyToLocalSettings(completingOnboarding:)`.
@@ -74,8 +76,8 @@ struct UserProfile: Codable, Equatable {
                 ? nil
                 : DraftsOnly.current
         profile.triageScope = text(TriageScope.storageKey)
-        profile.suggestedActions = flag(SuggestedActions.storageKey)
         profile.agentLedEmailSessions = flag(AgentLedEmailSettings.key)
+        profile.joTipsEnabled = flag(JoTips.storageKey)
         profile.hasCompletedOnboarding = flag(OnboardingState.storageKey)
         profile.appearance = text(AppearanceSetting.storageKey)
         return profile
@@ -107,8 +109,8 @@ struct UserProfile: Codable, Equatable {
         // key.
         DraftsOnly.replace(with: draftsOnlySafeguardByAccount)
         write(triageScope, TriageScope.storageKey)
-        write(suggestedActions, SuggestedActions.storageKey)
         write(agentLedEmailSessions, AgentLedEmailSettings.key)
+        write(joTipsEnabled, JoTips.storageKey)
         if completingOnboarding { write(hasCompletedOnboarding, OnboardingState.storageKey) }
         write(appearance, AppearanceSetting.storageKey)
     }
@@ -127,7 +129,7 @@ struct UserProfile: Codable, Equatable {
             ThreadQueue.storageKey,
             TriageScope.storageKey,
             AgentLedEmailSettings.key,
-            SuggestedActions.storageKey,
+            JoTips.storageKey,
             AppearanceSetting.storageKey,
         ] {
             defaults.removeObject(forKey: key)
@@ -143,7 +145,7 @@ struct UserProfile: Codable, Equatable {
 extension UserProfile {
     /// Ported from the old server's `PROFILE_SETTING_FIELDS`. The three filing
     /// rules are deliberately absent: they answer for the account, not for one workspace.
-    static let workspaceFields = ["mailFooterEnabled", "draftsOnlySafeguardByAccount", "triageScope", "suggestedActions"]
+    static let workspaceFields = ["mailFooterEnabled", "draftsOnlySafeguardByAccount", "triageScope"]
 
     func replacingWorkspaceSettings(with other: UserProfile) throws -> UserProfile {
         var values = try JSONSerialization.jsonObject(with: JSONEncoder().encode(self)) as? [String: Any] ?? [:]

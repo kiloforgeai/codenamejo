@@ -4,7 +4,7 @@ import Foundation
 /// from local state. The schemas are `LiveToolSchemas`, and `tools` is what a call to each runs.
 enum LiveSessionSetup {
     static let onboardingOpening = "Hi! I'm Jo. I check your emails and help you get through them by doing things, not just talking about them."
-    static let fastActionNames: Set<String> = ["archive_message", "mark_spam", "trash_message", "triage_next"]
+    static let fastActionNames: Set<String> = ["mark_spam", "trash_message", "triage_next"]
 
     /// What this dial asks for.
     struct Request {

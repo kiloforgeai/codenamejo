@@ -1,7 +1,6 @@
 import Foundation
 
 enum LiveFastAction: String {
-    case archive = "archive_message"
     case trash = "trash_message"
     case spam = "mark_spam"
     case next = "triage_next"
@@ -28,8 +27,6 @@ enum LiveFastAction: String {
             text.removeLast(suffix.count)
         }
         switch text {
-        case "archive", "archive it", "archive this", "archive that", "archive this one", "archive that one",
-             "archive this email", "archive that email": return .archive
         case "mark as spam", "mark it as spam", "mark this as spam", "mark that as spam",
              "mark this email as spam", "mark that email as spam", "report spam", "report it as spam",
              "report this as spam", "report this email as spam", "this is spam", "that's spam",

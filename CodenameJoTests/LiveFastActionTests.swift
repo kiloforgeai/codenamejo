@@ -15,7 +15,7 @@ final class LiveFastActionTests: XCTestCase {
 
     func testOnlyWholeExplicitCommandsMatch() {
         for text in ["Archive.", "archive this email", "please archive it", "archive that please!"] {
-            XCTAssertEqual(LiveFastAction.parse(text), .archive, text)
+            XCTAssertNil(LiveFastAction.parse(text), text)
         }
         for text in ["Next.", "next email", "go next", "skip this email"] {
             XCTAssertEqual(LiveFastAction.parse(text), .next, text)
@@ -28,13 +28,13 @@ final class LiveFastActionTests: XCTestCase {
         }
     }
 
-    func testReportedArchivePhrasesDoNotNeedDelegation() {
+    func testArchivePhrasesAlwaysNeedDelegation() {
         for text in ["Archive this one for me, please", "You can archive this one as well",
                      "Awesome. Can you archive this one for me, please",
                      "Can you archive it for me, please", "Please archive it for me",
                      "Can you please archive this email", "Could you archive this email?",
                      "Would you archive this one for me?", "can you archive this"] {
-            XCTAssertEqual(LiveFastAction.parse(text), .archive, text)
+            XCTAssertNil(LiveFastAction.parse(text), text)
         }
     }
 
@@ -64,7 +64,7 @@ final class LiveFastActionTests: XCTestCase {
     func testConversationalWrappersStillRequireOneExplicitAction() {
         for text in ["You can archive", "Can archive", "We can archive it", "Just archive it",
                      "Then you can just archive", "I think we can just archive it", "Okay, archive."] {
-            XCTAssertEqual(LiveFastAction.parse(text), .archive, text)
+            XCTAssertNil(LiveFastAction.parse(text), text)
         }
         for text in ["Okay, next", "Yeah, let's go to next", "Go ahead and skip this email"] {
             XCTAssertEqual(LiveFastAction.parse(text), .next, text)

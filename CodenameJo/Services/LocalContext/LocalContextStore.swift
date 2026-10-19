@@ -640,7 +640,7 @@ final class LocalContextStore: Sendable {
         // The Superhuman connector is gone.
         migrator.registerMigration("v40-drop-superhuman", migrate: RetiredSuperhumanSchema.drop)
         migrator.registerMigration("v41-workspace-profiles", migrate: WorkspaceProfileRows.createSchema)
-        migrator.registerMigration("v42-email-categories", migrate: EmailCategoryRows.createSchema)
+        migrator.registerMigration("v42-email-categories", migrate: RetiredEmailCategorySchema.createSchema)
         migrator.registerMigration("v43-turn-record", migrate: TurnStore.addRecord)
         migrator.registerMigration("v44-queue-snapshot-owner", migrate: DailyEmailQueueSnapshotRecord.addOwner)
         // The Better Auth user id is gone; every row it owned moves to this install's id.
@@ -653,6 +653,9 @@ final class LocalContextStore: Sendable {
         migrator.registerMigration("v46-custom-commands", migrate: CustomCommandRows.createSchema)
         migrator.registerMigration("v47-calendar-busy-fields", migrate: CalendarStore.addBusyFields)
         migrator.registerMigration("v48-mail-message-bodies", migrate: MailStore.createBodies)
+        migrator.registerMigration("v49-drop-email-categories") { db in
+            try db.execute(sql: "DROP TABLE IF EXISTS email_category")
+        }
         return migrator
     }
 }

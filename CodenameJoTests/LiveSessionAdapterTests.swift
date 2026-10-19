@@ -221,6 +221,23 @@ final class LiveSessionAdapterTests: XCTestCase {
     }
 
     @MainActor
+    func testArchiveWaitsForCompleteInputAndRunsOnlyAsABrainTool() async throws {
+        let h = Harness()
+        try h.receive(["type": "session.started"])
+        try h.receive(["type": "session.input_transcript.delta", "delta": "archive it", "start_ms": 100, "end_ms": 200])
+        try await Task.sleep(for: .milliseconds(650))
+        XCTAssertTrue(h.calls.isEmpty)
+        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .trash))
+        try await Task.sleep(for: .milliseconds(450))
+        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .trash))
+        try h.start()
+        try h.function("archive", name: "archive_message")
+        XCTAssertEqual(h.calls.map(\.name), ["archive_message"])
+        h.result("archive")
+        h.adapter.close()
+    }
+
+    @MainActor
     func testAWholeCommandSettlesBeforeOtherSpeech() async throws {
         var finished: [String] = []
         let adapter = LiveSessionAdapter(wire: { _ in }, emit: {
@@ -228,15 +245,15 @@ final class LiveSessionAdapterTests: XCTestCase {
         })
         adapter.receive(try JSONSerialization.data(withJSONObject: ["type": "session.started"]))
         adapter.receive(try JSONSerialization.data(withJSONObject: [
-            "type": "session.input_transcript.delta", "delta": "archive it", "start_ms": 1000, "end_ms": 1500]))
+            "type": "session.input_transcript.delta", "delta": "delete it", "start_ms": 1000, "end_ms": 1500]))
         try await Task.sleep(for: .milliseconds(650))
-        XCTAssertEqual(finished, ["archive it"])
+        XCTAssertEqual(finished, ["delete it"])
         adapter.receive(try JSONSerialization.data(withJSONObject: [
-            "type": "session.input_transcript.delta", "delta": "archive it and reply", "start_ms": 4000, "end_ms": 4500]))
+            "type": "session.input_transcript.delta", "delta": "delete it and reply", "start_ms": 4000, "end_ms": 4500]))
         try await Task.sleep(for: .milliseconds(650))
-        XCTAssertEqual(finished, ["archive it"], "Anything else still waits the full second")
+        XCTAssertEqual(finished, ["delete it"], "Anything else still waits the full second")
         try await Task.sleep(for: .milliseconds(450))
-        XCTAssertEqual(finished, ["archive it", "archive it and reply"])
+        XCTAssertEqual(finished, ["delete it", "delete it and reply"])
         adapter.close()
     }
 
@@ -396,7 +413,7 @@ final class LiveSessionAdapterTests: XCTestCase {
     @MainActor
     private func finalizedCommand(_ h: Harness, start: Double = 100) async throws {
         try h.receive(["type": "session.input_transcript.delta", "start_ms": start,
-                       "end_ms": start + 100, "delta": "Archive this."])
+                       "end_ms": start + 100, "delta": "Delete this."])
         try h.start("r\(Int(start))", delegation: "d\(Int(start))")
         try await Task.sleep(for: .milliseconds(1050))
     }
@@ -819,12 +836,12 @@ final class LiveSessionAdapterTests: XCTestCase {
     func testFastActionWaitsForFinalTranscriptAndSuppressesDuplicateTool() async throws {
         let h = Harness()
         try h.receive(["type": "session.started"])
-        try h.receive(["type": "session.input_transcript.delta", "start_ms": 100, "end_ms": 200, "delta": "Archive this."])
+        try h.receive(["type": "session.input_transcript.delta", "start_ms": 100, "end_ms": 200, "delta": "Delete this."])
         try h.start()
-        XCTAssertFalse(h.adapter.beginFastAction(callId: "early", action: .archive))
+        XCTAssertFalse(h.adapter.beginFastAction(callId: "early", action: .trash))
         try await Task.sleep(for: .milliseconds(1050))
-        XCTAssertTrue(h.adapter.beginFastAction(callId: "local", action: .archive))
-        XCTAssertFalse(h.adapter.beginFastAction(callId: "duplicate", action: .archive))
+        XCTAssertTrue(h.adapter.beginFastAction(callId: "local", action: .trash))
+        XCTAssertFalse(h.adapter.beginFastAction(callId: "duplicate", action: .trash))
         try h.function("late")
         XCTAssertTrue(h.calls.isEmpty, "The brain call waits while the app action is pending")
         h.result("local")
@@ -843,11 +860,11 @@ final class LiveSessionAdapterTests: XCTestCase {
         try await finalizedCommand(h)
         try h.function("brain-first", response: "r100")
         XCTAssertEqual(h.calls.count, 1)
-        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .archive))
+        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .trash))
     }
 
     @MainActor
-    func testAnsweredAcknowledgementDoesNotPoisonTheNextArchiveAuthorization() async throws {
+    func testAnsweredAcknowledgementDoesNotPoisonTheNextDeleteAuthorization() async throws {
         let h = Harness()
         try h.receive(["type": "session.started"])
         try h.receive(["type": "session.input_transcript.delta", "start_ms": 100,
@@ -856,17 +873,17 @@ final class LiveSessionAdapterTests: XCTestCase {
         try h.receive(["type": "session.output_transcript.delta", "start_ms": 300,
                        "end_ms": 500, "delta": "You're welcome."])
         try await finalizedCommand(h, start: 3000)
-        XCTAssertTrue(h.adapter.beginFastAction(callId: "after-aside", action: .archive))
+        XCTAssertTrue(h.adapter.beginFastAction(callId: "after-aside", action: .trash))
     }
 
     @MainActor
-    func testUndelegatedArchiveCorrelatesContinuationAndSuppressesLateDelegation() async throws {
+    func testUndelegatedDeleteCorrelatesContinuationAndSuppressesLateDelegation() async throws {
         let h = Harness()
         try h.receive(["type": "session.started"])
         try h.receive(["type": "session.input_transcript.delta", "start_ms": 100,
-                       "end_ms": 200, "delta": "You can archive."])
+                       "end_ms": 200, "delta": "You can delete it."])
         try await Task.sleep(for: .milliseconds(1050))
-        XCTAssertTrue(h.adapter.beginFastAction(callId: "local", action: .archive))
+        XCTAssertTrue(h.adapter.beginFastAction(callId: "local", action: .trash))
         XCTAssertEqual(h.delegationTurns["local"], 1)
         h.result("local")
         try h.lifecycle("response.created", response: "continuation")
@@ -890,16 +907,16 @@ final class LiveSessionAdapterTests: XCTestCase {
         let h = Harness()
         try h.start()
         try h.receive(["type": "session.input_transcript.delta", "start_ms": 100,
-                       "end_ms": 200, "delta": "Archive."])
+                       "end_ms": 200, "delta": "Delete it."])
         try await Task.sleep(for: .milliseconds(1050))
-        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .archive))
+        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .trash))
     }
 
     @MainActor
     func testRefusalIsReusedWithoutRetryAndNewTurnCanAct() async throws {
         let h = Harness()
         try await finalizedCommand(h)
-        XCTAssertTrue(h.adapter.beginFastAction(callId: "local", action: .archive))
+        XCTAssertTrue(h.adapter.beginFastAction(callId: "local", action: .trash))
         h.adapter.outbound(["type": "conversation.item.create", "item": ["type": "function_call_output",
             "call_id": "local", "output": "Refused: account unavailable. No archive was accepted."]])
         try h.function("late", response: "r100")
@@ -918,7 +935,7 @@ final class LiveSessionAdapterTests: XCTestCase {
     func testFollowupReadsAllowedButLateWritesAndDispatchAreSuppressed() async throws {
         let h = Harness()
         try await finalizedCommand(h)
-        XCTAssertTrue(h.adapter.beginFastAction(callId: "local", action: .archive))
+        XCTAssertTrue(h.adapter.beginFastAction(callId: "local", action: .trash))
         h.result("local")
         for name in ["archive_message", "triage_next", "dispatch", "gmail_archive_message", "gmail_send_email"] {
             try h.receive(["type": "response.event", "delegation_id": "d100", "event": [
@@ -942,7 +959,7 @@ final class LiveSessionAdapterTests: XCTestCase {
         try h.receive(["type": "session.input_transcript.delta", "start_ms": 100, "end_ms": 200, "delta": "Don't"])
         try await Task.sleep(for: .milliseconds(1050))
         try await finalizedCommand(h, start: 2000)
-        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .archive))
+        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .trash))
         try h.function("normal-brain", response: "r2000")
         XCTAssertEqual(h.calls.map(\.id), ["normal-brain"])
     }
@@ -957,7 +974,7 @@ final class LiveSessionAdapterTests: XCTestCase {
         try h.receive(["type": "session.output_transcript.delta", "start_ms": 300,
                        "end_ms": 400, "delta": "Mm-hmm."])
         try await finalizedCommand(h, start: 2000)
-        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .archive))
+        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .trash))
     }
 
     @MainActor
@@ -970,7 +987,7 @@ final class LiveSessionAdapterTests: XCTestCase {
         try h.receive(["type": "session.output_transcript.delta", "start_ms": 300,
                        "end_ms": 400, "delta": "I'll wait for you to finish."])
         try await finalizedCommand(h, start: 2000)
-        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .archive))
+        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .trash))
     }
 
     @MainActor
@@ -983,7 +1000,7 @@ final class LiveSessionAdapterTests: XCTestCase {
         try h.receive(["type": "session.output_transcript.delta", "start_ms": 300,
                        "end_ms": 400, "delta": "What should I remind you to do?"])
         try await finalizedCommand(h, start: 2000)
-        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .archive))
+        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .trash))
     }
 
     @MainActor
@@ -996,7 +1013,7 @@ final class LiveSessionAdapterTests: XCTestCase {
         try h.receive(["type": "session.output_transcript.delta", "start_ms": 300,
                        "end_ms": 400, "delta": "Tell me what you'd like to be reminded to do."])
         try await finalizedCommand(h, start: 2000)
-        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .archive))
+        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .trash))
     }
 
     @MainActor
@@ -1008,16 +1025,16 @@ final class LiveSessionAdapterTests: XCTestCase {
         try h.lifecycle("response.completed")
         try await Task.sleep(for: .milliseconds(1050))
         try await finalizedCommand(h, start: 2000)
-        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .archive))
+        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .trash))
         try h.receive(["type": "session.input_transcript.delta", "start_ms": 2200, "end_ms": 2300, "delta": " until I say so"])
-        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .archive))
+        XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .trash))
     }
 
     @MainActor
     func testSyntheticResultRetainsDelegationWhenBrainEmittedNoTool() async throws {
         let h = Harness()
         try await finalizedCommand(h)
-        XCTAssertTrue(h.adapter.beginFastAction(callId: "local", action: .archive))
+        XCTAssertTrue(h.adapter.beginFastAction(callId: "local", action: .trash))
         h.result("local")
         try h.lifecycle("response.completed", response: "r100")
         try h.lifecycle("response.created", response: "continuation")
@@ -1320,13 +1337,13 @@ final class LiveSessionAdapterTests: XCTestCase {
         let h = Harness()
         try h.receive(["type": "session.started"])
         try h.receive(["type": "session.input_transcript.delta", "start_ms": 100,
-                       "end_ms": 200, "delta": "Awesome. Can you archive this one for me, please"])
-        XCTAssertFalse(h.adapter.beginFastAction(callId: "early", action: .archive))
+                       "end_ms": 200, "delta": "Awesome. Can you delete this email for me, please"])
+        XCTAssertFalse(h.adapter.beginFastAction(callId: "early", action: .trash))
         try await Task.sleep(for: .milliseconds(1050))
-        XCTAssertTrue(h.adapter.beginFastAction(callId: "local", action: .archive))
+        XCTAssertTrue(h.adapter.beginFastAction(callId: "local", action: .trash))
         XCTAssertFalse(h.adapter.hasUnresolvedQueueAction)
         XCTAssertTrue(h.sent.isEmpty, "Starting the action requires no new model request or context round trip")
-        XCTAssertFalse(h.adapter.beginFastAction(callId: "duplicate", action: .archive))
+        XCTAssertFalse(h.adapter.beginFastAction(callId: "duplicate", action: .trash))
     }
 
     @MainActor
@@ -1393,7 +1410,7 @@ final class LiveSessionAdapterTests: XCTestCase {
     }
 
     @MainActor
-    func testBackchannelDoesNotPoisonImmediateFastArchive() async throws {
+    func testBackchannelDoesNotPoisonImmediateFastDelete() async throws {
         for filler in ["Mm-hmm", "�", "Um"] {
             let h = Harness()
             try h.receive(["type": "session.started"])
@@ -1401,9 +1418,9 @@ final class LiveSessionAdapterTests: XCTestCase {
                            "end_ms": 200, "delta": filler])
             try await Task.sleep(for: .milliseconds(1050))
             try h.receive(["type": "session.input_transcript.delta", "start_ms": 2000,
-                           "end_ms": 2100, "delta": "You can archive"])
+                           "end_ms": 2100, "delta": "You can delete this"])
             try await Task.sleep(for: .milliseconds(1050))
-            XCTAssertTrue(h.adapter.beginFastAction(callId: "local", action: .archive), filler)
+            XCTAssertTrue(h.adapter.beginFastAction(callId: "local", action: .trash), filler)
             XCTAssertTrue(h.sent.isEmpty, "The shortcut must require no backend request")
             XCTAssertFalse(h.adapter.hasUnresolvedQueueAction)
             h.adapter.close()

@@ -57,154 +57,39 @@ final class LocalEmailPresentationTests: XCTestCase {
         XCTAssertTrue(attached.fromMe)
     }
 
-    // MARK: - Spoken parts
-
-    func testArchiveWordingAndSenderCountRule() async {
-        func content(_ scope: String?, _ question: String? = nil) -> P.Content {
-            P.Content(summary: "s", suggestedQuestion: question, archiveScope: scope)
-        }
-        let two: @Sendable (String, String, Int) async throws -> Int = { _, query, cap in
-            XCTAssertEqual(query, "in:inbox from:receipts@shop.example")
-            XCTAssertEqual(cap, 2)
-            return 2
-        }
-        let one: @Sendable (String, String, Int) async throws -> Int = { _, _, _ in 1 }
-        let from = "\"Shop Receipts\" <receipts@shop.example>"
-        let sender = await P.resolveArchiveSuggestion(content("sender"), account: "a@x.test", from: from, fromMe: false, count: two)
-        XCTAssertEqual(sender, "Want me to archive all your Shop Receipts emails?")
-        let lone = await P.resolveArchiveSuggestion(content("sender"), account: "a@x.test", from: from, fromMe: false, count: one)
-        XCTAssertEqual(lone, P.singleArchive)
-        let mine = await P.resolveArchiveSuggestion(content("sender"), account: "a@x.test", from: from, fromMe: true, count: two)
-        XCTAssertEqual(mine, P.singleArchive)
-        let message = await P.resolveArchiveSuggestion(content("message"), account: "a@x.test", from: from, fromMe: false, count: two)
-        XCTAssertEqual(message, P.singleArchive)
-        let other = await P.resolveArchiveSuggestion(content(nil, "Want me to find a time?"), account: "a@x.test",
-                                                     from: from, fromMe: false, count: two)
-        XCTAssertEqual(other, "Want me to find a time?")
+    func testSummaryKeepsWholeWordsWithinSpeechBudget() throws {
+        XCTAssertEqual(try P.spokenSummary("  Short.  "), "Short.")
+        XCTAssertLessThanOrEqual(try P.spokenSummary(String(repeating: "Résumé ", count: 100)).utf8.count, 250)
+        XCTAssertThrowsError(try P.spokenSummary("   "))
     }
 
-    func testSummaryTrimsToFitAndEndsOnTheReason() throws {
-        let long = Array(repeating: "word", count: 80).joined(separator: " ")
-        let withReason = try P.spokenSummary(long, question: "Want me to reply?", reason: " It's a part-time role. ")
-        XCTAssertTrue(withReason.hasSuffix(" It's a part-time role."))
-        XCTAssertLessThanOrEqual(withReason.utf8.count, 210)
-        let check = try P.spokenSummary("Short.", question: "Want me to check where they're based?", reason: "No city.")
-        XCTAssertEqual(check, "Short.")
-        XCTAssertLessThanOrEqual(try P.spokenSummary(long, question: nil, reason: "x").utf8.count, 250)
-        XCTAssertEqual(P.trimToBytes("one two three", 7), "one two")
-        XCTAssertThrowsError(try P.spokenSummary("   ", question: nil, reason: nil))
-    }
-
-    // MARK: - Categories
-
-    func testChooseCategory() {
-        let known = [P.Category(name: "receipt", description: "Purchase receipts")]
-        XCTAssertEqual(P.chooseCategory(known, decision: .init(choice: "receipt", confidence: 0.9), guess: nil)?.category.name, "receipt")
-        let guessed = P.chooseCategory(known, decision: .init(choice: "receipt", confidence: 0.3),
-                                       guess: .init(name: "Cold Sales Outreach", description: " Unsolicited pitches "))
-        XCTAssertEqual(guessed?.category, P.Category(name: "cold_sales_outreach", description: "Unsolicited pitches"))
-        XCTAssertEqual(guessed?.isNew, true)
-        XCTAssertEqual(P.chooseCategory(known, decision: nil, guess: .init(name: "Receipt", description: "x"))?.isNew, false)
-        XCTAssertNil(P.chooseCategory(known, decision: nil, guess: .init(name: "none of these", description: "x")))
-        XCTAssertEqual(P.parseDecision(["answers": [["name": "category", "choice": "receipt", "confidence": 0.7]] as [[String: Any]]]),
-                       P.Decision(choice: "receipt", confidence: 0.7))
-    }
-
-    func testPlaybookParsingKeepsWholeSentencesUnderTheCap() throws {
-        XCTAssertNil(P.parsePlaybook(#"{"playbook":"They archive.","changed":false}"#))
-        XCTAssertEqual(P.parsePlaybook(#"{"playbook":"  They   archive. ","changed":true}"#), "They archive.")
-        let sentence = "They reply when the candidate is full-time and otherwise they archive it. "
-        let long = String(repeating: sentence, count: 12)
-        let raw = String(decoding: try JSONSerialization.data(withJSONObject: ["playbook": long, "changed": true]), as: UTF8.self)
-        let kept = try XCTUnwrap(P.parsePlaybook(raw))
-        XCTAssertLessThanOrEqual(kept.utf8.count, P.playbookBytes)
-        XCTAssertTrue(kept.hasSuffix("archive it."))
-        let turns = P.parseTurns([("assistant", "Hi"), ("user", "  archive it  "), ("system", "x")])
-        XCTAssertEqual(turns?.map(\.text), ["Hi", "archive it"])
-        XCTAssertNil(P.parseTurns([("assistant", "Hi")]))
-    }
-
-    // MARK: - Store and the whole preparation
-
-    private func store() throws -> EmailCategoryRows {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        return EmailCategoryRows(dbPool: try XCTUnwrap(LocalContextStore(url: url).dbPool))
-    }
-
-    func testStoreCapsOrdersAndScopesByUser() async throws {
-        let rows = try store()
-        let start = Date(timeIntervalSince1970: 1_800_000_000)
-        for index in 0..<22 {
-            try await rows.touch(userId: "u1", account: "A@x.test", name: "c\(index)", description: "d",
-                                 now: start.addingTimeInterval(Double(index)))
-        }
-        try await rows.touch(userId: "u2", account: "a@x.test", name: "other", description: "d", now: start)
-        let known = try await rows.known(userId: "u1", account: "a@x.test")
-        XCTAssertEqual(known.count, EmailCategoryRows.maxCategories)
-        XCTAssertEqual(known.first?.name, "c21")
-        let dropped = try await rows.category(userId: "u1", account: "a@x.test", name: "c0")
-        XCTAssertNil(dropped)
-        var other = try await rows.known(userId: "u2", account: "a@x.test")
-        XCTAssertEqual(other.map(\.name), ["other"])
-        try await rows.purge(userId: "u1")
-        let purged = try await rows.known(userId: "u1", account: "a@x.test")
-        XCTAssertTrue(purged.isEmpty)
-        other = try await rows.known(userId: "u2", account: "a@x.test")
-        XCTAssertEqual(other.count, 1)
-    }
-
-    func testPrepareSummarizesStoresTheCategoryAndRewritesItsPlaybook() async throws {
-        let rows = try store()
-        let fetched = message(parts: [part("text/plain", "Your receipt for $12.")], from: "Shop <receipts@shop.example>")
+    func testPreparationRequestsOnlyASummary() async throws {
+        let fetched = message(parts: [part("text/plain", "Your receipt for $12.")])
         let requests = RequestLog()
-        let deps = P.Dependencies(
-            read: { _, _ in fetched },
-            respond: { body, _ in
-                await requests.add(body)
-                if body["text"].flatMap({ ($0 as? [String: Any])?["format"] as? [String: Any] })?["type"] as? String == "json_object" {
-                    return #"{"playbook":"They archive receipts.","changed":true}"#
-                }
-                return #"{"summary":"Shop sent a receipt for twelve dollars.","suggestedAction":null,"archiveScope":"message","categoryGuess":{"name":"receipt","description":"Purchase receipts"},"reason":null}"#
-            },
-            decide: { _ in XCTFail("no known categories yet"); return [:] },
-            count: { _, _, _ in 0 },
-            timeZone: { _ in "America/Los_Angeles" },
-            userId: { "u1" }, store: rows, draftsOnly: { _ in true })
+        let deps = P.Dependencies(read: { _, _ in fetched }, respond: { body, _ in
+            await requests.add(body)
+            return #"{"summary":"Dana sent a receipt for twelve dollars."}"#
+        }, timeZone: { _ in "America/Los_Angeles" })
         let key = LiveEmailPresentation.Key(account: "owner@example.test", threadId: "t1", messageId: "m1",
                                             exchangeId: "", messageIDs: ["m1"], selectedIDs: ["m1"])
-        let scope = ProfileRuntime.Scope(profileId: "p", isDefault: true, emails: ["owner@example.test"], suggestedActions: true)
-        let prepared = try await P.prepare(key, scope: scope, deps: deps)
-        XCTAssertEqual(prepared.summary, "Shop sent a receipt for twelve dollars.")
-        XCTAssertEqual(prepared.suggestedQuestion, P.singleArchive)
-        XCTAssertEqual(prepared.category, "receipt")
-        XCTAssertEqual(prepared.sentAt, "2026-09-22T17:00:00.000Z")
-        let first = await requests.bodies.first
-        let summary = try XCTUnwrap(first)
-        XCTAssertNil(summary["service_tier"])
-        XCTAssertEqual(summary["model"] as? String, "gpt-5.6-luna")
-        let known = try await rows.known(userId: "u1", account: "owner@example.test")
-        XCTAssertEqual(known.map(\.description), ["Purchase receipts"])
-
-        let changed = await P.reportPlaybook(account: " Owner@example.test ", category: "receipt",
-            turns: [("user", "archive it"), ("assistant", "Done.")], tools: ["archive_message", "Bad-Name"], deps: deps)
-        XCTAssertTrue(changed)
-        let receipt = try await rows.category(userId: "u1", account: "owner@example.test", name: "receipt")
-        XCTAssertEqual(receipt?.playbook, "They archive receipts.")
-        let last = await requests.bodies.last
-        let rewrite = try XCTUnwrap(last)
-        XCTAssertNil(rewrite["service_tier"])
-        XCTAssertTrue((rewrite["input"] as? String ?? "").contains(#"Tools used while this email was current: ["archive_message"]"#))
-        let unknown = await P.reportPlaybook(account: "owner@example.test", category: "newsletter",
-                                             turns: [("user", "archive it")], tools: [], deps: deps)
-        XCTAssertFalse(unknown)
+        let prepared = try await P.prepare(key, scope: .init(profileId: "p", isDefault: true), deps: deps)
+        XCTAssertEqual(prepared.summary, "Dana sent a receipt for twelve dollars.")
+        let bodies = await requests.bodies
+        XCTAssertEqual(bodies.count, 1)
+        let text = try XCTUnwrap(bodies.first?["text"] as? [String: Any])
+        let format = try XCTUnwrap(text["format"] as? [String: Any])
+        let schema = try XCTUnwrap(format["schema"] as? [String: Any])
+        XCTAssertEqual(schema["required"] as? [String], ["summary"])
+        XCTAssertEqual(Set((schema["properties"] as? [String: Any] ?? [:]).keys), ["summary"])
+        XCTAssertTrue(try XCTUnwrap(prepared.speakerLine(for: #"{"done":false,"item":{"account":"owner@example.test","id":"m1","threadId":"t1"}}"#))
+            .contains("What would you like to do with it?"))
     }
 
     func testPrepareRejectsAMessageFromAnotherThread() async throws {
         let deps = P.Dependencies(
             read: { _, _ in self.message(thread: "elsewhere", parts: [self.part("text/plain", "Hi")]) },
             respond: { _, _ in XCTFail("no summary for a rejected chain"); return "" },
-            decide: { _ in [:] }, count: { _, _, _ in 0 }, timeZone: { _ in nil }, userId: { nil },
-            store: try store(), draftsOnly: { _ in true })
+            timeZone: { _ in nil })
         let key = LiveEmailPresentation.Key(account: "owner@example.test", threadId: "t1", messageId: "m1",
                                             exchangeId: "", messageIDs: ["m1"], selectedIDs: ["m1"])
         do {

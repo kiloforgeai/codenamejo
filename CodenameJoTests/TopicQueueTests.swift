@@ -72,9 +72,6 @@ final class TopicQueueTests: XCTestCase {
     }
 
     func testClusterPreparationSharesAllMembersAndReadContextInOneQuestion() throws {
-        let previous = UserDefaults.standard.object(forKey: SuggestedActions.storageKey)
-        defer { UserDefaults.standard.set(previous, forKey: SuggestedActions.storageKey) }
-        UserDefaults.standard.set(true, forKey: SuggestedActions.storageKey)
         var first = item("a")
         first.exchangeContext = [.init(id: "read", from: "Store", subject: "Update",
             date: "", snippet: "Earlier context", internalDate: 0)]
@@ -95,16 +92,15 @@ final class TopicQueueTests: XCTestCase {
                      "messages": group.ids.map { ["id": $0] }, "conversations": conversations]]
         let step = String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self)
         XCTAssertEqual(LiveEmailPresentation.Key.step(step), key)
-        let question = "September 29 at 2pm PT is free for 30 minutes. Should I book it?"
         let prepared = LiveEmailPresentation(key: key, summary: "Store needs a delivery meeting.",
-            from: "Store", to: group.account, sentAt: "2026-09-21T15:00:00Z", suggestedQuestion: question)
+            from: "Store", to: group.account, sentAt: "2026-09-21T15:00:00Z")
         let line = try XCTUnwrap(LiveSpokenStepContract.line(step: step, lead: "Next, ", prepared: prepared))
-        XCTAssertEqual(line.components(separatedBy: question).count, 2)
+        XCTAssertEqual(line.components(separatedBy: "What would you like to do with it?").count, 2)
         XCTAssertEqual(FullDuplexVoiceClient.presentableScript(step: step, lead: "Next, ", prepared: prepared), line)
         XCTAssertNil(FullDuplexVoiceClient.presentableScript(step: step, lead: "Next, ", prepared: nil))
         let annotated = try XCTUnwrap(prepared.annotating(step))
         let annotatedPayload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(annotated.utf8)) as? [String: Any])
-        XCTAssertEqual((annotatedPayload["item"] as? [String: Any])?["suggestedQuestion"] as? String, question)
+        XCTAssertNil((annotatedPayload["item"] as? [String: Any])?["suggestedQuestion"])
         XCTAssertNil(LiveSpokenStepContract.line(step: step, lead: "Next, "))
         let smaller = try XCTUnwrap(group.keeping(group.conversation.filter { $0.id != "a" }))
         XCTAssertNotEqual(LiveEmailPresentation.Key.item(smaller)?.identity, key.identity)

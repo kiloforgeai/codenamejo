@@ -78,15 +78,12 @@ final class WorkspaceProfileTests: XCTestCase {
         account.threadQueue = true
         account.mailHeadersOnly = true
         account.agentLedEmailSessions = false
-        account.suggestedActions = true
         var work = UserProfile()
-        work.suggestedActions = false
         work.triageScope = "all"
         let effective = try account.replacingWorkspaceSettings(with: work)
         XCTAssertEqual(effective.threadQueue, true)
         XCTAssertEqual(effective.mailHeadersOnly, true)
         XCTAssertEqual(effective.agentLedEmailSessions, false)
-        XCTAssertEqual(effective.suggestedActions, false)
         XCTAssertEqual(effective.triageScope, "all")
     }
 

@@ -160,9 +160,6 @@ final class FullDuplexVoiceClient {
     /// it.** See `renderLocalDispatchReportAnchor`. This is the only place on the phone that knows
     /// where the cursor actually is at the moment a report lands.
     var standingStep: String?
-    /// What was said and called while `standingStep` was current, for its category's playbook.
-    var playbookTurns: [(role: String, text: String)] = []
-    var playbookTools: [String] = []
     /// The opening asked "want to do some cleanup?"; a yes steps the queue here, not via the model.
     var nothingImportantOfferStanding = false
     /// The opening asked "want me to go through your inbox?" on a session whose queue is on this
@@ -170,7 +167,6 @@ final class FullDuplexVoiceClient {
     var feedOfferStanding = false
     /// When that yes was taken here, so the wait until Jo is audible again can be logged.
     var feedOfferAcceptedAt: ContinuousClock.Instant?
-    var suggestedActions = SuggestedActionTracker()
     var dispatchScopeRequired = false
     /// True from `output_audio_buffer.started` until `stopped`/`cleared` — i.e.
     /// while the speaker is genuinely making noise, which is not the same as "a
@@ -582,7 +578,6 @@ final class FullDuplexVoiceClient {
         // nothing rewrites it on a fresh dial, so the previous call's message would anchor
         // a recovered answer injected before this call has walked anything.
         standingStep = nil
-        suggestedActions.startDial()
         greetingSentAt = nil
         dispatchRecoveryReady = false
         openingIncludesRecoveredAnswers = false
@@ -1165,8 +1160,6 @@ final class FullDuplexVoiceClient {
     }
 
     private func teardown(reason: String) {
-        logSuggestedAction(suggestedActions.ended())
-        reportPlaybook(leaving: standingStep)
         resetLivePreparation()
         endAfterFarewell = false
         endWatchdog?.cancel()
@@ -1433,8 +1426,7 @@ final class FullDuplexVoiceClient {
         case .liveInputText(let text):
             if transport?.liveAdapter?.answersPendingOffer == nil {
                 transport?.liveAdapter?.answersPendingOffer = { [weak self] text in
-                    self?.suggestedActions.wouldAccept(text) != nil
-                        || (self?.feedOfferStanding == true && SuggestedActionTracker.answer(to: text) == .accepted)
+                    self?.feedOfferStanding == true && FeedOfferAnswer.answer(to: text) == .accepted
                 }
             }
             latestCompletedUserUtterance = text
@@ -1443,19 +1435,14 @@ final class FullDuplexVoiceClient {
         case .liveInputFinished(let text):
             userSpeaking = false
             latestCompletedUserUtterance = text
-            notePlaybookTurn("user", text)
             onUserTranscript?(text, true)
             onUserTurnCommitted?()
             liveInputComplete = true
-            let suggestion = suggestedActions.userSaid(text)
-            logSuggestedAction(suggestion)
             if tryOnboardingAnswer(text) {
                 // An onboarding answer the phone acts on itself; see `tryOnboardingAnswer`.
             } else if tryLocalCoachingAnswer(text) || tryFeedOfferAnswer(text) || tryNothingImportantAnswer(text)
                 || tryFeedOfferAcceptance(text) {
                 transport?.liveAdapter?.resolveLocalInput()
-            } else if trySuggestedAction(suggestion, text: text) {
-                // Jo's own suggestion, accepted: the phone already knows what it meant.
             } else if !tryLiveFastAction(text) {
                 tryModelRoutedFastAction(text)
             }
@@ -1561,7 +1548,6 @@ final class FullDuplexVoiceClient {
             let text = transcript.isEmpty ? (assistantTurns[itemId] ?? "") : transcript
             noteCoachingLessonSpoken(in: text, itemId: itemId)
             noteFeedQuestionSpoken(in: text)
-            noteSuggestionSpoken(in: text)
             assistantTurns[itemId] = text
             // What Jo actually said, for a console reader.
             RealtimeLog.log("spoke: \(text.prefix(200))")
@@ -1671,7 +1657,6 @@ final class FullDuplexVoiceClient {
         // detached: a record of an answer must not delay the answer. A store that failed to open
         // makes this a no-op.
         case .mcpCallResult(let name, let serverLabel, let argumentsJSON, let itemJSON):
-            if standingStep != nil { playbookTools.append(ToolNarration.canonical(name)) }
             let resultOutput = Self.mcpOutput(from: itemJSON)
             let confirmedEffects = GmailWriteEffect.decodeEffects(in: itemJSON)
             if let confirmedEffects {
@@ -2083,7 +2068,6 @@ final class FullDuplexVoiceClient {
             onFeedFocus?(feedFocusTracker.finishTerminalResponse())
             terminalFeedReached = false
         }
-        notePlaybookTurn("assistant", text)
         onAssistantTranscript?(text, true)
     }
 
@@ -2606,73 +2590,6 @@ final class FullDuplexVoiceClient {
         RealtimeLog.log("liveFastAction: \(action.rawValue) starting without a brain tool call")
         runFunctionTool(callId: id, name: action.rawValue, argumentsJSON: String(decoding: data, as: UTF8.self))
         return true
-    }
-
-    /// A yes to the suggestion Jo just made for this email, run on the phone instead of waiting
-    /// for the brain. "Archive it?" is the quick archive; "archive all your X emails?" and
-    /// "unsubscribe?" start the same dispatch the brain would, scoped to the sender's exact
-    /// address. Anything else ("find a time?", "how do you want to respond?") needs the brain.
-    private func trySuggestedAction(
-        _ resolved: (SuggestedActionTracker.Outcome, SuggestedActionTracker.Offer)?, text: String
-    ) -> Bool {
-        guard let (outcome, offer) = resolved, outcome == .accepted, transport != nil,
-              let step = standingStep, LiveEmailPresentation.Key.step(step)?.identity == offer.identity
-        else { return false }
-        let question = Self.normalize(offer.question)
-        if question == Self.normalize("Want me to archive it?") {
-            return tryLiveFastAction(text, routed: .archive)
-        }
-        let sweep = question.hasPrefix(Self.normalize("Want me to archive all your"))
-        let unsubscribe = question == Self.normalize("Want me to unsubscribe?")
-        guard sweep || unsubscribe,
-              let prepared = livePreparation.ready(for: step, profileId: ProfileRuntime.snapshot?.profileId),
-              let sender = Self.senderAddress(prepared.from) else { return false }
-        let name = Self.senderName(prepared.from) ?? sender
-        let query = "in:inbox from:\(sender)"
-        let arguments: [String: Any] = [
-            "task": (unsubscribe ? "Unsubscribe from \(sender) and archive" : "Archive")
-                + " every email from \(sender) in the inbox. Use the exact Gmail query \(query).",
-            "expects": "receipt",
-            "scope": "current_email",
-            "account": offer.identity.account,
-            "announce": unsubscribe
-                ? "I'm unsubscribing you from \(name)."
-                : "I'm archiving all your \(name) emails.",
-            "queue_cleanup": ["message_id": offer.identity.messageId, "query": query],
-        ]
-        guard isActive, openingWasAudible, !userSpeaking, liveInputComplete,
-              onboardingFlow == nil, endCueTask == nil, functionCallTask == nil,
-              localTriageForEmailOpening, let anchor = liveFastAnchor,
-              anchor.matches(step: standingStep, profileId: ProfileRuntime.snapshot?.profileId,
-                             revision: liveQueueRevision),
-              let adapter = transport?.liveAdapter,
-              let data = try? JSONSerialization.data(withJSONObject: arguments) else { return false }
-        let id = "local-" + UUID().uuidString
-        guard adapter.beginFastAction(callId: id, action: nil, routed: true) else { return false }
-        liveFastAnchor = nil
-        liveFastProfileId = anchor.profileId
-        toolCalledThisResponse = true
-        RealtimeLog.log("suggestedAction: \(unsubscribe ? "unsubscribe" : "archive-all") dispatched without a brain tool call")
-        runFunctionTool(callId: id, name: "dispatch", argumentsJSON: String(decoding: data, as: UTF8.self))
-        return true
-    }
-
-    /// The bare address in "Name <addr>", only when it is plainly one address.
-    nonisolated static func senderAddress(_ from: String) -> String? {
-        var address = from
-        if let open = from.lastIndex(of: "<"), let close = from.lastIndex(of: ">"), open < close {
-            address = String(from[from.index(after: open)..<close])
-        }
-        address = address.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let valid = address.range(of: #"^[a-z0-9._+%-]+@[a-z0-9.-]+\.[a-z]{2,}$"#, options: .regularExpression) != nil
-        return valid ? address : nil
-    }
-
-    nonisolated static func senderName(_ from: String) -> String? {
-        guard let open = from.firstIndex(of: "<") else { return nil }
-        let name = from[..<open].trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        return name.isEmpty ? nil : name
     }
 
     private func refuseLiveFunction(_ call: LiveSessionAdapter.Call, reason: String, output: String) {

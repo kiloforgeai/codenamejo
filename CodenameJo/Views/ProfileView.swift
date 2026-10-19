@@ -62,6 +62,7 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
     @AppStorage(LocalVoice.storageKey) private var localVoice = LocalVoice.paradee.rawValue
     @ObservedObject private var localSpeech = Container.shared.localSpeech()
     @AppStorage(LocalVoiceSettings.allLocalKey) private var allLocal = false
+    @AppStorage(JoTips.storageKey) private var joTips = true
     @AppStorage(VoiceNotesDefault.ownerKey) private var voiceNotesOwner: String?
 
     private var voiceNotes: Binding<Bool> {
@@ -217,6 +218,14 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
     /// The voice decisions that belong to the user: whether the Note action is available.
     private var voiceSection: some View {
         Section {
+            Toggle(isOn: $joTips) {
+                SettingsRow.label("Jo tips", icon: "lightbulb",
+                    detail: "Quick tips between emails. Changes apply to your next call.")
+            }
+            .tint(Theme.toggleOn)
+            .accessibilityIdentifier("joTipsToggle")
+            .listRowBackground(Theme.surface)
+
             // `VoiceSettings.voiceNotes` says what off stops and why turning it back on takes a relaunch.
             Toggle(isOn: voiceNotes) {
                 SettingsRow.label(

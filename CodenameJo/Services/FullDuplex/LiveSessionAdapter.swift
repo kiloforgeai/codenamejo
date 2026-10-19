@@ -382,6 +382,8 @@ final class LiveSessionAdapter {
             }
             if payload["type"] as? String == "response.create" {
                 refreshBrainState()
+                // Client lifecycle events are synchronous; an obsolete continuation may start no request.
+                backendStarting = false
                 clientBrain.continueResponse(delegation: continuationDelegation)
                 return
             }

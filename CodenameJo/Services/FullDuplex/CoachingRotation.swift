@@ -1,5 +1,13 @@
 import Foundation
 
+enum JoTips {
+    static let storageKey = "joTipsEnabled"
+
+    static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: storageKey) as? Bool ?? true
+    }
+}
+
 /// The quick-tip rotation and `coach_capability`, on the phone. Lessons ship in the bundled
 /// `prompts/coaching.json`; which ones this phone has offered or had dismissed stays in `UserDefaults`.
 enum CoachingRotation {
@@ -66,6 +74,7 @@ enum CoachingRotation {
     /// apart so a fresh onboarding can teach it again unless it was dismissed.
     static func plan(_ eligibility: Eligibility, catalog: [Lesson] = catalog,
                      defaults: UserDefaults = .standard) -> FullDuplexBroker.CoachingPlan {
+        guard JoTips.isEnabled(defaults: defaults) else { return .init(lessons: []) }
         let offered = Set((defaults.dictionary(forKey: offeredKey) ?? [:]).keys)
         let dismissed = Set(defaults.stringArray(forKey: dismissedKey) ?? [])
         let lessons = catalog.filter {

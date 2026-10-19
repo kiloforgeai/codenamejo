@@ -4299,7 +4299,7 @@ actor LocalTriageQueue {
 
     static func threadStanding(_ item: Item, scope: Scope) -> [String: Any]? {
         if item.isTopicGroup {
-            return ["queued": item.ids.count, "note": "These emails from the same sender concern one specific matter across separate Gmail threads. Give ONE concise summary of the latest state and outstanding requests, using all selected messages and their conversation context. Open with who and what; do not enumerate repetitive updates. End with item.suggestedQuestion when supplied: ONE checked calendar slot for the whole cluster. Otherwise ask what to do with it; never invent a proactive suggestion. Later updates supersede earlier requests. Do not suggest separate actions for each email or use only the representative. Next leaves the entire group. For archive it, call archive_message with message_id set to item.archiveGroupId and the account; this archives all presented threads; an explicitly selected email targets only its thread. Replies and other writes require a specific member; ask which one if ambiguous. Never use the representative as an implicit reply target."]
+            return ["queued": item.ids.count, "note": "These emails from the same sender concern one specific matter across separate Gmail threads. Give ONE concise summary of the latest state and outstanding requests, using all selected messages and their conversation context. Open with who and what; do not enumerate repetitive updates. Ask what to do with it; never invent a proactive suggestion. Later updates supersede earlier requests. Do not suggest separate actions for each email or use only the representative. Next leaves the entire group. For archive it, call archive_message with message_id set to item.archiveGroupId and the account; this archives all presented threads; an explicitly selected email targets only its thread. Replies and other writes require a specific member; ask which one if ambiguous. Never use the representative as an implicit reply target."]
         }
         let messages = item.conversation
         let hasDraft = item.hasDraft ?? false
@@ -4824,18 +4824,9 @@ actor LocalTriageQueue {
         } else {
             note += "Only an explicit word-for-word read request gets the original wording. "
         }
-        note += "End with item.suggestedQuestion VERBATIM in this same response when supplied. "
-        note += "Exception: after switching items or accounts, a bare yes before this item has been presented "
-        note += "answers the previous item's question, however short it was, and is not permission to present this one. "
-        note += "It needs clarification: Did you mean the previous offer, or something for this email? "
-        note += "Stop any summary underway; ask only that question, without acting. "
-        note += "This overrides automatic presentation and the generic question below. "
-        note += "It is already prepared speech: say the summary AND the whole suggested question, "
-        note += "then stop. A summary alone is incomplete, even for what is this email. Ask it once per item: "
-        note += "answers to follow-ups about this item end without re-asking it, and the offer stays open. No lookup "
-        note += "or delegation is needed to speak these supplied fields. Otherwise ask "
-        note += "'What would you like to do with it?' and nothing else. Without item.suggestedQuestion, never offer an action "
-        note += "of your own (no 'want me to draft/find/accept…'). Do not invent other proactive suggestions. "
+        note += "Ask 'What would you like to do with it?' once per item, then wait. "
+        note += "Answer follow-up questions without repeating the introduction or offering an action. "
+        note += "Never invent a proactive suggestion. "
         note += "Wait for the answer. When they "
         note += "have said what to do — "
         note += "archive, label, reply, or nothing — do it and call triage_next again in "
@@ -4845,14 +4836,7 @@ actor LocalTriageQueue {
         note += "answer with nothing that decides anything (\"okay\", \"sure\", \"got it\"), "
         note += "call triage_next only if the preceding question was the generic action question "
         note += "or 'How do you want to deal with it?'. "
-        note += "An explicit yes or sure to a concrete suggested action accepts that offer for "
-        note += "this item and account; do not skip it. Delegate it with the suggestion text; the backend picks the tools "
-        note += "and checks the calendar itself. Finding a time is synchronous, never a dispatch: keep this email selected, "
-        note += "wait for the free time, ask whether it works, and do not call triage_next first. "
-        note += "An open question such as 'How do you want to respond?' is not an offer: a bare yes, okay or sure "
-        note += "gives no direction, so ask what they want to say and do not advance. "
-        note += "No declines the suggestion without advancing; ask what they want instead. Then wait. Next "
-        note += "or skip advances without accepting it. Silence or noise accepts nothing."
+        note += "Next or skip advances without acting. Silence or noise authorizes nothing."
         return note
     }
 

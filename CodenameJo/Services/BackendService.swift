@@ -89,21 +89,17 @@ class BackendService: ObservableObject {
         UserProfile.clearLocalSettings()
         // The trace flag is per-handset, not on the profile, but a staff tool must not stay armed.
         FullDuplexTrace.clearLocal()
-        UserDefaults.standard.removeObject(forKey: SuggestedActions.accountDefaultKey)
         VoiceNotesDefault.clear()
         // Here, not at the Settings button, because account deletion and an expired-session 401
         // also end here. Detached: a failed delete must not hold up the UI.
         let outbox = Container.shared.turnSaveOutbox()
         let profileRows = Container.shared.workspaceProfileRows()
-        let categoryRows = Container.shared.emailCategoryRows()
         let commandRows = Container.shared.customCommandRows()
         Task.detached(priority: .utility) {
             guard let signedOutOwner else { return }
             await outbox.purge(owner: signedOutOwner)
             do { try await profileRows.purgeDossiers(userId: signedOutOwner) }
             catch { print("profileDossier: sign-out purge failed: \(error.localizedDescription)") }
-            do { try await categoryRows.purge(userId: signedOutOwner) }
-            catch { print("emailCategory: sign-out purge failed: \(error.localizedDescription)") }
             do { try await commandRows.purge(userId: signedOutOwner) }
             catch { print("customCommand: sign-out purge failed: \(error.localizedDescription)") }
         }
