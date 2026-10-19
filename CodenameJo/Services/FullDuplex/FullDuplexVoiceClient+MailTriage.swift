@@ -35,7 +35,7 @@ extension FullDuplexVoiceClient {
     /// `2 since read` and dropped exactly these rows. This is that write, done immediately
     /// instead of at the next foreground.
     private static let unreadRemovers: Set<String> = [
-        "archive_message", "trash_message", "mark_spam", "unsubscribe_sender",
+        "archive_message", "trash_message", "mark_spam",
     ]
 
     /// Badge the queue's current message when a broker write lands on it, and — for a bulk
@@ -63,6 +63,8 @@ extension FullDuplexVoiceClient {
             }
             return
         }
+
+        guard !failed, output.map({ !ToolNarration.isRefusal($0) }) == true else { return }
 
         if LocalQueueMCPWritePolicy.finishesCurrentMessage(canonical, output: output) {
             queueReceiptInstructionsPending = LocalQueueMCPWritePolicy.receiptInstructions(
@@ -99,12 +101,8 @@ extension FullDuplexVoiceClient {
         let thread = Self.stringArgument("thread_id", in: argumentsJSON)
         guard named != nil || thread != nil else { return }
 
-        // **Sender-wide by construction, so it prunes unconditionally.** Every one of
-        // `unsubscribe_sender`'s four outcomes writes a rule and clears the backlog — the
-        // old server's `sweepsTheSender` needed no bulk marker beside this tool for exactly that
-        // reason, and neither does this.
         let clearsExisting = canonical != "unsubscribe_sender"
-            || Self.boolArgument("clear_existing", in: argumentsJSON) != false
+            || Self.boolArgument("clear_existing", in: argumentsJSON) == true
         if let id = named, canonical == "unsubscribe_sender", clearsExisting {
             noteUnsubscribePrune(argumentsJSON: argumentsJSON, messageId: id)
         }

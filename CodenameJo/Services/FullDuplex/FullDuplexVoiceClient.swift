@@ -1693,7 +1693,8 @@ final class FullDuplexVoiceClient {
             // turned down still *completes* — the tool ran and produced a sentence — so
             // the completion event says nothing about whether the write happened. The
             // answer is in the text, and this is the only event that carries it.
-            if let output = resultOutput, ToolNarration.isRefusal(output) {
+            if let output = resultOutput,
+               GmailWriteEffect.hasFailure(in: itemJSON) || ToolNarration.isRefusal(output) {
                 RealtimeLog.log("tools: \(name) REFUSED — \(output.prefix(120))")
                 onToolFailed?(name)
             } else {

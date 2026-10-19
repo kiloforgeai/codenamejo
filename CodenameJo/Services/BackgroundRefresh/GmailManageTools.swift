@@ -111,15 +111,15 @@ enum GmailManageTools {
                  ["message_id": string("The message, from a search hit or the queue step. Omit only if you genuinely have none: in a "
                      + "queue the message they are standing on is used, and `search` finds it anywhere else."),
                   "sender": string("Whose mail to stop, when there is no message in front of you — a sending domain or address, e.g. "
-                     + "'redditmail.com'. The newest message from them is what gets read for the unsubscribe link. Pass "
-                     + "a broader domain ('pinterest.com') when the user means every stream a company sends, and leave "
-                     + "it out when message_id or the queue supplies one."),
+                     + "'redditmail.com'. The newest message from them is what gets read for the unsubscribe link. This selects a "
+                     + "message to inspect; it does not stop every stream from that domain. Leave it out when "
+                     + "message_id or the queue supplies one."),
                   "search": string("A Gmail query matching this message and nothing else, e.g. 'from:stripe subject:\"Your "
                      + "receipt\"'. Pass it with message_id; it is what finds the message if the id does not resolve."),
                   "account": writeAccount,
-                  "clear_existing": boolean("Whether to archive the existing matching inbox backlog after unsubscribing. Defaults to true for "
-                     + "compatibility. Pass false when the user approved only the unsubscribe; existing messages then "
-                     + "remain in the inbox."),
+                  "clear_existing": boolean("Whether to archive the existing matching inbox backlog after unsubscribing. Defaults to false. "
+                     + "Pass true only with explicit approval to archive; this runs only after confirmed one-click "
+                     + "acceptance. Unsuccessful or unconfirmed requests leave existing mail alone."),
                   "clear_existing_query": string("Optional exact Gmail query for the backlog archive when clear_existing is true. Use this for a "
                      + "disclosed category-and-sender cleanup; otherwise the tool clears the sending host's inbox "
                      + "backlog.")],
@@ -269,21 +269,15 @@ enum GmailManageTools {
         """
 
     private static let unsubscribeNote = """
-        Actually unsubscribe from a sender's mail, AND stop the rest arriving, AND by default clear what is \
-        already there — one call. Set clear_existing false when the user approved only unsubscribing and did \
-        not separately approve a backlog archive. When the approved cleanup is narrower than all mail from \
-        that sender, pass clear_existing_query to pin the archive to that exact Gmail query. "Unsubscribe me \
-        from these", "stop these emails", "get me off this list", "I don't want these any more" are this \
-        tool. Never do this by hand with create_mailbox_filter and modify_matching: those cannot \
-        unsubscribe, so the sender keeps sending and the user only stops seeing it. A rule happens in every \
-        case; the clear-out happens unless clear_existing is false. Never follow this with \
-        create_mailbox_filter, or with modify_matching when the backlog was already cleared, for the same \
-        sender. **The answer says which of four things happened and you must repeat the distinction, not \
-        flatten it to "unsubscribed":** it unsubscribed outright; it sent a request it cannot confirm; it \
-        emailed an unsubscribe address; or the sender offers no unsubscribe at all, which means a person \
-        wrote to them rather than a mailing list — say that plainly, the rule still ran. It keys on the \
-        sending host, so 'explore.pinterest.com' stops one Pinterest stream and not the other three — pass \
-        sender 'pinterest.com' when they mean the whole company.
+        Unsubscribe using the sender's authenticated one-click route. Never create a skip-inbox filter as \
+        part of unsubscribing or as a fallback. If no supported route exists, the request fails, or the \
+        outcome cannot be confirmed, say it was not unsubscribed (or not confirmed) and leave existing \
+        mail alone. An emailed unsubscribe request is not confirmation; report that distinction and do \
+        not repeat it automatically. Do not substitute create_mailbox_filter, modify_matching, archive, \
+        spam or a queue skip after an unsuccessful unsubscribe. Set clear_existing true only when the \
+        user separately approved archiving existing mail; that archive runs only after confirmed \
+        one-click acceptance. Pass clear_existing_query to limit an approved archive to its exact scope. \
+        The unsubscribe covers the mailing list on the selected message, not every stream from a company.
         """
 
     private static let sendDraftNote = """
@@ -435,9 +429,12 @@ enum GmailManageTools {
             return (output, false, confirmed())
         } catch let refusal as Refusal {
             RealtimeLog.log("gmailManage: \(name) refused — \(refusal.text.prefix(120))")
-            return (refusal.text, true, confirmed())
+            let output = name == unsubscribe && !refusal.text.lowercased().hasPrefix("not ")
+                && !refusal.text.hasPrefix("Unsubscribed from ") ? "Not unsubscribed. " + refusal.text : refusal.text
+            return (output, true, confirmed())
         } catch {
-            return (GmailReadTools.describe(error), true, confirmed())
+            let output = (name == unsubscribe ? "Not unsubscribed. " : "") + GmailReadTools.describe(error)
+            return (output, true, confirmed())
         }
     }
 
@@ -1147,14 +1144,7 @@ enum GmailManageTools {
         return url
     }
 
-    private final class NoRedirects: NSObject, URLSessionTaskDelegate {
-        func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
-                        newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
-            completionHandler(nil)
-        }
-    }
-
-    /// RFC 8058's fixed body. A redirect counts as taken; it is never followed.
+    /// Only a successful one-click POST confirms acceptance; redirects are never followed.
     private static func postUnsubscribe(_ raw: String) async -> Bool {
         guard let url = safeUnsubscribeURL(raw) else {
             RealtimeLog.log("gmailManage: unsubscribe POST refused — not a public https URL")
@@ -1166,10 +1156,10 @@ enum GmailManageTools {
         request.httpBody = Data("List-Unsubscribe=One-Click".utf8)
         request.timeoutInterval = 5
         do {
-            let (_, response) = try await URLSession.shared.data(for: request, delegate: NoRedirects())
+            let (_, response) = try await Container.shared.unsubscribeHTTP().data(for: request)
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             RealtimeLog.log("gmailManage: unsubscribe POST \(url.host ?? "") → \(code)")
-            return (200..<400).contains(code)
+            return (200..<300).contains(code)
         } catch {
             RealtimeLog.log("gmailManage: unsubscribe POST failed — \(error.localizedDescription.prefix(160))")
             return false
@@ -1208,7 +1198,7 @@ enum GmailManageTools {
         let target = try single(accounts)
         let token = try await GmailReadTools.token(target)
         let said = GmailReadTools.string(args, "sender") ?? ""
-        let clearExisting = args["clear_existing"] as? Bool != false
+        let clearExisting = args["clear_existing"] as? Bool == true
         let clearExistingQuery = GmailReadTools.string(args, "clear_existing_query") ?? ""
 
         var messageId = GmailReadTools.string(args, "message_id") ?? ""
@@ -1241,88 +1231,40 @@ enum GmailManageTools {
         let host = !said.isEmpty && !said.contains(":") ? senderHost(said) : unsubHost
         guard !host.isEmpty else { throw Refusal(text: "Could not tell who that message is from, so nothing was changed.") }
         let query = clearExistingQuery.isEmpty ? "from:\(host)" : clearExistingQuery
-        let filters = canFilter(target)
-
-        let offered = headers.oneClick != nil || headers.link != nil || headers.mailto != nil
-        let stopped: String
-        enum Route { case oneClick, link, mailto, unsigned, none }
-        let route: Route = offered && !headers.dkimPass ? .unsigned
-            : headers.oneClick != nil ? .oneClick : headers.link != nil ? .link : headers.mailto != nil ? .mailto : .none
-        switch route {
-        case .unsigned: stopped = "The unsubscribe on \(unsubHost)'s mail isn't signed by them, so I didn't use it."
-        case .oneClick: stopped = "Unsubscribed from \(unsubHost)."
-        case .link: stopped = "Sent an unsubscribe request to \(unsubHost) — I can't confirm they honoured it."
-        case .mailto: stopped = "Emailed \(unsubHost)'s unsubscribe address."
-        case .none: stopped = "No unsubscribe on \(unsubHost) — it isn't a mailing list."
+        let unchanged = " Existing mail was left in your inbox; no skip-inbox rule was created."
+        guard headers.dkimPass else {
+            throw Refusal(text: "Not unsubscribed from \(unsubHost): no authenticated unsubscribe option was available." + unchanged)
         }
-        let ruled = !filters
-            ? " I can't add a rule to keep the rest out — \(target) needs reconnecting in Settings for that"
-                + (clearExisting ? " — but I'm clearing out what's already there." : ".")
-            : host == unsubHost
-                ? " Their mail now skips your inbox\(clearExisting ? ", and I'm clearing out what's already there" : "")."
-                : " Mail from \(host) now skips your inbox — that covers every address they send "
-                    + "from, where the unsubscribe only covered \(unsubHost)"
-                    + (clearExisting ? " — and I'm clearing out what's already there." : ".")
-        let briefly = route == .oneClick && filters && host == unsubHost
-
-        var problems: [String] = []
-        var unsubscribeFailed = false
-        switch route {
-        case .oneClick:
-            if !(await postUnsubscribe(headers.oneClick ?? "")) {
-                if let mailto = headers.mailto {
-                    do { try await sendMail(token, to: mailto.to, subject: mailto.subject, body: mailto.body) }
-                    catch { unsubscribeFailed = true }
-                } else {
-                    unsubscribeFailed = true
-                }
-            }
-        case .link:
-            _ = await postUnsubscribe(headers.link ?? "")
-        case .mailto:
+        let confirmed = if let oneClick = headers.oneClick { await postUnsubscribe(oneClick) } else { false }
+        guard confirmed else {
             if let mailto = headers.mailto {
-                do { try await sendMail(token, to: mailto.to, subject: mailto.subject, body: mailto.body) }
-                catch { problems.append("the unsubscribe message to \(unsubHost) did not send") }
-            }
-        case .unsigned, .none:
-            break
-        }
-
-        var ruleSaved = filters
-        var backlogCleared = clearExisting
-        if filters {
-            do {
-                _ = try await GmailAPI.call("POST", path: "settings/filters",
-                    body: ["criteria": ["from": host], "action": ["removeLabelIds": ["INBOX"]]], token: token)
-            } catch let error where status(error) == 409 {
-                RealtimeLog.log("gmailManage: unsubscribe rule for \(host) was already there")
-            } catch {
-                ruleSaved = false
-                problems.append("the rule to keep \(host) out of your inbox was not saved")
-            }
-        }
-        if clearExisting {
-            do {
-                let swept = try await runSweep(["action": "archive", "query": query], [target], effects)
-                if swept.changed == 0, !swept.text.hasPrefix("Nothing in the inbox matches") {
-                    backlogCleared = false
-                    problems.append("the backlog from \(host) was not cleared — \(swept.text)")
+                do {
+                    try await sendMail(token, to: mailto.to, subject: mailto.subject, body: mailto.body)
+                } catch {
+                    throw Refusal(text: "Not unsubscribed from \(unsubHost): the unsubscribe email failed to send (\(detail(error)))." + unchanged)
                 }
-            } catch {
-                backlogCleared = false
-                problems.append("the backlog from \(host) was not cleared — \(detail(error))")
+                throw Refusal(text: "Not confirmed unsubscribed from \(unsubHost): an unsubscribe email was sent, "
+                    + "but the sender has not confirmed it. Do not repeat the request automatically." + unchanged)
             }
-        } else if (try? await modify(token, account: target, id: messageId, add: [], remove: ["UNREAD"], effects)) == nil {
-            problems.append("the message from \(unsubHost) could not be marked read")
+            let reason = headers.oneClick != nil ? "the one-click request was not confirmed"
+                : headers.link != nil ? "the sender requires a manual unsubscribe page"
+                : "the sender provides no unsubscribe option"
+            throw Refusal(text: "Not unsubscribed from \(unsubHost): \(reason)." + unchanged)
         }
-        if unsubscribeFailed {
-            let kept = [ruleSaved ? "their mail skips your inbox now" : "", backlogCleared ? "I've cleaned the backlog" : ""]
-                .filter { !$0.isEmpty }
-            problems.insert("Couldn't unsubscribe you from \(unsubHost)"
-                + (kept.isEmpty ? "" : ", but \(kept.joined(separator: " and "))"), at: 0)
+        let stopped = "Unsubscribed from \(unsubHost)."
+        guard clearExisting else { return stopped }
+        do {
+            let swept = try await runSweep(["action": "archive", "query": query], [target], effects)
+            if swept.changed == 0, !swept.text.hasPrefix("Nothing in the inbox matches") {
+                throw Refusal(text: "\(stopped) The requested backlog archive was not completed — \(swept.text)")
+            }
+            return stopped + " " + swept.text
+        } catch let refusal as Refusal {
+            throw Refusal(text: refusal.text.hasPrefix(stopped) ? refusal.text
+                : stopped + " The requested backlog archive was not completed — " + refusal.text)
+        } catch {
+            throw Refusal(text: "\(stopped) The requested backlog archive was not completed — \(detail(error))")
         }
-        guard problems.isEmpty else { throw Refusal(text: problems.joined(separator: "; ")) }
-        return briefly ? stopped : stopped + ruled
     }
 
     // MARK: - Drafts

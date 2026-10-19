@@ -21,6 +21,7 @@ extension Container {
     var profileDossier: Factory<ProfileDossierLearner> {
         self { ProfileDossierLearner(rows: Container.shared.workspaceProfileRows()) }.singleton
     }
+    var unsubscribeHTTP: Factory<any HTTPDataTransport> { self { UnsubscribeHTTPTransport() }.singleton }
     var providerHTTP: Factory<any HTTPDataTransport> { self { URLSessionDataTransport() }.singleton }
     /// The Google token server and Google's revoke endpoint.
     var tokenServerHTTP: Factory<any HTTPDataTransport> { self { URLSessionDataTransport() }.singleton }

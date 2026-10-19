@@ -50,8 +50,7 @@ enum ToolNarration {
         "label_message": Phrasing(present: "labelling it", past: "labelled it"),
         // Gmail's Report spam. Not "reporting it", which reads as a report filed with us.
         "mark_spam": Phrasing(present: "marking it spam", past: "marked it spam"),
-        // One call that unsubscribes, writes a rule and clears the backlog, named for the
-        // unsubscribe. The spoken reply says which of its outcomes happened.
+        // Unsubscribe success is separate from an unconfirmed request or an inbox filter.
         "unsubscribe_sender": Phrasing(present: "unsubscribing", past: "unsubscribed"),
         // A standing rule, not this message: the user said "from now on", not "filter".
         "create_mailbox_filter": Phrasing(present: "setting up the rule", past: "set up the rule"),
