@@ -95,17 +95,18 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         let rows = [row("first", thread: "first", date: 2, sender: "Andrew"),
                     row("last", thread: "last", date: 1, sender: "Beth")]
         try await fixture.seed(rows, unread: ["first", "last"])
-        let reads = LoaderCalls(results: [[]])
+        // The opening's own unread refresh is the first read.
+        let reads = LoaderCalls(results: [[], []])
         let queue = LocalTriageQueue(liveFeatures: true, mailAccounts: { ["queue@example.test"] },
                                     unreadOpeningLoader: { _ in reads.next() })
         let opening = await queue.step(.init(restart: true, scope: .unread), store: fixture.store)
         XCTAssertEqual(try current(opening.output)["id"] as? String, "first")
-        XCTAssertEqual(reads.count, 0, "Nothing is re-checked while unread has more than its last message")
+        XCTAssertEqual(reads.count, 1, "Nothing is re-checked while unread has more than its last message")
         let last = await queue.step(.init(), store: fixture.store, dealtWith: false)
         XCTAssertEqual(try current(last.output)["id"] as? String, "last")
-        try await waitUntil { reads.count == 1 }
+        try await waitUntil { reads.count == 2 }
         let leaving = await queue.step(.init(), store: fixture.store, dealtWith: false)
-        XCTAssertEqual(reads.count, 1, "The crossing uses the re-check read on the last message")
+        XCTAssertEqual(reads.count, 2, "The crossing uses the re-check read on the last message")
         XCTAssertEqual(leaving.served, .hit)
         await queue.end()
     }
@@ -115,14 +116,15 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         defer { fixture.close() }
         UserDefaults.standard.set(false, forKey: ThreadQueue.storageKey)
         try await fixture.seed([row("only", thread: "only", date: 1, sender: "Andrew")], unread: ["only"])
-        let reads = LoaderCalls(results: [nil, []])
+        // The opening's own unread refresh, the failed read ahead, then the crossing's live read.
+        let reads = LoaderCalls(results: [[], nil, []])
         let queue = LocalTriageQueue(liveFeatures: true, mailAccounts: { ["queue@example.test"] },
                                     unreadOpeningLoader: { _ in reads.next() })
         let opening = await queue.step(.init(restart: true, scope: .unread), store: fixture.store)
         XCTAssertEqual(try current(opening.output)["id"] as? String, "only")
-        try await waitUntil { reads.count == 1 }
+        try await waitUntil { reads.count == 2 }
         let leaving = await queue.step(.init(), store: fixture.store, dealtWith: false)
-        XCTAssertEqual(reads.count, 2)
+        XCTAssertEqual(reads.count, 3)
         XCTAssertEqual(leaving.served, .live, "The user waited on the second read")
         XCTAssertEqual(try object(leaving.output)["done"] as? Bool, true)
         await queue.end()
