@@ -1431,7 +1431,9 @@ actor LocalTriageQueue {
             "onboarding": ["step": config == nil ? stage.onboardingStep : position, "kind": kind, "note": note], "note": note]
         // The handoff lines are recited by the phone, as the about step's script already is.
         if onboardingMailModePending {
-            payload["script"] = config?.mailModeQuestion ?? EmailOnboardingContract.mailModeQuestion
+            // The receipt is a full sentence: "Draft saved." was dropped as a repeated receipt.
+            let receipt = config?.steps.first { $0.kind == "welcome" }?.receipt ?? EmailOnboardingContract.welcomeDraftReceipt
+            payload["script"] = receipt + " " + (config?.mailModeQuestion ?? EmailOnboardingContract.mailModeQuestion)
         } else if stage.kind(in: config) == "welcome" {
             payload["script"] = config?.step(stage.onboardingStep)?.line ?? EmailOnboardingContract.welcomeLine
         }

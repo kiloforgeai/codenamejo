@@ -1753,7 +1753,7 @@ extension FullDuplexVoiceClient {
             // A stage with its own line is said here with the receipt, as a prepared next email is.
             if pendingDraft == nil, result.ok == true, Self.isOnboardingStep(step.output),
                let script = Self.stepScript(step.output),
-               self.speakScriptedStage(Self.draftAdvanceReceipt + " " + script, dial: dial, userTurn: userTurn) {
+               self.speakScriptedStage(script, dial: dial, userTurn: userTurn) {
                 self.finishContextTool(
                     callId: callId, tool: tool,
                     output: result.text + Self.renderPresentedOnboardingAdvance(stepOutput: step.output),

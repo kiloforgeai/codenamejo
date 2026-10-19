@@ -162,7 +162,9 @@ final class EmailOnboardingTests: XCTestCase {
         XCTAssertEqual(try script(welcome.output), config.steps[0].line)
         XCTAssertTrue(welcome.output.contains("to this exact thread"), "the note still drives the draft")
         let question = await queue.step(.init(), store: store, dealtWith: true)
-        XCTAssertEqual(try script(question.output), config.mailModeQuestion)
+        XCTAssertEqual(try script(question.output),
+                       [config.steps[0].receipt, config.mailModeQuestion].compactMap { $0 }.joined(separator: " "))
+        XCTAssertEqual(config.steps[0].receipt, "Your reply is saved as a draft.")
         XCTAssertEqual(try stage(question.output), 1, "the question shares the welcome stage")
         await queue.end()
     }
