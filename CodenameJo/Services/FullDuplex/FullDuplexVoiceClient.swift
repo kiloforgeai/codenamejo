@@ -1461,7 +1461,9 @@ final class FullDuplexVoiceClient {
             liveInputComplete = true
             let suggestion = suggestedActions.userSaid(text)
             logSuggestedAction(suggestion)
-            if tryLocalCoachingAnswer(text) || tryFeedOfferAnswer(text) || tryNothingImportantAnswer(text)
+            if tryOnboardingAnswer(text) {
+                // An onboarding answer the phone acts on itself; see `tryOnboardingAnswer`.
+            } else if tryLocalCoachingAnswer(text) || tryFeedOfferAnswer(text) || tryNothingImportantAnswer(text)
                 || tryFeedOfferAcceptance(text) {
                 transport?.liveAdapter?.resolveLocalInput()
             } else if trySuggestedAction(suggestion, text: text) {
@@ -1573,6 +1575,9 @@ final class FullDuplexVoiceClient {
             noteFeedQuestionSpoken(in: text)
             noteSuggestionSpoken(in: text)
             assistantTurns[itemId] = text
+            // What Jo actually said, for a console reader: two device runs could not tell whether
+            // a scripted line was spoken, cut short or doubled.
+            RealtimeLog.log("spoke: \(text.prefix(200))")
             assistantAwaitsAnswer = itemId != stoppedAssistantItem && LiveSessionAdapter.endsOnQuestion(text)
             if assistantAwaitsAnswer {
                 questionAskedAt = .now

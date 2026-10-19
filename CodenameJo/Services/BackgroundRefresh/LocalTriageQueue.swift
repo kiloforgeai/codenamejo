@@ -1405,7 +1405,7 @@ actor LocalTriageQueue {
     /// v2 numbers the walk; v1 keeps its fixed 5.
     private var onboardingFinishStage: [String: Any] {
         let finish = onboardingFlow?.config?.finish
-        return ["step": onboardingFlow?.config == nil ? 5 : items.count + 1,
+        return ["step": onboardingFlow?.config == nil ? 5 : items.count + 1, "kind": "finish",
                 "note": EmailOnboardingContract.finishInstruction(
                     tip: finish?.tip ?? EmailOnboardingContract.tip,
                     question: finish?.question ?? EmailOnboardingContract.question)]
@@ -1425,8 +1425,10 @@ actor LocalTriageQueue {
         let note = onboardingMailModePending
             ? config?.mailModeQuestion.map(EmailOnboardingContract.mailModeInstruction(question:)) ?? EmailOnboardingContract.mailModeNote
             : stage.about.map { EmailOnboardingContract.aboutInstruction($0, question: aboutQuestion) } ?? stage.note(config: config)
+        // `kind` is what the phone reads to answer a stage itself; see `tryOnboardingAnswer`.
+        let kind = onboardingMailModePending ? "mail_mode" : stage.kind(in: config)
         var payload: [String: Any] = ["done": false, "position": position,
-            "onboarding": ["step": config == nil ? stage.onboardingStep : position, "note": note], "note": note]
+            "onboarding": ["step": config == nil ? stage.onboardingStep : position, "kind": kind, "note": note], "note": note]
         // The two handoff lines are the speaker's to recite, as the about step's script already
         // is. Left inside the note, the welcome line came out as an ordinary email summary ending
         // on "What would you like to do with it?", and the question after the draft depended on

@@ -477,6 +477,64 @@ enum EmailOnboardingContract {
         return result
     }
 
+    /// The composer's instructions for the Nate reply: `prompts/onboarding/reply.md` with his question in it.
+    static func replyPrompt(question: String, text: LivePrompt.Text = .bundled) throws -> String {
+        try text("onboarding/reply", ["question": question])
+    }
+
+    /// The Nate reply, written on the phone from what they said. A one-shot call on a prompt a
+    /// few hundred tokens long, where the brain turn it replaces read forty thousand and took ten
+    /// seconds. Nil when the words are not an answer to Nate, when there is no key, or when the
+    /// call fails: the brain keeps the turn, as before.
+    static func composeWelcomeReply(words: String, question: String? = WelcomeEmail.copy?.question,
+                                    text: LivePrompt.Text = .bundled) async -> String? {
+        guard let question, let prompt = try? replyPrompt(question: question, text: text) else {
+            RealtimeLog.log("onboarding: reply composer has no prompt or question")
+            return nil
+        }
+        do {
+            // One user message holding the prompt and their words, the shape the about step's
+            // call already takes; the prompt carries the "JSON" that json_object mode requires.
+            let answer = try await LiveOpenAI.read([["type": "input_text", "text": prompt + "\n\nTheir words:\n" + words]],
+                                                   json: true, timeout: 8)
+            guard let reply = parseReply(answer) else {
+                RealtimeLog.log("onboarding: reply composer declined — \(answer.prefix(160))")
+                return nil
+            }
+            return reply
+        } catch {
+            RealtimeLog.log("onboarding: reply composer failed — \(error)")
+            return nil
+        }
+    }
+
+    /// The reply out of the composer's JSON, only when it says the words were an answer.
+    static func parseReply(_ text: String) -> String? {
+        guard let raw = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any],
+              raw["answers"] as? Bool == true,
+              let reply = (raw["reply"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !reply.isEmpty, reply.count <= 600 else { return nil }
+        return reply
+    }
+
+    /// The mail-mode answer as the phone reads it: "send" or "drafts" when exactly one of them is
+    /// named and nothing negates it, "skip" on its own, nil for anything else. Nil hands the
+    /// turn to the brain, whose note already says a bare yes or no needs clarifying.
+    static func mailModeAnswer(_ transcript: String) -> String? {
+        let spoken = transcript.lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init)
+        let words = Set(spoken)
+        // A question about the choice is not the choice.
+        guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?"),
+              !["what", "which", "how", "why", "does", "do", "is", "can", "could", "should", "would", "will", "are"]
+                .contains(spoken.first ?? ""),
+              words.isDisjoint(with: ["not", "don", "dont", "never", "no", "nope", "rather", "instead"]) else { return nil }
+        let send = !words.isDisjoint(with: ["send", "sending", "sent"])
+        let drafts = !words.isDisjoint(with: ["draft", "drafts", "drafting"])
+        if send != drafts { return send ? "send" : "drafts" }
+        if !send, words.contains("skip") { return "skip" }
+        return nil
+    }
+
     static let tip = "You're in your Feed. I bring forward emails that need your attention and help you handle them by voice. Whenever you need something, just ask."
     static let question = "Congrats on finishing onboarding! Want to keep going through your inbox?"
     static let finish = finishInstruction(tip: tip, question: question)

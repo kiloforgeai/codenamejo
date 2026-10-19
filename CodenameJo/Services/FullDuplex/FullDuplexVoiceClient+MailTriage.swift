@@ -490,11 +490,20 @@ extension FullDuplexVoiceClient {
             adapter.presentScript(script)
             RealtimeLog.log("onboarding: about script sent directly to speaker")
         } else {
-            adapter.speakExactly(script)
+            adapter.presentPreparedEmail(script, request: Self.reciteStageLineRequest)
             RealtimeLog.log("onboarding: stage script sent directly to speaker")
         }
         return true
     }
+
+    /// How the speaker is asked for an onboarding stage's line: the same ordered presentation
+    /// path a prepared email takes, with the line said as written. `speakExactly` rides the
+    /// commentary channel, whose "say nothing else and call no tool" outlived the line on a
+    /// device run (2026-10-19): the question after the Nate draft was cut short and the next
+    /// two turns went unanswered.
+    /// "Including its first sentence": told not to repeat a receipt, the speaker dropped "Draft
+    /// saved." from the front of the line on a device run (2026-10-19).
+    static let reciteStageLineRequest = "Say the latest application-supplied line exactly as written, including its first sentence, then stop and wait for the user. Do not add anything to it and do not delegate."
 
     func presentPreparedEmail(callId: String, tool: String, step: String,
                                       ms: Double, outcome: String, query: String, dial: Int, userTurn: Int,
@@ -683,7 +692,7 @@ extension FullDuplexVoiceClient {
     private func speakScriptedStage(_ line: String, dial: Int, userTurn: Int) -> Bool {
         guard isActive, dialGeneration == dial, liveUserTurn == userTurn, endCueTask == nil,
               !userSpeaking, let adapter = transport?.liveAdapter else { return false }
-        adapter.speakExactly(line)
+        adapter.presentPreparedEmail(line, request: Self.reciteStageLineRequest)
         RealtimeLog.log("onboarding: stage script sent directly to speaker")
         return true
     }
@@ -1081,6 +1090,86 @@ extension FullDuplexVoiceClient {
             handledMessageId: standingStep.flatMap(LiveEmailPresentation.Key.step)?.messageId)
         RealtimeLog.log("coaching: armed \(capability) at the \(interstitial) checkpoint"
             + (speech == nil ? " (the backend speaks it)" : " (recited here)"))
+    }
+
+    // MARK: - Onboarding answers the phone owns
+
+    /// An onboarding answer the phone acts on without the brain. Each of these stages asked a
+    /// question the phone itself scripted, so the phone knows what an answer to it is: the Nate
+    /// reply is composed here with a small one-shot call and drafted, "send" or "drafts" saves
+    /// the preference, and a yes to the finish question steps into the inbox. Measured on a
+    /// phone on 2026-10-19, the brain turn for the Nate reply alone took 9.6 s on 39k input tokens.
+    /// Anything else, a question, a skip, a side request, stays the brain's, as before.
+    ///
+    /// The mail-mode and finish answers reserve the turn at once, the way a fast archive does.
+    /// The Nate reply reserves it only once the composer has a reply in hand, a second or two
+    /// later; the brain starts in parallel, as it does behind every fast action, and its late
+    /// `create_draft` is answered with the result the phone already has.
+    ///
+    /// - Returns: true when the phone took the turn.
+    func tryOnboardingAnswer(_ transcript: String) -> Bool {
+        guard onboardingFlow != nil, isActive, openingWasAudible, !userSpeaking,
+              endCueTask == nil, functionCallTask == nil, transport?.liveAdapter != nil,
+              let step = standingStep, let kind = Self.onboardingKind(step) else { return false }
+        switch kind {
+        case "welcome":
+            composeWelcomeReplyAndDraft(transcript, step: step)
+            return false
+        case "mail_mode":
+            guard let mode = EmailOnboardingContract.mailModeAnswer(transcript) else { return false }
+            return beginOnboardingTurn(tool: "triage_next", arguments: ["onboarding_mail_mode": mode],
+                                       detail: "mail mode \(mode)")
+        case "about", "finish":
+            // The about stage asks the finish question only when it carries its script.
+            guard kind == "finish" || Self.stepScript(step) != nil,
+                  LiveCoachingAnswer.parse(transcript) == .accepted else { return false }
+            return beginOnboardingTurn(tool: "triage_next", arguments: [:], detail: "finish yes")
+        default:
+            return false
+        }
+    }
+
+    /// The stage an onboarding step is on, from `onboarding.kind`; nil off onboarding.
+    nonisolated static func onboardingKind(_ step: String) -> String? {
+        ((try? JSONSerialization.jsonObject(with: Data(step.utf8)) as? [String: Any])?["onboarding"]
+            as? [String: Any])?["kind"] as? String
+    }
+
+    /// Reserve the turn and run the phone's own tool for it. The tool's result closes the fast
+    /// action; when it says the application is presenting, the brain adds nothing.
+    private func beginOnboardingTurn(tool: String, arguments: [String: String], detail: String) -> Bool {
+        guard let adapter = transport?.liveAdapter,
+              let data = try? JSONSerialization.data(withJSONObject: arguments) else { return false }
+        let id = "local-" + UUID().uuidString
+        guard adapter.beginFastAction(callId: id, action: nil, routed: true) else { return false }
+        toolCalledThisResponse = true
+        RealtimeLog.log("onboarding: \(detail) — handled on the phone without a brain turn")
+        let argumentsJSON = String(decoding: data, as: UTF8.self)
+        if tool == "create_draft" {
+            answerLocalMailWrite(callId: id, argumentsJSON: argumentsJSON)
+        } else {
+            answerTriageNext(callId: id, argumentsJSON: argumentsJSON)
+        }
+        return true
+    }
+
+    /// Compose the Nate reply from their words, then draft it as this turn's action if the
+    /// composer says the words were an answer and nothing has moved on meanwhile.
+    private func composeWelcomeReplyAndDraft(_ words: String, step: String) {
+        let dial = dialGeneration
+        let started = Date()
+        Task { [weak self] in
+            guard let reply = await EmailOnboardingContract.composeWelcomeReply(words: words) else {
+                RealtimeLog.log("onboarding: no reply composed on the phone — the brain keeps the turn")
+                return
+            }
+            guard let self, self.isActive, dial == self.dialGeneration, self.endCueTask == nil,
+                  !self.userSpeaking, self.functionCallTask == nil,
+                  self.latestCompletedUserUtterance == words, self.standingStep == step else { return }
+            RealtimeLog.log("onboarding: reply composed on the phone in \(Int(Date().timeIntervalSince(started) * 1000)) ms")
+            _ = self.beginOnboardingTurn(tool: "create_draft", arguments: ["body": reply, "user_request": words],
+                                         detail: "Nate reply")
+        }
     }
 
     /// Answer the **invitation** here rather than through the backend.

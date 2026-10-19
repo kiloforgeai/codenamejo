@@ -167,6 +167,55 @@ final class EmailOnboardingTests: XCTestCase {
         await queue.end()
     }
 
+    private func kind(_ output: String) throws -> String? {
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any])
+        return (object["onboarding"] as? [String: Any])?["kind"] as? String
+    }
+
+    func testStagesNameTheirKindForThePhone() async throws {
+        let config = try XCTUnwrap(LocalOnboardingRun.config())
+        let flow = EmailOnboardingFlow(version: 2, runId: UUID().uuidString, welcome: item(1),
+            mailModeChoice: .init(account: "owner@example.test", status: "welcome", mode: nil), config: config)
+        let queue = LocalTriageQueue()
+        await queue.configure(coachingPlan: nil,
+            forceOnboardingFeedLesson: false, sequentialFeed: false, calendarFeedDue: false,
+            localCalendar: false, onboardingFlow: flow, onboardingLoader: { .init(items: [], failures: []) })
+        let store = MailStore(database: nil, userId: "test-user")
+        let welcome = await queue.openingStep(store: store)
+        XCTAssertEqual(try kind(welcome.output), "welcome")
+        let question = await queue.step(.init(), store: store, dealtWith: true)
+        XCTAssertEqual(try kind(question.output), "mail_mode")
+        var choice = LocalTriageQueue.Input()
+        choice.onboardingMailMode = "drafts"
+        let finish = await queue.step(choice, store: store, dealtWith: false)
+        XCTAssertEqual(try kind(finish.output), "finish")
+        await queue.end()
+    }
+
+    func testTheMailModeAnswerIsReadOnThePhone() {
+        XCTAssertEqual(EmailOnboardingContract.mailModeAnswer("You can send my emails."), "send")
+        XCTAssertEqual(EmailOnboardingContract.mailModeAnswer("Keep them in drafts please"), "drafts")
+        XCTAssertEqual(EmailOnboardingContract.mailModeAnswer("Just draft them."), "drafts")
+        XCTAssertEqual(EmailOnboardingContract.mailModeAnswer("skip"), "skip")
+        XCTAssertNil(EmailOnboardingContract.mailModeAnswer("Yes"), "a bare yes is the brain's to clarify")
+        XCTAssertNil(EmailOnboardingContract.mailModeAnswer("Don't send them, keep drafts"), "both named")
+        XCTAssertNil(EmailOnboardingContract.mailModeAnswer("No, not send"), "negated")
+        XCTAssertNil(EmailOnboardingContract.mailModeAnswer("I'd rather you send them"), "hedged")
+        XCTAssertNil(EmailOnboardingContract.mailModeAnswer("What does drafts mean?"))
+    }
+
+    func testTheComposedReplyIsKeptOnlyWhenItAnswersNate() throws {
+        XCTAssertEqual(EmailOnboardingContract.parseReply(#"{"answers":true,"reply":" Hey Nate, it went really well. "}"#),
+                       "Hey Nate, it went really well.")
+        XCTAssertNil(EmailOnboardingContract.parseReply(#"{"answers":false,"reply":""}"#))
+        XCTAssertNil(EmailOnboardingContract.parseReply(#"{"answers":false,"reply":"Hey Nate, skip this"}"#))
+        XCTAssertNil(EmailOnboardingContract.parseReply(#"{"answers":true,"reply":"   "}"#))
+        XCTAssertNil(EmailOnboardingContract.parseReply("not json"))
+        let prompt = try EmailOnboardingContract.replyPrompt(question: "How did your onboarding go?")
+        XCTAssertTrue(prompt.contains("\"How did your onboarding go?\""))
+        XCTAssertTrue(prompt.contains("Return JSON"))
+    }
+
     func testTheNateReplyIsSteeredOntoHisThreadAsADraft() throws {
         let welcome = EmailOnboardingItem(account: "owner@example.test", id: "welcome-id", threadId: "welcome-thread",
             from: "Nate from Codename Jo <nate@kiloforge.com>", subject: "don't type your reply", date: "2026-10-19",
