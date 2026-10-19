@@ -4,8 +4,8 @@
     {
       "id": "welcome",
       "kind": "welcome",
-      "line": "Nate, the founder of Codename Jo, is wondering how your onboarding went. You can tell him you loved it, and I'll draft your reply.",
-      "receipt": "Your reply is saved as a draft."
+      "line": "Nate, the founder of Codename Jo, is wondering how your onboarding went. You can tell him you loved it, and I'll send your reply.",
+      "receipt": "Your reply has been sent."
     },
     {
       "id": "mail_mode",

@@ -1,6 +1,6 @@
 Nate, who built the email assistant Jo, emailed this person one question: "{{question}}" Jo read the question aloud and told them to answer by speaking. What they said is the user message below.
 
-Decide whether their words answer Nate, then write the reply Jo will save as a draft from them to Nate.
+Decide whether their words answer Nate, then write the reply Jo will send from them to Nate.
 
 Rules:
 - answers: true when the words answer Nate's question, including a short or partial answer ("I loved it", "pretty good so far"). false when they are a question or an instruction to Jo ("what did he say", "skip this", "archive it", "what's on my calendar") or have nothing to do with the question.
