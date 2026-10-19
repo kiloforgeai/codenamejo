@@ -1149,8 +1149,13 @@ extension FullDuplexVoiceClient {
             }
             guard let self, self.isActive, dial == self.dialGeneration, self.endCueTask == nil,
                   !self.userSpeaking, self.functionCallTask == nil,
-                  self.latestCompletedUserUtterance == words, self.standingStep == step else { return }
-            RealtimeLog.log("onboarding: reply composed on the phone in \(Int(Date().timeIntervalSince(started) * 1000)) ms")
+                  self.latestCompletedUserUtterance == words else { return }
+            let ms = Int(Date().timeIntervalSince(started) * 1000)
+            guard self.standingStep == step else {
+                RealtimeLog.log("onboarding: reply composed in \(ms) ms, after the stage had moved on")
+                return
+            }
+            RealtimeLog.log("onboarding: reply composed on the phone in \(ms) ms")
             _ = self.beginOnboardingTurn(tool: "create_draft", arguments: ["body": reply, "user_request": words],
                                          detail: "Nate reply")
         }
