@@ -1918,9 +1918,9 @@ class RealtimeService: ObservableObject {
     /// open issues" filed as Linear, "post that" as Typefully, "which file" as
     /// Drive — and every one of those labels became a filter chip on the History
     /// screen offering to narrow a list by a service that does not exist here.
-    /// Adding a service to this ladder is only correct once there is a connector
-    /// behind it; `ConnectionsService.connectedServices` is what then decides
-    /// whether its chip appears.
+    /// A service joins this ladder through its connector's `inferenceKeywords`;
+    /// `ConnectionsService.connectedServices` is what then decides whether its
+    /// chip appears.
     ///
     /// Still a keyword guess on the user's words, and still rough — it labels a
     /// row, it does not route anything. Two keywords went with the services that
@@ -1935,13 +1935,10 @@ class RealtimeService: ObservableObject {
         let lower = text.lowercased()
         if lower.contains("email") || lower.contains("gmail") || lower.contains("inbox")
             || lower.contains("mail") { return "Gmail" }
-        if lower.contains("granola") { return "Granola" }
-        if lower.contains("slack") { return "Slack" }
-        if lower.contains("github") || lower.contains("pull request") || lower.contains("pr ")
-            || lower.contains("issue") || lower.contains("repo") || lower.contains("merge")
-            || lower.contains("workflow") { return "GitHub" }
-        if lower.contains("notion") || lower.contains("page") || lower.contains("doc")
-            || lower.contains("note") || lower.contains("database") { return "Notion" }
+        for connector in ConnectorRegistry.all where connector.historyIcon != nil
+            && connector.inferenceKeywords.contains(where: lower.contains) {
+            return connector.displayName
+        }
         if lower.contains("calendar") || lower.contains("meeting") || lower.contains("schedule")
             || lower.contains("invite") || lower.contains("invitation")
             || lower.contains("event") { return "Calendar" }

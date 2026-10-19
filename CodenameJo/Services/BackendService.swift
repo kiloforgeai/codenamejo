@@ -72,12 +72,7 @@ class BackendService: ObservableObject {
         purgeCachedMail()
         // Both go: the cache alone leaves a phone that can refill it, the grant alone leaves mail on disk.
         forgetGoogleGrant()
-        GitHubAccountStore.removeAll()
-        GranolaConnector.forget()
-        CustomMCPConnector.forget()
-        forgetSlackGrants()
-        // Notion's grants and its client registration are this account's too.
-        RemoteMCPGrantStore.removeAll(.notion)
+        for connector in ConnectorRegistry.all { connector.forget() }
         // The detached purges below must delete this account's rows, not whatever is on disk when they run.
         let signedOutOwner = userId
         userId = nil
@@ -159,28 +154,13 @@ class BackendService: ObservableObject {
         GoogleCredential.invalidateCache()
     }
 
-    /// Slack tokens and the Slack queue go with the account, same as Google's grants.
-    private func forgetSlackGrants() {
-        SlackGrantStore.removeAll()
-        let slackQueue = Container.shared.localSlack()
-        let cache = Container.shared.slackQueueCache()
-        Task.detached(priority: .utility) {
-            await slackQueue.end()
-            await cache.purgeAll()
-        }
-    }
-
     /// Signed-out launches discard both app and Google credentials left in Keychain.
     func dropOrphanedGoogleGrant() {
         guard !isSignedIn else { return }
         RealtimeLog.log("credential cleanup: signed-out launch")
         forgetGoogleGrant()
-        // Keychain items outlive deleting the app; a GitHub token must not outlive the account.
-        GitHubAccountStore.removeAll()
-        GranolaConnector.forget()
-        CustomMCPConnector.forget()
-        forgetSlackGrants()
-        RemoteMCPGrantStore.removeAll(.notion)
+        // Keychain items outlive deleting the app; a connector's token must not outlive the account.
+        for connector in ConnectorRegistry.all { connector.forget() }
         purgeCachedMail()
     }
 
@@ -196,10 +176,7 @@ class BackendService: ObservableObject {
             }
         }
         for grant in GoogleAccountStore.all() { await GoogleTokenServer.revoke(grant.refreshToken) }
-        for grant in RemoteMCPGrantStore.grants(.granola) { await RemoteMCPAuth.revoke(grant) }
-        for grant in SlackGrantStore.all() { await SlackOAuth.revoke(grant) }
-        for grant in RemoteMCPGrantStore.grants(.notion) { await RemoteMCPAuth.revoke(grant) }
-        for server in CustomMCPServerStore.all() { await CustomMCPConnector.remove(server) }
+        for connector in ConnectorRegistry.all { await connector.revokeAll() }
         signOut()
         // The next sign-in on this phone is somebody new.
         InstallIdentity.reset()

@@ -261,10 +261,7 @@ class WorkspaceProfileStore: ObservableObject {
             guard let owner = backend.userId else { throw BackendError.notSignedIn }
             let held = try await connections(of: profile.id)
             for mailbox in held { await Container.shared.connections().disconnectGmail(mailbox.email) }
-            for grant in NotionTools.grants(profileId: profile.id) {
-                await RemoteMCPAuth.revoke(grant)
-                RemoteMCPGrantStore.remove(grant.id, .notion)
-            }
+            for connector in ConnectorRegistry.all { await connector.forgetProfile(profile.id) }
             do { try await rows.delete(userId: owner, id: profile.id) }
             catch WorkspaceProfileError.notFound { /* Already gone — deletion is idempotent. */ }
             // Queued voice notes attributed to the deleted profile have nowhere to run; drop them with it.

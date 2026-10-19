@@ -88,12 +88,9 @@ struct CommandRecord: Codable, Identifiable, Hashable {
 extension CommandRecord {
     /// Display table of services and SF Symbols, not a capability list: legacy names stay so old
     /// rows still draw. History's chips intersect it with `connectedServices`.
-    static let knownServices: [(name: String, icon: String)] = [
-        ("Gmail", "envelope.fill"),
-        ("Slack", "bubble.left.and.bubble.right.fill"),
-        ("GitHub", "chevron.left.forwardslash.chevron.right"),
-        ("Notion", "doc.text.fill"),
-        ("Granola", "text.bubble.fill"),
+    static let knownServices: [(name: String, icon: String)] = [("Gmail", "envelope.fill")]
+        + ConnectorRegistry.all.compactMap { connector in connector.historyIcon.map { (connector.displayName, $0) } }
+        + [
         ("Calendar", "calendar"),
         // Kept only so existing rows still draw; `inferService` no longer produces it.
         ("Kiloforge", "bolt.fill"),

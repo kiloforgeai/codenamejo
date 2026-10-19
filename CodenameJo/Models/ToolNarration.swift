@@ -181,10 +181,10 @@ enum ToolNarration {
         return false
     }
 
-    /// Which service a step is talking to, as an SF Symbol. Matched on substrings and prefixes, so
-    /// a vendor rename loses a glyph and nothing else; the `notion` test has to come early.
+    /// Which service a step is talking to, as an SF Symbol. A connector names its own glyph; the
+    /// rest is matched on substrings and prefixes, so a vendor rename loses a glyph and nothing else.
     static func sourceIcon(for tool: String) -> String? {
-        if CustomMCPTools.isCustomTool(tool) { return "puzzlepiece.extension.fill" }
+        if let connector = ConnectorRegistry.owner(of: tool) { return connector.toolIcon }
         if canonical(tool) == "list_profiles" { return "person.crop.circle.fill" }
         if canonical(tool) == "current_time" { return "clock" }
         if canonical(tool) == "dispatch" { return "magnifyingglass" }
@@ -192,12 +192,6 @@ enum ToolNarration {
         if canonical(tool) == "mark_spam" { return "exclamationmark.shield" }
         if canonical(tool) == "unsubscribe_sender" { return "bell.slash" }
         if canonical(tool) == "triage_next" { return "arrow.right.circle" }
-        if tool.hasPrefix("slack_") { return "number" }
-        if tool.hasPrefix("notion") { return "note.text" }
-        if tool.hasPrefix("granola_") { return "text.bubble.fill" }
-        // GitHub by prefix, ahead of the mail test, which would claim names containing "thread" and
-        // the like.
-        if tool.hasPrefix("github_") { return "chevron.left.forwardslash.chevron.right" }
         // Exact match: "search" appears in many other tool names.
         if tool == "web_search" { return "globe" }
         // Must precede the mail bucket, so a context tool never reads as a fresh Gmail read.
@@ -249,7 +243,7 @@ enum ToolNarration {
     /// The bare tool name, with the server's connector prefix (`gmail_`, `github_`, `slack_`)
     /// removed. Shared with `TriageQueueStore.advancesQueue` so the two matchers never disagree.
     static func canonical(_ tool: String) -> String {
-        for prefix in ["gmail_", "github_"] where tool.hasPrefix(prefix) {
+        for prefix in ["gmail_"] + ConnectorRegistry.all.compactMap(\.toolPrefix) where tool.hasPrefix(prefix) {
             return String(tool.dropFirst(prefix.count))
         }
         // A user's own server: `mcp_<server>_<tool>` reads as the tool alone.

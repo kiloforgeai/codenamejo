@@ -31,10 +31,10 @@ final class LiveToolRegistryTests: XCTestCase {
 
     func testEverythingASessionOrJobIsGivenIsRoutedOnce() {
         var state = LiveSessionSetup.State(inboxes: ["a@x.test"], calendars: ["a@x.test"])
-        state.githubAccounts = ["octo"]
-        state.granola = true
-        state.slackWorkspaces = ["T1"]
-        state.notion = true
+        state.connectors = [
+            GitHubConnector.id: ConnectorStatus(accounts: ["octo"]), GranolaConnector.id: ConnectorStatus(accounts: ["a@x.test"]),
+            SlackConnector.id: ConnectorStatus(accounts: ["T1"]), NotionConnector.id: ConnectorStatus(accounts: ["Notion"]),
+        ]
         var offered = Set<String>()
         for opening in [SessionOpening.emailQueue, .none] {
             var request = LiveSessionSetup.Request(opening: opening, dispatch: true, shortcutText: true, shortcutRead: true)
@@ -45,7 +45,8 @@ final class LiveToolRegistryTests: XCTestCase {
                                                                     catalog: catalog)))
         }
         offered.formUnion(names(LiveSessionSetup.workerTools(inboxes: ["a@x.test"], calendars: ["a@x.test"],
-                                                             draftsOnly: { _ in false }, notion: true, catalog: catalog)))
+                                                             draftsOnly: { _ in false }, connectors: state.connectors,
+                                                             catalog: catalog)))
         XCTAssertEqual(offered.subtracting(registry.keys), [])
         XCTAssertEqual(Set(registry.keys).subtracting(offered).subtracting(undeclared), [],
                        "registered but never offered")

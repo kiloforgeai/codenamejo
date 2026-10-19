@@ -22,37 +22,35 @@ final class ConnectionsService: ObservableObject {
         /// Every account this phone holds a grant for, across profiles.
         var deviceGrantAccounts: [String] = []
         var gmailAvailable = false
-        /// Connected GitHub logins. What the token may do is `GitHubTools.allowedTools`.
-        var githubAccounts: [String] = []
-        var githubAvailable = false
-        /// Logins whose token GitHub answered 401 to. They stay in `githubAccounts` so the row can offer Reconnect.
-        var githubNeedsReauth: [String] = []
-        /// Connected Notion workspace names: one Notion connection is one workspace.
-        var notionMcpAccounts: [String] = []
-        var notionMcpAvailable = false
-        /// Workspaces whose MCP credential has been rejected. An expired access token is not here:
-        /// it renews on use.
-        var notionMcpNeedsReauth: [String] = []
-        /// The active profile's Granola accounts, by email, read from `RemoteMCPGrantStore`.
-        var granolaAccounts: [String] = []
-        var granolaAvailable = false
-        /// Accounts whose refresh Granola refused. An expired access token is not here: it renews on use.
-        var granolaNeedsReauth: [String] = []
-        /// The active profile's own MCP servers, from `CustomMCPServerStore`, each with whether its
-        /// credential still works. Always available: there is nothing to configure in the build.
+        /// Every connector's standing for the active profile, by `Connector.id` (`Connector.status`).
+        /// An account that needs reconnecting stays in `accounts` so its row can offer Reconnect.
+        var connectors: [String: ConnectorStatus] = [:]
+        /// The active profile's own MCP servers with what their rows show: host, auth and tools.
         var customMCPServers: [CustomMCPServerStatus] = []
-        var customMCPAvailable = false
-        /// The active profile's Slack workspaces, by name, from the Keychain. `slackAvailable` is
-        /// whether this build has a Slack app at all (`JO_SLACK_CLIENT_ID`).
-        var slackAccounts: [String] = []
-        var slackAvailable = false
-        /// Workspaces whose refresh Slack refused, or whose refresh token passed its 30 days.
-        var slackNeedsReauth: [String] = []
         /// Whether the status has been read yet. Before it has, "nothing is connected" is unknown,
         /// and must not gate the mic.
         var hasLoadedStatus = false
         /// A failed status read for this profile; switching clears the previous scope first.
         var statusLoadFailed = false
+
+        // The per-connector names the Settings rows read, over `connectors`.
+        private subscript(_ id: String) -> ConnectorStatus {
+            get { connectors[id] ?? ConnectorStatus() }
+            set { connectors[id] = newValue }
+        }
+        var githubAccounts: [String] { get { self[GitHubConnector.id].accounts } set { self[GitHubConnector.id].accounts = newValue } }
+        var githubAvailable: Bool { get { self[GitHubConnector.id].available } set { self[GitHubConnector.id].available = newValue } }
+        var githubNeedsReauth: [String] { get { self[GitHubConnector.id].needsReauth } set { self[GitHubConnector.id].needsReauth = newValue } }
+        var notionMcpAccounts: [String] { get { self[NotionConnector.id].accounts } set { self[NotionConnector.id].accounts = newValue } }
+        var notionMcpAvailable: Bool { get { self[NotionConnector.id].available } set { self[NotionConnector.id].available = newValue } }
+        var notionMcpNeedsReauth: [String] { get { self[NotionConnector.id].needsReauth } set { self[NotionConnector.id].needsReauth = newValue } }
+        var granolaAccounts: [String] { get { self[GranolaConnector.id].accounts } set { self[GranolaConnector.id].accounts = newValue } }
+        var granolaAvailable: Bool { get { self[GranolaConnector.id].available } set { self[GranolaConnector.id].available = newValue } }
+        var granolaNeedsReauth: [String] { get { self[GranolaConnector.id].needsReauth } set { self[GranolaConnector.id].needsReauth = newValue } }
+        var customMCPAvailable: Bool { get { self[CustomMCPConnector.id].available } set { self[CustomMCPConnector.id].available = newValue } }
+        var slackAccounts: [String] { get { self[SlackConnector.id].accounts } set { self[SlackConnector.id].accounts = newValue } }
+        var slackAvailable: Bool { get { self[SlackConnector.id].available } set { self[SlackConnector.id].available = newValue } }
+        var slackNeedsReauth: [String] { get { self[SlackConnector.id].needsReauth } set { self[SlackConnector.id].needsReauth = newValue } }
     }
 
     @Published var status = Status()
@@ -101,16 +99,9 @@ final class ConnectionsService: ObservableObject {
                 || !hasFilters(email)
                 || !hasDeviceGrant(email)
         }.map { _ in "Gmail" }
-        let notionAttention = notionMcpAccounts.filter {
-            notionMcpNeedsReauth.contains($0)
-        }.map { _ in "Notion" }
-        let granolaAttention = granolaAccounts.filter {
-            granolaNeedsReauth.contains($0)
-        }.map { _ in "Granola" }
-        let slackAttention = slackAccounts.filter { slackNeedsReauth.contains($0) }.map { _ in "Slack" }
-        let githubAttention = githubNeedsReauth.map { _ in "GitHub" }
-        let customAttention = customMCPServers.filter(\.needsReauth).map { _ in "Custom MCP" }
-        return gmailAttention + notionAttention + granolaAttention + slackAttention + githubAttention + customAttention
+        return gmailAttention + ConnectorRegistry.all.flatMap { connector in
+            (status.connectors[connector.id]?.needsReauth ?? []).map { _ in connector.displayName }
+        }
     }
 
     var attentionCount: Int {
@@ -132,11 +123,7 @@ final class ConnectionsService: ObservableObject {
     var hasAnyConnector: Bool {
         !hasLoadedStatus
             || !gmailAccounts.isEmpty
-            || !notionMcpAccounts.isEmpty
-            || !granolaAccounts.isEmpty
-            || !slackAccounts.isEmpty
-            || !githubAccounts.isEmpty
-            || !customMCPServers.isEmpty
+            || status.connectors.values.contains { !$0.accounts.isEmpty }
     }
 
     /// The `CommandRecord.serviceName` values this account can reach now, for History's filter
@@ -145,10 +132,10 @@ final class ConnectionsService: ObservableObject {
         var names: [String] = []
         if !gmailAccounts.isEmpty { names.append("Gmail") }
         if !calendarAccounts.isEmpty { names.append("Calendar") }
-        if !slackAccounts.isEmpty { names.append("Slack") }
-        if !notionMcpAccounts.isEmpty { names.append("Notion") }
-        if !granolaAccounts.isEmpty { names.append("Granola") }
-        if !githubAccounts.isEmpty { names.append("GitHub") }
+        for connector in ConnectorRegistry.all where connector.historyIcon != nil
+            && !(status.connectors[connector.id]?.accounts.isEmpty ?? true) {
+            names.append(connector.displayName)
+        }
         names.append("General")
         return names
     }
@@ -188,21 +175,8 @@ final class ConnectionsService: ObservableObject {
         }.map(\.email))
         next.gmailNeedsReauth = ProfileRuntime.allowedMailAccounts(allNeedsReauth)
         next.gmailAvailable = GoogleTokenServer.isConfigured
-        let granola = GranolaConnector.grants(profileId: requestedProfile)
-        next.granolaAccounts = granola.map(\.label)
-        next.granolaNeedsReauth = granola.filter(\.needsReauth).map(\.label)
-        next.granolaAvailable = true
+        next.connectors = ConnectorRegistry.statuses(profileId: requestedProfile)
         next.customMCPServers = CustomMCPConnector.servers(profileId: requestedProfile).map(CustomMCPConnector.status)
-        next.customMCPAvailable = true
-        refreshSlack(into: &next)
-        let notion = NotionTools.grants(profileId: requestedProfile)
-        next.notionMcpAccounts = notion.map(\.label)
-        next.notionMcpNeedsReauth = notion.filter(\.needsReauth).map(\.label)
-        next.notionMcpAvailable = true
-        let github = GitHubAccountStore.all()
-        next.githubAccounts = github.map(\.login)
-        next.githubNeedsReauth = github.filter { $0.needsReauth == true }.map(\.login)
-        next.githubAvailable = !AppHosts.githubClientID.isEmpty
         next.hasLoadedStatus = true
         next.statusLoadFailed = false
         status = next
@@ -278,18 +252,6 @@ final class ConnectionsService: ObservableObject {
     }
 
     // MARK: - Slack
-
-    /// The active profile's workspaces; one whose refresh token outlived its 30 days is marked now,
-    /// so the reconnect shows before anything tries to use it.
-    private func refreshSlack(into status: inout Status) {
-        for grant in SlackGrantStore.all() where grant.needsReauth != true && grant.refreshExpired() {
-            SlackGrantStore.markNeedsReauth(grant.teamId)
-        }
-        let grants = SlackGrantStore.inProfile()
-        status.slackAvailable = SlackConfig.isConfigured
-        status.slackAccounts = grants.map(\.teamName)
-        status.slackNeedsReauth = grants.filter { $0.needsReauth == true }.map(\.teamName)
-    }
 
     /// Connect or reconnect a workspace: one PKCE consent straight to Slack. Bound to the active
     /// profile; a reconnect of the same workspace replaces its grant.

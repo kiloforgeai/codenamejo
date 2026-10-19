@@ -150,9 +150,9 @@ final class CustomMCPToolsTests: XCTestCase {
         XCTAssertNil(off.prompt["customMCP"])
 
         let mvp = server(tools: [tool("file_issue")])
-        state.customMCPTools = CustomMCPTools.definitions(servers: [mvp], usable: { _ in true })
-        state.customMCPServers = ["MVP"]
-        state.customMCPNeedsReauth = ["Old"]
+        state.connectors[CustomMCPConnector.id] = ConnectorStatus(
+            accounts: ["MVP", "Old"], needsReauth: ["Old"],
+            dynamicTools: CustomMCPTools.definitions(servers: [mvp], usable: { _ in true }))
         let on = LiveSessionSetup.resolve(.init(), state, catalog: catalog)
         XCTAssertEqual(on.tools.compactMap { $0["name"] as? String }.last, "mcp_mvp_file_issue")
         XCTAssertEqual(on.prompt["customMCP"] as? [String], ["MVP"])

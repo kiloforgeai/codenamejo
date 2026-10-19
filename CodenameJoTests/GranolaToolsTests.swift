@@ -154,13 +154,12 @@ final class GranolaSessionTests: XCTestCase {
         XCTAssertFalse(off.tools.contains { ($0["name"] as? String)?.hasPrefix("granola_") == true })
         XCTAssertNil(off.prompt["granolaNeedsReauth"])
 
-        state.granola = true
-        state.granolaNeedsReauth = ["old@x.test"]
+        state.connectors[GranolaConnector.id] = ConnectorStatus(accounts: ["a@x.test", "old@x.test"], needsReauth: ["old@x.test"])
         let on = LiveSessionSetup.resolve(.init(), state, catalog: catalog)
         XCTAssertEqual(on.tools.compactMap { $0["name"] as? String }.suffix(3), GranolaTools.names)
         XCTAssertEqual(on.prompt["skills"] as? [String], ["email", "granola"])
         XCTAssertEqual(on.prompt["granolaNeedsReauth"] as? [String], ["old@x.test"])
-        XCTAssertTrue(GranolaTools.names.allSatisfy(LiveFastAction.feedIndependent.contains))
+        XCTAssertTrue(GranolaTools.names.allSatisfy { LiveFastAction.allowsFollowup(name: $0, arguments: "{}", step: nil) })
     }
 
     func testThePromptCarriesTheSkillAndTheReconnectNote() throws {
@@ -178,7 +177,8 @@ final class GranolaSessionTests: XCTestCase {
             .map { CoachingRotation.Lesson(capability: $0, copy: "copy") }
         XCTAssertEqual(CoachingRotation.plan(.init(), catalog: catalog, defaults: defaults).lessons.map(\.capability),
                        ["dispatch"])
-        XCTAssertEqual(CoachingRotation.plan(.init(hasGranola: true), catalog: catalog, defaults: defaults)
+        let connected = CoachingRotation.Eligibility(connectors: [GranolaConnector.id: ConnectorStatus(accounts: ["a@x.test"])])
+        XCTAssertEqual(CoachingRotation.plan(connected, catalog: catalog, defaults: defaults)
             .lessons.map(\.capability), ["granola_meetings", "granola_action_items", "dispatch"])
         XCTAssertNotNil(CoachingRotation.copy(for: "granola_action_items"))
     }

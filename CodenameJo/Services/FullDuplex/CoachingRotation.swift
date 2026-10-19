@@ -27,17 +27,12 @@ enum CoachingRotation {
     }
 
     /// What this phone can tell about which lessons apply to the account.
-    struct Eligibility: Equatable {
-        /// This build has a Slack app and no workspace is connected yet.
-        var slackConnectable = false
+    struct Eligibility {
         var multipleInboxes = false
         var hasFeedItems = false
         var hasCommands = false
-        /// This build can sign in to GitHub, and whether a login is connected.
-        var githubAvailable = false
-        var githubConnected = false
-        var hasGranola = false
-        var notionConnected = false
+        /// Each connector's standing, by `Connector.id`; absent is not connected and not connectable.
+        var connectors: [String: ConnectorStatus] = [:]
     }
 
     static func adopted(_ capability: String, _ eligibility: Eligibility) -> Bool {
@@ -49,15 +44,15 @@ enum CoachingRotation {
         }
     }
 
+    /// A connector's lessons are named `<id>_…`: `<id>_connect` is for a build that can sign in and
+    /// has nothing connected yet, and every other one waits for a working connection.
     static func available(_ capability: String, _ eligibility: Eligibility) -> Bool {
+        if let connector = ConnectorRegistry.all.first(where: { capability.hasPrefix($0.id + "_") }) {
+            let status = eligibility.connectors[connector.id] ?? ConnectorStatus()
+            return capability == connector.id + "_connect" ? status.available && status.accounts.isEmpty : status.isConnected
+        }
         switch capability {
         case "multi_account_routing": return eligibility.multipleInboxes
-        case "github_connect": return eligibility.githubAvailable && !eligibility.githubConnected
-        case "github_reviews": return eligibility.githubConnected
-        case "granola_meetings", "granola_action_items": return eligibility.hasGranola
-        case "slack_connect": return eligibility.slackConnectable
-        case "notion_notes": return eligibility.notionConnected
-        case "notion_connect": return !eligibility.notionConnected
         default: return true
         }
     }
