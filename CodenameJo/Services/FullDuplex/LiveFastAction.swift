@@ -42,17 +42,18 @@ enum LiveFastAction: String {
         }
     }
 
-    /// Tools that read no message, thread or account from the step and never move the cursor,
-    /// so a feed that changed mid-turn is no reason to refuse them. Mail writes never belong here.
+    /// The phone's own tools that read no message, thread or account from the step and never move
+    /// the cursor, so a feed that changed mid-turn is no reason to refuse them. Mail writes never
+    /// belong here; a connector answers for its own tools (`Connector.isFeedIndependent`).
     static let feedIndependent: Set<String> = [
         "current_time", "list_calendar_events", "search_calendar", "coach_capability",
         "set_rule", "web_search", "search_context", "save_context", "forget_context",
-        "granola_list_meetings", "granola_get_meeting", "granola_action_items",
     ]
 
     static func allowsFollowup(name: String, arguments: String, step: String?) -> Bool {
-        if feedIndependent.contains(name) || GitHubTools.readTools.contains(name)
-            || CustomMCPTools.isCustomTool(name) { return true }
+        if feedIndependent.contains(name) || ConnectorRegistry.owner(of: name)?.isFeedIndependent(name) == true {
+            return true
+        }
         guard let step, let key = LiveEmailPresentation.Key.step(step),
               let args = try? JSONSerialization.jsonObject(with: Data(arguments.utf8)) as? [String: Any],
               (args["account"] as? String)?.lowercased() == key.account else { return false }

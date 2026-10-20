@@ -119,12 +119,13 @@ enum LocalVoiceBrain {
         let started = Date()
         let mail = GoogleAccountStore.mailAccounts()
         let calendar = CalendarTools.accounts()
-        let notion = NotionTools.isConnected(profileId: profileId)
+        // Notion alone of the connectors, as before the registry: the local brain is the dispatch loop, not a call.
+        let notion = NotionConnector().status(profileId: profileId)
         let relay = FullDuplexBroker.workerTools(mail: ProfileRuntime.allowedMailAccounts(mail), calendar: calendar,
-                                                 notion: notion)
+                                                 connectors: [NotionConnector.id: notion])
         let relayNames = Set(relay.compactMap { $0["name"] as? String })
         let tools = DispatchWorker.tools(mail: mail, calendar: calendar, relay: relay)
-        let instructions = try instructions(mail: !mail.isEmpty, calendar: !calendar.isEmpty, notion: notion)
+        let instructions = try instructions(mail: !mail.isEmpty, calendar: !calendar.isEmpty, notion: notion.isConnected)
         let names = Set(tools.compactMap { $0["name"] as? String })
         let cacheKey = SHA256.hash(data: Data((instructions + names.sorted().joined()).utf8)).prefix(16)
             .map { String(format: "%02x", $0) }.joined()

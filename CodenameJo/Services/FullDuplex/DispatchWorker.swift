@@ -121,20 +121,14 @@ enum DispatchWorker {
         let calendar = CalendarTools.accounts()
         let target = job.scope == .independent ? nil : target(standingOnJSON: job.standingOnJSON, facts: job.facts)
         let receipt = job.expects == .receipt
-        let notion = NotionTools.isConnected(profileId: job.profileId)
-        // The job's own profile, as Notion's grant is read: a note can run after the user switched.
-        let granola = GranolaConnector.grants(profileId: job.profileId).contains { !$0.needsReauth }
-        let slack = !SlackWorkspace.served(profileId: job.profileId).isEmpty
-        let github = GitHubAccountStore.usable().map(\.login)
-        let servers = CustomMCPConnector.servers(profileId: job.profileId)
+        // The job's own profile, not the active one: a note can run after the user switched.
+        let connectors = ConnectorRegistry.statuses(profileId: job.profileId)
         let relay = FullDuplexBroker.workerTools(mail: ProfileRuntime.allowedMailAccounts(mail), calendar: calendar,
-                                                 notion: notion, granola: granola, slack: slack, githubAccounts: github,
-                                                 customMCPTools: CustomMCPTools.definitions(servers: servers))
+                                                 connectors: connectors)
         let relayNames = Set(relay.compactMap { $0["name"] as? String })
         let tools = tools(mail: mail, calendar: calendar, relay: relay)
         let instructions = try instructions(receipt: receipt, mail: !mail.isEmpty, calendar: !calendar.isEmpty,
-                                            notion: notion, granola: granola, slack: slack, github: !github.isEmpty,
-                                            customMCP: servers.filter(CustomMCPConnector.isUsable).map(\.name))
+                                            connectors: connectors)
         var input: [[String: Any]] = [
             ["role": "user", "content": job.task],
             ["role": "developer", "content": try context(job, target: target, mail: mail, calendar: calendar)],
@@ -308,39 +302,16 @@ enum DispatchWorker {
     private static let readOnlyManage: Set<String> = [GmailManageTools.listLabels, GmailManageTools.listFilters]
 
     /// Whether a tool's `account` is a mail or calendar account, the one a live call pins on a job.
-    static func takesMailAccount(_ name: String) -> Bool {
-        !(NotionTools.names.contains(name) || GranolaTools.names.contains(name) || SlackTools.readNames.contains(name)
-          || SlackTools.writeNames.contains(name) || GitHubTools.isGitHubTool(name) || CustomMCPTools.isCustomTool(name))
-    }
+    /// A connector tool takes none: GitHub's `account` is a login, and the rest have no such field.
+    static func takesMailAccount(_ name: String) -> Bool { !ConnectorRegistry.owns(name) }
 
     static func execute(_ name: String, _ arguments: String, relayNames: Set<String>,
                                 cursor: GmailManageTools.Cursor?, standingOn: [String: Any]?, profileId: String?)
         async -> (output: String, failed: Bool, write: Bool) {
-        if NotionTools.names.contains(name), relayNames.contains(name) {
-            let result = await FullDuplexBroker.runTool(name: name, argumentsJSON: arguments, profileId: profileId)
-            return (result.text, result.ok == false, NotionTools.writes.contains(name))
-        }
-        // The live call's connectors, each on the job profile's own grant.
-        if GranolaTools.names.contains(name), relayNames.contains(name) {
-            let grants = GranolaConnector.grants(profileId: profileId).filter { !$0.needsReauth }
-            let result = await GranolaTools.run(name: name, argumentsJSON: arguments, grants: grants)
-            return (result.text, result.ok == false, false)
-        }
-        if SlackTools.readNames.contains(name) || SlackTools.writeNames.contains(name), relayNames.contains(name) {
-            let result = await SlackTools.run(name: name, argumentsJSON: arguments,
-                                              workspaces: SlackWorkspace.served(profileId: profileId))
-            return (result.text, !result.ok, SlackTools.writeNames.contains(name))
-        }
-        if GitHubTools.isGitHubTool(name), relayNames.contains(name) {
-            let result = await GitHubTools.run(name: name, argumentsJSON: arguments)
-            return (result.text, result.ok == false, GitHubTools.writeTools.contains(name))
-        }
-        // A listed tool says nothing about whether it writes, so every call is recorded as one: a
-        // needless line in a failure report beats a write the report never mentions.
-        if CustomMCPTools.isCustomTool(name), relayNames.contains(name) {
-            let result = await CustomMCPTools.run(name: name, argumentsJSON: arguments,
-                                                  servers: CustomMCPConnector.servers(profileId: profileId))
-            return (result.text, result.ok == false, true)
+        // A connector's tool, on the job profile's own grant.
+        if let connector = ConnectorRegistry.owner(of: name), relayNames.contains(name) {
+            let result = await connector.run(name, argumentsJSON: arguments, profileId: profileId)
+            return (result.text, result.ok == false, connector.writes(name))
         }
         if GmailReadTools.names.contains(name) {
             let result = await GmailReadTools.run(name: name, argumentsJSON: arguments)
@@ -376,14 +347,14 @@ enum DispatchWorker {
     // MARK: - Prompt
 
     /// The stable half: policy, cached across jobs. Per-job state goes in `context`, after the task.
-    static func instructions(receipt: Bool, mail: Bool, calendar: Bool, notion: Bool = false, granola: Bool = false,
-                             slack: Bool = false, github: Bool = false, customMCP: [String] = [],
+    static func instructions(receipt: Bool, mail: Bool, calendar: Bool, connectors: [String: ConnectorStatus] = [:],
                              text: LivePrompt.Text = .bundled) throws -> String {
         var facts = LivePrompt.Facts()
-        facts.skills = (mail ? ["email"] : []) + (calendar ? ["calendar"] : []) + (slack ? ["slack"] : [])
-            + (notion ? ["notion"] : []) + (granola ? ["granola"] : []) + (github ? ["github"] : [])
+        facts.skills = (mail ? ["email"] : []) + (calendar ? ["calendar"] : [])
+            + ConnectorRegistry.all.compactMap { connectors[$0.id]?.isConnected == true ? $0.skill : nil }
         var out = try LivePrompt.baseInstructions(facts, text: text)
         // Before the worker section, so its reading of every "ask the user" above covers this note too.
+        let customMCP = connectors[CustomMCPConnector.id]?.working ?? []
         if !customMCP.isEmpty {
             out += "\n\n" + (try text("notes/custom-mcp", ["servers": customMCP.joined(separator: ", ")]))
         }

@@ -42,11 +42,81 @@ struct CustomMCPServerStatus: Equatable, Identifiable, Sendable {
 
 /// Adding, reconnecting, refreshing and removing the user's own MCP servers, all on this phone.
 /// A pasted token, or no credential at all, becomes a grant that never expires and is never renewed.
-enum CustomMCPConnector {
+struct CustomMCPConnector: Connector {
     enum Failure: Error, Equatable {
         case cancelled
         case failed(String)
     }
+
+    static let id = "customMCP"
+    var id: String { Self.id }
+    var displayName: String { "Custom MCP" }
+    /// A user's own server files no History rows: `inferService` has no word for it.
+    var historyIcon: String? { nil }
+    var toolIcon: String { "puzzlepiece.extension.fill" }
+    /// No skill: the brain gets `notes/custom-mcp` naming the servers instead.
+    var skill: String? { nil }
+    var reauthNote: String? { "custom-mcp-reauth" }
+    var inferenceKeywords: [String] { [] }
+    /// The tools come from each server's own listing (`ConnectorStatus.dynamicTools`), not the bundle.
+    var schemas: [[String: Any]] { [] }
+    var toolNames: [String] { [] }
+
+    func owns(_ tool: String) -> Bool { CustomMCPTools.isCustomTool(tool) }
+    /// A listed tool says nothing about whether it writes, so every call counts as one.
+    func writes(_ tool: String) -> Bool { true }
+    /// Nothing a user's server does reads the mail step.
+    func isFeedIndependent(_ tool: String) -> Bool { owns(tool) }
+
+    func sessionTools(_ status: ConnectorStatus, catalog: LiveSessionSetup.Catalog) -> [[String: Any]] { status.dynamicTools }
+    func workerTools(_ status: ConnectorStatus, catalog: LiveSessionSetup.Catalog) -> [[String: Any]] { status.dynamicTools }
+
+    /// The servers serving this call, by name, for `notes/custom-mcp`; and the ones to reconnect.
+    func promptFacts(_ status: ConnectorStatus) -> [String: Any] {
+        var facts: [String: Any] = [:]
+        if !status.working.isEmpty { facts["customMCP"] = status.working }
+        if !status.needsReauth.isEmpty { facts[id + "NeedsReauth"] = status.needsReauth }
+        return facts
+    }
+
+    /// Named by server rather than by account: a custom server has no account label of its own.
+    func reauthText(_ servers: [String], text: LivePrompt.Text) throws -> String {
+        guard !servers.isEmpty else { return "" }
+        let names = servers.joined(separator: " and ")
+        let which = servers.count == 1 ? "their \(names) server" : "their \(names) servers"
+        return try text("notes/custom-mcp-reauth", ["which": which])
+    }
+
+    func status(profileId: String?) -> ConnectorStatus {
+        let servers = Self.servers(profileId: profileId)
+        return ConnectorStatus(accounts: servers.map(\.name),
+                               needsReauth: servers.filter { !Self.isUsable($0) }.map(\.name),
+                               available: true, dynamicTools: CustomMCPTools.definitions(servers: servers))
+    }
+
+    /// Offered from the tool lists the servers gave last time; the lists are refreshed behind this
+    /// dial so the next one sees what each server has now.
+    func dialStatus(profileId: String?) async -> ConnectorStatus {
+        let current = self.status(profileId: profileId)
+        Self.refreshToolsInBackground(Self.servers(profileId: profileId))
+        return current
+    }
+
+    func run(_ name: String, argumentsJSON: String, profileId: String?) async -> FullDuplexBroker.ToolResult {
+        await CustomMCPTools.run(name: name, argumentsJSON: argumentsJSON, servers: Self.servers(profileId: profileId))
+    }
+
+    func forget() { Self.forget() }
+
+    func revokeAll() async {
+        for server in CustomMCPServerStore.all() { await Self.remove(server) }
+    }
+
+    func forgetProfile(_ profileId: String) async {
+        for server in Self.servers(profileId: profileId) { await Self.remove(server) }
+    }
+
+    // MARK: - Servers
 
     /// The servers added under the active profile.
     static func servers(profileId: String? = ProfileRuntime.snapshot?.profileId) -> [CustomMCPServer] {

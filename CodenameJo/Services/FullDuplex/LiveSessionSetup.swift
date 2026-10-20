@@ -31,25 +31,10 @@ enum LiveSessionSetup {
         var unreachable: [String] = []
         var draftsOnly: (String) -> Bool = { _ in true }
         var triageScope: String?
-        var notionNeedsReauth: [String] = []
-        /// GitHub logins whose token GitHub still honours, and the ones it has refused.
-        var githubAccounts: [String] = []
-        var githubNeedsReauth: [String] = []
-        /// A working Granola grant in the active profile, and the accounts whose refresh was refused.
-        var granola = false
-        var granolaNeedsReauth: [String] = []
-        /// The active profile's Slack workspaces whose grant works, and those needing reconnecting.
-        var slackWorkspaces: [String] = []
-        var slackNeedsReauth: [String] = []
-        /// A Notion grant of the active profile still works, so dispatch jobs get Notion's tools.
-        var notion = false
         /// Google profile names, best first: the first inbox's, then the signed-in account's.
         var ownerNames: [String?] = []
-        /// The profile's own MCP servers: their tools as function definitions, the names of the
-        /// ones serving this call, and the ones whose credential was refused.
-        var customMCPTools: [[String: Any]] = []
-        var customMCPServers: [String] = []
-        var customMCPNeedsReauth: [String] = []
+        /// Each connector's standing for the active profile, by `Connector.id`; absent is not connected.
+        var connectors: [String: ConnectorStatus] = [:]
     }
 
     struct Result {
@@ -225,15 +210,13 @@ enum LiveSessionSetup {
                 }
             }
         }
-        let connectors: [any LiveTool] = (LiveToolSchemas.github + LiveToolSchemas.granola + LiveToolSchemas.notion)
-            .map { ConnectorTool($0) }
+        // Every other connector's tools are relayed to `FullDuplexBroker.runTool`; Slack's are the phone tools above.
+        let connectors: [any LiveTool] = ConnectorRegistry.all.filter { $0.id != SlackConnector.id }
+            .flatMap { $0.schemas.map { ConnectorTool($0) } }
         return Dictionary(uniqueKeysWithValues: (phone + slack + connectors).map { ($0.name, $0) })
     }()
 
     private static let queueNote = " The result may carry the already-advanced queue. Follow it and do not call triage_next afterwards."
-    /// Notion's tools are the second agent's alone, so every Notion ask is a dispatch.
-    static let notionDispatchNote = " Notion is the exception: only the second agent has it, so anything in their Notion — "
-        + "finding or reading a page or database, filing a note, marking something done — goes here, even a single lookup."
 
     static func resolve(_ request: Request, _ state: State, catalog: Catalog) -> Result {
         let inboxes = state.inboxes, calendars = state.calendars
@@ -252,7 +235,10 @@ enum LiveSessionSetup {
         let accounts = Accounts(inboxes: inboxes, calendars: calendars, unread: unreadAccounts)
         var tools: [[String: Any]] = []
         func add(_ key: String, note: String = "") { tools.append(catalog.tool(key, accounts, note: note)) }
-        if request.dispatch { add("dispatch", note: state.notion ? notionDispatchNote : "") }
+        // A dispatch-only connector says so on `dispatch` itself, so the model hands those asks over.
+        func status(_ connector: any Connector) -> ConnectorStatus { state.connectors[connector.id] ?? ConnectorStatus() }
+        let dispatchNotes = ConnectorRegistry.all.compactMap { status($0).isConnected ? $0.dispatchNote : nil }
+        if request.dispatch { add("dispatch", note: dispatchNotes.joined()) }
         if cacheServesMailbox {
             add("search_recent")
             add("search_drafts")
@@ -291,16 +277,12 @@ enum LiveSessionSetup {
         if request.shortcutText { add("send_text") }
         if request.shortcutRead { add("read_texts") }
         add("find_contact")
-        if state.granola { GranolaTools.names.forEach { add($0) } }
-        let slack = !state.slackWorkspaces.isEmpty
-        if slack { SlackTools.catalogOrder.forEach { add($0) } }
-        tools += GitHubTools.definitions(logins: state.githubAccounts, catalog: catalog)
-        tools += state.customMCPTools
+        for connector in ConnectorRegistry.all { tools += connector.sessionTools(status(connector), catalog: catalog) }
+        let slack = status(SlackConnector()).isConnected
 
         var prompt: [String: Any] = [
             "skills": (inboxes.isEmpty ? [] : ["email"]) + (calendars.isEmpty ? [] : ["calendar"])
-                + (slack ? ["slack"] : []) + (state.granola ? ["granola"] : [])
-                + (state.githubAccounts.isEmpty ? [] : ["github"]),
+                + ConnectorRegistry.all.compactMap { !$0.dispatchOnly && status($0).isConnected ? $0.skill : nil },
             "memory": true, "profiles": true, "profileManagement": true,
             "calendarAccounts": calendars, "localClock": true,
             "sequentialOpening": !fiveStep && opening == .emailQueue && sequentialFeed,
@@ -310,23 +292,21 @@ enum LiveSessionSetup {
             "onboardingMailMode": onboardingMailMode, "mailModeSwitching": true,
             "drafting": inboxes.filter(state.draftsOnly), "sending": inboxes.filter { !state.draftsOnly($0) },
             "googleNeedsReauth": state.needsReauth, "googleUnreachable": state.unreachable,
-            "notionNeedsReauth": state.notionNeedsReauth,
-            "githubNeedsReauth": state.githubNeedsReauth,
         ]
+        for connector in ConnectorRegistry.all {
+            prompt.merge(connector.promptFacts(status(connector))) { _, new in new }
+        }
         if let run = request.onboardingRun {
             let configured = String(run.opening.trimmingCharacters(in: .whitespacesAndNewlines).prefix(600))
             prompt["fiveStepOnboarding"] = ["resume": run.resume, "opening": run.resume
                 ? EmailOnboardingContract.resumeLine : configured.isEmpty ? onboardingOpening : configured]
         }
-        if !state.granolaNeedsReauth.isEmpty { prompt["granolaNeedsReauth"] = state.granolaNeedsReauth }
-        if !state.customMCPServers.isEmpty { prompt["customMCP"] = state.customMCPServers }
-        if !state.customMCPNeedsReauth.isEmpty { prompt["customMCPNeedsReauth"] = state.customMCPNeedsReauth }
+        // The Feed's Slack stage: the one connector that is a queue of its own, not just tools.
         if slack {
             prompt["localSlackTriage"] = true
             prompt["slackFeedStage"] = sequentialFeed
             prompt["importantSlackStage"] = sequentialFeed
         }
-        if !state.slackNeedsReauth.isEmpty { prompt["slackNeedsReauth"] = state.slackNeedsReauth }
         if opening == .feedOffer, sequentialFeed { prompt["feedOffer"] = true }
         if interactiveCoaching { prompt["coaching"] = request.coachingLessons > 0 ? "lessons" : "none" }
         if let scope = state.triageScope, TriageScope(rawValue: scope) != nil { prompt["triageScope"] = scope }
@@ -419,25 +399,18 @@ enum LiveSessionSetup {
         return nil
     }
 
-    /// The mail and calendar writes a dispatched job may call, Notion's tools when the job's
-    /// profile has a working grant, and the connectors the live call has — Granola, Slack, GitHub
-    /// and the profile's own MCP servers — so a job or a saved command can reach every tool the
-    /// user can. No cancel and no Slack queue: both stay with the live call.
+    /// The mail and calendar writes a dispatched job may call, and every connector the job's profile
+    /// has, so a job or a saved command can reach every tool the user can. No cancel and no Slack
+    /// queue: both stay with the live call.
     static func workerTools(inboxes: [String], calendars: [String], draftsOnly: (String) -> Bool,
-                            notion: Bool = false, granola: Bool = false, slack: Bool = false,
-                            githubAccounts: [String] = [], customMCPTools: [[String: Any]] = [],
-                            catalog: Catalog) -> [[String: Any]] {
+                            connectors: [String: ConnectorStatus] = [:], catalog: Catalog) -> [[String: Any]] {
         let accounts = Accounts(inboxes: inboxes, calendars: calendars)
         let sends = inboxes.contains { !draftsOnly($0) }
         let mail = ["count_messages", "find_person.worker", "create_draft", "archive_message", "trash_message",
                     "label_message", "mark_spam"] + (sends ? ["send_email"] : []) + ["forward_email"]
         return (inboxes.isEmpty ? [] : mail.map { catalog.tool($0, accounts) })
             + (calendars.isEmpty ? [] : [catalog.tool("respond_to_calendar_event", accounts)])
-            + (notion ? NotionTools.names.map { catalog.tool($0) } : [])
-            + (granola ? GranolaTools.names.map { catalog.tool($0) } : [])
-            + (slack ? SlackTools.catalogOrder.filter { $0 != SlackTools.queueName }.map { catalog.tool($0) } : [])
-            + GitHubTools.definitions(logins: githubAccounts, catalog: catalog)
-            + customMCPTools
+            + ConnectorRegistry.all.flatMap { $0.workerTools(connectors[$0.id] ?? ConnectorStatus(), catalog: catalog) }
     }
 
     /// Whether the mail cache covers exactly the mailboxes being served: a missing one would make a

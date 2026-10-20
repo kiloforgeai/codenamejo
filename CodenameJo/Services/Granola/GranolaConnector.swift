@@ -10,8 +10,47 @@ extension RemoteMCPService {
         scope: "openid profile email offline_access")
 }
 
-/// Granola sign-in, sign-out and the grants a dial serves, all on this phone.
-enum GranolaConnector {
+/// Granola sign-in, sign-out and the grants a dial serves, all on this phone. Read-only meeting notes.
+struct GranolaConnector: Connector {
+    static let id = "granola"
+    var id: String { Self.id }
+    var displayName: String { "Granola" }
+    var historyIcon: String? { "text.bubble.fill" }
+    var toolIcon: String { "text.bubble.fill" }
+    var skill: String? { "granola" }
+    var reauthNote: String? { "granola-reauth" }
+    var inferenceKeywords: [String] { ["granola"] }
+    var schemas: [[String: Any]] { LiveToolSchemas.granola }
+    var toolNames: [String] { GranolaTools.names }
+
+    func writes(_ tool: String) -> Bool { false }
+
+    func status(profileId: String?) -> ConnectorStatus {
+        let grants = Self.grants(profileId: profileId)
+        return ConnectorStatus(accounts: grants.map(\.label), needsReauth: grants.filter(\.needsReauth).map(\.label),
+                               available: true)
+    }
+
+    func run(_ name: String, argumentsJSON: String, profileId: String?) async -> FullDuplexBroker.ToolResult {
+        await GranolaTools.run(name: name, argumentsJSON: argumentsJSON,
+                               grants: Self.grants(profileId: profileId).filter { !$0.needsReauth })
+    }
+
+    func forget() { Self.forget() }
+
+    func revokeAll() async {
+        for grant in RemoteMCPGrantStore.grants(.granola) { await RemoteMCPAuth.revoke(grant) }
+    }
+
+    func forgetProfile(_ profileId: String) async {
+        for grant in Self.grants(profileId: profileId) {
+            await RemoteMCPAuth.revoke(grant)
+            RemoteMCPGrantStore.remove(grant.id, .granola)
+        }
+    }
+
+    // MARK: - Sign-in
+
     /// The grants connected under the active profile.
     static func grants(profileId: String? = ProfileRuntime.snapshot?.profileId) -> [RemoteMCPGrant] {
         RemoteMCPGrantStore.grants(.granola, profileId: profileId)

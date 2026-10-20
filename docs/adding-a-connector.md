@@ -32,8 +32,8 @@ Ask, or work out, these four things. They decide which template you copy.
    - **Live and dispatch** (Granola, Slack, GitHub, Custom MCP): the voice session calls them directly,
      and the background dispatch agent gets the same tools, so a handed-over job or a saved command can
      use them. This is the default: a tool only the live call has is one a saved command cannot run.
-   - **Dispatch-only** (Notion): only the background dispatch agent sees the tools. See
-     `DispatchWorker.swift` (`NotionTools` in `loop` and `execute`) and `LiveSessionSetup.workerTools`.
+   - **Dispatch-only** (Notion): only the background dispatch agent sees the tools. Set `dispatchOnly`
+     to true on the connector, and say so in its `dispatchNote`; `NotionConnector` is the example.
 3. **Read-only, or writes too?** Every write needs a read-back and a yes on a later turn, which the skill
    prompt enforces. Mark writes as `performedTool` in the tool result. If the grant allows more than
    you mean to expose, keep an allowlist the way `GitHubTools.allowedTools` does: GitHub's `repo` scope
@@ -90,65 +90,48 @@ Replace `<Name>` / `<name>` with the connector's name.
 
 | File | What goes in it |
 |---|---|
-| `CodenameJo/Services/<Name>/<Name>Connector.swift` | `extension RemoteMCPService { static let <name> = RemoteMCPService(id:, displayName:, endpoint:, scope:) }` plus `grants` / `connect` (labels the grant from the who-am-I tool) / `disconnect` (revokes) / `forget`. Copy `GranolaConnector.swift`. **`id` must never change once shipped**: it namespaces the Keychain items. |
+| `CodenameJo/Services/<Name>/<Name>Connector.swift` | A `struct <Name>Connector: Connector`. The protocol (`Services/Connectors/Connector.swift`) is the card every connector fills in: `id`, `displayName`, the History and step-row glyphs, `skill`, `reauthNote`, `inferenceKeywords`, `schemas`, `writes`, `status(profileId:)`, `run`, `forget`, `revokeAll` and `forgetProfile`; the defaults cover tools from `LiveToolSchemas` and a `<id>NeedsReauth` prompt fact. For a hosted MCP, the same file holds `extension RemoteMCPService { static let <name> = … }` and the `grants` / `connect` (labels the grant from the who-am-I tool) / `disconnect` statics. Copy `GranolaConnector.swift` (read-only, hosted MCP, profile-scoped grants) or `GitHubConnector.swift` (own OAuth, one connection for every profile, a write allowlist). **`id` must never change once shipped**: it namespaces the Keychain items, keys the prompt facts and the coaching lessons, and is what the fixture names. |
 | `CodenameJo/Services/<Name>/<Name>Tools.swift` | `names` (prefix every tool with `<name>_`), a `Call` typealias that tests can swap out, and `run(name:argumentsJSON:)` that turns **our** arguments into the vendor's tool. Relay only the keys your schema names. Give several accounts a sensible meaning: reads are tagged per account, writes need `account` (see `CalendarTools.definitions(accounts:)`). Explain each `RemoteMCPError` in words the model can say. |
 | `Services/FullDuplex/LiveToolSchemas.swift` | One `static let` per tool, `{type, name, description, parameters, strict: false}`, and a `static let <name>` array of them. Write the schemas for a voice turn, short and in our own words, not the vendor's verbatim schema. |
 | `prompts/skills/<name>.md` | The skill text: when to use which tool, how to say results ("name three and stop"), and a **Confirm first** list for every write. |
 | `prompts/notes/<name>-reauth.md` | One paragraph containing `{{which}}`, used when a grant's refresh was refused. Copy `granola-reauth.md`. |
-| `prompts/coaching.json` | One or two lessons with capability ids like `<name>_<thing>`. |
+| `prompts/coaching.json` | One or two lessons with capability ids `<id>_connect` and `<id>_<thing>`. The rotation reads the id: `<id>_connect` is offered while the build can sign in and nothing is connected, the rest once something is. |
 | `CodenameJo/Resources/Assets.xcassets/Connector<Name>.imageset/` | The logo. An SVG mark uses the template rendering intent (copy `ConnectorNotion`'s `Contents.json`); a full-colour PNG uses `original` (Granola). Simple Icons has most marks. |
 | `CodenameJoTests/<Name>ToolsTests.swift` | Copy `GranolaToolsTests.swift`. Cover argument mapping, several accounts, refused grant → reconnect text, no grant, the account label, the scope, the session's tools/skill/reauth following the grants, the prompt, lessons gated on a connection, the broker routing a tool, sign-out forgetting grants, and the attention badge. |
 
-## 4. Existing files: add `<name>` next to every `granola`
+## 4. Existing files
 
-Running `grep -rn -i granola CodenameJo CodenameJoTests prompts README.md` lists nearly every place. This is
-the full set:
+Everything that once named each connector in turn — the session's tools, the dispatch worker, the prompt's
+skills and reconnect notes, sign-out, account and profile deletion, History's chips, the step-row glyph,
+coaching and `ConnectionsService.status.connectors` — now iterates `ConnectorRegistry.all`. What is left is
+the registry line, the Settings and onboarding rows (each connector signs in differently), and the
+per-tool tables.
 
-- **`Views/ProfileConnectionsSection.swift`**
-  - Add the case to the `ProfileConnectionProvider` enum, then fill in `title`, `icon` and `state(in:)`.
-  - Add `if provider == .<name> { <name>Section }`.
-  - Add a `<name>Section`, copied from the Granola section.
-  - Add `ConnectorCopy.<name>`, one honest sentence on what it can and can't do.
-- **`Onboarding/OnboardingConnectView.swift`:** `ConnectorLogo`, `onboardingBlurb`, the `available` and
-  `accounts` maps, `connect(_:)`, and the comment at the top of the file.
-- **`Services/ConnectionsService.swift`**
-  - Add `@Published` `<name>Accounts` / `<name>Available` / `<name>NeedsReauth`.
-  - Add the connector to `attentionProviderNames`, `hasAnyConnector`, `connectedServices`, `refresh()`
-    and `clearPublishedStatus`.
-  - Add a `connect<Name>(replacing:)` / `disconnect<Name>` section. `busyConnector` uses `"<name>"`.
-- **`Views/ProfileView.swift`:** the three handler-protocol methods, the view-model properties, the
-  Combine sinks and the interactor implementations.
-- **`Models/ConnectorCapability.swift`:** `static let <name>: [ConnectorCapability]`. Every chip must be
-  true; if something can't delete, say so.
-- **`Models/ToolNarration.swift`:** a spoken `Phrasing` for each tool, plus a `sourceIcon` prefix rule
-  (`tool.hasPrefix("<name>_")`).
-- **`Models/CommandRecord.swift`:** add `knownServices` (name and SF Symbol). The order decides the order
-  of History's chips.
-- **`Services/RealtimeService.swift`:** `inferService` keywords. Put specific words before GitHub's
-  generic "issue".
-- **`Services/FullDuplex/`**
-  - `FullDuplexBroker.swift`: read the grants in session setup, set `state.<name>…`, add to coaching
-    eligibility and the session log line, and route the tool names in `runTool`.
-  - `LiveSessionSetup.swift`: `State` fields, register the tools in `tools` (a `ConnectorTool` each, run
-    by `runTool`), add them to the session, add the skill to `skills`, and the
-    `<name>NeedsReauth` prompt fact.
-  - `LiveSessionSetup.workerTools` and `FullDuplexBroker.workerTools`: a `<name>` parameter that adds
-    the same tools to a dispatched job.
-  - `DispatchWorker.swift`: read the job profile's grant in `loop` and pass it to `workerTools` and
-    `instructions` (which adds the skill); route the names in `execute`, saying whether each writes;
-    and list the tool names in `takesMailAccount`, so a pinned mail account is never passed to them.
-  - `LivePrompt.swift`: the `Facts` field and parse, `skillOrder`, and a `reauthNote(...)` entry.
-  - `LiveFastAction.swift`: add **read** tools to `feedIndependent`, never writes.
-  - `CoachingRotation.swift`: an `Eligibility` flag and an `available` case for your lessons.
-- **Grant cleanup**
-  - `Services/BackendService.swift`: `<Name>Connector.forget()` in both sign-out paths, and revoke every
-    grant in account delete.
-  - `Services/WorkspaceProfileStore.swift`: revoke and remove the deleted profile's grants.
-- **Tests:** add a scenario line to `CodenameJoTests/Fixtures/live-session-parity.json`, and decode the
-  new state keys in `LiveSessionSetupParityTests.state(_:)`.
+- **`Services/Connectors/ConnectorRegistry.swift`:** append `<Name>Connector()` to `all`. Its position is
+  the skill order in the brain prompt and the chip order in History.
+- **Settings and onboarding rows**
+  - `Views/ProfileConnectionsSection.swift`: add the case to the `ProfileConnectionProvider` enum, then fill
+    in `title`, `icon` and `state(in:)`; add `if provider == .<name> { <name>Section }` and a `<name>Section`
+    copied from the Granola section; add `ConnectorCopy.<name>`, one honest sentence on what it can and
+    can't do.
+  - `Onboarding/OnboardingConnectView.swift`: `ConnectorLogo`, `onboardingBlurb`, the `available` and
+    `accounts` maps, `connect(_:)`, and the comment at the top of the file.
+  - `Services/ConnectionsService.swift`: the named forwarders on `Status` the rows read
+    (`<name>Accounts` / `<name>Available` / `<name>NeedsReauth`, over `connectors[<Name>Connector.id]`), and
+    a `connect<Name>(replacing:)` / `disconnect<Name>` section. `busyConnector` uses `"<name>"`.
+  - `Views/ProfileView.swift`: the handler-protocol methods, the view-model properties, the Combine sinks
+    and the interactor implementations.
+- **Per-tool tables**, one entry per tool
+  - `Models/ToolNarration.swift`: a spoken `Phrasing` for each tool. The glyph and the prefix come from the
+    connector.
+  - `Services/CustomCommandRules.swift`: which of the tools a saved command may run.
+  - `Models/ConnectorCapability.swift`: `static let <name>: [ConnectorCapability]`. Every chip must be true;
+    if something can't delete, say so.
+- **Tests:** add a scenario line to `CodenameJoTests/Fixtures/live-session-parity.json`, and map its state
+  keys onto `state.connectors[<Name>Connector.id]` in `LiveSessionSetupParityTests.state(_:)`.
   - Each scenario in that fixture is a single line of compact JSON (`separators=(',',':')`).
   - Clone a neighbouring scenario with a script, then change its `state`, `tools` (the full entries from
-    `LiveToolSchemas`, in the order `LiveSessionSetup` adds them) and `prompt`.
+    `LiveToolSchemas`, in the order the connector's `sessionTools` adds them) and `prompt`.
 - **`README.md`:** a row in the Connectors table, plus the "talks to each service directly" list.
 
 ## 5. Build and verify
@@ -165,6 +148,8 @@ line.
 
 - **"Unable to type-check this expression in reasonable time"** usually means the `skills` array in
   `LiveSessionSetup.resolve` has grown too long. Build it up in steps instead.
+- **A connector tool that reaches the model but "has no executor"** means `owns(_:)` does not claim its
+  name: the registry routes a call to the first connector whose `owns` says yes.
 - **Tests:** run `<Name>ToolsTests`, `LiveSessionSetupParityTests`, `DispatchWorkerTests` and any `*ToolsTests` near what you
   touched. The suite is slow, so if the person would rather run it themselves, ask first.
 - **Check on a device:** Settings → Connections → connect (the account email shows); ask Jo something

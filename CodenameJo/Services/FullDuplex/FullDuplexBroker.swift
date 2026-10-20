@@ -207,22 +207,17 @@ enum FullDuplexBroker {
             }
         }
         let feedBriefingOwners = cadenceUserId.map { ["feed-items:\($0)"] } ?? []
-        // Granola's grants for this profile; a refused refresh is flagged on use, never here.
-        let granolaGrants = GranolaConnector.grants()
-        let granola = granolaGrants.contains { !$0.needsReauth }
+        // Every connector's standing for the active profile, each renewing what it renews at dial.
+        let connectors = await ConnectorRegistry.dialStatuses(profileId: ProfileRuntime.snapshot?.profileId)
         // Re-read first, off the main actor's writer wait, so the eligibility below sees the list.
         await Container.shared.customCommands().refresh()
         let coachingEligibility = await MainActor.run {
             let commands = Container.shared.customCommands()
             return CoachingRotation.Eligibility(
-                slackConnectable: SlackConfig.isConfigured && SlackGrantStore.all().isEmpty,
                 multipleInboxes: GoogleAccountStore.mailAccounts().count > 1,
                 hasFeedItems: !FeedItems.all().isEmpty,
                 hasCommands: !commands.commands.isEmpty,
-                githubAvailable: !AppHosts.githubClientID.isEmpty,
-                githubConnected: !GitHubAccountStore.usable().isEmpty,
-                hasGranola: granola,
-                notionConnected: NotionTools.isConnected(profileId: ProfileRuntime.snapshot?.profileId))
+                connectors: connectors)
         }
         let coachingPlan = CoachingRotation.plan(coachingEligibility)
 
@@ -246,29 +241,15 @@ enum FullDuplexBroker {
         let calendarAccounts = await CalendarTools.accounts()
         let grants = await reachability(mailboxes + calendarAccounts.filter { !mailboxes.contains($0) })
         let failed = Set(grants.needsReauth + grants.unreachable)
-        let slack = await slackReachability()
-        var state = LiveSessionSetup.State(
+        let state = LiveSessionSetup.State(
             inboxes: mailboxes.filter { !failed.contains($0) },
             calendars: calendarAccounts.filter { !failed.contains($0) },
             needsReauth: grants.needsReauth, unreachable: grants.unreachable,
             draftsOnly: { DraftsOnly.isOn(for: $0) },
             triageScope: UserDefaults.standard.string(forKey: TriageScope.storageKey),
-            notionNeedsReauth: NotionTools.needsReauth(profileId: ProfileRuntime.snapshot?.profileId),
-            githubAccounts: GitHubAccountStore.usable().map(\.login),
-            githubNeedsReauth: GitHubAccountStore.needsReauth(),
-            granola: granola, granolaNeedsReauth: granolaGrants.filter(\.needsReauth).map(\.label),
-            notion: NotionTools.isConnected(profileId: ProfileRuntime.snapshot?.profileId),
             ownerNames: [mailboxes.first.flatMap { GoogleAccountStore.grant(for: $0)?.displayName },
-                         GoogleAccountStore.primary()?.displayName])
-        state.slackWorkspaces = slack.workspaces
-        state.slackNeedsReauth = slack.needsReauth
-        // The profile's own MCP servers, offered from the tool lists they gave last time; the
-        // lists are refreshed behind this dial so the next one sees what the server has now.
-        let customServers = CustomMCPConnector.servers()
-        state.customMCPTools = CustomMCPTools.definitions(servers: customServers)
-        state.customMCPServers = customServers.filter(CustomMCPConnector.isUsable).map(\.name)
-        state.customMCPNeedsReauth = customServers.filter { !CustomMCPConnector.isUsable($0) }.map(\.name)
-        CustomMCPConnector.refreshToolsInBackground(customServers)
+                         GoogleAccountStore.primary()?.displayName],
+            connectors: connectors)
         let setup = LiveSessionSetup.resolve(request, state, catalog: LiveSessionSetup.Catalog.bundled)
 
         // Mail search, body reads, mail management and calendar list/create/update are the phone's own tools,
@@ -328,36 +309,16 @@ enum FullDuplexBroker {
                 + (state.inboxes.isEmpty ? "none" : state.inboxes.joined(separator: "+")) + ")")
             + " · \(coachingPlan.lessons.count) coaching lesson(s) preloaded"
             + (shortcutText ? " · send_text via Shortcuts" : " · NO send_text shortcut")
-            + (granola ? " · granola" : "")
             + (grants.needsReauth.isEmpty ? "" : " · google needs reauth: \(grants.needsReauth.joined(separator: ", "))")
             + (grants.unreachable.isEmpty ? "" : " · google unreachable: \(grants.unreachable.joined(separator: ", "))")
-            + (slack.workspaces.isEmpty ? "" : " · slack on device (\(slack.workspaces.count) workspace(s))")
-            + (slack.needsReauth.isEmpty ? "" : " · slack needs reauth: \(slack.needsReauth.joined(separator: ", "))")
-            + (state.notion ? " · notion via dispatch" : "")
-            + (state.notionNeedsReauth.isEmpty ? "" : " · notion needs reauth")
-            + (state.githubAccounts.isEmpty ? "" : " · github: \(state.githubAccounts.joined(separator: ", "))")
-            + (state.githubNeedsReauth.isEmpty ? "" : " · github needs reauth: \(state.githubNeedsReauth.joined(separator: ", "))")
-            + (state.customMCPServers.isEmpty ? "" : " · mcp: \(state.customMCPServers.joined(separator: ", ")) (\(state.customMCPTools.count) tools)")
-            + (state.customMCPNeedsReauth.isEmpty ? "" : " · mcp needs reauth: \(state.customMCPNeedsReauth.joined(separator: ", "))"))
+            + ConnectorRegistry.all.map { connector -> String in
+                let status = connectors[connector.id] ?? ConnectorStatus()
+                guard !status.accounts.isEmpty else { return "" }
+                return " · \(connector.id): \(status.working.joined(separator: ", "))"
+                    + (status.dynamicTools.isEmpty ? "" : " (\(status.dynamicTools.count) tools)")
+                    + (status.needsReauth.isEmpty ? "" : " needs reauth: \(status.needsReauth.joined(separator: ", "))")
+            }.joined())
         return session
-    }
-
-    /// The active profile's Slack workspaces, each token renewed if due: a refused renewal or a
-    /// refresh token past its 30 days needs the user; a transient failure still serves the tools.
-    private static func slackReachability() async -> (workspaces: [String], needsReauth: [String]) {
-        let grants = SlackGrantStore.inProfile()
-        var workspaces: [String] = [], needsReauth: [String] = []
-        for grant in grants {
-            switch await Container.shared.slackCredentials().token(teamId: grant.teamId) {
-            case .success: workspaces.append(grant.teamName)
-            case .failure(.needsReauth): needsReauth.append(grant.teamName)
-            case .failure(.transient(let why)):
-                RealtimeLog.log("slack: \(grant.teamName) token unavailable at dial — \(why)")
-                workspaces.append(grant.teamName)
-            case .failure(.notConnected): break
-            }
-        }
-        return (workspaces, needsReauth)
     }
 
     /// Each grant's state, as Google answers a refresh (or the cached token): a revoked grant needs
@@ -411,10 +372,6 @@ enum FullDuplexBroker {
         conversationId: String? = nil, deferArchive: Bool = false, deferDraft: Bool = false, deferSpam: Bool = false, deferTrash: Bool = false, deferSend: Bool = false, deferCalendar: Bool = false, deferLabel: Bool = false,
         profileId: String? = ProfileRuntime.snapshot?.profileId, onboardingReply: Bool = false
     ) async -> ToolResult {
-        // Notion's MCP, called from this phone with the profile's own grant.
-        if NotionTools.names.contains(name) {
-            return await NotionTools.run(name: name, argumentsJSON: argumentsJSON, profileId: profileId)
-        }
         if LocalMailWrites.names.contains(name) {
             let deferred = (name == "archive_message" && deferArchive) || (name == "mark_spam" && deferSpam)
                 || (name == "trash_message" && deferTrash) || (name == "label_message" && deferLabel)
@@ -435,17 +392,9 @@ enum FullDuplexBroker {
             return await LocalCalendarWrites.run(name: name, argumentsJSON: argumentsJSON, defer: deferCalendar,
                                                  conversationId: conversationId)
         }
-        // Every github_ name goes here so one outside ALLOWED_TOOLS is refused there, not reported as unknown.
-        if GitHubTools.isGitHubTool(name) {
-            return await GitHubTools.run(name: name, argumentsJSON: argumentsJSON)
-        }
-        if GranolaTools.names.contains(name) {
-            return await GranolaTools.run(name: name, argumentsJSON: argumentsJSON)
-        }
-        // The user's own MCP servers, called from this phone with the profile's grant.
-        if CustomMCPTools.isCustomTool(name) {
-            return await CustomMCPTools.run(name: name, argumentsJSON: argumentsJSON,
-                                            servers: CustomMCPConnector.servers(profileId: profileId))
+        // A connector's tool, called from this phone with the profile's own grant.
+        if let connector = ConnectorRegistry.owner(of: name) {
+            return await connector.run(name, argumentsJSON: argumentsJSON, profileId: profileId)
         }
         RealtimeLog.log("tools: \(name) has no executor on this phone")
         return ToolResult(text: "There is no tool called \(name). Use only the tools you were given.", ok: false)
@@ -462,12 +411,9 @@ enum FullDuplexBroker {
 
     /// The mail and calendar writes a dispatched job may call, and the connectors the job's
     /// profile has, as Responses function tools.
-    static func workerTools(mail: [String], calendar: [String], notion: Bool = false, granola: Bool = false,
-                            slack: Bool = false, githubAccounts: [String] = [],
-                            customMCPTools: [[String: Any]] = []) -> [[String: Any]] {
+    static func workerTools(mail: [String], calendar: [String],
+                            connectors: [String: ConnectorStatus] = [:]) -> [[String: Any]] {
         LiveSessionSetup.workerTools(inboxes: mail, calendars: calendar,
-                                     draftsOnly: { DraftsOnly.isOn(for: $0) }, notion: notion, granola: granola,
-                                     slack: slack, githubAccounts: githubAccounts, customMCPTools: customMCPTools,
-                                     catalog: .bundled)
+                                     draftsOnly: { DraftsOnly.isOn(for: $0) }, connectors: connectors, catalog: .bundled)
     }
 }

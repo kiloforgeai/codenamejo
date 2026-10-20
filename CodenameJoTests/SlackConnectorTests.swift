@@ -453,7 +453,7 @@ final class SlackConnectorTests: XCTestCase {
         XCTAssertNil(without.prompt["localSlackTriage"])
         XCTAssertFalse(without.localSlackTriage)
 
-        state.slackWorkspaces = ["Acme"]
+        state.connectors[SlackConnector.id] = ConnectorStatus(accounts: ["Acme"])
         let with = LiveSessionSetup.resolve(request, state, catalog: catalog)
         let names = with.tools.compactMap { $0["name"] as? String }.filter { $0.hasPrefix("slack_") }
         XCTAssertEqual(names, SlackTools.catalogOrder)
@@ -466,7 +466,7 @@ final class SlackConnectorTests: XCTestCase {
     func testALapsedWorkspaceGetsTheReconnectNoteAndNoTools() throws {
         let catalog = LiveSessionSetup.Catalog.bundled
         var state = LiveSessionSetup.State(inboxes: ["a@x.test"])
-        state.slackNeedsReauth = ["Acme"]
+        state.connectors[SlackConnector.id] = ConnectorStatus(accounts: ["Acme"], needsReauth: ["Acme"])
         let setup = LiveSessionSetup.resolve(.init(), state, catalog: catalog)
         XCTAssertFalse(setup.tools.contains { ($0["name"] as? String)?.hasPrefix("slack_") == true })
         let brain = try LivePrompt.brainInstructions(LivePrompt.Facts(setup.prompt), timeZone: "UTC")
@@ -490,7 +490,8 @@ final class SlackConnectorTests: XCTestCase {
     func testTheConnectLessonIsOfferedOnlyWhileSlackCanBeConnected() {
         let catalog = [CoachingRotation.Lesson(capability: "slack_connect", copy: "c")]
         let defaults = UserDefaults(suiteName: "slack-coaching-\(UUID().uuidString)")!
-        XCTAssertEqual(CoachingRotation.plan(.init(slackConnectable: true), catalog: catalog, defaults: defaults)
+        let connectable = CoachingRotation.Eligibility(connectors: [SlackConnector.id: ConnectorStatus(available: true)])
+        XCTAssertEqual(CoachingRotation.plan(connectable, catalog: catalog, defaults: defaults)
             .lessons.map(\.capability), ["slack_connect"])
         XCTAssertTrue(CoachingRotation.plan(.init(), catalog: catalog, defaults: defaults).lessons.isEmpty)
         XCTAssertNotNil(CoachingRotation.copy(for: "slack_connect"))

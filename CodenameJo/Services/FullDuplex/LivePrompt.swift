@@ -48,13 +48,10 @@ enum LivePrompt {
         var onboardingMailMode = false, mailModeSwitching = false
         var drafting: [String] = [], sending: [String] = []
         var googleNeedsReauth: [String] = [], googleUnreachable: [String] = []
-        var notionNeedsReauth: [String] = []
-        var granolaNeedsReauth: [String] = []
-        var slackNeedsReauth: [String] = []
-        var githubNeedsReauth: [String] = []
-        /// The user's own MCP servers serving this call, and the ones needing reconnecting.
+        /// Each connector's accounts whose credential was refused, by `Connector.id`.
+        var connectorNeedsReauth: [String: [String]] = [:]
+        /// The user's own MCP servers serving this call.
         var customMCP: [String] = []
-        var customMCPNeedsReauth: [String] = []
         /// The user's saved commands: the section explaining them, and every keyword, switched off or not.
         var commands = false
         var commandKeywords: [String] = []
@@ -86,11 +83,11 @@ enum LivePrompt {
             onboardingMailMode = flag("onboardingMailMode"); mailModeSwitching = flag("mailModeSwitching")
             drafting = list("drafting"); sending = list("sending")
             googleNeedsReauth = list("googleNeedsReauth"); googleUnreachable = list("googleUnreachable")
-            notionNeedsReauth = list("notionNeedsReauth")
-            granolaNeedsReauth = list("granolaNeedsReauth")
-            slackNeedsReauth = list("slackNeedsReauth")
-            githubNeedsReauth = list("githubNeedsReauth")
-            customMCP = list("customMCP"); customMCPNeedsReauth = list("customMCPNeedsReauth")
+            for connector in ConnectorRegistry.all {
+                let accounts = list(connector.id + "NeedsReauth")
+                if !accounts.isEmpty { connectorNeedsReauth[connector.id] = accounts }
+            }
+            customMCP = list("customMCP")
             commands = flag("commands"); commandKeywords = list("commandKeywords")
             profileContext = (json["profileContext"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         }
@@ -136,7 +133,8 @@ enum LivePrompt {
         return out
     }
 
-    private static let skillOrder = ["email", "calendar", "slack", "notion", "granola", "github"]
+    /// Mail and calendar first, then the connectors in registry order.
+    private static var skillOrder: [String] { ["email", "calendar"] + ConnectorRegistry.all.compactMap(\.skill) }
 
     static func baseInstructions(_ facts: Facts, text: Text) throws -> String {
         let skills = try skillOrder.filter(facts.skills.contains).map { name in
@@ -205,14 +203,11 @@ enum LivePrompt {
         if !f.commandKeywords.isEmpty {
             s += try "\n\n" + text("notes/commands") + "\n" + f.commandKeywords.map { "- " + $0 }.joined(separator: "\n")
         }
-        for note in try [googleNote(f, text: text),
-                         reauthNote("notion-reauth", "Notion", f.notionNeedsReauth, text: text),
-                         reauthNote("granola-reauth", "Granola", f.granolaNeedsReauth, text: text),
-                         reauthNote("slack-reauth", "Slack", f.slackNeedsReauth, text: text),
-                         reauthNote("github-reauth", "GitHub", f.githubNeedsReauth, text: text),
-                         customMCPReauthNote(f, text: text)] where !note.isEmpty {
-            s += "\n\n" + note
+        var notes = [try googleNote(f, text: text)]
+        for connector in ConnectorRegistry.all {
+            notes.append(try connector.reauthText(f.connectorNeedsReauth[connector.id] ?? [], text: text))
         }
+        for note in notes where !note.isEmpty { s += "\n\n" + note }
         return s
     }
 
@@ -247,14 +242,6 @@ enum LivePrompt {
                 "which": f.googleUnreachable.count == 1 ? "that account is" : "those accounts are"]))
         }
         return parts.joined(separator: " ")
-    }
-
-    /// Named by server rather than by account: a custom server has no account label of its own.
-    static func customMCPReauthNote(_ f: Facts, text: Text) throws -> String {
-        guard !f.customMCPNeedsReauth.isEmpty else { return "" }
-        let names = f.customMCPNeedsReauth.joined(separator: " and ")
-        let which = f.customMCPNeedsReauth.count == 1 ? "their \(names) server" : "their \(names) servers"
-        return try text("notes/custom-mcp-reauth", ["which": which])
     }
 
     static func reauthNote(_ name: String, _ service: String, _ accounts: [String], text: Text) throws -> String {

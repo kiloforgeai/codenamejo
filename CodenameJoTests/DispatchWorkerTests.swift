@@ -97,9 +97,13 @@ final class DispatchWorkerTests: XCTestCase {
     func testConnectorToolsReachTheWorkerOnlyWhenConnected() throws {
         let catalog = LiveSessionSetup.Catalog.bundled
         let mcp: [String: Any] = ["type": "function", "name": "mcp_acme_file_issue", "parameters": ["type": "object"]]
+        let connectors: [String: ConnectorStatus] = [
+            NotionConnector.id: ConnectorStatus(accounts: ["Notion"]), GranolaConnector.id: ConnectorStatus(accounts: ["a@x.test"]),
+            SlackConnector.id: ConnectorStatus(accounts: ["Acme"]), GitHubConnector.id: ConnectorStatus(accounts: ["octo"]),
+            CustomMCPConnector.id: ConnectorStatus(accounts: ["Acme MCP"], dynamicTools: [mcp]),
+        ]
         let all = LiveSessionSetup.workerTools(inboxes: ["owner@example.test"], calendars: [], draftsOnly: { _ in true },
-                                               notion: true, granola: true, slack: true, githubAccounts: ["octo"],
-                                               customMCPTools: [mcp], catalog: catalog)
+                                               connectors: connectors, catalog: catalog)
         let names = all.compactMap { $0["name"] as? String }
         for name in GranolaTools.names + GitHubTools.readTools + GitHubTools.writeTools + NotionTools.names
             + ["slack_read_channel", "slack_send_message", "mcp_acme_file_issue"] {
@@ -121,8 +125,11 @@ final class DispatchWorkerTests: XCTestCase {
         for marker in ["# Slack", "# Code", "# Meetings", "# Notes", "own tool servers"] {
             XCTAssertFalse(plain.contains(marker), marker)
         }
-        let full = try DispatchWorker.instructions(receipt: false, mail: true, calendar: false, notion: true,
-                                                   granola: true, slack: true, github: true, customMCP: ["Acme"])
+        let full = try DispatchWorker.instructions(receipt: false, mail: true, calendar: false, connectors: [
+            NotionConnector.id: ConnectorStatus(accounts: ["Notion"]), GranolaConnector.id: ConnectorStatus(accounts: ["a@x.test"]),
+            SlackConnector.id: ConnectorStatus(accounts: ["Acme"]), GitHubConnector.id: ConnectorStatus(accounts: ["octo"]),
+            CustomMCPConnector.id: ConnectorStatus(accounts: ["Acme"]),
+        ])
         for marker in ["# Slack", "# Code", "# Meetings", "# Notes", "own tool servers to this app: Acme"] {
             XCTAssertTrue(full.contains(marker), marker)
         }

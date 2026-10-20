@@ -236,10 +236,11 @@ final class GitHubToolsTests: XCTestCase {
         let catalog = LiveSessionSetup.Catalog.bundled
         let without = LiveSessionSetup.resolve(.init(), .init(inboxes: ["a@x.test"]), catalog: catalog)
         XCTAssertFalse(without.tools.contains { ($0["name"] as? String)?.hasPrefix("github_") == true })
-        XCTAssertEqual(without.prompt["githubNeedsReauth"] as? [String], [])
+        XCTAssertNil(without.prompt["githubNeedsReauth"])
 
-        let with = LiveSessionSetup.resolve(.init(), .init(inboxes: ["a@x.test"], githubAccounts: ["octo"],
-                                                           githubNeedsReauth: ["old"]), catalog: catalog)
+        var state = LiveSessionSetup.State(inboxes: ["a@x.test"])
+        state.connectors[GitHubConnector.id] = ConnectorStatus(accounts: ["octo", "old"], needsReauth: ["old"])
+        let with = LiveSessionSetup.resolve(.init(), state, catalog: catalog)
         XCTAssertEqual(Set(with.tools.compactMap { $0["name"] as? String }.filter { $0.hasPrefix("github_") }),
                        GitHubTools.allowedTools)
         XCTAssertEqual(with.prompt["skills"] as? [String], ["email", "github"])
@@ -249,7 +250,7 @@ final class GitHubToolsTests: XCTestCase {
     func testThePromptCarriesTheSkillAndTheReconnectNote() throws {
         var facts = LivePrompt.Facts()
         facts.skills = ["github"]
-        facts.githubNeedsReauth = ["octo"]
+        facts.connectorNeedsReauth[GitHubConnector.id] = ["octo"]
         let brain = try LivePrompt.brainInstructions(facts, timeZone: "UTC")
         XCTAssertTrue(brain.contains("github_search_repositories first"))
         XCTAssertTrue(brain.contains("require a read-back and an explicit yes"))
@@ -259,11 +260,14 @@ final class GitHubToolsTests: XCTestCase {
     }
 
     func testTheGitHubLessonsFollowTheConnection() {
+        let available = CoachingRotation.Eligibility(connectors: [GitHubConnector.id: ConnectorStatus(available: true)])
+        let connected = CoachingRotation.Eligibility(
+            connectors: [GitHubConnector.id: ConnectorStatus(accounts: ["octo"], available: true)])
         XCTAssertFalse(CoachingRotation.available("github_connect", .init()))
-        XCTAssertTrue(CoachingRotation.available("github_connect", .init(githubAvailable: true)))
-        XCTAssertFalse(CoachingRotation.available("github_connect", .init(githubAvailable: true, githubConnected: true)))
-        XCTAssertTrue(CoachingRotation.available("github_reviews", .init(githubAvailable: true, githubConnected: true)))
-        XCTAssertFalse(CoachingRotation.available("github_reviews", .init(githubAvailable: true)))
+        XCTAssertTrue(CoachingRotation.available("github_connect", available))
+        XCTAssertFalse(CoachingRotation.available("github_connect", connected))
+        XCTAssertTrue(CoachingRotation.available("github_reviews", connected))
+        XCTAssertFalse(CoachingRotation.available("github_reviews", available))
         XCTAssertNotNil(CoachingRotation.copy(for: "github_connect"))
         XCTAssertNotNil(CoachingRotation.copy(for: "github_reviews"))
     }

@@ -24,15 +24,20 @@ final class LiveSessionSetupParityTests: XCTestCase {
             inboxes: raw["inboxes"] as? [String] ?? [], calendars: raw["calendars"] as? [String] ?? [],
             needsReauth: raw["needsReauth"] as? [String] ?? [], unreachable: raw["unreachable"] as? [String] ?? [],
             draftsOnly: { byAccount[$0.lowercased()] ?? fallback },
-            triageScope: raw["triageScope"] as? String,
-            notionNeedsReauth: raw["notionNeedsReauth"] as? [String] ?? [],
-            githubAccounts: raw["githubAccounts"] as? [String] ?? [],
-            githubNeedsReauth: raw["githubNeedsReauth"] as? [String] ?? [],
-            granola: raw["granola"] as? Bool == true, granolaNeedsReauth: raw["granolaNeedsReauth"] as? [String] ?? [],
-            notion: raw["notion"] as? Bool == true)
+            triageScope: raw["triageScope"] as? String)
+        // The fixture's per-connector keys, as the old server wrote them, onto each connector's standing.
+        func status(working: [String], needsReauth: [String]) -> ConnectorStatus {
+            ConnectorStatus(accounts: working + needsReauth, needsReauth: needsReauth)
+        }
+        state.connectors[NotionConnector.id] = status(working: raw["notion"] as? Bool == true ? ["Notion"] : [],
+                                                      needsReauth: raw["notionNeedsReauth"] as? [String] ?? [])
+        state.connectors[GranolaConnector.id] = status(working: raw["granola"] as? Bool == true ? ["granola"] : [],
+                                                       needsReauth: raw["granolaNeedsReauth"] as? [String] ?? [])
+        state.connectors[GitHubConnector.id] = status(working: raw["githubAccounts"] as? [String] ?? [],
+                                                      needsReauth: raw["githubNeedsReauth"] as? [String] ?? [])
         // Phone-only scenarios: Slack was never the old server's, so these two were written here.
-        state.slackWorkspaces = raw["slackWorkspaces"] as? [String] ?? []
-        state.slackNeedsReauth = raw["slackNeedsReauth"] as? [String] ?? []
+        state.connectors[SlackConnector.id] = status(working: raw["slackWorkspaces"] as? [String] ?? [],
+                                                     needsReauth: raw["slackNeedsReauth"] as? [String] ?? [])
         return state
     }
 
@@ -109,7 +114,7 @@ final class LiveSessionSetupParityTests: XCTestCase {
             let raw = scenario["state"] as? [String: Any] ?? [:]
             let state = state(raw)
             let tools = LiveSessionSetup.workerTools(inboxes: state.inboxes, calendars: state.calendars,
-                                                     draftsOnly: state.draftsOnly, notion: state.notion, catalog: catalog)
+                                                     draftsOnly: state.draftsOnly, connectors: state.connectors, catalog: catalog)
             try assertSameTools(tools, scenario["tools"] as? [Any] ?? [], name)
         }
     }
