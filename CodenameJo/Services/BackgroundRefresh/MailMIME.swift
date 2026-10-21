@@ -4,6 +4,7 @@ import Foundation
 enum MailMIME {
     /// Appended when `MailFooter.isOn`.
     static let footer = "Sent via Codename Jo 🪩 https://codenamejo.com"
+    private static let htmlFooter = #"Sent via <a href="https://codenamejo.com">Codename Jo 🪩</a>"#
 
     /// One outgoing message, draft or send. `cc` and `bcc` are bare addresses or, for reply-all, the
     /// answered message's entries as written.
@@ -19,18 +20,28 @@ enum MailMIME {
         var footer = false
     }
 
-    /// No From, MIME-Version, Date or Message-ID: Gmail fills them in.
+    /// Gmail supplies From, Date and Message-ID. Branded mail includes a linked HTML alternative.
     static func plain(_ message: Outgoing) -> String {
         var headers = ["To: \(message.to)"]
         if !message.cc.isEmpty { headers.append("Cc: \(message.cc.joined(separator: ", "))") }
         if !message.bcc.isEmpty { headers.append("Bcc: \(message.bcc.joined(separator: ", "))") }
         headers.append("Subject: \(encodeHeader(message.subject))")
-        headers.append("Content-Type: text/plain; charset=UTF-8")
+        if !message.footer { headers.append("Content-Type: text/plain; charset=UTF-8") }
         if let inReplyTo = message.inReplyTo, !inReplyTo.isEmpty {
             headers.append("In-Reply-To: \(inReplyTo)")
             headers.append("References: \(inReplyTo)")
         }
-        let body = message.footer ? "\(message.body)\n\n\(footer)" : message.body
+        guard message.footer else {
+            return base64url((headers + ["", message.body]).joined(separator: "\r\n"))
+        }
+        let boundary = "b_\(UUID().uuidString.lowercased())"
+        headers += ["MIME-Version: 1.0", "Content-Type: multipart/alternative; boundary=\"\(boundary)\""]
+        let parts = [("plain", "\(message.body)\n\n\(footer)"),
+                     ("html", "\(plainHTML(message.body))\n<p>\(htmlFooter)</p>")]
+        let body = parts.map { type, content in
+            "--\(boundary)\r\nContent-Type: text/\(type); charset=UTF-8\r\n"
+                + "Content-Transfer-Encoding: base64\r\n\r\n\(base64Lines(Data(content.utf8)))\r\n"
+        }.joined() + "--\(boundary)--"
         return base64url((headers + ["", body]).joined(separator: "\r\n"))
     }
 
@@ -76,8 +87,8 @@ enum MailMIME {
         var footer = false
     }
 
-    /// Text and HTML in `multipart/alternative` when the original had HTML, inside `multipart/mixed` when anything
-    /// is attached. Part bodies are base64 folded at 76 columns, which keeps a `--` boundary out of the content.
+    /// HTML originals and branded forwards include both alternatives; attachments use a mixed wrapper.
+    /// Base64 part bodies keep MIME boundaries out of the content.
     static func forward(_ fwd: Forward, boundary: () -> String = { "b_\(UUID().uuidString.lowercased())" }) -> String {
         let src = fwd.source
         let stripped = src.subject.replacingOccurrences(of: #"^\s*((re|fwd?):\s*)+"#, with: "",
@@ -89,8 +100,9 @@ enum MailMIME {
 
         let textBody = (note.map { "\($0)\n\n" } ?? "") + "\(block.text)\n\n\(src.text)"
             + (fwd.footer ? "\n\n\(footer)" : "")
-        let htmlDoc = src.html.isEmpty ? "" : (note.map { "<p>\(escapeHTML($0))</p>\n" } ?? "")
-            + "\(block.html)\n\(src.html)" + (fwd.footer ? "\n<p>\(escapeHTML(footer))</p>" : "")
+        let htmlDoc = src.html.isEmpty && !fwd.footer ? "" : (note.map { "<p>\(escapeHTML($0))</p>\n" } ?? "")
+            + "\(block.html)\n\(src.html.isEmpty ? plainHTML(src.text) : src.html)"
+            + (fwd.footer ? "\n<p>\(htmlFooter)</p>" : "")
 
         func leaf(_ headers: [String], _ content: String) -> String { (headers + ["", content]).joined(separator: "\r\n") }
         func multipart(_ subtype: String, _ parts: [String]) -> String {
@@ -147,6 +159,10 @@ enum MailMIME {
             line = end
         }
         return out + String(encoded[line...])
+    }
+
+    private static func plainHTML(_ text: String) -> String {
+        "<div style=\"white-space: pre-wrap;\">\(escapeHTML(text))</div>"
     }
 
     /// `&` before `<`, or the escape rewrites its own output.

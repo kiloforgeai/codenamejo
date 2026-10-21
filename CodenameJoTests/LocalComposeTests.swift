@@ -167,7 +167,9 @@ final class LocalComposeTests: XCTestCase {
             let pair = line.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
             headers[pair[0]] = pair[1]
         }
-        return (headers, parts.dropFirst().joined(separator: "\r\n\r\n"))
+        let body = headers["Content-Type"]?.hasPrefix("multipart/alternative") == true
+            ? try MailMIMEParts.body(text, type: "plain") : parts.dropFirst().joined(separator: "\r\n\r\n")
+        return (headers, body)
     }
 
     private func dealt(_ mails: Mail...) -> [Mail] { mails }

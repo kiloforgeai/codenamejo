@@ -50,6 +50,8 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
     /// key, so a view model copy would be a second source of truth.
     @AppStorage(AppearanceSetting.storageKey) private var appearance = AppearanceSetting.system
 
+    @AppStorage(MailFooter.storageKey) private var mailFooterEnabled = false
+
     /// Which inboxes have the Drafts-only safeguard on. Empty or a missing entry reads as off.
     @AppStorage(DraftsOnly.byAccountStorageKey) private var draftsOnlyByAccount = Data()
 
@@ -115,7 +117,10 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
                     }
                     notificationsSection
                     // Only drawn once there is a mailbox to list.
-                    if !viewModel.gmailAccounts.isEmpty { safeguardsSection }
+                    if !viewModel.gmailAccounts.isEmpty {
+                        safeguardsSection
+                        signatureSection
+                    }
                     // The notification automation trigger this relies on is iOS 27's.
                     if #available(iOS 27, *) { messagesSection }
                     privacySection
@@ -371,6 +376,24 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
                     + "forwards are written into its Gmail Drafts and you send them yourself. "
                     + "Reading, searching, archiving and labelling are unaffected either way."
             )
+        }
+    }
+
+    /// The linked Jo signature on outgoing mail. See `MailFooter`.
+    private var signatureSection: some View {
+        Section {
+            Toggle(isOn: $mailFooterEnabled) {
+                SettingsRow.label(
+                    "Sent via Codename Jo",
+                    icon: "signature",
+                    detail: "Add a linked Jo signature to outgoing emails and drafts."
+                )
+            }
+            .tint(Theme.toggleOn)
+            .accessibilityIdentifier("mailFooterToggle")
+            .listRowBackground(Theme.surface)
+        } header: {
+            SettingsRow.header("Signature")
         }
     }
 
