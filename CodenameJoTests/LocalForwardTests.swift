@@ -20,7 +20,7 @@ final class LocalForwardTests: XCTestCase {
     private var paths: [String] = []
 
     private static let defaultsKeys = [StandingRule.archiveAfterForward.storageKey, MailFooter.storageKey,
-                                       DraftsOnly.storageKey, DraftsOnly.byAccountStorageKey]
+                                       DraftsOnly.byAccountStorageKey]
 
     override func setUp() async throws {
         try await super.setUp()
@@ -41,7 +41,6 @@ final class LocalForwardTests: XCTestCase {
         let notices = notices!
         Container.shared.localWriteNotices.register { notices }
         Self.defaultsKeys.forEach { UserDefaults.standard.removeObject(forKey: $0) }
-        UserDefaults.standard.set(false, forKey: DraftsOnly.storageKey)
         await contacts.recordSent(account: owner, email: "sam@acme.test")
     }
 
@@ -199,11 +198,11 @@ final class LocalForwardTests: XCTestCase {
     // MARK: - Drafts only, first-time recipients, the standing rule
 
     func testADraftsOnlyInboxSavesTheWholeForwardAsADraft() async throws {
-        UserDefaults.standard.set(true, forKey: DraftsOnly.storageKey)
+        DraftsOnly.set(true, for: owner)
         let scripted = gmail(parts: [Part(filename: "invoice.pdf", size: 1_000, attachmentId: "a1")])
         let result = await run(["message_id": "m1", "to": "new@acme.test", "note": "FYI"])
-        XCTAssertEqual(result.text, "Draft forward to new@acme.test saved in \(owner) — nothing was sent, because this "
-            + "inbox is set to drafts only.")
+        XCTAssertEqual(result.text, "Draft forward to new@acme.test saved in \(owner) — nothing was sent, because Drafts "
+            + "only is on for this inbox.")
         XCTAssertEqual(result.ok, true)
         XCTAssertEqual(posts(scripted), ["drafts"])
         XCTAssertFalse(scripted.calls.contains { $0.path == "messages" }, "a draft is not asked the first-time question")
@@ -256,7 +255,7 @@ final class LocalForwardTests: XCTestCase {
         XCTAssertEqual(told, "\n\nthat didn't forward (gmail 500) — nothing went out, so it needs asking for again.")
         XCTAssertEqual(scripted.calls.filter { $0.path == "messages/send" }.count, 1)
 
-        UserDefaults.standard.set(true, forKey: DraftsOnly.storageKey)
+        DraftsOnly.set(true, for: owner)
         gmail { $0.path == "drafts" ? (500, "application/json", "{}") : nil }
         let draft = await run(["message_id": "m1", "to": "sam@acme.test"])
         XCTAssertEqual(draft.text, "that draft forward didn't save (gmail 500) — there is nothing in \(owner)'s drafts, "

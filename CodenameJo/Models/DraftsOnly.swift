@@ -1,30 +1,22 @@
 import Foundation
 
-/// Whether Jo may send mail, or only write drafts. Per inbox (`draftsOnlyByAccount`), falling
-/// back to the account flag; every absence reads as on, matching `mailSendPolicy` in the broker.
+/// The Drafts-only safeguard: per inbox, whether Jo may only write drafts there. Off, the default,
+/// Jo sends or drafts as the user asks; on, nothing is sent from that inbox.
 enum DraftsOnly {
-    static let storageKey = "draftsOnly"
-
     /// The per-inbox answers, stored as encoded JSON `Data` so `@AppStorage` can observe them.
-    static let byAccountStorageKey = "draftsOnlyByAccount"
+    /// A new key rather than the old `draftsOnlyByAccount`: that one defaulted every inbox to
+    /// drafts, and reading it again would keep everyone drafts-only.
+    static let byAccountStorageKey = "draftsOnlySafeguardByAccount"
 
-    /// The account-wide answer. **The fallback now, not the setting** — see the type doc.
-    static var isOn: Bool {
-        UserDefaults.standard.object(forKey: storageKey) as? Bool ?? true
-    }
-
-    /// What this inbox does: its own answer if it has one, the account's otherwise.
+    /// Whether this inbox has the safeguard on. Absent reads as off.
     static func isOn(for email: String) -> Bool {
-        isOn(
-            for: email,
-            in: UserDefaults.standard.data(forKey: byAccountStorageKey),
-            fallback: isOn)
+        isOn(for: email, in: UserDefaults.standard.data(forKey: byAccountStorageKey))
     }
 
     /// The resolution against the caller's `@AppStorage` value; Settings binds through this so its
     /// rows redraw (a `Binding` reading `UserDefaults` directly registers no dependency).
-    static func isOn(for email: String, in encoded: Data?, fallback: Bool) -> Bool {
-        decode(encoded)[key(email)] ?? fallback
+    static func isOn(for email: String, in encoded: Data?) -> Bool {
+        decode(encoded)[key(email)] ?? false
     }
 
     /// That map with one address answered, encoded to store again.
@@ -40,7 +32,7 @@ enum DraftsOnly {
             setting(draftsOnly, for: email, in: stored()), forKey: byAccountStorageKey)
     }
 
-    /// Drop an address's answer on Disconnect, so a reconnected mailbox starts in Drafts.
+    /// Drop an address's answer on Disconnect, so a reconnected mailbox starts with the safeguard off.
     static func forget(_ email: String) {
         var map = decode(stored())
         map[key(email)] = nil
@@ -54,7 +46,7 @@ enum DraftsOnly {
         case mixed
     }
 
-    /// No inboxes reads as `allDraft`, matching `mailWriteMode` server-side.
+    /// No inboxes reads as `allDraft`: with nowhere to send from, nothing is sent.
     static func summary(for inboxes: [String]) -> Summary {
         let drafting = inboxes.filter { isOn(for: $0) }.count
         if drafting == inboxes.count { return .allDraft }
@@ -64,8 +56,8 @@ enum DraftsOnly {
 
     // MARK: - Storage
 
-    /// Lowercased and trimmed both ways, because the broker keys the same map the same way and a
-    /// mismatch falls back, which can send from a mailbox set to draft.
+    /// Lowercased and trimmed both ways, because a mismatch reads as off, which can send from a
+    /// mailbox with the safeguard on.
     static func key(_ email: String) -> String {
         email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }

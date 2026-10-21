@@ -17,16 +17,15 @@ struct UserProfile: Codable, Equatable {
     var archiveAfterForward: Bool?
     var archiveAfterLabel: Bool?
 
-    /// Whether the assistant may send mail at all, or only draft it. See `DraftsOnly`.
-    var draftsOnly: Bool?
     var onboardingMailModeAccount: String?
 
     /// Whether the mail queue groups its messages into conversations. See `ThreadQueue`.
     var threadQueue: Bool?
 
-    /// What each named inbox does, where `draftsOnly` answers for the rest. `nil` and `[:]` both
-    /// mean no inbox has an answer of its own.
-    var draftsOnlyByAccount: [String: Bool]?
+    /// Which inboxes have the Drafts-only safeguard on. See `DraftsOnly`. `nil` and `[:]` both mean
+    /// none has; a new field name so a profile saved under the old drafts-by-default key can't
+    /// bring it back.
+    var draftsOnlySafeguardByAccount: [String: Bool]?
 
     /// Where a queue starts when the user hasn't said in the call — a `TriageScope` raw value,
     /// `nil` for the whole automatic walk. Read by the phone's `LocalTriageQueue`.
@@ -69,11 +68,10 @@ struct UserProfile: Codable, Equatable {
         profile.archiveAfterReply = flag(StandingRule.archiveAfterReply.storageKey)
         profile.archiveAfterForward = flag(StandingRule.archiveAfterForward.storageKey)
         profile.archiveAfterLabel = flag(StandingRule.archiveAfterLabel.storageKey)
-        profile.draftsOnly = flag(DraftsOnly.storageKey)
         profile.onboardingMailModeAccount = text(EmailOnboardingContract.mailModeAccountKey)
         profile.threadQueue = flag(ThreadQueue.storageKey)
         // Presence, not emptiness: an absent key means this build never wrote one.
-        profile.draftsOnlyByAccount =
+        profile.draftsOnlySafeguardByAccount =
             defaults.data(forKey: DraftsOnly.byAccountStorageKey) == nil
                 ? nil
                 : DraftsOnly.current
@@ -106,12 +104,11 @@ struct UserProfile: Codable, Equatable {
         write(archiveAfterReply, StandingRule.archiveAfterReply.storageKey)
         write(archiveAfterForward, StandingRule.archiveAfterForward.storageKey)
         write(archiveAfterLabel, StandingRule.archiveAfterLabel.storageKey)
-        write(draftsOnly, DraftsOnly.storageKey)
         write(onboardingMailModeAccount, EmailOnboardingContract.mailModeAccountKey)
         write(threadQueue, ThreadQueue.storageKey)
         // Through `DraftsOnly` because the stored shape is encoded JSON; `nil` still removes the
         // key.
-        DraftsOnly.replace(with: draftsOnlyByAccount)
+        DraftsOnly.replace(with: draftsOnlySafeguardByAccount)
         write(triageScope, TriageScope.storageKey)
         write(suggestedActions, SuggestedActions.storageKey)
         write(agentLedEmailSessions, AgentLedEmailSettings.key)
@@ -129,7 +126,6 @@ struct UserProfile: Codable, Equatable {
             StandingRule.archiveAfterReply.storageKey,
             StandingRule.archiveAfterForward.storageKey,
             StandingRule.archiveAfterLabel.storageKey,
-            DraftsOnly.storageKey,
             DraftsOnly.byAccountStorageKey,
             ThreadQueue.storageKey,
             TriageScope.storageKey,
@@ -150,7 +146,7 @@ struct UserProfile: Codable, Equatable {
 extension UserProfile {
     /// Ported from the old server's `PROFILE_SETTING_FIELDS`. The three filing
     /// rules are deliberately absent: they answer for the account, not for one workspace.
-    static let workspaceFields = ["mailFooterEnabled", "draftsOnly", "draftsOnlyByAccount", "triageScope", "suggestedActions"]
+    static let workspaceFields = ["mailFooterEnabled", "draftsOnlySafeguardByAccount", "triageScope", "suggestedActions"]
 
     func replacingWorkspaceSettings(with other: UserProfile) throws -> UserProfile {
         var values = try JSONSerialization.jsonObject(with: JSONEncoder().encode(self)) as? [String: Any] ?? [:]

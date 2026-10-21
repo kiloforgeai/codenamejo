@@ -4,7 +4,7 @@ import FactoryKit
 import Speech
 import SwiftUI
 
-// Onboarding coordinator on a `NavigationStack`: welcome, openAIKey, connectTools, drafts,
+// Onboarding coordinator on a `NavigationStack`: welcome, openAIKey, connectTools,
 // notifications, microphone, speech, preparing. Container view: NO #Preview.
 
 /// Moving between steps and finishing. Which steps exist depends on whether the user is signed in;
@@ -50,11 +50,6 @@ struct OnboardingFlow<Interactor: ViewWithModelLifecycleObserver<OnboardingFlowV
                     // Pushed on a finished Google sign-in; back would only reopen its consent.
                     .navigationBarBackButtonHidden(true)
 
-            case .drafts:
-                OnboardingDraftsViewComponent.make(
-                    onNext: { interactor.advance(viewModel: viewModel) }
-                )
-
             case .notifications:
                 OnboardingNotificationsViewComponent.make(
                     onNext: { interactor.advance(viewModel: viewModel) }
@@ -98,7 +93,7 @@ struct OnboardingFlowComponent {
 final class OnboardingFlowViewModel: ViewModel {
     enum Step: Int, CaseIterable {
         case openAIKey, welcome, microphone, speech, connectTools,
-             notifications, drafts, preparing
+             notifications, preparing
 
         static let flowSteps: [Step] = [
             // The key straight after the welcome page's Google consent: nothing before it calls
@@ -107,7 +102,6 @@ final class OnboardingFlowViewModel: ViewModel {
             .welcome, .openAIKey, .microphone, .speech,
             .connectTools,
             .notifications,
-            // .drafts,
             .preparing
         ]
     }
@@ -128,7 +122,6 @@ final class OnboardingFlowViewModel: ViewModel {
 @MainActor
 final class OnboardingFlowInteractor: ViewModelInteractor<OnboardingFlowViewModel> {
     @Injected(\.backend) private var backend
-    @Injected(\.connections) private var connections
     @Injected(\.userProfile) private var userProfile
     @Injected(\.voiceLauncher) private var voiceLauncher
     @Injected(\.realtimeService) private var realtimeService
@@ -176,11 +169,6 @@ final class OnboardingFlowInteractor: ViewModelInteractor<OnboardingFlowViewMode
 
 extension OnboardingFlowInteractor: OnboardingFlowHandler {
     func advance(viewModel: OnboardingFlowViewModel) {
-        // Guard: the drafts step's copy names Gmail Drafts. It only ever drops a later step, so the
-        // snapshot on `steps` doesn't shift.
-        if viewModel.step == .connectTools, connections.gmailAccounts.isEmpty {
-            viewModel.steps.removeAll { $0 == .drafts }
-        }
         // A permission already answered is dropped rather than shown and skipped.
         if AVAudioApplication.shared.recordPermission != .undetermined,
            !viewModel.path.contains(.microphone) {

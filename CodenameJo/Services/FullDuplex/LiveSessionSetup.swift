@@ -110,7 +110,6 @@ enum LiveSessionSetup {
     static let tools: [String: any LiveTool] = {
         let s = LiveToolSchemas.self
         let phone: [any LiveTool] = [
-            PhoneTool(s.setMailMode) { $0.answerSetMailMode(callId: $1.id, argumentsJSON: $1.arguments) },
             PhoneTool(s.listProfiles) { $0.answerProfiles(callId: $1.id, name: $1.name, argumentsJSON: $1.arguments) },
             PhoneTool(s.switchProfile) { $0.answerProfiles(callId: $1.id, name: $1.name, argumentsJSON: $1.arguments) },
             PhoneTool(s.createProfile) { $0.runProfileManagement(callId: $1.id, name: $1.name, argumentsJSON: $1.arguments) },
@@ -284,7 +283,7 @@ enum LiveSessionSetup {
         add("set_rule")
         add("feed_items")
         if localCoachingDelivery { add("coach_capability") }
-        for name in ["set_mail_mode", "list_profiles", "switch_profile", "create_profile", "rename_profile",
+        for name in ["list_profiles", "switch_profile", "create_profile", "rename_profile",
                      "search_context", "list_calls", "save_context", "forget_context", "end_session", "stop_listening"] {
             add(name)
         }

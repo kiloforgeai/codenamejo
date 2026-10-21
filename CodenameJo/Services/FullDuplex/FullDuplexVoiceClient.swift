@@ -2801,29 +2801,14 @@ final class FullDuplexVoiceClient {
         runFunctionToolBlocking(callId: call.id, name: call.name, argumentsJSON: call.arguments)
     }
 
-    func answerSetMailMode(callId: String, argumentsJSON: String) {
-        let mode = Self.stringArgument("mode", in: argumentsJSON) ?? ""
-        let account = Self.stringArgument("account", in: argumentsJSON)
-        let dial = dialGeneration
-        let started = Date()
-        Task { [weak self] in
-            let result = await Container.shared.userProfile().setMailMode(mode: mode, account: account)
-            guard let self, self.isActive, self.dialGeneration == dial else { return }
-            self.finishContextTool(callId: callId, tool: "set_mail_mode", output: result.output,
-                ms: Date().timeIntervalSince(started) * 1000,
-                outcome: result.saved ? "wrote" : "refused", query: ProfileRuntime.snapshot?.profileId ?? "",
-                detail: mode, failed: !result.saved, dial: dial)
-        }
-    }
-
     func answerProfiles(callId: String, name: String, argumentsJSON: String) {
         let profiles = Container.shared.workspaceProfiles()
         let arguments = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8))) as? [String: Any]
         let destination = profiles.profiles.first { $0.name.compare(arguments?["name"] as? String ?? "", options: [.caseInsensitive]) == .orderedSame }
         if name == "list_profiles" || destination == nil {
             let names = profiles.profiles.map(\.name).joined(separator: ", ")
-            // The active profile's inboxes and their mode as of now, since set_mail_mode can change it mid-call.
-            let inboxes = (ProfileRuntime.snapshot?.emails ?? []).map { "\($0) (\(DraftsOnly.isOn(for: $0) ? "drafts" : "send"))" }
+            // The active profile's inboxes and their safeguard as of now, since Settings can change it mid-call.
+            let inboxes = (ProfileRuntime.snapshot?.emails ?? []).map { "\($0) (\(DraftsOnly.isOn(for: $0) ? "drafts only" : "sends or drafts as asked"))" }
             let active = profiles.selected.map { ". Active profile: \($0.name). Its inboxes: " + (inboxes.isEmpty ? "none" : inboxes.joined(separator: ", ")) } ?? ""
             let output = name == "list_profiles" ? "Profiles: " + names + active + "." : "No profile matches that name. Available profiles: " + names
             finishContextTool(callId: callId, tool: name, output: output, ms: 0, outcome: "hit", query: "", detail: "profiles")

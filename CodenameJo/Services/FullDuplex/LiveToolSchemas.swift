@@ -766,27 +766,6 @@ enum LiveToolSchemas {
         "strict": false,
     ]
 
-    static let setMailMode: [String: Any] = [
-        "type": "function",
-        "name": "set_mail_mode",
-        "description": "Enable or disable ongoing draft mode for one email account in the selected profile without ending this call. If multiple inboxes exist, ask which account and wait for the answer before calling; do not infer it from the feed. With exactly one inbox, account may be omitted. mode drafts enables draft mode; mode send disables it and enables future requested sends. All other inboxes and profiles are unchanged. If a different profile is requested, switch_profile first and wait for success. This never sends existing drafts or writes a message. Confirm only after success.",
-        "parameters": [
-            "type": "object",
-            "properties": [
-                "mode": [
-                    "type": "string",
-                    "enum": ["send", "drafts"],
-                ],
-                "account": [
-                    "type": "string",
-                    "description": "Exact connected email address chosen by the user in the active profile. Required when the profile has multiple inboxes; omit only for a single-inbox profile.",
-                ],
-            ],
-            "required": ["mode"],
-        ],
-        "strict": false,
-    ]
-
     static let listProfiles: [String: Any] = [
         "type": "function",
         "name": "list_profiles",

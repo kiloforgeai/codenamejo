@@ -65,12 +65,12 @@ final class WorkspaceProfileTests: XCTestCase {
         var outgoing = UserProfile()
         outgoing.appearance = "dark"
         outgoing.archiveAfterReply = true
-        outgoing.draftsOnlyByAccount = ["personal@example.test": true]
+        outgoing.draftsOnlySafeguardByAccount = ["personal@example.test": true]
         let incoming = try outgoing.replacingWorkspaceSettings(with: UserProfile())
         XCTAssertEqual(incoming.appearance, "dark")
         // A filing rule answers for the account, so a switch must not clear it (#798).
         XCTAssertEqual(incoming.archiveAfterReply, true)
-        XCTAssertNil(incoming.draftsOnlyByAccount)
+        XCTAssertNil(incoming.draftsOnlySafeguardByAccount)
     }
 
     func testPreparationCombinesAccountSettingsWithDestinationOverrides() throws {

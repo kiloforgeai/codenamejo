@@ -72,7 +72,7 @@ enum CustomCommandRules {
         // A step that switches a rule switches it again on every run, including back on.
         "set_rule": false,
         // Each would change something every time the keyword is said.
-        "feed_items": false, "coach_capability": false, "set_mail_mode": false,
+        "feed_items": false, "coach_capability": false,
         "switch_profile": false, "create_profile": false, "rename_profile": false,
         "end_session": false, "stop_listening": false,
         // A command that edits, lists or runs commands can rewrite or invoke itself.
