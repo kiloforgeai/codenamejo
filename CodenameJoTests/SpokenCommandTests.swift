@@ -6,6 +6,21 @@ import XCTest
 /// that must not.
 final class SpokenCommandTests: XCTestCase {
 
+    func testExplicitJoResetPhrases() {
+        for phrase in ["Jo, reset.", "Hey Joe, reset please", "Reset Jo", "Jo force reset",
+                       "Force reset Joe", "OK, reset Jo, thank you"] {
+            XCTAssertEqual(SpokenCommand.match(phrase), .resetCall, phrase)
+        }
+    }
+
+    func testResetNeverMatchesNegationQuestionsOrEmailContent() {
+        for phrase in ["Don't reset Jo", "Jo reset the password", "How do I reset Jo?",
+                       "Tell Joe reset", "The email says Jo reset", "Can Jo reset my password?",
+                       "reset", "start over", "restart the email", "Jo reset but not yet"] {
+            XCTAssertNil(SpokenCommand.match(phrase), phrase)
+        }
+    }
+
     func testAcceptedWordingsEndTheCall() {
         for said in ["End the chat.", "Hang up.", "end session", "Goodbye.",
                      "end the conversation", "I am done"] {

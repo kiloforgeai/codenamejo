@@ -563,6 +563,10 @@ class RealtimeService: ObservableObject {
             // two questions ago, which reads as work that never happened.
             self?.turnSteps = []
         }
+        client.onResetRequested = { [weak self, weak client] in
+            guard let self, let client, self.fullDuplex === client else { return }
+            self.resetLiveConversation()
+        }
         // The model asked to hang up and has finished saying goodbye.
         //
         // **`endBySpokenCommand()`, not `endConversation()`, and the name is now half
@@ -1395,7 +1399,7 @@ class RealtimeService: ObservableObject {
                 try await client.start(announcingConnect: announcingConnect, opening: opening)
                 // Ended during the handshake, and the consequence if it isn't
                 // caught is a call nobody is in, holding the microphone open.
-                guard let self, self.isConversing else {
+                guard let self, self.isConversing, self.fullDuplex === client else {
                     RealtimeLog.log("fullduplex: ended before it connected — closing the call")
                     client.stop()
                     return
@@ -1415,21 +1419,38 @@ class RealtimeService: ObservableObject {
                         + "on the next connect, not this one")
                 }
             } catch {
+                guard let self, self.fullDuplex === client, self.isConversing else { return }
                 RealtimeLog.log("fullduplex: start failed \(error.localizedDescription)")
-                if let self, self.isConversing, let engine = self.localVoiceEngine(after: error.localizedDescription) {
+                if let engine = self.localVoiceEngine(after: error.localizedDescription) {
                     self.beginLocalVoice(engine: engine, reason: "dial failed: \(error.localizedDescription)")
                     return
                 }
-                self?.isConversing = false
-                self?.clearFeedFocus()
+                self.isConversing = false
+                self.clearFeedFocus()
                 // Without this a dial that never connected leaves notes unsendable for
                 // the rest of the launch, with nothing on screen to say why. Drains as
                 // well as resumes, which is free when the dial failed for want of a
                 // network: `drain()` returns at its own `isOnline` guard.
-                self?.resumeMemoQueue()
-                self?.sessionState = .error(error.localizedDescription)
+                self.resumeMemoQueue()
+                self.sessionState = .error(error.localizedDescription)
             }
         }
+    }
+
+    /// Replace the stuck client without waiting for its tools or starting a new History conversation.
+    private func resetLiveConversation() {
+        guard isConversing, localVoice == nil, let id = activeConversationId else { return }
+        RealtimeLog.log("conversation: spoken reset — replacing the live session")
+        fullDuplex?.stop()
+        fullDuplex = nil
+        isConversing = false
+        commandStartTime = nil
+        pendingBrainSteps = []
+        lastCommandText = ""
+        clearCard()
+        connectFullDuplex()
+        fullDuplex?.resetAcknowledgementPending = true
+        startConversation(in: id, announcingConnect: false, opening: .none)
     }
 
     /// - Parameter reason: what to file the conversation's row under. Defaults to the

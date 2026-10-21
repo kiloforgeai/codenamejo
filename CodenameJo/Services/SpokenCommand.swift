@@ -7,15 +7,24 @@ enum SpokenCommand: Equatable {
     /// Hang up. The same operation as the red button and the Live Activity's X.
     case endCall
 
+    /// Rebuild the live session without waiting for its tools or deleting saved data.
+    case resetCall
+
     /// The phrase, matched whole. `nil` for everything else, which is nearly
     /// everything the user ever says.
     static func match(_ text: String) -> SpokenCommand? {
         let phrase = normalized(text)
         guard !phrase.isEmpty else { return nil }
+        if resetCallPhrases.contains(phrase) { return .resetCall }
         return endCallPhrases.contains(phrase) ? .endCall : nil
     }
 
     // MARK: - Internals
+
+    private static let resetCallPhrases: Set<String> = [
+        "jo reset", "joe reset", "reset jo", "reset joe",
+        "jo force reset", "joe force reset", "force reset jo", "force reset joe",
+    ]
 
     /// Every accepted wording, normalized (`i'm` is `im`). No `mute`/`unmute`: a muted track sends
     /// silence, so "unmute" could never be heard.

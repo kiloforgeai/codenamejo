@@ -83,6 +83,8 @@ final class FullDuplexVoiceClient {
     /// Mute — the model called `stop_listening`. The caller mutes through the same path
     /// as the Mute button, so every mute indicator follows.
     var onMuteRequested: (() -> Void)?
+    var onResetRequested: (() -> Void)?
+    var resetAcknowledgementPending = false
 
     func installProfileDossier(_ dossier: ProfileDossierContext?, profileId: String) {
         guard isActive, ProfileRuntime.snapshot?.profileId == profileId else { return }
@@ -683,7 +685,8 @@ final class FullDuplexVoiceClient {
         }
         pump = Task { [weak self] in
             for await signal in transport.signals {
-                await self?.handle(signal)
+                guard !Task.isCancelled, let self, self.isActive else { return }
+                self.handle(signal)
             }
         }
         didObserveCapture = false
@@ -1160,6 +1163,9 @@ final class FullDuplexVoiceClient {
     }
 
     private func teardown(reason: String) {
+        resetAcknowledgementPending = false
+        modelRoute?.task.cancel()
+        modelRoute = nil
         resetLivePreparation()
         endAfterFarewell = false
         endWatchdog?.cancel()
@@ -1255,6 +1261,9 @@ final class FullDuplexVoiceClient {
 
     private func handle(_ signal: RealtimeSignal) {
         switch signal {
+        case .liveResetRequested:
+            guard isActive, endCueTask == nil else { return }
+            onResetRequested?()
         case .connected:
             // The one thing the watchdog was waiting for. First, so nothing below it
             // can suspend with a deadline still armed against a call that is up.
@@ -1563,6 +1572,10 @@ final class FullDuplexVoiceClient {
         case .sessionCreated(let model):
             RealtimeLog.log("session: created (\(model ?? "unknown model"))")
             sessionReadyForOpening = true
+            if resetAcknowledgementPending {
+                resetAcknowledgementPending = false
+                transport?.liveAdapter?.speakExactly("I've reset the call. What would you like to do?")
+            }
             if acceptedOpening == .emailQueue, !localTriageForEmailOpening, !toolsReachable {
                 holdOpeningForToolReadiness()
             }
@@ -2543,7 +2556,8 @@ final class FullDuplexVoiceClient {
     private func routeWithModel(_ text: String) {
         LiveIntentRouter.prewarm()
         modelRoute?.task.cancel()
-        guard LiveFastAction.parse(text) == nil else { modelRoute = nil; return }
+        guard SpokenCommand.match(text) != .resetCall,
+              LiveFastAction.parse(text) == nil else { modelRoute = nil; return }
         modelRoute = (text, Task {
             try? await Task.sleep(for: .milliseconds(200))
             if Task.isCancelled { return nil }
