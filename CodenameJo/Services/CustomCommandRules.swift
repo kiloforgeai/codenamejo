@@ -17,6 +17,30 @@ enum CustomCommandRules {
         raw.split(whereSeparator: \.isWhitespace).joined(separator: " ").lowercased()
     }
 
+    /// Return only the named command; unrelated steps must never enter a run's context.
+    static func run(keyword raw: String, commands: [CustomCommand]) -> Result<String, Refusal> {
+        let keyword = normalise(raw)
+        guard !keyword.isEmpty else {
+            return .failure(Refusal("Specify the saved command's exact keyword. No command was run."))
+        }
+        guard let command = commands.first(where: { $0.keyword == keyword }) else {
+            return .failure(Refusal("There is no saved command called \"\(keyword)\". No command was run. Do not guess another command."))
+        }
+        guard command.enabled else {
+            return .failure(Refusal("\"\(keyword)\" is switched off. No command was run."))
+        }
+        guard !command.actions.isEmpty else {
+            return .failure(Refusal("\"\(keyword)\" has no steps. No command was run."))
+        }
+        let steps = command.actions.enumerated().map { "  \($0.offset + 1). \($0.element.line)" }
+            .joined(separator: "\n")
+        return .success("The saved command \"\(keyword)\". The numbered steps are the only instructions — "
+            + "do those, in order, and nothing else. Saying the keyword was the user's yes: run every step "
+            + "without reading it back or waiting for a confirming turn, then say what each one did. "
+            + "Keep the original email IDs and account for all steps about that email, even if an earlier "
+            + "step advances the queue. Never apply a remaining step to the next email.\n" + steps)
+    }
+
     // MARK: - Steps
 
     /// **Every tool, labelled with whether a command may use it as a step.** Not a safety gate

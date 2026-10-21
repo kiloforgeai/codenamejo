@@ -33,6 +33,54 @@ final class LiveClientBrainTests: XCTestCase {
         "name": "archive_message", "arguments": "{\"message_id\":\"a\"}"]
     @MainActor private func drain() async { for _ in 0..<20 { await Task.yield() } }
 
+    @MainActor func testLargeCommandLookupDoesNotPoisonContinuationOrNextTurn() async throws {
+        let h = Harness(); h.start(); await drain()
+        let instructions = String(repeating: "command instruction ", count: 5_500)
+        h.reply([["type": "function_call", "call_id": "cmd", "name": "commands",
+                  "arguments": #"{"action":"run","keyword":"follow up"}"#]])
+        await drain()
+        h.brain.item(["type": "function_call_output", "call_id": "cmd", "output": instructions])
+        h.brain.continueResponse(delegation: "d1"); await drain()
+        XCTAssertTrue(h.failures.isEmpty)
+        guard h.requests.count == 2 else { return XCTFail("Command continuation was rejected before reaching the model") }
+        let body = try XCTUnwrap(h.requests.last)
+        let input = try LiveOpenAI.boundedInput(body)
+        XCTAssertEqual(input.first { $0["call_id"] as? String == "cmd" && $0["type"] as? String == "function_call_output" }?["output"] as? String, instructions)
+        XCTAssertFalse((body["context"] as? String ?? "").contains("command instruction"))
+        h.reply([Self.call]); await drain()
+        h.brain.item(["type": "function_call_output", "call_id": "c1", "output": "Archive queued for email A"])
+        h.brain.continueResponse(delegation: "d1"); await drain()
+        h.reply([]); await drain()
+        h.brain.user("What did you do?", turn: 2); h.brain.begin("d2", live: true, turn: 2)
+        h.brain.settle(turn: 2); await drain()
+        let context = try XCTUnwrap(h.requests.last?["context"] as? String)
+        XCTAssertFalse(context.contains("command instruction"))
+        XCTAssertTrue(context.contains("Archive queued for email A"))
+        XCTAssertTrue(context.contains("follow up"))
+        XCTAssertTrue(h.failures.isEmpty)
+        h.reply([]); await drain()
+    }
+
+    @MainActor func testCommandSaveRetainsReceiptWithoutRepeatingItsDefinition() async throws {
+        let h = Harness(); h.start(); await drain()
+        let detail = String(repeating: "saved instruction ", count: 6_000)
+        let args: [String: Any] = ["action": "save", "keyword": "follow up",
+            "actions": [["tool": "label_message", "detail": detail]]]
+        let raw = String(decoding: try JSONSerialization.data(withJSONObject: args), as: UTF8.self)
+        h.reply([["type": "function_call", "call_id": "save", "name": "commands", "arguments": raw]])
+        await drain()
+        h.brain.item(["type": "function_call_output", "call_id": "save", "output": "Saved follow up."])
+        h.brain.continueResponse(delegation: "d1"); await drain()
+        XCTAssertTrue(h.failures.isEmpty)
+        guard h.requests.count == 2 else { return XCTFail("Saved definition blocked its own receipt") }
+        let context = try XCTUnwrap(h.requests.last?["context"] as? String)
+        XCTAssertTrue(context.contains("Saved follow up."))
+        XCTAssertFalse(context.contains("saved instruction"))
+        let input = try LiveOpenAI.boundedInput(try XCTUnwrap(h.requests.last))
+        XCTAssertEqual(input.first { $0["call_id"] as? String == "save" }?["arguments"] as? String, raw)
+        h.reply([]); await drain()
+    }
+
     @MainActor func testCorrectionSuppressesProposalAndWaitsForSettledTranscript() async {
         let h = Harness(); h.start(); await drain()
         h.brain.user("archive it — no, skip it", turn: 1)

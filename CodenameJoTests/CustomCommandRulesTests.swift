@@ -13,6 +13,40 @@ final class CustomCommandRulesTests: XCTestCase {
         return nil
     }
 
+    func testRunReturnsOnlyTheExactNamedCommandsSteps() throws {
+        let followUp = CustomCommand(id: "follow", keyword: "follow up", spoken: "Follow up", instruction: "PRIVATE LABEL",
+            actions: [.init(tool: "label_message", detail: "Follow Up on the current email"),
+                      .init(tool: "archive_message", detail: "the same email")], enabled: true)
+        let other = CustomCommand(id: "other", keyword: "research", spoken: "", instruction: "",
+            actions: [.init(tool: "web_search", detail: String(repeating: "UNRELATED", count: 20_000))], enabled: true)
+        let result = try CustomCommandRules.run(keyword: " FOLLOW   UP ", commands: [other, followUp]).get()
+        XCTAssertTrue(result.contains("1. label_message"))
+        XCTAssertTrue(result.contains("2. archive_message"))
+        XCTAssertFalse(result.contains("research"))
+        XCTAssertFalse(result.contains("UNRELATED"))
+        XCTAssertFalse(result.contains("PRIVATE LABEL"))
+        XCTAssertLessThan(result.utf8.count, 1_000)
+        XCTAssertEqual(result, try CustomCommandRules.run(keyword: "follow up", commands: [followUp]).get())
+    }
+
+    func testRunRefusesMissingDisabledAndEmptyCommandsWithoutAnotherCommandsSteps() throws {
+        var command = CustomCommand(id: "follow", keyword: "follow up", spoken: "", instruction: "",
+            actions: [.init(tool: "label_message", detail: "PRIVATE STEPS")], enabled: true)
+        for keyword in ["", "follow", "command follow up", "follow up today"] {
+            XCTAssertThrowsError(try CustomCommandRules.run(keyword: keyword, commands: [command]).get()) {
+                XCTAssertFalse(($0 as? CustomCommandRules.Refusal)?.sentence.contains("PRIVATE STEPS") == true)
+            }
+        }
+        command.enabled = false
+        XCTAssertThrowsError(try CustomCommandRules.run(keyword: "follow up", commands: [command]).get()) {
+            XCTAssertTrue(($0 as? CustomCommandRules.Refusal)?.sentence.contains("switched off") == true)
+        }
+        command.enabled = true; command.actions = []
+        XCTAssertThrowsError(try CustomCommandRules.run(keyword: "follow up", commands: [command]).get()) {
+            XCTAssertTrue(($0 as? CustomCommandRules.Refusal)?.sentence.contains("no steps") == true)
+        }
+    }
+
     func testAKeywordIsNormalised() throws {
         XCTAssertEqual(CustomCommandRules.normalise("  Candidate\t Screen  "), "candidate screen")
         let saved = try CustomCommandRules.validateSave(keyword: "  Candidate\t Screen  ", actions: steps).get()

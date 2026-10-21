@@ -154,7 +154,7 @@ final class LiveClientBrain {
         }
         if item["type"] as? String == "function_call_output", let id = item["call_id"] as? String,
            let call = functionItems[id] {
-            actionRecords.append(["call": call, "result": LiveCompactContext.text(item["output"] as? String ?? "No result", includeEmailContent: false)])
+            actionRecords.append(Self.actionRecord(call: call, output: item["output"] as? String ?? "No result"))
             functionItems.removeValue(forKey: id)
             while actionRecords.count > 12 { actionRecords.removeFirst() }
         }
@@ -162,6 +162,27 @@ final class LiveClientBrain {
            let text = item["content"] as? String {
             observe(text)
         } else { input.append(item) }
+    }
+
+    /// Keep command definitions in the active exchange, not a second copy in every later turn.
+    private static func actionRecord(call: [String: Any], output: String) -> [String: Any] {
+        var call = call
+        var result = LiveCompactContext.text(output, includeEmailContent: false)
+        if call["name"] as? String == "commands",
+           let raw = call["arguments"] as? String,
+           let arguments = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [String: Any] {
+            let action = arguments["action"] as? String ?? "run"
+            if action == "save" {
+                let identity = arguments.filter { ["action", "keyword"].contains($0.key) }
+                if let data = try? JSONSerialization.data(withJSONObject: identity, options: [.sortedKeys]) {
+                    call["arguments"] = String(decoding: data, as: UTF8.self)
+                }
+            } else if action == "run" || action == "list" {
+                result = "Command lookup returned; this was not execution of its steps. "
+                    + "Individual action records report what ran. Fetch the command again for a new run."
+            }
+        }
+        return ["call": call, "result": result]
     }
 
     func begin(_ id: String, live: Bool, turn: Int) {
@@ -266,7 +287,11 @@ final class LiveClientBrain {
             mandatory["applicationUpdates"] = optionalUpdates
         }
         guard let stateData = try? JSONSerialization.data(withJSONObject: mandatory, options: [.sortedKeys]),
-              stateData.count <= 96_000 else { fail("The current task context is too large to process safely."); return }
+              stateData.count <= 96_000 else {
+            let sizes = mandatory.keys.sorted().map { "\($0)=\(LiveOpenAI.bytes(mandatory[$0]!))" }.joined(separator: " ")
+            RealtimeLog.log("liveBrain: context limit exceeded bytes by field: " + sizes)
+            fail("The current task context is too large to process safely."); return
+        }
         let prior = history.enumerated().filter { $0.offset != turnHistoryIndex }.map(\.element)
         let body: [String: Any] = ["requestId": UUID().uuidString,
             "context": String(decoding: stateData, as: UTF8.self), "history": Array(prior.suffix(12)), "input": input,

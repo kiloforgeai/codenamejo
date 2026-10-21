@@ -3072,43 +3072,26 @@ final class FullDuplexVoiceClient {
     func answerCommands(callId: String, argumentsJSON: String) {
         switch Self.stringArgument("action", in: argumentsJSON) ?? "run" {
         case "list": answerCommandNames(callId: callId)
-        case "run": answerCommandList(callId: callId)
+        case "run": answerCommandRun(callId: callId, keyword: Self.stringArgument("keyword", in: argumentsJSON) ?? "")
         default: answerCommandManage(callId: callId, argumentsJSON: argumentsJSON)
         }
     }
 
-    /// `run` — every switched-on command's steps, read out of the store this phone holds. A
-    /// switched-off command is *absent* rather than flagged, so there is nothing to follow.
-    /// **No labels**: a name beside the steps was read as a second order, and done twice.
-    /// **The keyword is the yes**, and the header says so here as well as in the prompt: a
-    /// command that filed an issue stopped to read the title back and wait, because the
-    /// GitHub skill and the tool's own description both ask for that on an ordinary turn.
-    private func answerCommandList(callId: String) {
+    /// Read one enabled command; a missing keyword must not expand to the entire library.
+    private func answerCommandRun(callId: String, keyword: String) {
         let started = Date()
-        let enabled = customCommands.enabledCommands
         let output: String
-        if enabled.isEmpty {
-            output =
-                "This user has no commands switched on. If they just asked for one by "
-                + "name, say it is switched off — do not guess what it meant."
-        } else {
-            let header = "The user's commands. The numbered steps are the only "
-                + "instructions — do those, in order, and nothing else. Saying the keyword was "
-                + "the user's yes: run every step without reading it back or waiting for a "
-                + "confirming turn, then say what each one did.\n"
-            output = header + enabled.map { command in
-                let steps = command.actions.enumerated()
-                    .map { "  \($0.offset + 1). \($0.element.line)" }
-                    .joined(separator: "\n")
-                guard !steps.isEmpty else { return "• \(command.keyword)" }
-                return "• \(command.keyword)\n\(steps)"
-            }.joined(separator: "\n")
+        let failed: Bool
+        switch CustomCommandRules.run(keyword: keyword, commands: customCommands.commands) {
+        case .success(let instructions): output = instructions; failed = false
+        case .failure(let refusal): output = refusal.sentence; failed = true
         }
         finishContextTool(
             callId: callId, tool: "commands", output: output,
             ms: Date().timeIntervalSince(started) * 1000,
-            outcome: enabled.isEmpty ? "local_empty" : "local_hit",
-            query: "", detail: "\(enabled.count) enabled", subsystem: "commands")
+            outcome: failed ? "local_refused" : "local_hit",
+            query: keyword, detail: "run → \(failed ? "refused" : "found")",
+            subsystem: "commands", failed: failed)
     }
 
     /// `summarize` — the last step of a command, where the assistant says what it found. It
