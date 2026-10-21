@@ -206,6 +206,20 @@ final class LocalSlackQueueTests: XCTestCase {
         XCTAssertEqual(target?.label, "#D1")
     }
 
+    func testPreparedFeedStartsWithoutCacheOrNetworkAndExcludesImportantStage() async {
+        let queue = LocalSlackQueue()
+        await queue.beginCall()
+        _ = await queue.startImportant(snapshot([item("C1")]))
+        await queue.end()
+        await queue.prepareFeed(snapshot([item("C1"), item("C2")]),
+                                profileKey: SlackQueueRefresh.profileKey())
+        let answer = await queue.step(direction: nil, restart: false, stop: false,
+                                      now: Date().addingTimeInterval(3600))
+        XCTAssertFalse(answer.closed)
+        XCTAssertEqual((object(answer.text)["item"] as? [String: Any])?["channel_id"] as? String, "C2")
+        await queue.end()
+    }
+
     func testSnapshotWithoutBandStillDecodes() throws {
         let json = #"{"teamId":"T1","teamName":"Acme","channelId":"C1","label":"x","kind":"channel","#
             + #""unread":1,"more":false,"messages":[],"why":""}"#

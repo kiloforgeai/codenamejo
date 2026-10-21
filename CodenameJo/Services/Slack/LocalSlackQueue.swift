@@ -39,6 +39,7 @@ actor LocalSlackQueue {
         var presentation: String? = nil
     }
 
+    private var preparedFeed: (profileKey: String, snapshot: SlackQueueSnapshot)?
     private var queue: SlackQueueSnapshot?
     private var position = 0
     private var advancedInlineAt: Date?
@@ -52,6 +53,7 @@ actor LocalSlackQueue {
     var isRunning: Bool { queue != nil }
 
     func end() {
+        preparedFeed = nil
         queue = nil
         position = 0
         advancedInlineAt = nil
@@ -78,6 +80,11 @@ actor LocalSlackQueue {
         payload["workspaces"] = snapshot.workspaces
         payload["report"] = Self.reportObject(snapshot.report)
         return Answer(text: Self.json(payload), closed: false)
+    }
+
+    /// Hold the call's prepared feed through its tip/calendar without reloading the network.
+    func prepareFeed(_ snapshot: SlackQueueSnapshot, profileKey: String) {
+        preparedFeed = (profileKey, snapshot)
     }
 
     /// How many conversations in `snapshot` the important stage has not already walked.
@@ -297,6 +304,11 @@ actor LocalSlackQueue {
     }
 
     private func load(forceRefresh: Bool) async -> SlackQueueSnapshot? {
+        let prepared = preparedFeed
+        preparedFeed = nil
+        if !forceRefresh, let prepared, prepared.profileKey == SlackQueueRefresh.profileKey() {
+            return unwalked(prepared.snapshot)
+        }
         if !forceRefresh, let stored = await SlackQueueRefresh.cached(),
            Date().timeIntervalSince(stored.generatedAt) < Self.servingFreshness, let queue = stored.queue {
             return unwalked(queue)

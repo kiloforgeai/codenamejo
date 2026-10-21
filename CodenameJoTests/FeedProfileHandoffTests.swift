@@ -1,4 +1,5 @@
 import XCTest
+import FactoryKit
 @testable import CodenameJo
 
 final class FeedProfileHandoffTests: XCTestCase {
@@ -125,6 +126,48 @@ final class FeedProfileHandoffTests: XCTestCase {
         XCTAssertEqual(try payload(terminal)["nextProfile"] as? String, "Work")
         XCTAssertEqual(try payload(terminal)["calendarDue"] as? Bool, false)
         XCTAssertNil(try payload(terminal)["coaching"])
+        await queue.end()
+    }
+
+    func testTerminalTipCarriesPreparedCalendarForItsContinuation() async throws {
+        let queue = LocalTriageQueue(mailAccounts: { [] })
+        await queue.configure(coachingPlan: .init(lessons: [.init(capability: "voice_only",
+            copy: "Hands free", speech: "Quick tip: hands free. Was that helpful?",
+            answerInstruction: "Feedback only.")]), localCoachingDelivery: true,
+            forceOnboardingFeedLesson: false, sequentialFeed: true,
+            calendarFeedDue: true, localCalendar: false)
+        await queue.installCalendarPrefetch(.init(events: [], attendees: [], covered: true,
+            servedLive: false, successful: true, ms: 0))
+        let result = try payload(await queue.terminalFeed(["done": true], trigger: "test"))
+        XCTAssertNotNil(result["coaching"])
+        XCTAssertEqual(result["calendarDue"] as? Bool, true)
+        XCTAssertNotNil(result["calendarAfterCoaching"] as? String)
+        XCTAssertNil(result["calendarEvents"], "Do not present calendar before the tip is answered")
+        await queue.end()
+    }
+
+    func testLongCallKeepsPreparedSlackThroughCalendarInsteadOfRescanning() async throws {
+        let queue = LocalTriageQueue(mailAccounts: { [] })
+        await queue.configure(coachingPlan: .init(lessons: []),
+            forceOnboardingFeedLesson: false, sequentialFeed: true,
+            calendarFeedDue: true, dynamicSlackFeed: true, localCalendar: false)
+        let team = UUID().uuidString
+        let prepared = SlackQueueSnapshot(workspaces: ["Prepared workspace"], total: 1,
+            items: [.init(teamId: team, teamName: "Prepared workspace", channelId: "C-prepared",
+                withUserId: nil, label: "Prepared channel", kind: "channel", unread: 1, more: false,
+                messages: [], why: "")],
+            report: .init(workspacesUnavailable: nil, unchecked: 0, unreachable: 0,
+                          readStateUnknown: 0, dmsUnavailable: nil, markUnavailable: nil))
+        await queue.installSlackPrefetch(.init(generatedAt: Date().addingTimeInterval(-3600),
+            teams: [team], queue: prepared), profileId: ProfileRuntime.snapshot?.profileId)
+        await Container.shared.localSlack().beginCall()
+        let result = try payload(await queue.terminalFeed(["done": true], trigger: "test"))
+        XCTAssertEqual(result["slackDue"] as? Bool, true)
+        XCTAssertNil(result["slackStep"], "Calendar is still ahead of Slack")
+        let slack = await Container.shared.localSlack().step(direction: nil, restart: false, stop: false)
+        XCTAssertEqual((try payload(slack.text)["item"] as? [String: Any])?["channel_id"] as? String,
+                       "C-prepared")
+        await Container.shared.localSlack().end()
         await queue.end()
     }
 

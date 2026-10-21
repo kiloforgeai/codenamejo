@@ -280,6 +280,7 @@ final class FullDuplexVoiceClient {
     var lastCoachingOfferId: String?
     private var calendarReadTool = "list_calendar_events"
     var calendarFeedPending = false
+    var calendarAfterCoaching: String?
     private var calendarFeedOwners: [String] = []
     var terminalFeedReached = false
     private var terminalFeedResponsePending = false
@@ -606,6 +607,7 @@ final class FullDuplexVoiceClient {
         profileOfferAcceptedAt = nil
         calendarReadTool = "list_calendar_events"
         calendarFeedPending = false
+        calendarAfterCoaching = nil
         calendarFeedOwners = []
         terminalFeedReached = false
         terminalFeedResponsePending = false
@@ -2078,7 +2080,9 @@ final class FullDuplexVoiceClient {
         guard let id = currentAssistantItem, id != finalizedAssistantItem,
               let text = assistantTurns[id], !text.isEmpty else { return }
         finalizedAssistantItem = id
-        if responseCompleted, sequentialFeed, terminalFeedReached {
+        if responseCompleted, sequentialFeed, terminalFeedReached,
+           pendingCoaching == nil, !calendarFeedPending, !slackFeedPending,
+           pendingFeedCompletion == nil || pendingFeedCompletion?.asked == true {
             onFeedFocus?(feedFocusTracker.finishTerminalResponse())
             terminalFeedReached = false
         }
@@ -2416,6 +2420,8 @@ final class FullDuplexVoiceClient {
         /// `triage_next` the model made first.
         let handledMessageId: String?
         var lessonSpoken = false
+        var resumeRequested = false
+        var waitingForCalendar = false
         /// The spoken item the lesson landed in. A Live item ends at a 0.8 s pause rather than
         /// at a turn, so without this a lesson split across two items resumes over itself.
         var spokenAtItem: String?
@@ -3973,6 +3979,7 @@ final class FullDuplexVoiceClient {
         guard calendarFeedPending else { return }
         CalendarFeedCadence.markComplete(owners: calendarFeedOwners)
         calendarFeedPending = false
+        calendarAfterCoaching = nil
         RealtimeLog.log(
             "feed: calendar completed via \(source); marked \(calendarFeedOwners.count) owner(s)")
         armTerminalFeedWrapUp(source: source)
@@ -4538,6 +4545,11 @@ extension FullDuplexVoiceClient {
     func startOnboardingDispatchForTesting(flow: EmailOnboardingFlow, callId: String, argumentsJSON: String) {
         onboardingFlow = flow
         startDispatch(callId: callId, argumentsJSON: argumentsJSON)
+    }
+
+    func activateFeedForTesting(transport: FullDuplexTransport) {
+        self.transport = transport
+        isActive = true
     }
 
     func cancelDispatchesForTesting() {

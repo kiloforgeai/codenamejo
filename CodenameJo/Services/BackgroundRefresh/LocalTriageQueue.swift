@@ -602,6 +602,7 @@ actor LocalTriageQueue {
     private var calendarFeedDue = false
     /// The calendar stage's rest-of-today, started at session setup so the stage never waits on it.
     private var calendarAgendaPrefetch: Task<CalendarSearch.Result?, Never>?
+    private var calendarAgendaPrepared: CalendarSearch.Result?
     /// The events the last inlined calendar stage carried, for the Feed card.
     private(set) var inlinedCalendarEvents: [CalendarStore.Event] = []
     /// The Feed reaches Slack for the active profile; the sweep starts with the call.
@@ -934,14 +935,17 @@ actor LocalTriageQueue {
         pageFeedPresented = false
         self.calendarFeedDue = calendarFeedDue
         calendarAgendaPrefetch?.cancel()
+        calendarAgendaPrepared = nil
         calendarAgendaPrefetch = calendarFeedDue && sequentialFeed
             ? Task {
                 let granted = GoogleAccountStore.all()
                     .filter { GoogleCredential.calendarScopes.allSatisfy($0.scopes.contains) }
                     .map(\.email)
-                return await CalendarSearch.feedAgenda(
+                let result = await CalendarSearch.feedAgenda(
                     accounts: ProfileRuntime.allowedMailAccounts(granted),
                     store: CalendarStore(database: Container.shared.localContext().dbPool))
+                if !Task.isCancelled { self.calendarAgendaPrepared = result }
+                return result
             }
             : nil
         inlinedCalendarEvents = []
@@ -1036,6 +1040,7 @@ actor LocalTriageQueue {
         calendarFeedDue = false
         calendarAgendaPrefetch?.cancel()
         calendarAgendaPrefetch = nil
+        calendarAgendaPrepared = nil
         inlinedCalendarEvents = []
         dynamicSlackFeed = false
         importantSlackStage = false
@@ -3913,11 +3918,12 @@ actor LocalTriageQueue {
         let scope = ProfileRuntime.snapshot
         var slackLoaded: SlackQueueCache.Loaded?
         if dynamicSlackFeed {
-            slackLoaded = await slackFeedPrefetch?.value
-            let stale = slackLoaded.map {
-                Date().timeIntervalSince($0.generatedAt) >= SlackQueueRefresh.backgroundFreshness
-            } ?? true
-            if stale { slackLoaded = await SlackQueueRefresh.forFeed(scope: scope) }
+            // One prepared sweep belongs to this profile's call, even after a long tip or inbox walk.
+            if let prepared = slackFeedPrefetched, prepared.profileId == scope?.profileId {
+                slackLoaded = prepared.loaded
+            } else {
+                slackLoaded = await slackFeedPrefetch?.value
+            }
             guard ProfileRuntime.snapshot?.profileId == scope?.profileId else { return Self.json(base) }
         }
         let stagesPresented = feedEmitted || pageFeedPresented
@@ -3930,7 +3936,8 @@ actor LocalTriageQueue {
         let slackCount = await Container.shared.localSlack().unwalkedCount(slackLoaded?.queue)
         let slackDue = dynamicSlackFeed && slackCount > 0
             && CalendarFeedCadence.isDue(owners: SlackFeedCadence.owners(teams: slackTeams))
-        if slackDue {
+        if slackDue, let prepared = slackLoaded?.queue {
+            await Container.shared.localSlack().prepareFeed(prepared, profileKey: SlackQueueRefresh.profileKey(scope))
             payload["slackDue"] = true
             payload["slackTeams"] = slackTeams
         }
@@ -3944,7 +3951,7 @@ actor LocalTriageQueue {
             + "tool required by the answer. After its terminal answer or a decline, "
             + "continue the remaining stages. "
             + "Then, only when calendarDue is true, say exactly \"That's all in "
-            + "the emails, let's go through your calendar now.\" When calendarEvents is present it is the rest of today, already "
+            + "the emails, let's go through your calendar now.\" When calendarEvents or calendarAfterCoaching is present it is the rest of today, already "
             + "looked up: summarize it chronologically right after that line, in the same response, "
             + "and call no time or calendar tool. Otherwise start current_time and the "
             + "calendar lookup in that same response, before results arrive. Do not offer a "
@@ -3959,10 +3966,9 @@ actor LocalTriageQueue {
                 : "")
             + "Preserve the terminal completion instructions. " + FeedProfileHandoff.completionInstructions
         if !stagesPresented, let coaching = await takeFeedCoaching(page: false) { payload["coaching"] = coaching }
-        // Behind a tip the stage is a later turn, so it keeps its own lookup.
-        if payload["calendarDue"] as? Bool == true, payload["coaching"] == nil,
-           let agenda = await inlineCalendarAgenda() {
-            payload["calendarEvents"] = agenda
+        if payload["calendarDue"] as? Bool == true,
+           let agenda = await inlineCalendarAgenda(waitForPreparation: payload["coaching"] == nil) {
+            payload[payload["coaching"] == nil ? "calendarEvents" : "calendarAfterCoaching"] = agenda
         }
         // With no tip or calendar in between, Slack's first conversation rides in this same step,
         // so the mail close and the first Slack conversation are one turn.
@@ -4182,7 +4188,7 @@ actor LocalTriageQueue {
                     + "answer or a decline, continue. "
                     + (calendarDue
                         ? "Then say exactly \"Let's pause the emails and go through your "
-                            + "calendar now.\" When calendarEvents is present it is the rest "
+                            + "calendar now.\" When calendarEvents or calendarAfterCoaching is present it is the rest "
                             + "of today, already looked up: summarize it right after that line "
                             + "and call no time or calendar tool. Otherwise start current_time "
                             + "and the calendar lookup in that same response before results "
@@ -4198,18 +4204,27 @@ actor LocalTriageQueue {
         if firstPage, let coaching = await takeFeedCoaching(page: true) {
             payload["coaching"] = coaching
         }
-        if calendarDue, payload["coaching"] == nil, let agenda = await inlineCalendarAgenda() {
-            payload["calendarEvents"] = agenda
+        if calendarDue, let agenda = await inlineCalendarAgenda(waitForPreparation: payload["coaching"] == nil) {
+            payload[payload["coaching"] == nil ? "calendarEvents" : "calendarAfterCoaching"] = agenda
         }
         // An empty checkpoint has no work to present; advance within the same action.
         guard calendarDue || payload["coaching"] != nil else { return nil }
         return payload
     }
 
+    /// Install a completed preparation for deterministic feed-transition tests.
+    func installCalendarPrefetch(_ result: CalendarSearch.Result?) {
+        calendarAgendaPrefetch?.cancel()
+        calendarAgendaPrepared = result
+        calendarAgendaPrefetch = Task { result }
+    }
+
     /// The prefetched agenda as the stage's `calendarEvents`, or nil when it could not be
     /// read — the stage then runs the model's own lookup.
-    private func inlineCalendarAgenda() async -> String? {
-        guard let agenda = await calendarAgendaPrefetch?.value else { return nil }
+    private func inlineCalendarAgenda(waitForPreparation: Bool) async -> String? {
+        // An invitation must not wait for the later calendar stage to finish preparing.
+        let prepared = waitForPreparation ? await calendarAgendaPrefetch?.value : calendarAgendaPrepared
+        guard let agenda = prepared else { return nil }
         let remaining = CalendarSearch.remaining(agenda)
         inlinedCalendarEvents = remaining.events
         return CalendarSearch.formatted(remaining, query: "")

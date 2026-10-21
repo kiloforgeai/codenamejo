@@ -113,3 +113,99 @@ final class LiveCoachingSpeakerContractTests: XCTestCase {
         XCTAssertNil(StandingRule(rawValue: "feed"))
     }
 }
+
+
+extension LiveCoachingSpeakerContractTests {
+    @MainActor private func preparedClient() -> FullDuplexVoiceClient {
+        let client = FullDuplexVoiceClient()
+        let transport = FullDuplexTransport()
+        transport.liveAdapter = LiveSessionAdapter(wire: { _ in }, emit: { _ in })
+        client.activateFeedForTesting(transport: transport)
+        client.sequentialFeed = true
+        client.terminalFeedReached = true
+        client.pendingCoaching = .init(speech: nil, capability: "voice_only",
+            interstitial: "feed", handledMessageId: nil, lessonSpoken: true,
+            spokenAtItem: "lesson")
+        client.currentAssistantItem = "feedback"
+        client.assistantTurns["feedback"] = "Glad that helped."
+        client.pendingFeedCompletion = LiveFeedCompletion.from(step: #"{"done":true,"interstitial":"feed","nextProfile":"Work"}"#)
+        client.armFeedStages(from: #"{"done":true,"interstitial":"feed","calendarDue":true,"calendarAfterCoaching":"No events remain today."}"#)
+        return client
+    }
+
+    @MainActor func testTipContinuesPreparedCalendarThenAsksProfileQuestion() {
+        let client = preparedClient()
+        defer { client.transport?.liveAdapter?.close() }
+        XCTAssertTrue(client.resumeFeedAfterLessonIfSettled())
+        XCTAssertFalse(client.calendarFeedPending)
+        XCTAssertNil(client.calendarAfterCoaching)
+        XCTAssertTrue(client.pendingCoaching?.waitingForCalendar == true)
+        XCTAssertFalse(client.resumeFeedAfterLessonIfSettled(), "Do not move on before calendar speech")
+        client.currentAssistantItem = "calendar"
+        client.assistantTurns["calendar"] = "No events remain today."
+        XCTAssertTrue(client.resumeFeedAfterLessonIfSettled())
+        XCTAssertNil(client.pendingCoaching)
+        XCTAssertTrue(client.pendingFeedCompletion?.asked == true)
+        XCTAssertFalse(client.resumeFeedAfterLessonIfSettled())
+    }
+
+    @MainActor func testBusyToolDoesNotLosePostTipContinuation() {
+        let client = preparedClient()
+        defer { client.transport?.liveAdapter?.close() }
+        client.functionCallTask = Task {}
+        XCTAssertFalse(client.resumeFeedAfterLessonIfSettled())
+        XCTAssertNotNil(client.pendingCoaching)
+        XCTAssertTrue(client.calendarFeedPending)
+        client.functionCallTask = nil
+        XCTAssertTrue(client.resumeFeedAfterLessonIfSettled())
+        XCTAssertFalse(client.calendarFeedPending)
+    }
+
+    @MainActor func testBusyToolAlsoDefersTheClosingQuestion() {
+        let client = preparedClient()
+        defer { client.transport?.liveAdapter?.close() }
+        client.calendarFeedPending = false
+        client.functionCallTask = Task {}
+        XCTAssertFalse(client.resumeFeedAfterLessonIfSettled())
+        XCTAssertNotNil(client.pendingCoaching)
+        XCTAssertFalse(client.pendingFeedCompletion?.asked == true)
+        client.functionCallTask = nil
+        XCTAssertTrue(client.resumeFeedAfterLessonIfSettled())
+        XCTAssertTrue(client.pendingFeedCompletion?.asked == true)
+    }
+
+    @MainActor func testDecliningTipStartsPreparedCalendar() {
+        let client = preparedClient()
+        defer { client.transport?.liveAdapter?.close() }
+        client.pendingCoaching?.lessonSpoken = false
+        client.pendingCoaching?.spokenAtItem = nil
+        XCTAssertTrue(client.tryLocalCoachingAnswer("No thanks"))
+        XCTAssertFalse(client.tryLocalCoachingAnswer("yes"), "The invitation is no longer pending")
+        XCTAssertFalse(client.calendarFeedPending)
+        XCTAssertTrue(client.pendingCoaching?.waitingForCalendar == true)
+    }
+
+    @MainActor func testUnavailablePrefetchRequestsCalendarOnlyOnceAndWaitsForResult() {
+        let client = preparedClient()
+        defer { client.transport?.liveAdapter?.close() }
+        client.calendarAfterCoaching = nil
+        XCTAssertTrue(client.resumeFeedAfterLessonIfSettled())
+        client.currentAssistantItem = "lookup"
+        client.assistantTurns["lookup"] = "Checking your calendar."
+        XCTAssertFalse(client.resumeFeedAfterLessonIfSettled())
+        XCTAssertTrue(client.calendarFeedPending)
+        client.completeCalendarFeedIfPending(source: "test result")
+        XCTAssertTrue(client.resumeFeedAfterLessonIfSettled())
+        XCTAssertTrue(client.pendingFeedCompletion?.asked == true)
+    }
+
+    @MainActor func testTipQuestionDoesNotAdvanceOrFinishTerminalFeed() {
+        let client = preparedClient()
+        defer { client.transport?.liveAdapter?.close() }
+        client.assistantTurns["feedback"] = "Was that helpful?"
+        XCTAssertFalse(client.resumeFeedAfterLessonIfSettled())
+        client.emitFinalTranscript()
+        XCTAssertTrue(client.terminalFeedReached)
+        XCTAssertTrue(client.calendarFeedPending)
+    }
+}
