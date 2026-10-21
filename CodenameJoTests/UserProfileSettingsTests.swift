@@ -15,7 +15,7 @@ final class UserProfileSettingsTests: XCTestCase {
         StandingRule.archiveAfterForward.storageKey,
         StandingRule.archiveAfterLabel.storageKey,
         DraftsOnly.byAccountStorageKey,
-        EmailOnboardingContract.mailModeAccountKey, ThreadQueue.storageKey,
+        ThreadQueue.storageKey,
         TriageScope.storageKey,
         AgentLedEmailSettings.key,
         OnboardingState.storageKey,

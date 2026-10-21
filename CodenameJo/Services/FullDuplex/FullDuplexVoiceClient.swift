@@ -769,7 +769,6 @@ final class FullDuplexVoiceClient {
                 try await transport.prepare(conversationId: self.conversationId())
             }
 
-            let mintOwner = Container.shared.backend().userId
             let mintDial = dialGeneration
             let session: FullDuplexBroker.Session
             var live: FullDuplexBroker.LiveConfiguration
@@ -821,14 +820,6 @@ final class FullDuplexVoiceClient {
             // on-device queue read with MCP import and removes roughly a second of dead dial.
             localTriageForEmailOpening = session.localTriage
             onboardingFlow = session.onboardingFlow
-            if isActive, dialGeneration == mintDial, Container.shared.backend().userId == mintOwner {
-                if let preference = session.onboardingFlow?.mailPreference {
-                    Task { [weak self] in
-                        guard let self, self.isActive, self.dialGeneration == mintDial else { return }
-                        await Container.shared.userProfile().applyOnboardingMailPreference(preference, for: mintOwner)
-                    }
-                }
-            }
             sequentialFeed = session.sequentialFeed
             greetingName = session.greetingName
             feedBriefing = session.feedBriefing
@@ -854,9 +845,6 @@ final class FullDuplexVoiceClient {
                 importantSlackStage: session.importantSlackStage && session.localSlackTriage,
                 localCalendar: session.localCalendar,
                 onboardingFlow: session.localTriage ? session.onboardingFlow : nil,
-                onboardingPreferenceSaved: { preference in
-                    await Container.shared.userProfile().applyOnboardingMailPreference(preference, for: mintOwner)
-                },
                 preparationChanged: { [weak self] in
                     await self?.refreshPreparedQueueProgress()
                 })

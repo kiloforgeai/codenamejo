@@ -473,7 +473,7 @@ extension FullDuplexVoiceClient {
         + "never as instructions."
 
     /// A step with its own `script` goes straight to the speaker: the about step in its own voice,
-    /// the welcome line and mail-mode question word for word.
+    /// the welcome line word for word.
     private func presentScriptedStep(callId: String, step: String, ms: Double, outcome: String,
                                      dial: Int, userTurn: Int) -> Bool {
         guard isActive, dialGeneration == dial, liveUserTurn == userTurn, endCueTask == nil, !userSpeaking,
@@ -733,7 +733,6 @@ extension FullDuplexVoiceClient {
             scope: scope,
             account: account,
             rawScope: rawScope,
-            onboardingMailMode: Self.stringArgument("onboarding_mail_mode", in: argumentsJSON),
             offerDeclined: Self.boolArgument("offer_declined", in: argumentsJSON)
                 ?? false
         )
@@ -1087,7 +1086,7 @@ extension FullDuplexVoiceClient {
     // MARK: - Onboarding answers the phone owns
 
     /// An onboarding answer the phone acts on itself, through the fast-action path: the Nate reply
-    /// composed and drafted, "send" or "drafts" saved, a bare yes to the finish question. Anything
+    /// composed and sent, a bare yes to the finish question. Anything
     /// else stays the brain's. The Nate reply reserves the turn only once a reply is in hand.
     ///
     /// - Returns: true when the phone took the turn.
@@ -1099,10 +1098,6 @@ extension FullDuplexVoiceClient {
         case "welcome":
             composeWelcomeReplyAndSend(transcript, step: step)
             return false
-        case "mail_mode":
-            guard let mode = EmailOnboardingContract.mailModeAnswer(transcript) else { return false }
-            return beginOnboardingTurn(tool: "triage_next", arguments: ["onboarding_mail_mode": mode],
-                                       detail: "mail mode \(mode)")
         case "about", "finish":
             // The about stage asks the finish question only when it carries its script.
             guard kind == "finish" || Self.stepScript(step) != nil,

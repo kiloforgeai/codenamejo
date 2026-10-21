@@ -229,7 +229,7 @@ enum FullDuplexBroker {
         var request = LiveSessionSetup.Request()
         request.opening = opening
         request.onboardingRun = onboardingFlow.map {
-            ($0.mailModeChoice != nil, $0.resume == true, $0.config?.opening ?? "")
+            ($0.resume == true, $0.config?.opening ?? "")
         }
         request.dispatch = true
         request.shortcutText = shortcutText

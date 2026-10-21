@@ -45,7 +45,7 @@ enum LivePrompt {
         var triageScope: String?
         var calendar = false
         var dispatch = false, emailLinkDispatch = false, endSession = false
-        var onboardingMailMode = false, mailModeSwitching = false
+        var mailModeSwitching = false
         var drafting: [String] = [], sending: [String] = []
         var googleNeedsReauth: [String] = [], googleUnreachable: [String] = []
         var notionNeedsReauth: [String] = []
@@ -83,7 +83,7 @@ enum LivePrompt {
             triageScope = json["triageScope"] as? String
             calendar = flag("calendar")
             dispatch = flag("dispatch"); emailLinkDispatch = flag("emailLinkDispatch"); endSession = flag("endSession")
-            onboardingMailMode = flag("onboardingMailMode"); mailModeSwitching = flag("mailModeSwitching")
+            mailModeSwitching = flag("mailModeSwitching")
             drafting = list("drafting"); sending = list("sending")
             googleNeedsReauth = list("googleNeedsReauth"); googleUnreachable = list("googleUnreachable")
             notionNeedsReauth = list("notionNeedsReauth")
@@ -189,10 +189,9 @@ enum LivePrompt {
         if f.dispatch { s += try addendum("dispatch") }
         if f.dispatch && f.emailLinkDispatch { s += try addendum("email-link-dispatch") }
         if f.endSession { s += try addendum("end-session") }
-        if f.onboardingMailMode { s += try "\n" + text("notes/onboarding-mail-mode") + "\n" }
         if f.mailModeSwitching {
             s += try addendum("mail-mode") + "\n"
-        } else if !f.onboardingMailMode {
+        } else {
             s += try "\n" + text("notes/mail-preferences", [
                 "drafting": f.drafting.isEmpty ? "none" : f.drafting.joined(separator: ", "),
                 "sending": f.sending.isEmpty ? "none" : f.sending.joined(separator: ", "),

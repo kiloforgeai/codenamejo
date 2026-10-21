@@ -438,9 +438,8 @@ actor LocalTriageQueue {
         /// The `scope` string as it arrived, when this build does not know it. Kept apart from an absent
         /// scope (`nil` means nobody has been asked yet) so `step` can tell the user what happened.
         var rawScope: String?
-        var onboardingMailMode: String? = nil
         /// The user answered no to the offer the previous step made. Undeclared in the schema
-        /// and asked for by the step's own note, like `onboarding_mail_mode`.
+        /// and asked for by the step's own note.
         var offerDeclined = false
         /// A dispatch handoff's advance. It must hand over an email: the job's answer rides the step
         /// after it, and a tip here would strand the answer inside the lesson.
@@ -575,11 +574,6 @@ actor LocalTriageQueue {
     /// The preparation body calls `stepWithoutWaitingForPreparation` so it never waits on itself.
     private var preparationTask: Task<Void, Never>?
     private var onboardingFlow: EmailOnboardingFlow?
-    private var onboardingMailModePending = false
-    private var onboardingMailModeResumeAdvance = false
-    private var onboardingMailModeReceipt: OnboardingMailModeReceipt?
-    private var onboardingPreferenceSaved: (@Sendable (OnboardingMailPreference) async -> Void)?
-    private var onboardingModeSaver: (@Sendable (String) async throws -> OnboardingMailModeReceipt)?
     private var onboardingItems: [String: EmailOnboardingItem] = [:]
     private var onboardingPreparation: Task<EmailOnboardingSelection, Never>?
     private var onboardingPrepared = false
@@ -919,8 +913,6 @@ actor LocalTriageQueue {
         localCalendar: Bool,
         onboardingFlow: EmailOnboardingFlow? = nil,
         onboardingLoader: (@Sendable () async -> EmailOnboardingSelection)? = nil,
-        onboardingModeSaver: (@Sendable (String) async throws -> OnboardingMailModeReceipt)? = nil,
-        onboardingPreferenceSaved: (@Sendable (OnboardingMailPreference) async -> Void)? = nil,
         preparationChanged: (@Sendable () async -> Void)? = nil
     ) async {
         // App-open preparation owns the actor until its checkpoint is durable, so session setup waits
@@ -976,12 +968,8 @@ actor LocalTriageQueue {
             if self.onboardingFlow?.runId != onboardingFlow.runId {
                 await end()
                 self.onboardingFlow = onboardingFlow
-                self.onboardingMailModePending = onboardingFlow.mailModeChoice?.status == "pending"
-                self.onboardingModeSaver = onboardingModeSaver
                 onboardingResumeStep = onboardingFlow.resume == true ? OnboardingResume.step : 0
-                for seeded in onboardingFlow.seededItems
-                where (seeded.kind(in: onboardingFlow.config) != "welcome" || onboardingFlow.mailPreference == nil)
-                    && seeded.onboardingStep >= onboardingResumeStep {
+                for seeded in onboardingFlow.seededItems where seeded.onboardingStep >= onboardingResumeStep {
                     items.append(seeded.queueItem)
                     onboardingItems[seeded.id] = seeded
                 }
@@ -993,16 +981,6 @@ actor LocalTriageQueue {
                     let mail = await LocalOnboardingMail.prepare(flow: onboardingFlow, store: store)
                     guard let about = await about else { return mail }
                     return .init(items: mail.items + [about], failures: mail.failures)
-                }
-            }
-            self.onboardingModeSaver = onboardingModeSaver
-            self.onboardingPreferenceSaved = onboardingPreferenceSaved
-            if let preference = onboardingFlow.mailPreference {
-                self.onboardingFlow?.mailPreference = preference
-                self.onboardingFlow?.mailModeChoice = onboardingFlow.mailModeChoice
-                if running, position >= 1, position <= items.count, onboardingOnWelcome {
-                    onboardingMailModePending = false
-                    onboardingMailModeResumeAdvance = true
                 }
             }
             feedEligible = false
@@ -1286,9 +1264,6 @@ actor LocalTriageQueue {
             return await onboardingStep(input, store: store, dealtWith: finishesCurrent,
                 opening: startsNewSession)
         }
-        if input.onboardingMailMode != nil {
-            return (Self.json(["note": "The onboarding preference is not active. No setting or queue position changed."]), .ask)
-        }
         if input.offerDeclined { noteOfferDeclined() }
         // The yes to the cleanup offer serves the first message rather than stepping past it.
         if nothingImportantStanding {
@@ -1386,7 +1361,6 @@ actor LocalTriageQueue {
         onboardingPrepared = true
         onboardingFailures = selection.failures
         for item in selection.items where onboardingItems[item.id] == nil && item.onboardingStep >= onboardingResumeStep {
-            if item.kind(in: onboardingFlow?.config) == "welcome", onboardingFlow?.mailPreference != nil { continue }
             onboardingItems[item.id] = item
             items.append(item.queueItem)
         }
@@ -1427,25 +1401,19 @@ actor LocalTriageQueue {
         let aboutQuestion = stage.about != nil && position == items.count
             ? config?.finish?.question ?? EmailOnboardingContract.question : nil
         if aboutQuestion != nil { onboardingCompletionPresented = true }
-        let note = onboardingMailModePending
-            ? config?.mailModeQuestion.map(EmailOnboardingContract.mailModeInstruction(question:)) ?? EmailOnboardingContract.mailModeNote
-            : stage.about.map { EmailOnboardingContract.aboutInstruction($0, question: aboutQuestion) } ?? stage.note(config: config)
+        let note = stage.about.map { EmailOnboardingContract.aboutInstruction($0, question: aboutQuestion) } ?? stage.note(config: config)
         // `kind` is what the phone reads to answer a stage itself; see `tryOnboardingAnswer`.
-        let kind = onboardingMailModePending ? "mail_mode" : stage.kind(in: config)
+        let kind = stage.kind(in: config)
         var payload: [String: Any] = ["done": false, "position": position,
             "onboarding": ["step": config == nil ? stage.onboardingStep : position, "kind": kind, "note": note], "note": note]
         // The handoff lines are recited by the phone, as the about step's script already is.
-        if onboardingMailModePending {
-            // The receipt and preference question are spoken together.
-            let receipt = config?.steps.first { $0.kind == "welcome" }?.receipt ?? EmailOnboardingContract.welcomeSendReceipt
-            payload["script"] = receipt + " " + (config?.mailModeQuestion ?? EmailOnboardingContract.mailModeQuestion)
-        } else if stage.kind(in: config) == "welcome" {
+        if stage.kind(in: config) == "welcome" {
             payload["script"] = config?.step(stage.onboardingStep)?.line ?? EmailOnboardingContract.welcomeLine
         }
         // A beat has a placeholder item so the cursor can stand on it; it is never shown as mail.
         if let about = stage.about {
             payload["about"] = ["items": about.items]
-            if let aboutQuestion, !onboardingMailModePending {
+            if let aboutQuestion {
                 payload["script"] = EmailOnboardingContract.aboutScript(about, question: aboutQuestion)
             }
         } else if stage.kind(in: config) != "beat" {
@@ -1472,52 +1440,6 @@ actor LocalTriageQueue {
             await end()
             return (Self.json(["stopped": true, "note": "Onboarding has stopped."]), .hit)
         }
-        if let mode = input.onboardingMailMode {
-            guard ["drafts", "send", "skip"].contains(mode) else {
-                return (Self.json(["onboarding": ["step": 1], "note": "Choose send or drafts explicitly; yes/no is ambiguous. Nothing was saved."]), .ask)
-            }
-            let alreadyAdvanced = onboardingMailModeReceipt != nil && !onboardingMailModeResumeAdvance
-            guard onboardingMailModePending || alreadyAdvanced || onboardingMailModeResumeAdvance,
-                  let flow = onboardingFlow else {
-                return (Self.json(["onboarding": ["step": 1], "note": "The preference question is not pending. Nothing was saved or advanced."]), .ask)
-            }
-            let runId = flow.runId
-            let preferenceSaved = onboardingPreferenceSaved
-            do {
-                let receipt: OnboardingMailModeReceipt
-                if let onboardingModeSaver { receipt = try await onboardingModeSaver(mode) }
-                else { receipt = try EmailOnboardingContract.saveMailMode(flow: flow, mode: mode) }
-                guard receipt.mailPreference.account == flow.mailModeChoice?.account else { throw URLError(.cannotParseResponse) }
-                // Saving belongs to the signed-in owner even if this call has ended.
-                await preferenceSaved?(receipt.mailPreference)
-                guard onboardingFlow?.runId == runId else { return (Self.json(["stopped": true]), .hit) }
-                onboardingMailModeReceipt = receipt
-                onboardingMailModePending = false
-                onboardingMailModeResumeAdvance = false
-                if alreadyAdvanced {
-                    return (mailModeOutput(receipt, output: onboardingCompletionPresented
-                        ? Self.json(["onboarding": onboardingFinishStage]) : onboardingCurrent()), .hit)
-                }
-                await prepareOnboardingTail()
-                guard onboardingFlow?.runId == runId else { return (Self.json(["stopped": true]), .hit) }
-                onboardingMailModeResumeAdvance = false
-                let next = await advance(Input(), store: store, dealtWith: dealtWith)
-                return (mailModeOutput(receipt, output: next.0), next.1)
-            } catch {
-                guard onboardingFlow?.runId == runId else { return (Self.json(["stopped": true]), .hit) }
-                RealtimeLog.log("onboarding: preference save failed — \(error)")
-                return (Self.json(["onboarding": ["step": 1], "note": "I couldn’t confirm the preference was saved. Please try that choice again. " + EmailOnboardingContract.mailModeNote]), .ask)
-            }
-        }
-        if onboardingMailModeResumeAdvance {
-            let runId = onboardingFlow?.runId
-            await prepareOnboardingTail()
-            guard onboardingFlow?.runId == runId, runId != nil else { return (Self.json(["stopped": true]), .hit) }
-            onboardingMailModeResumeAdvance = false
-            if running, onboardingOnWelcome {
-                return await advance(Input(), store: store, dealtWith: dealtWith)
-            }
-        }
         if onboardingCompletionPresented {
             let seen = items
             await end()
@@ -1535,13 +1457,6 @@ actor LocalTriageQueue {
             return (onboardingCurrent(), .hit)
         }
         if opening || input.direction == "back" { return (onboardingCurrent(), .hit) }
-        if onboardingMailModePending { return (onboardingCurrent(), .hit) }
-        if let flow = onboardingFlow, flow.mailModeChoice != nil, flow.mailPreference == nil,
-           onboardingMailModeReceipt == nil, onboardingOnWelcome {
-            onboardingMailModePending = true
-            OnboardingResume.asked(runId: flow.runId)
-            return (onboardingCurrent(), .hit)
-        }
         await prepareOnboardingTail()
         guard onboardingFlow != nil else { return (Self.json(["stopped": true]), .hit) }
         return await advance(input, store: store, dealtWith: dealtWith)
@@ -1553,15 +1468,6 @@ actor LocalTriageQueue {
         let firstMail = steps.firstIndex { ["important", "cleanup"].contains($0.kind) }.map { $0 + 1 } ?? .max
         let firstSeeded = items.first.flatMap { onboardingItems[$0.id]?.onboardingStep } ?? .max
         return firstMail < firstSeeded
-    }
-
-    private func mailModeOutput(_ receipt: OnboardingMailModeReceipt, output: String) -> String {
-        guard var payload = try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any],
-              let data = try? JSONEncoder().encode(receipt.mailPreference),
-              let preference = try? JSONSerialization.jsonObject(with: data) else { return output }
-        // No spoken receipt: Live's own acknowledgement of their answer already says it.
-        payload["mailPreference"] = preference
-        return Self.json(payload)
     }
 
     private func performStep(
@@ -2870,11 +2776,6 @@ actor LocalTriageQueue {
         onboardingPreparation?.cancel()
         onboardingPreparation = nil
         onboardingFlow = nil
-        onboardingMailModePending = false
-        onboardingMailModeResumeAdvance = false
-        onboardingMailModeReceipt = nil
-        onboardingModeSaver = nil
-        onboardingPreferenceSaved = nil
         onboardingItems = [:]
         onboardingPrepared = false
         onboardingCompletionPresented = false
@@ -3627,7 +3528,7 @@ actor LocalTriageQueue {
     func onboardingWelcomeReply(_ arguments: String) -> String? {
         guard let welcome = onboardingFlow?.welcome else { return nil }
         return EmailOnboardingContract.welcomeReplyArguments(
-            arguments, welcome: welcome, onWelcomeStage: onboardingOnWelcome && !onboardingMailModePending)
+            arguments, welcome: welcome, onWelcomeStage: onboardingOnWelcome)
     }
 
     static func draftRelayArguments(_ arguments: String, in items: [Item]) -> String {

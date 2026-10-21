@@ -105,24 +105,6 @@ final class UserProfileStore: ObservableObject {
         }
     }
 
-    /// Merge the broker's saved first-mailbox choice before another whole-profile upload.
-    func applyOnboardingMailPreference(_ preference: OnboardingMailPreference, for owner: String?) async {
-        guard backend.isSignedIn, owner != nil, backend.userId == owner,
-              UserDefaults.standard.string(forKey: EmailOnboardingContract.mailModeAccountKey) != preference.account
-        else { return }
-        await inFlightUpload?.value
-        guard backend.isSignedIn, backend.userId == owner,
-              UserDefaults.standard.string(forKey: EmailOnboardingContract.mailModeAccountKey) != preference.account
-        else { return }
-        UserDefaults.standard.set(preference.account, forKey: EmailOnboardingContract.mailModeAccountKey)
-        if let draftsOnly = preference.draftsOnly {
-            DraftsOnly.set(draftsOnly, for: preference.account)
-        }
-        if !(await flush()) {
-            RealtimeLog.log("onboarding: saved mail preference is pending local profile synchronization")
-        }
-    }
-
     // MARK: - Saving
 
     /// Upload the current settings if they differ from the last profile seen.

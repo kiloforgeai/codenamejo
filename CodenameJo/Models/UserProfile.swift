@@ -17,7 +17,6 @@ struct UserProfile: Codable, Equatable {
     var archiveAfterForward: Bool?
     var archiveAfterLabel: Bool?
 
-    var onboardingMailModeAccount: String?
 
     /// Whether the mail queue groups its messages into conversations. See `ThreadQueue`.
     var threadQueue: Bool?
@@ -68,7 +67,6 @@ struct UserProfile: Codable, Equatable {
         profile.archiveAfterReply = flag(StandingRule.archiveAfterReply.storageKey)
         profile.archiveAfterForward = flag(StandingRule.archiveAfterForward.storageKey)
         profile.archiveAfterLabel = flag(StandingRule.archiveAfterLabel.storageKey)
-        profile.onboardingMailModeAccount = text(EmailOnboardingContract.mailModeAccountKey)
         profile.threadQueue = flag(ThreadQueue.storageKey)
         // Presence, not emptiness: an absent key means this build never wrote one.
         profile.draftsOnlySafeguardByAccount =
@@ -104,7 +102,6 @@ struct UserProfile: Codable, Equatable {
         write(archiveAfterReply, StandingRule.archiveAfterReply.storageKey)
         write(archiveAfterForward, StandingRule.archiveAfterForward.storageKey)
         write(archiveAfterLabel, StandingRule.archiveAfterLabel.storageKey)
-        write(onboardingMailModeAccount, EmailOnboardingContract.mailModeAccountKey)
         write(threadQueue, ThreadQueue.storageKey)
         // Through `DraftsOnly` because the stored shape is encoded JSON; `nil` still removes the
         // key.

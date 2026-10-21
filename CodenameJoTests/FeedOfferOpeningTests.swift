@@ -52,7 +52,7 @@ final class FeedOfferOpeningTests: XCTestCase {
         XCTAssertTrue(brain.contains("# Fresh-call feed offer"))
         XCTAssertFalse(brain.contains("# Fresh-call sequential email feed"))
 
-        request.onboardingRun = (mailMode: true, resume: true, opening: "")
+        request.onboardingRun = (resume: true, opening: "")
         let resumedSetup = LiveSessionSetup.resolve(request, state, catalog: catalog)
         XCTAssertEqual(resumedSetup.openingMode, .emailQueue)
         XCTAssertEqual(SessionOpening.accepted(
