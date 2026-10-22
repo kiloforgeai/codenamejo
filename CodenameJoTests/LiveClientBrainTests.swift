@@ -368,7 +368,7 @@ extension LiveClientBrainTests {
         try receive(["type": "session.input_transcript.delta", "delta": "archive it", "start_ms": 0, "end_ms": 100])
         try receive(["type": "session.delegation.created", "offset_ms": 100,
                      "delegation": ["id": "client-d1", "target": "client"]])
-        try await Task.sleep(for: .milliseconds(1150))
+        try await Task.sleep(for: .milliseconds(650))
         await drain()
         XCTAssertEqual(calls, 1)
         XCTAssertEqual(requests.count, 2)
@@ -506,7 +506,7 @@ extension LiveClientBrainTests {
             try receive(["type": "session.input_transcript.delta", "delta": "archive it", "start_ms": turn * 2000, "end_ms": turn * 2000 + 100])
             try receive(["type": "session.delegation.created", "offset_ms": turn * 2000 + 100,
                 "delegation": ["id": "d\(turn)", "target": "client"]])
-            try await Task.sleep(for: .milliseconds(1150)); await drain()
+            try await Task.sleep(for: .milliseconds(650)); await drain()
         }
         XCTAssertEqual(codes, ["live_client_brain_failed"])
         XCTAssertEqual(requests, 2)

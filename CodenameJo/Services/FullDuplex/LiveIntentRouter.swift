@@ -5,7 +5,7 @@ import FoundationModels
 /// the fixed list misses ("get rid of this", "toss it") can still take the fast path.
 @Generable
 enum LiveSpokenIntent: String {
-    case spam, trash, next, other
+    case archive, spam, trash, next, other
 }
 
 @Generable
@@ -18,8 +18,9 @@ struct LiveSpokenRoute {
 enum LiveIntentRouter {
     private static let instructions = """
     You classify one spoken utterance from someone going through their email inbox by voice, one email at a time.
+    archive: they want the current email archived, filed away, gotten rid of, tossed, or cleared.
     spam: they say the current email is spam or junk.
-    trash: they explicitly say delete or trash. Archive, file away, get rid of, toss and clear mean other.
+    trash: they explicitly say delete or trash. "Get rid of" and "toss" mean archive, not trash.
     next: they want to skip the current email or move on to the next one without acting on it.
     other: anything else. That includes replies, drafts, questions, small talk, thanks, statements, a negated instruction ("don't archive it"), \
     a question about something already done, and any instruction about a meeting, a different email, a person, a calendar, or the call itself.
@@ -44,7 +45,9 @@ enum LiveIntentRouter {
         switch action {
         case .trash:
             if has(["delete", "trash"]) { return .trash }
-            return nil
+            return has(["get rid", "toss", "archive"]) ? .archive : nil
+        case .archive:
+            return has(["archive", "get rid", "toss", "file it", "file this", "file that", "clear it", "clear this"]) ? .archive : nil
         case .spam:
             return has(["spam", "junk"]) ? .spam : nil
         case .next:
@@ -73,6 +76,7 @@ enum LiveIntentRouter {
         let ms = elapsed.seconds * 1000 + elapsed.attoseconds / 1_000_000_000_000_000
         RealtimeLog.log("fmRouter: '\(text)' → \(intent?.rawValue ?? "error") in \(ms) ms")
         switch intent {
+        case .archive: return .archive
         case .spam: return .spam
         case .trash: return .trash
         case .next: return .next
