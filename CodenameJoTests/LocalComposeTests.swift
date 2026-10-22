@@ -367,6 +367,19 @@ final class LocalComposeTests: XCTestCase {
 
     // MARK: - Drafts only, and the first-time check
 
+    /// Off is the default: an inbox nobody has set sends what the user asked to send.
+    func testAnInboxWithNoSafeguardSetSendsTheSend() async throws {
+        let scripted = gmail(dealt(Mail(id: "m1", from: dana, to: owner)))
+        let result = await run("send_email", ["thread_id": "T1", "body": "Sounds good."])
+        XCTAssertEqual(result.text, "Sent to \(dana) from \(owner).")
+        XCTAssertEqual(posts(scripted), ["messages/send"])
+
+        let draft = gmail(dealt(Mail(id: "m1", from: dana, to: owner)))
+        let drafted = await run("create_draft", ["thread_id": "T1", "body": "Sounds good."])
+        XCTAssertEqual(posts(draft), ["drafts"], "and still drafts when they ask for a draft")
+        XCTAssertFalse(drafted.text.contains("Drafts only"))
+    }
+
     func testOnboardingReplySendsWithoutChangingTheSafeguard() async throws {
         DraftsOnly.set(true, for: owner)
         let scripted = gmail(dealt(Mail(id: "m1", from: dana, to: owner)))

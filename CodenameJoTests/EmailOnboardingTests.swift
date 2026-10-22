@@ -361,6 +361,24 @@ final class EmailOnboardingTests: XCTestCase {
         await queue.end()
     }
 
+    /// The Nate send lands straight on the about step now that no question sits between them.
+    /// Its line is too long for `presentPreparedEmail`, which drops it without a sound, so the
+    /// speech after the write has to be routed to `presentScript` (on device, 2026-10-21).
+    func testTheNateSendLandsOnAnAboutStepRoutedToTheLongScriptSpeaker() async throws {
+        let queue = try await aboutQueue(draft: true)
+        let store = MailStore(database: nil, userId: "test-user")
+        let welcome = await queue.openingStep(store: store)
+        let welcomeSpeech = try XCTUnwrap(FullDuplexVoiceClient.stageSpeech(welcome.output))
+        XCTAssertFalse(welcomeSpeech.about, "the welcome line is recited word for word")
+
+        let about = await queue.step(.init(), store: store, dealtWith: true)
+        XCTAssertEqual(try kind(about.output), "about")
+        let speech = try XCTUnwrap(FullDuplexVoiceClient.stageSpeech(about.output))
+        XCTAssertTrue(speech.about)
+        XCTAssertTrue(speech.script.hasSuffix("Keep going?"))
+        await queue.end()
+    }
+
     func testMissingAboutDraftGoesStraightToFinish() async throws {
         let queue = try await aboutQueue(draft: false)
         let store = MailStore(database: nil, userId: "test-user")

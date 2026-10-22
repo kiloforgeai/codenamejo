@@ -477,21 +477,27 @@ extension FullDuplexVoiceClient {
     private func presentScriptedStep(callId: String, step: String, ms: Double, outcome: String,
                                      dial: Int, userTurn: Int) -> Bool {
         guard isActive, dialGeneration == dial, liveUserTurn == userTurn, endCueTask == nil, !userSpeaking,
-              let adapter = transport?.liveAdapter,
-              let json = try? JSONSerialization.jsonObject(with: Data(step.utf8)) as? [String: Any],
-              let script = json["script"] as? String else { return false }
+              let adapter = transport?.liveAdapter, let speech = Self.stageSpeech(step) else { return false }
         finishContextTool(callId: callId, tool: "triage_next",
             output: "The application is presenting this step directly. Return no user-facing text and do not advance now; "
                 + "follow the step's note for the user's answer:\n" + step,
             ms: ms, outcome: outcome, query: "scripted", detail: "advanced with scripted speech", dial: dial)
-        Self.presentStageScript(script, about: json["about"] != nil, on: adapter)
+        Self.presentStageScript(speech, on: adapter)
         return true
     }
 
-    /// The about step's line runs past `presentPreparedEmail`'s 450 bytes, which drops it
-    /// silently, so it goes through `presentScript`; any other stage is recited word for word.
-    private static func presentStageScript(_ script: String, about: Bool, on adapter: LiveSessionAdapter) {
-        if about {
+    /// A step's own line, and whether it is the about step. That one runs past
+    /// `presentPreparedEmail`'s 450 bytes, which drops it silently, so it needs `presentScript`.
+    nonisolated static func stageSpeech(_ step: String) -> (script: String, about: Bool)? {
+        guard let json = try? JSONSerialization.jsonObject(with: Data(step.utf8)) as? [String: Any],
+              let script = json["script"] as? String else { return nil }
+        return (script, json["about"] != nil)
+    }
+
+    /// The about step through `presentScript`; any other stage recited word for word.
+    private static func presentStageScript(_ speech: (script: String, about: Bool), on adapter: LiveSessionAdapter) {
+        let script = speech.script
+        if speech.about {
             adapter.presentScript(script)
             RealtimeLog.log("onboarding: about script sent directly to speaker")
         } else {
@@ -689,10 +695,8 @@ extension FullDuplexVoiceClient {
     /// Recite a stage's own line now; false leaves it to the backend, as when the user has the turn.
     private func speakScriptedStage(_ step: String, dial: Int, userTurn: Int) -> Bool {
         guard isActive, dialGeneration == dial, liveUserTurn == userTurn, endCueTask == nil,
-              !userSpeaking, let adapter = transport?.liveAdapter,
-              let json = try? JSONSerialization.jsonObject(with: Data(step.utf8)) as? [String: Any],
-              let script = json["script"] as? String else { return false }
-        Self.presentStageScript(script, about: json["about"] != nil, on: adapter)
+              !userSpeaking, let adapter = transport?.liveAdapter, let speech = Self.stageSpeech(step) else { return false }
+        Self.presentStageScript(speech, on: adapter)
         return true
     }
 
