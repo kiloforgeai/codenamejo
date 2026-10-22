@@ -484,14 +484,20 @@ extension FullDuplexVoiceClient {
             output: "The application is presenting this step directly. Return no user-facing text and do not advance now; "
                 + "follow the step's note for the user's answer:\n" + step,
             ms: ms, outcome: outcome, query: "scripted", detail: "advanced with scripted speech", dial: dial)
-        if json["about"] != nil {
+        Self.presentStageScript(script, about: json["about"] != nil, on: adapter)
+        return true
+    }
+
+    /// The about step's line runs past `presentPreparedEmail`'s 450 bytes, which drops it
+    /// silently, so it goes through `presentScript`; any other stage is recited word for word.
+    private static func presentStageScript(_ script: String, about: Bool, on adapter: LiveSessionAdapter) {
+        if about {
             adapter.presentScript(script)
             RealtimeLog.log("onboarding: about script sent directly to speaker")
         } else {
-            adapter.presentPreparedEmail(script, request: Self.reciteStageLineRequest)
+            adapter.presentPreparedEmail(script, request: reciteStageLineRequest)
             RealtimeLog.log("onboarding: stage script sent directly to speaker")
         }
-        return true
     }
 
     /// The prepared-email presentation path, not `speakExactly`: the commentary channel's "say
@@ -681,11 +687,12 @@ extension FullDuplexVoiceClient {
     }
 
     /// Recite a stage's own line now; false leaves it to the backend, as when the user has the turn.
-    private func speakScriptedStage(_ line: String, dial: Int, userTurn: Int) -> Bool {
+    private func speakScriptedStage(_ step: String, dial: Int, userTurn: Int) -> Bool {
         guard isActive, dialGeneration == dial, liveUserTurn == userTurn, endCueTask == nil,
-              !userSpeaking, let adapter = transport?.liveAdapter else { return false }
-        adapter.presentPreparedEmail(line, request: Self.reciteStageLineRequest)
-        RealtimeLog.log("onboarding: stage script sent directly to speaker")
+              !userSpeaking, let adapter = transport?.liveAdapter,
+              let json = try? JSONSerialization.jsonObject(with: Data(step.utf8)) as? [String: Any],
+              let script = json["script"] as? String else { return false }
+        Self.presentStageScript(script, about: json["about"] != nil, on: adapter)
         return true
     }
 
@@ -1755,8 +1762,7 @@ extension FullDuplexVoiceClient {
             if Self.isFeedInterstitial(step.output) { self.terminalFeedReached = true }
             // A stage with its own line is said here with the receipt, as a prepared next email is.
             if pendingDraft == nil, result.ok == true, Self.isOnboardingStep(step.output),
-               let script = Self.stepScript(step.output),
-               self.speakScriptedStage(script, dial: dial, userTurn: userTurn) {
+               self.speakScriptedStage(step.output, dial: dial, userTurn: userTurn) {
                 self.finishContextTool(
                     callId: callId, tool: tool,
                     output: result.text + Self.renderPresentedOnboardingAdvance(stepOutput: step.output),
