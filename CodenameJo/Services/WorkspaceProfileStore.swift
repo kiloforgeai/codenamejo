@@ -173,8 +173,7 @@ class WorkspaceProfileStore: ObservableObject {
                         keys,
                         scope: .init(profileId: profile.id, isDefault: profile.isDefault,
                                      emails: ownedMailboxes.map { $0.email.lowercased() },
-                                     mailHeadersOnly: preferences.mailHeadersOnly ?? false,
-                                     suggestedActions: preferences.suggestedActions ?? SuggestedActions.accountDefault), userId: userId)
+                                     mailHeadersOnly: preferences.mailHeadersOnly ?? false), userId: userId)
                     RealtimeLog.log("openingSummary: warming \(keys.count) destination candidate(s) for \(profile.id)")
                 } catch { RealtimeLog.log("openingSummary: destination unavailable — \(error.localizedDescription)") }
             }

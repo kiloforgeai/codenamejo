@@ -216,7 +216,7 @@ final class LocalInbox {
         if engine == .openAI, let key = LiveEmailPresentation.Key.step(step),
            let prepared = await FullDuplexBroker.prepareEmail(key, scope: ProfileRuntime.snapshot),
            let body = prepared.spokenBody {
-            text = [body, prepared.suggestionForSpeech(enabled: true)].compactMap { $0 }.joined(separator: " ")
+            text = body
         }
         if text == nil, LocalVoiceBrain.onDeviceAvailable {
             let content = await Self.content(of: email)

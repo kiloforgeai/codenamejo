@@ -2,7 +2,7 @@ import Foundation
 
 /// Compact the model-facing copy; queue storage and full-message retrieval keep their original data.
 enum LiveCompactContext {
-    static func text(_ text: String) -> String {
+    static func text(_ text: String, includeEmailContent: Bool = true) -> String {
         var result = ""
         var cursor = text.startIndex
         while let start = text[cursor...].firstIndex(of: "{") {
@@ -28,7 +28,7 @@ enum LiveCompactContext {
             let original = String(text[start..<end])
             if let data = original.data(using: .utf8),
                let object = try? JSONSerialization.jsonObject(with: data),
-               let encoded = try? JSONSerialization.data(withJSONObject: compact(object), options: [.sortedKeys]) {
+               let encoded = try? JSONSerialization.data(withJSONObject: compact(object, includeEmailContent: includeEmailContent), options: [.sortedKeys]) {
                 result += String(decoding: encoded, as: UTF8.self)
             } else { result += original }
             cursor = end
@@ -51,20 +51,21 @@ enum LiveCompactContext {
         return item
     }
 
-    private static func compact(_ value: Any) -> Any {
-        if let array = value as? [Any] { return array.map(compact) }
+    private static func compact(_ value: Any, includeEmailContent: Bool) -> Any {
+        if let array = value as? [Any] { return array.map { compact($0, includeEmailContent: includeEmailContent) } }
         guard var object = value as? [String: Any] else { return value }
         if var item = object["item"] as? [String: Any], item["id"] != nil, item["account"] != nil {
             item = compactItem(item)
+            if !includeEmailContent { item.removeValue(forKey: "emailContent") }
             if item["bodySummary"] != nil { item.removeValue(forKey: "snippet") }
             object["item"] = item
-            object["contentAccess"] = "The prepared bodySummary covers the selected conversation and latest reply. "
+            object["contentAccess"] = (item["emailContent"] == nil ? "" : FeedEmailContent.guidance) + "The prepared bodySummary covers the selected conversation and latest reply. "
                 + "If absent or more detail is needed, retrieve the selected message IDs; summaryMessages and exchangeContext are context, not action targets. "
                 + "Never use the representative ID to choose a reply in an ambiguous group."
         }
         for (key, value) in object {
-            if key == "pinned_feed", let text = value as? String { object[key] = self.text(text) }
-            else if key != "item" { object[key] = compact(value) }
+            if key == "pinned_feed", let text = value as? String { object[key] = self.text(text, includeEmailContent: includeEmailContent) }
+            else if key != "item" { object[key] = compact(value, includeEmailContent: includeEmailContent) }
         }
         return object
     }

@@ -599,7 +599,7 @@ enum LiveToolSchemas {
     static let commands: [String: Any] = [
         "type": "function",
         "name": "commands",
-        "description": "The user's own commands: a keyword they say, and the tool calls it runs. Answered on the device, instantly. `run` when they say a keyword — it returns that command's steps, which you then carry out in order. `list` when they ask what commands they have — it returns names to read back, and no steps, because they asked what they have rather than how it works. `save` to create one or change what a keyword does, `delete` to remove one, `enable` and `disable` to switch one without losing it.",
+        "description": "The user's own commands: a keyword they say, and the tool calls it runs. Answered on the device, instantly. `run` with that exact `keyword` when they say a saved command — it returns that command's steps, which you then carry out in order. `list` when they ask what commands they have — it returns names to read back, and no steps, because they asked what they have rather than how it works. `save` to create one or change what a keyword does, `delete` to remove one, `enable` and `disable` to switch one without losing it.",
         "parameters": [
             "type": "object",
             "properties": [

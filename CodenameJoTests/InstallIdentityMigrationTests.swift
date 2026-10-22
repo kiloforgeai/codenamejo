@@ -4,7 +4,7 @@ import XCTest
 @testable import CodenameJo
 
 /// `v45-install-identity`: a phone upgrading from the Better Auth build keeps its profiles,
-/// queue, categories and turns, re-owned by the install id.
+/// queue and turns, re-owned by the install id.
 final class InstallIdentityMigrationTests: XCTestCase {
     private var path: URL!
     private let old = "ba-" + UUID().uuidString
@@ -31,8 +31,10 @@ final class InstallIdentityMigrationTests: XCTestCase {
         let profiles = WorkspaceProfileRows(dbPool: pool)
         let work = try await profiles.create(userId: old, name: "Work")
         try await profiles.adopt(userId: old, emails: ["me@example.test"], into: work.id)
-        try await EmailCategoryRows(dbPool: pool).touch(userId: old, account: "me@example.test",
-                                                        name: "receipts", description: "Receipts")
+        try await pool.write { db in
+            try db.execute(sql: "INSERT INTO email_category VALUES (?, ?, ?, ?, ?, ?)",
+                           arguments: [self.old, "me@example.test", "receipts", "Receipts", Date(), "Archive receipts."])
+        }
         let turns = TurnStore(database: pool)
         await turns.record(TurnStore.Turn(id: "t1", userId: old, conversationId: "c", commandText: "hi",
             responseText: "hello", serviceName: "General", status: "success", issuedAt: Date()))
@@ -52,8 +54,8 @@ final class InstallIdentityMigrationTests: XCTestCase {
         XCTAssertTrue(listed.contains { $0.id == work.id && $0.name == "Work" })
         let mailboxes = try await profiles.mailboxes(userId: install, profileId: work.id)
         XCTAssertEqual(mailboxes, ["me@example.test"])
-        let categories = try await EmailCategoryRows(dbPool: pool).known(userId: install, account: "me@example.test")
-        XCTAssertEqual(categories.map(\.name), ["receipts"])
+        let hasCategories = try await pool.read { try $0.tableExists("email_category") }
+        XCTAssertFalse(hasCategories)
         let owners = try await pool.read { db in
             try [String: String](uniqueKeysWithValues: Row.fetchAll(db, sql: "SELECT id, user_id FROM turn_row")
                 .map { ($0["id"] as String, $0["user_id"] as String) })

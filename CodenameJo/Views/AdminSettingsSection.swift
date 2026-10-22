@@ -13,8 +13,7 @@ import SwiftUI
 /// went. Only the dial timing is left.
 ///
 /// **`Mail` went too.** Thread grouping, suggested actions and the queue's automatic
-/// start are the defaults now, and the signature stays off unless a profile already
-/// turned it on.
+/// start are the defaults now. The signature toggle lives in Settings → Sending.
 ///
 /// **Record calls left on 2026-08-18 and Voice notes followed it**, both now Settings →
 /// **Voice** on every account (`ProfileView.voiceSection`). They failed the test the two

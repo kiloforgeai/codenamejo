@@ -7,12 +7,15 @@ final class LiveClientBrainTests: XCTestCase {
         var replies: [CheckedContinuation<[String: Any], Error>] = []
         var events: [[String: Any]] = []
         var speech: [String] = []
+        var spokenDelegations: [String?] = []
         var failures: [String] = []
         lazy var brain = LiveClientBrain(request: { [unowned self] body in
             requests.append(body)
             return try await withCheckedThrowingContinuation { replies.append($0) }
         }, deliver: { [unowned self] in events.append($0) },
-           speak: { [unowned self] text, _ in speech.append(text) },
+           speak: { [unowned self] text, delegation in
+               speech.append(text); spokenDelegations.append(delegation)
+           },
            failed: { [unowned self] in failures.append($0) })
         func start() {
             brain.updateState("email A", scope: "personal")
@@ -29,6 +32,54 @@ final class LiveClientBrainTests: XCTestCase {
     private static let call: [String: Any] = ["type": "function_call", "call_id": "c1",
         "name": "archive_message", "arguments": "{\"message_id\":\"a\"}"]
     @MainActor private func drain() async { for _ in 0..<20 { await Task.yield() } }
+
+    @MainActor func testLargeCommandLookupDoesNotPoisonContinuationOrNextTurn() async throws {
+        let h = Harness(); h.start(); await drain()
+        let instructions = String(repeating: "command instruction ", count: 5_500)
+        h.reply([["type": "function_call", "call_id": "cmd", "name": "commands",
+                  "arguments": #"{"action":"run","keyword":"follow up"}"#]])
+        await drain()
+        h.brain.item(["type": "function_call_output", "call_id": "cmd", "output": instructions])
+        h.brain.continueResponse(delegation: "d1"); await drain()
+        XCTAssertTrue(h.failures.isEmpty)
+        guard h.requests.count == 2 else { return XCTFail("Command continuation was rejected before reaching the model") }
+        let body = try XCTUnwrap(h.requests.last)
+        let input = try LiveOpenAI.boundedInput(body)
+        XCTAssertEqual(input.first { $0["call_id"] as? String == "cmd" && $0["type"] as? String == "function_call_output" }?["output"] as? String, instructions)
+        XCTAssertFalse((body["context"] as? String ?? "").contains("command instruction"))
+        h.reply([Self.call]); await drain()
+        h.brain.item(["type": "function_call_output", "call_id": "c1", "output": "Archive queued for email A"])
+        h.brain.continueResponse(delegation: "d1"); await drain()
+        h.reply([]); await drain()
+        h.brain.user("What did you do?", turn: 2); h.brain.begin("d2", live: true, turn: 2)
+        h.brain.settle(turn: 2); await drain()
+        let context = try XCTUnwrap(h.requests.last?["context"] as? String)
+        XCTAssertFalse(context.contains("command instruction"))
+        XCTAssertTrue(context.contains("Archive queued for email A"))
+        XCTAssertTrue(context.contains("follow up"))
+        XCTAssertTrue(h.failures.isEmpty)
+        h.reply([]); await drain()
+    }
+
+    @MainActor func testCommandSaveRetainsReceiptWithoutRepeatingItsDefinition() async throws {
+        let h = Harness(); h.start(); await drain()
+        let detail = String(repeating: "saved instruction ", count: 6_000)
+        let args: [String: Any] = ["action": "save", "keyword": "follow up",
+            "actions": [["tool": "label_message", "detail": detail]]]
+        let raw = String(decoding: try JSONSerialization.data(withJSONObject: args), as: UTF8.self)
+        h.reply([["type": "function_call", "call_id": "save", "name": "commands", "arguments": raw]])
+        await drain()
+        h.brain.item(["type": "function_call_output", "call_id": "save", "output": "Saved follow up."])
+        h.brain.continueResponse(delegation: "d1"); await drain()
+        XCTAssertTrue(h.failures.isEmpty)
+        guard h.requests.count == 2 else { return XCTFail("Saved definition blocked its own receipt") }
+        let context = try XCTUnwrap(h.requests.last?["context"] as? String)
+        XCTAssertTrue(context.contains("Saved follow up."))
+        XCTAssertFalse(context.contains("saved instruction"))
+        let input = try LiveOpenAI.boundedInput(try XCTUnwrap(h.requests.last))
+        XCTAssertEqual(input.first { $0["call_id"] as? String == "save" }?["arguments"] as? String, raw)
+        h.reply([]); await drain()
+    }
 
     @MainActor func testCorrectionSuppressesProposalAndWaitsForSettledTranscript() async {
         let h = Harness(); h.start(); await drain()
@@ -92,20 +143,86 @@ final class LiveClientBrainTests: XCTestCase {
         XCTAssertEqual(h.speech, h.failures, "The failure line reaches the speaker")
     }
 
-    @MainActor func testFailureCompletesItsOwnTurnAndTheTurnStartedMeanwhileStillRuns() async throws {
+    @MainActor func testNewQuestionStartsWithoutWaitingForOldRequestAndIgnoresItsLateFailure() async throws {
         let h = Harness(); h.start(); await drain()
-        XCTAssertEqual(h.requests.count, 1)
-        // The user moves on while turn 1's request is still in flight.
         h.brain.user("read my calendar", turn: 2)
         h.brain.begin("d2", live: true, turn: 2)
         h.brain.settle(turn: 2); await drain()
-        XCTAssertEqual(h.requests.count, 1, "Turn 2 waits behind the in-flight request")
+        XCTAssertEqual(h.requests.count, 2)
         h.replies.removeFirst().resume(throwing: NSError(domain: "network", code: 1)); await drain()
-        XCTAssertEqual(h.failures.count, 1)
-        XCTAssertEqual(h.speech, h.failures)
-        XCTAssertEqual(h.requests.count, 2, "Turn 1's failure completes turn 1, not turn 2")
+        XCTAssertTrue(h.failures.isEmpty)
+        XCTAssertTrue(h.brain.busy, "A late failure must not clear the newer request")
         let input = try XCTUnwrap(h.requests.last?["input"] as? [[String: Any]])
         XCTAssertEqual(input.last?["content"] as? String, "read my calendar")
+        h.reply([["type": "message", "content": [["text": "You have a meeting at two."]]]]); await drain()
+        XCTAssertEqual(h.speech, ["You have a meeting at two."])
+        XCTAssertFalse(h.brain.busy)
+        let events = h.events.compactMap { $0["event"] as? [String: Any] }
+        XCTAssertEqual(events.filter { $0["type"] as? String == "response.completed" }.count, 2)
+    }
+
+    @MainActor func testTimedOutRequestReleasesTurnAndRejectsLateWriteProposal() async throws {
+        let h = Harness(); h.brain.requestBound = 0.05; h.start(); await drain()
+        try await Task.sleep(for: .milliseconds(150)); await drain()
+        XCTAssertFalse(h.brain.busy)
+        XCTAssertEqual(h.failures.count, 1)
+        XCTAssertEqual(h.spokenDelegations.first!, "d1")
+        h.brain.requestBound = 20
+        h.brain.user("what is this email about?", turn: 2)
+        h.brain.begin("d2", live: true, turn: 2); h.brain.settle(turn: 2); await drain()
+        XCTAssertEqual(h.requests.count, 2)
+        h.reply([Self.call]); await drain()
+        XCTAssertTrue(h.calls.isEmpty, "A late request must never execute its write proposal")
+        XCTAssertTrue(h.brain.busy)
+        h.reply([["type": "message", "content": [["text": "It is a meeting invitation."]]]]); await drain()
+        XCTAssertEqual(h.speech.last, "It is a meeting invitation.")
+        XCTAssertEqual(h.failures.count, 1)
+        let events = h.events.compactMap { $0["event"] as? [String: Any] }
+        XCTAssertEqual(events.filter { $0["type"] as? String == "response.failed" }.count, 1)
+    }
+
+    @MainActor func testNewQuestionPreservesAcceptedActionWhileDroppingItsSlowPresentation() async throws {
+        let h = Harness(); h.start(); await drain()
+        h.reply([Self.call]); await drain()
+        h.brain.acceptToolCall("c1")
+        h.brain.item(["type": "function_call_output", "call_id": "c1", "output": "Archive queued for email A"])
+        h.brain.continueResponse(delegation: "d1"); await drain()
+        h.brain.user("what did you do with that email?", turn: 2)
+        h.brain.begin("d2", live: true, turn: 2); h.brain.settle(turn: 2); await drain()
+        XCTAssertEqual(h.requests.count, 3)
+        XCTAssertTrue((h.requests.last?["context"] as? String)?.contains("Archive queued for email A") == true)
+        h.reply([Self.call]); await drain()
+        XCTAssertEqual(h.calls.count, 1, "Do not repeat the accepted archive")
+        h.reply([["type": "message", "content": [["text": "The archive is queued."]]]]); await drain()
+        XCTAssertEqual(h.speech, ["The archive is queued."])
+    }
+
+    @MainActor func testNewQuestionWaitsForAcceptedToolButSkipsOldContinuation() async throws {
+        let h = Harness(); h.start(); await drain()
+        h.reply([Self.call]); await drain()
+        h.brain.acceptToolCall("c1")
+        h.brain.user("what is the next email about?", turn: 2)
+        h.brain.begin("d2", live: true, turn: 2); h.brain.settle(turn: 2); await drain()
+        XCTAssertEqual(h.requests.count, 1, "An accepted action must keep its result")
+        h.brain.item(["type": "function_call_output", "call_id": "c1", "output": "Archive queued for email A"])
+        h.brain.continueResponse(delegation: "d1"); await drain()
+        XCTAssertEqual(h.requests.count, 2)
+        let input = try XCTUnwrap(h.requests.last?["input"] as? [[String: Any]])
+        XCTAssertEqual(input.last?["content"] as? String, "what is the next email about?")
+        XCTAssertTrue((h.requests.last?["context"] as? String)?.contains("Archive queued for email A") == true)
+        h.reply([["type": "message", "content": [["text": "The next email asks for approval."]]]]); await drain()
+        XCTAssertEqual(h.speech, ["The next email asks for approval."])
+    }
+
+    @MainActor func testRequestDeadlineDoesNotExpireWhileAcceptedToolRuns() async throws {
+        let h = Harness(); h.brain.requestBound = 0.05; h.start(); await drain()
+        h.reply([Self.call]); await drain()
+        h.brain.acceptToolCall("c1")
+        try await Task.sleep(for: .milliseconds(150)); await drain()
+        XCTAssertTrue(h.failures.isEmpty)
+        XCTAssertTrue(h.brain.busy)
+        h.brain.item(["type": "function_call_output", "call_id": "c1", "output": "Archive queued"])
+        h.brain.continueResponse(delegation: "d1"); await drain()
         h.reply([]); await drain()
     }
 
@@ -181,6 +298,27 @@ final class LiveClientBrainTests: XCTestCase {
         XCTAssertEqual(h.speech, ["Switched to Work. First up, work email."])
     }
 
+    @MainActor func testFeedTextReachesBackendAndDoesNotAccumulateAfterAdvance() async throws {
+        let h = Harness()
+        let step = #"{"item":{"id":"a","account":"owner","emailContent":{"messages":[{"id":"a","text":"Unique source body","textComplete":true}]}}}"#
+        h.brain.updateState(step, scope: "personal")
+        h.brain.observe(step)
+        h.brain.user("How much is due?", turn: 1)
+        h.brain.begin("d1", live: true, turn: 1)
+        h.brain.settle(turn: 1)
+        await drain()
+        let context = try XCTUnwrap(h.requests.last?["context"] as? String)
+        XCTAssertEqual(context.components(separatedBy: "Unique source body").count, 2)
+        h.reply([]); await drain()
+        h.brain.updateState("email B", scope: "personal")
+        h.brain.user("What is this?", turn: 2)
+        h.brain.begin("d2", live: true, turn: 2)
+        h.brain.settle(turn: 2)
+        await drain()
+        XCTAssertFalse(try XCTUnwrap(h.requests.last?["context"] as? String).contains("Unique source body"))
+        h.reply([]); await drain()
+    }
+
     func testCompactChainKeepsSummaryLatestReplyTargetsAndContextMembers() throws {
         let item: [String: Any] = ["id": "a", "account": "owner", "bodySummary": "The chain discusses pricing; latest reply asks for approval.",
             "messages": [["id": "a", "body": String(repeating: "body", count: 20_000)], ["id": "b", "from": "latest", "body": "latest body"]],
@@ -241,15 +379,16 @@ extension LiveClientBrainTests {
 }
 
 extension LiveClientBrainTests {
-    @MainActor func testUnpreparedFastResultGetsPresentationAfterOldProposalIsSuppressed() async {
+    @MainActor func testAcceptedFastResultStartsPresentationWithoutWaitingForOldProposal() async {
         let h = Harness(); h.start(); await drain()
         h.brain.recordFastResult("Archived A; B requires a body read", turn: 1)
         h.brain.updateState("email B", scope: "personal")
         h.brain.presentResult("Archived A; B requires a body read", delegation: "presentation", turn: 1)
-        XCTAssertEqual(h.requests.count, 1)
+        await drain()
+        XCTAssertEqual(h.requests.count, 2)
         h.reply([Self.call]); await drain()
         XCTAssertTrue(h.calls.isEmpty)
-        XCTAssertEqual(h.requests.count, 2)
+        XCTAssertTrue(h.brain.busy)
         XCTAssertEqual(h.requests.last?["presentationOnly"] as? Bool, true)
         h.reply([["type": "message", "content": [["type": "output_text", "text": "B asks for approval."]]]])
         await drain()
@@ -278,6 +417,74 @@ extension LiveClientBrainTests {
         XCTAssertTrue(context.contains("Confirm sending to Alice?"))
         XCTAssertTrue(context.contains("email A"))
         h.reply([]); await drain()
+    }
+
+    @MainActor func testAdapterAnswersNewQuestionWhileOldRequestNeverFinishes() async throws {
+        var wire: [[String: Any]] = []
+        var replies: [CheckedContinuation<[String: Any], Error>] = []
+        var calls = 0
+        let adapter = LiveSessionAdapter(wire: { wire.append($0) }, emit: {
+            if case .liveFunction = $0 { calls += 1 }
+        })
+        adapter.clientBrainState = { ("email A", "personal") }
+        adapter.enableClientDelegation { _ in
+            try await withCheckedThrowingContinuation { replies.append($0) }
+        }
+        func receive(_ event: [String: Any]) throws { adapter.receive(try JSONSerialization.data(withJSONObject: event)) }
+        try receive(["type": "session.started"])
+        for turn in 1...2 {
+            try receive(["type": "session.input_transcript.delta", "delta": "what does this email say?",
+                         "start_ms": turn * 2000, "end_ms": turn * 2000 + 100])
+            try receive(["type": "session.delegation.created", "offset_ms": turn * 2000 + 100,
+                         "delegation": ["id": "d\(turn)", "target": "client"]])
+            try await Task.sleep(for: .milliseconds(1150)); await drain()
+        }
+        XCTAssertEqual(replies.count, 2, "The old response must release the adapter's running response")
+        guard replies.count == 2 else {
+            replies.forEach { $0.resume(returning: ["output": []]) }
+            adapter.close()
+            return
+        }
+        replies[1].resume(returning: ["output": [["type": "message", "content": [["text": "It is a meeting invitation."]]]]])
+        await drain()
+        replies[0].resume(returning: ["output": [Self.call]])
+        await drain()
+        XCTAssertEqual(calls, 0)
+        XCTAssertTrue(wire.contains { $0["content"] as? String == "It is a meeting invitation."
+            && $0["delegation_id"] as? String == "d2" })
+        adapter.close()
+    }
+
+    @MainActor func testSkippedOldContinuationDoesNotBlockRecoveryOfNewQuestion() async throws {
+        var requests = 0
+        var calls: [String] = []
+        let adapter = LiveSessionAdapter(wire: { _ in }, emit: {
+            if case .liveFunction(let call) = $0 { calls.append(call.id) }
+        })
+        adapter.clientBrainState = { ("email A", "personal") }
+        adapter.enableClientDelegation { _ in
+            requests += 1
+            return ["output": requests == 1 ? [Self.call] : []]
+        }
+        func receive(_ event: [String: Any]) throws { adapter.receive(try JSONSerialization.data(withJSONObject: event)) }
+        try receive(["type": "session.started"])
+        try receive(["type": "session.input_transcript.delta", "delta": "archive it", "start_ms": 100, "end_ms": 200])
+        try receive(["type": "session.delegation.created", "offset_ms": 200,
+                     "delegation": ["id": "d1", "target": "client"]])
+        try await Task.sleep(for: .milliseconds(1150)); await drain()
+        XCTAssertEqual(calls, ["c1"])
+        try receive(["type": "session.input_transcript.delta", "delta": "what does the next email say?",
+                     "start_ms": 2000, "end_ms": 2100])
+        try await Task.sleep(for: .milliseconds(1150)); await drain()
+        adapter.outbound(["type": "conversation.item.create", "item": ["type": "function_call_output",
+            "call_id": "c1", "output": "Archive queued for email A"]])
+        adapter.outbound(["type": "response.create"])
+        await drain()
+        XCTAssertEqual(requests, 1, "The obsolete continuation must not make another model request")
+        XCTAssertTrue(adapter.recoverUnworkedRequest(anchor: .init(step: "email B", profileId: "personal", revision: 1)))
+        await drain()
+        XCTAssertEqual(requests, 2, "Recovery must not remain blocked by backendStarting")
+        adapter.close()
     }
 
     @MainActor func testAdapterReportsOneTaskFailureAndAcceptsNextTurn() async throws {

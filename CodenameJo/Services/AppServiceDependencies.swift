@@ -10,6 +10,19 @@ struct URLSessionDataTransport: HTTPDataTransport {
     }
 }
 
+struct UnsubscribeHTTPTransport: HTTPDataTransport {
+    private final class NoRedirects: NSObject, URLSessionTaskDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+    }
+
+    func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        try await URLSession.shared.data(for: request, delegate: NoRedirects())
+    }
+}
+
 protocol GoogleGrantStorage: Sendable {
     func all() -> [GoogleAccountStore.Grant]
     func save(_ grant: GoogleAccountStore.Grant) -> Bool

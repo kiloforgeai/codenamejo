@@ -40,30 +40,45 @@ final class MailMIMEForwardTests: XCTestCase {
         XCTAssertFalse(text.contains("multipart/"), "no HTML and nothing attached: no wrapper")
     }
 
-    func testAnHTMLOriginalGetsBothPartsWithTheNoteTheCcRowAndTheFooter() {
+    func testAnHTMLOriginalGetsBothPartsWithTheNoteTheCcRowAndTheFooter() throws {
         var html = source
         html.cc = "Pat <pat@acme.test>"
         html.html = "<p>Numbers <b>attached</b></p>"
         html.subject = ""
         let raw = MailMIME.forward(.init(to: "sam@acme.test", cc: ["lee@acme.test"], note: "  Please review.  ", source: html,
                                          footer: true), boundary: boundaries())
-        XCTAssertEqual(raw, "VG86IHNhbUBhY21lLnRlc3QNCkNjOiBsZWVAYWNtZS50ZXN0DQpTdWJqZWN0OiBGd2Q6IChubyBzdWJqZWN0KQ0KTUlNRS1WZXJzaW9uOiAxLj"
-            + "ANCkluLVJlcGx5LVRvOiA8b3JpZ0BtYWlsLnRlc3Q-DQpSZWZlcmVuY2VzOiA8b3JpZ0BtYWlsLnRlc3Q-DQpDb250ZW50LVR5cGU6IG11bHRp"
-            + "cGFydC9hbHRlcm5hdGl2ZTsgYm91bmRhcnk9ImJfMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwIg0KDQotLWJfMDAwMDAwMD"
-            + "AtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwDQpDb250ZW50LVR5cGU6IHRleHQvcGxhaW47IGNoYXJzZXQ9VVRGLTgNCkNvbnRlbnQtVHJh"
-            + "bnNmZXItRW5jb2Rpbmc6IGJhc2U2NA0KDQpVR3hsWVhObElISmxkbWxsZHk0S0NpMHRMUzB0TFMwdExTMGdSbTl5ZDJGeVpHVmtJRzFsYzNOaF"
-            + "oyVWdMUzB0TFMwdExTMHRDa1p5DQpiMjA2SUVSaGJtRWdUMnRoWm05eUlEeGtZVzVoUUdGamJXVXVkR1Z6ZEQ0S1JHRjBaVG9nVkhWbExDQXlO"
-            + "U0JCZFdjZ01qQXlOaUF3DQpPVG93TURvd01DQXRNRGN3TUFwVGRXSnFaV04wT2lBS1ZHODZJSGx2ZFVCcmFXeHZabTl5WjJVdWRHVnpkQXBEWX"
-            + "pvZ1VHRjBJRHh3DQpZWFJBWVdOdFpTNTBaWE4wUGdvS1RuVnRZbVZ5Y3lCaGRIUmhZMmhsWkM0S1ZHaGhibXR6Q2dwVFpXNTBJSFpwWVNCRGIy"
-            + "UmxibUZ0DQpaU0JLYnlEd242cXBJR2gwZEhCek9pOHZZMjlrWlc1aGJXVnFieTVqYjIwPQ0KLS1iXzAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLT"
-            + "AwMDAwMDAwMDAwMA0KQ29udGVudC1UeXBlOiB0ZXh0L2h0bWw7IGNoYXJzZXQ9VVRGLTgNCkNvbnRlbnQtVHJhbnNmZXItRW5jb2Rpbmc6IGJh"
-            + "c2U2NA0KDQpQSEErVUd4bFlYTmxJSEpsZG1sbGR5NDhMM0ErQ2p4d1BpMHRMUzB0TFMwdExTMGdSbTl5ZDJGeVpHVmtJRzFsYzNOaFoyVWdMUz"
-            + "B0DQpMUzB0TFMwdFBHSnlQZ3BHY205dE9pQkVZVzVoSUU5cllXWnZjaUFtYkhRN1pHRnVZVUJoWTIxbExuUmxjM1FtWjNRN1BHSnlQZ3BFDQpZ"
-            + "WFJsT2lCVWRXVXNJREkxSUVGMVp5QXlNREkySURBNU9qQXdPakF3SUMwd056QXdQR0p5UGdwVGRXSnFaV04wT2lBOFluSStDbFJ2DQpPaUI1Yj"
-            + "NWQWEybHNiMlp2Y21kbExuUmxjM1E4WW5JK0NrTmpPaUJRWVhRZ0pteDBPM0JoZEVCaFkyMWxMblJsYzNRbVozUTdQQzl3DQpQZ284Y0Q1T2RX"
-            + "MWlaWEp6SUR4aVBtRjBkR0ZqYUdWa1BDOWlQand2Y0Q0S1BIQStVMlZ1ZENCMmFXRWdRMjlrWlc1aGJXVWdTbThnDQo4SitxcVNCb2RIUndjem"
-            + "92TDJOdlpHVnVZVzFsYW04dVkyOXRQQzl3UGc9PQ0KLS1iXzAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMC0t")
+        let text = try MailMIMEParts.body(decoded(raw), type: "plain")
+        let body = try MailMIMEParts.body(decoded(raw), type: "html")
+        XCTAssertTrue(text.hasSuffix("Sent via Codename Jo 🪩 https://codenamejo.com"))
+        XCTAssertTrue(body.contains(html.html), "Original HTML is preserved")
+        XCTAssertTrue(body.contains("Please review."))
+        XCTAssertTrue(body.contains("Cc: Pat &lt;pat@acme.test&gt;"))
+        XCTAssertTrue(body.contains(#"<a href="https://codenamejo.com">Codename Jo 🪩</a>"#))
         XCTAssertTrue(decoded(raw).contains("Subject: Fwd: (no subject)\r\n"))
+    }
+
+    func testPlainForwardWithSignatureGetsALinkAndKeepsAttachments() throws {
+        var original = source
+        original.text = "Hi <Dana> & team\n\n  Numbers attached."
+        let bytes = Data([0, 1, 2, 128, 255])
+        let attachment = MailMIME.Attachment(filename: "numbers.pdf", mimeType: "application/pdf", size: 5, attachmentId: "a1")
+        let mime = decoded(MailMIME.forward(.init(to: "sam@acme.test", source: original,
+            attachments: [(attachment, bytes)], footer: true), boundary: boundaries()))
+        XCTAssertTrue(mime.contains("Content-Type: multipart/mixed;"))
+        XCTAssertTrue(mime.contains("Content-Type: multipart/alternative;"))
+        XCTAssertTrue(mime.contains("AAECgP8="), "Attachment bytes are unchanged")
+        XCTAssertTrue(try MailMIMEParts.body(mime, type: "plain").contains(original.text))
+        let html = try MailMIMEParts.body(mime, type: "html")
+        XCTAssertTrue(html.contains("Hi &lt;Dana&gt; &amp; team\n\n  Numbers attached."))
+        XCTAssertTrue(html.contains(#"<a href="https://codenamejo.com">Codename Jo 🪩</a>"#))
+    }
+
+    func testHTMLForwardWithSignatureOffAddsNoJoLink() throws {
+        var original = source
+        original.html = "<p>Original body</p>"
+        let mime = decoded(MailMIME.forward(.init(to: "sam@acme.test", source: original), boundary: boundaries()))
+        XCTAssertFalse(try MailMIMEParts.body(mime, type: "html").contains("codenamejo.com"))
+        XCTAssertFalse(try MailMIMEParts.body(mime, type: "plain").contains("codenamejo.com"))
     }
 
     func testAttachmentsRideInAMixedWrapperWithInlineImagesKeepingTheirContentID() {

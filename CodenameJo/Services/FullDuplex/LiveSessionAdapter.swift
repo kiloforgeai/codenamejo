@@ -382,6 +382,8 @@ final class LiveSessionAdapter {
             }
             if payload["type"] as? String == "response.create" {
                 refreshBrainState()
+                // Client lifecycle events are synchronous; an obsolete continuation may start no request.
+                backendStarting = false
                 clientBrain.continueResponse(delegation: continuationDelegation)
                 return
             }
@@ -874,6 +876,11 @@ final class LiveSessionAdapter {
             inputFinalizer = Task { [weak self] in
                 try? await Task.sleep(for: settle)
                 guard !Task.isCancelled, let self else { return }
+                if SpokenCommand.match(self.inputText) == .resetCall {
+                    self.close()
+                    self.emit(.liveResetRequested)
+                    return
+                }
                 self.finalizedInput = true
                 if Self.explicitlyRequestsBackground(self.inputText) {
                     self.backgroundRequestTurns.insert(self.inputTurn)

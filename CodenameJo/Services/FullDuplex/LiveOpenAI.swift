@@ -189,7 +189,10 @@ enum LiveOpenAI {
             + "Never repeat an accepted action. For an older action's status, retrieve its authoritative record with search_context. "
             + "If a prepared chain summary is absent, retrieve selected messages before summarizing; do not summarize snippets alone.\n"
             + context]
-        if bytes([state] + task) > taskBytes { throw fail("brain_task_too_large") }
+        if bytes([state] + task) > taskBytes {
+            RealtimeLog.log("liveBrain: task limit exceeded stateBytes=\(bytes(state)) taskBytes=\(bytes(task)) items=\(task.count)")
+            throw fail("brain_task_too_large")
+        }
         var recent = history
         while !recent.isEmpty, bytes([state] + recent + task) > taskBytes { recent.removeFirst() }
         return [state] + recent + task

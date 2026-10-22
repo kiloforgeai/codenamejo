@@ -18,6 +18,7 @@ final class UserProfileSettingsTests: XCTestCase {
         ThreadQueue.storageKey,
         TriageScope.storageKey,
         AgentLedEmailSettings.key,
+        JoTips.storageKey,
         OnboardingState.storageKey,
         AppearanceSetting.storageKey,
     ]
@@ -51,6 +52,23 @@ final class UserProfileSettingsTests: XCTestCase {
         // `bool(forKey:)` answers false for a missing key too, which would make "off" and
         // "never chosen" the same profile.
         XCTAssertEqual(UserProfile.capturingLocalSettings().threadQueue, false)
+    }
+
+    func testJoTipsChoicePersistsAcrossProfilesAndClearsOnSignOut() throws {
+        XCTAssertTrue(JoTips.isEnabled())
+        var profile = UserProfile()
+        profile.joTipsEnabled = false
+        profile.applyToLocalSettings()
+        XCTAssertFalse(JoTips.isEnabled())
+        let captured = UserProfile.capturingLocalSettings()
+        XCTAssertEqual(captured.joTipsEnabled, false)
+        let decoded = try JSONDecoder().decode(UserProfile.self, from: JSONEncoder().encode(captured))
+        XCTAssertEqual(decoded.joTipsEnabled, false)
+        let effective = try decoded.replacingWorkspaceSettings(with: UserProfile())
+        XCTAssertEqual(effective.joTipsEnabled, false, "Switching workspace must keep the account choice")
+        UserProfile.clearLocalSettings()
+        XCTAssertNil(UserProfile.capturingLocalSettings().joTipsEnabled)
+        XCTAssertTrue(JoTips.isEnabled())
     }
 
     func testAnEmptyStringIsNotAChoice() {

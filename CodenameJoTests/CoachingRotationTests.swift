@@ -68,6 +68,36 @@ final class CoachingRotationTests: XCTestCase {
                        ["feed", "multi_account_routing"])
     }
 
+    func testDisablingTipsRemovesBothRegularAndOnboardingLessonsWithoutDismissingThem() {
+        let defaults = scratchDefaults()
+        CoachingRotation.recordOffer("dispatch", defaults: defaults)
+        defaults.set(false, forKey: JoTips.storageKey)
+        let disabled = CoachingRotation.plan(.init(), catalog: catalog, defaults: defaults)
+        XCTAssertTrue(disabled.lessons.isEmpty)
+        XCTAssertNil(disabled.onboardingFeed)
+        defaults.set(true, forKey: JoTips.storageKey)
+        let enabled = CoachingRotation.plan(.init(), catalog: catalog, defaults: defaults)
+        XCTAssertEqual(enabled.lessons.map(\.capability), ["feed", "feed_items"])
+        XCTAssertEqual(enabled.onboardingFeed?.capability, "feed")
+    }
+
+    func testDisabledPlanCompletesFeedWithoutOfferingATip() async throws {
+        let defaults = scratchDefaults()
+        for enabled in [false, true] {
+            defaults.set(enabled, forKey: JoTips.storageKey)
+            let queue = LocalTriageQueue(mailAccounts: { [] })
+            await queue.configure(coachingPlan: CoachingRotation.plan(.init(), catalog: catalog, defaults: defaults),
+                localCoachingDelivery: true, forceOnboardingFeedLesson: true,
+                sequentialFeed: true, calendarFeedDue: false, localCalendar: false)
+            let output = await queue.terminalFeed(["done": true], trigger: "test")
+            let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any])
+            XCTAssertEqual(payload["done"] as? Bool, true)
+            XCTAssertEqual(payload["coaching"] != nil, enabled)
+            XCTAssertNotNil(payload["feedNote"], "Closing the feed must still have its normal instructions")
+            await queue.end()
+        }
+    }
+
     func testOnboardingKeepsTheFeedLessonUntilItIsDismissed() {
         let defaults = scratchDefaults()
         CoachingRotation.recordOffer("feed", defaults: defaults)

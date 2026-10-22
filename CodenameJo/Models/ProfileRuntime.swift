@@ -11,7 +11,6 @@ enum ProfileRuntime {
         /// Whether a profile switch is offered here; `WorkspaceProfileStore` sets it.
         var canSwitch = false
         var mailHeadersOnly: Bool? = nil
-        var suggestedActions: Bool? = nil
         var membershipRevision: Int? = nil
 
         func containsMailbox(_ account: String) -> Bool {
@@ -27,15 +26,5 @@ enum ProfileRuntime {
     static func allowedMailAccounts(_ accounts: [String]) -> [String] {
         guard let emails = snapshot?.emails else { return accounts }
         return accounts.filter { emails.contains($0.lowercased()) }
-    }
-}
-
-/// A profile override wins over the account’s `user.suggested_actions` default, which is on.
-enum SuggestedActions {
-    static let storageKey = "suggestedActions"
-    static let accountDefaultKey = "suggestedActions.accountDefault"
-    static var accountDefault: Bool { (UserDefaults.standard.object(forKey: accountDefaultKey) as? Bool) ?? true }
-    static var isEnabled: Bool {
-        (UserDefaults.standard.object(forKey: storageKey) as? Bool) ?? accountDefault
     }
 }

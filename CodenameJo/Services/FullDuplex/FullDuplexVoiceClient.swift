@@ -83,6 +83,8 @@ final class FullDuplexVoiceClient {
     /// Mute — the model called `stop_listening`. The caller mutes through the same path
     /// as the Mute button, so every mute indicator follows.
     var onMuteRequested: (() -> Void)?
+    var onResetRequested: (() -> Void)?
+    var resetAcknowledgementPending = false
 
     func installProfileDossier(_ dossier: ProfileDossierContext?, profileId: String) {
         guard isActive, ProfileRuntime.snapshot?.profileId == profileId else { return }
@@ -160,9 +162,6 @@ final class FullDuplexVoiceClient {
     /// it.** See `renderLocalDispatchReportAnchor`. This is the only place on the phone that knows
     /// where the cursor actually is at the moment a report lands.
     var standingStep: String?
-    /// What was said and called while `standingStep` was current, for its category's playbook.
-    var playbookTurns: [(role: String, text: String)] = []
-    var playbookTools: [String] = []
     /// The opening asked "want to do some cleanup?"; a yes steps the queue here, not via the model.
     var nothingImportantOfferStanding = false
     /// The opening asked "want me to go through your inbox?" on a session whose queue is on this
@@ -170,7 +169,6 @@ final class FullDuplexVoiceClient {
     var feedOfferStanding = false
     /// When that yes was taken here, so the wait until Jo is audible again can be logged.
     var feedOfferAcceptedAt: ContinuousClock.Instant?
-    var suggestedActions = SuggestedActionTracker()
     var dispatchScopeRequired = false
     /// True from `output_audio_buffer.started` until `stopped`/`cleared` — i.e.
     /// while the speaker is genuinely making noise, which is not the same as "a
@@ -282,6 +280,7 @@ final class FullDuplexVoiceClient {
     var lastCoachingOfferId: String?
     private var calendarReadTool = "list_calendar_events"
     var calendarFeedPending = false
+    var calendarAfterCoaching: String?
     private var calendarFeedOwners: [String] = []
     var terminalFeedReached = false
     private var terminalFeedResponsePending = false
@@ -582,7 +581,6 @@ final class FullDuplexVoiceClient {
         // nothing rewrites it on a fresh dial, so the previous call's message would anchor
         // a recovered answer injected before this call has walked anything.
         standingStep = nil
-        suggestedActions.startDial()
         greetingSentAt = nil
         dispatchRecoveryReady = false
         openingIncludesRecoveredAnswers = false
@@ -609,6 +607,7 @@ final class FullDuplexVoiceClient {
         profileOfferAcceptedAt = nil
         calendarReadTool = "list_calendar_events"
         calendarFeedPending = false
+        calendarAfterCoaching = nil
         calendarFeedOwners = []
         terminalFeedReached = false
         terminalFeedResponsePending = false
@@ -688,7 +687,8 @@ final class FullDuplexVoiceClient {
         }
         pump = Task { [weak self] in
             for await signal in transport.signals {
-                await self?.handle(signal)
+                guard !Task.isCancelled, let self, self.isActive else { return }
+                self.handle(signal)
             }
         }
         didObserveCapture = false
@@ -1165,8 +1165,9 @@ final class FullDuplexVoiceClient {
     }
 
     private func teardown(reason: String) {
-        logSuggestedAction(suggestedActions.ended())
-        reportPlaybook(leaving: standingStep)
+        resetAcknowledgementPending = false
+        modelRoute?.task.cancel()
+        modelRoute = nil
         resetLivePreparation()
         endAfterFarewell = false
         endWatchdog?.cancel()
@@ -1262,6 +1263,9 @@ final class FullDuplexVoiceClient {
 
     private func handle(_ signal: RealtimeSignal) {
         switch signal {
+        case .liveResetRequested:
+            guard isActive, endCueTask == nil else { return }
+            onResetRequested?()
         case .connected:
             // The one thing the watchdog was waiting for. First, so nothing below it
             // can suspend with a deadline still armed against a call that is up.
@@ -1433,8 +1437,7 @@ final class FullDuplexVoiceClient {
         case .liveInputText(let text):
             if transport?.liveAdapter?.answersPendingOffer == nil {
                 transport?.liveAdapter?.answersPendingOffer = { [weak self] text in
-                    self?.suggestedActions.wouldAccept(text) != nil
-                        || (self?.feedOfferStanding == true && SuggestedActionTracker.answer(to: text) == .accepted)
+                    self?.feedOfferStanding == true && FeedOfferAnswer.answer(to: text) == .accepted
                 }
             }
             latestCompletedUserUtterance = text
@@ -1443,19 +1446,14 @@ final class FullDuplexVoiceClient {
         case .liveInputFinished(let text):
             userSpeaking = false
             latestCompletedUserUtterance = text
-            notePlaybookTurn("user", text)
             onUserTranscript?(text, true)
             onUserTurnCommitted?()
             liveInputComplete = true
-            let suggestion = suggestedActions.userSaid(text)
-            logSuggestedAction(suggestion)
             if tryOnboardingAnswer(text) {
                 // An onboarding answer the phone acts on itself; see `tryOnboardingAnswer`.
             } else if tryLocalCoachingAnswer(text) || tryFeedOfferAnswer(text) || tryNothingImportantAnswer(text)
                 || tryFeedOfferAcceptance(text) {
                 transport?.liveAdapter?.resolveLocalInput()
-            } else if trySuggestedAction(suggestion, text: text) {
-                // Jo's own suggestion, accepted: the phone already knows what it meant.
             } else if !tryLiveFastAction(text) {
                 tryModelRoutedFastAction(text)
             }
@@ -1561,7 +1559,6 @@ final class FullDuplexVoiceClient {
             let text = transcript.isEmpty ? (assistantTurns[itemId] ?? "") : transcript
             noteCoachingLessonSpoken(in: text, itemId: itemId)
             noteFeedQuestionSpoken(in: text)
-            noteSuggestionSpoken(in: text)
             assistantTurns[itemId] = text
             // What Jo actually said, for a console reader.
             RealtimeLog.log("spoke: \(text.prefix(200))")
@@ -1577,6 +1574,10 @@ final class FullDuplexVoiceClient {
         case .sessionCreated(let model):
             RealtimeLog.log("session: created (\(model ?? "unknown model"))")
             sessionReadyForOpening = true
+            if resetAcknowledgementPending {
+                resetAcknowledgementPending = false
+                transport?.liveAdapter?.speakExactly("I've reset the call. What would you like to do?")
+            }
             if acceptedOpening == .emailQueue, !localTriageForEmailOpening, !toolsReachable {
                 holdOpeningForToolReadiness()
             }
@@ -1671,7 +1672,6 @@ final class FullDuplexVoiceClient {
         // detached: a record of an answer must not delay the answer. A store that failed to open
         // makes this a no-op.
         case .mcpCallResult(let name, let serverLabel, let argumentsJSON, let itemJSON):
-            if standingStep != nil { playbookTools.append(ToolNarration.canonical(name)) }
             let resultOutput = Self.mcpOutput(from: itemJSON)
             let confirmedEffects = GmailWriteEffect.decodeEffects(in: itemJSON)
             if let confirmedEffects {
@@ -1708,7 +1708,8 @@ final class FullDuplexVoiceClient {
             // turned down still *completes* — the tool ran and produced a sentence — so
             // the completion event says nothing about whether the write happened. The
             // answer is in the text, and this is the only event that carries it.
-            if let output = resultOutput, ToolNarration.isRefusal(output) {
+            if let output = resultOutput,
+               GmailWriteEffect.hasFailure(in: itemJSON) || ToolNarration.isRefusal(output) {
                 RealtimeLog.log("tools: \(name) REFUSED — \(output.prefix(120))")
                 onToolFailed?(name)
             } else {
@@ -2079,11 +2080,12 @@ final class FullDuplexVoiceClient {
         guard let id = currentAssistantItem, id != finalizedAssistantItem,
               let text = assistantTurns[id], !text.isEmpty else { return }
         finalizedAssistantItem = id
-        if responseCompleted, sequentialFeed, terminalFeedReached {
+        if responseCompleted, sequentialFeed, terminalFeedReached,
+           pendingCoaching == nil, !calendarFeedPending, !slackFeedPending,
+           pendingFeedCompletion == nil || pendingFeedCompletion?.asked == true {
             onFeedFocus?(feedFocusTracker.finishTerminalResponse())
             terminalFeedReached = false
         }
-        notePlaybookTurn("assistant", text)
         onAssistantTranscript?(text, true)
     }
 
@@ -2418,6 +2420,8 @@ final class FullDuplexVoiceClient {
         /// `triage_next` the model made first.
         let handledMessageId: String?
         var lessonSpoken = false
+        var resumeRequested = false
+        var waitingForCalendar = false
         /// The spoken item the lesson landed in. A Live item ends at a 0.8 s pause rather than
         /// at a turn, so without this a lesson split across two items resumes over itself.
         var spokenAtItem: String?
@@ -2558,7 +2562,8 @@ final class FullDuplexVoiceClient {
     private func routeWithModel(_ text: String) {
         LiveIntentRouter.prewarm()
         modelRoute?.task.cancel()
-        guard LiveFastAction.parse(text) == nil else { modelRoute = nil; return }
+        guard SpokenCommand.match(text) != .resetCall,
+              LiveFastAction.parse(text) == nil else { modelRoute = nil; return }
         modelRoute = (text, Task {
             try? await Task.sleep(for: .milliseconds(200))
             if Task.isCancelled { return nil }
@@ -2606,73 +2611,6 @@ final class FullDuplexVoiceClient {
         RealtimeLog.log("liveFastAction: \(action.rawValue) starting without a brain tool call")
         runFunctionTool(callId: id, name: action.rawValue, argumentsJSON: String(decoding: data, as: UTF8.self))
         return true
-    }
-
-    /// A yes to the suggestion Jo just made for this email, run on the phone instead of waiting
-    /// for the brain. "Archive it?" is the quick archive; "archive all your X emails?" and
-    /// "unsubscribe?" start the same dispatch the brain would, scoped to the sender's exact
-    /// address. Anything else ("find a time?", "how do you want to respond?") needs the brain.
-    private func trySuggestedAction(
-        _ resolved: (SuggestedActionTracker.Outcome, SuggestedActionTracker.Offer)?, text: String
-    ) -> Bool {
-        guard let (outcome, offer) = resolved, outcome == .accepted, transport != nil,
-              let step = standingStep, LiveEmailPresentation.Key.step(step)?.identity == offer.identity
-        else { return false }
-        let question = Self.normalize(offer.question)
-        if question == Self.normalize("Want me to archive it?") {
-            return tryLiveFastAction(text, routed: .archive)
-        }
-        let sweep = question.hasPrefix(Self.normalize("Want me to archive all your"))
-        let unsubscribe = question == Self.normalize("Want me to unsubscribe?")
-        guard sweep || unsubscribe,
-              let prepared = livePreparation.ready(for: step, profileId: ProfileRuntime.snapshot?.profileId),
-              let sender = Self.senderAddress(prepared.from) else { return false }
-        let name = Self.senderName(prepared.from) ?? sender
-        let query = "in:inbox from:\(sender)"
-        let arguments: [String: Any] = [
-            "task": (unsubscribe ? "Unsubscribe from \(sender) and archive" : "Archive")
-                + " every email from \(sender) in the inbox. Use the exact Gmail query \(query).",
-            "expects": "receipt",
-            "scope": "current_email",
-            "account": offer.identity.account,
-            "announce": unsubscribe
-                ? "I'm unsubscribing you from \(name)."
-                : "I'm archiving all your \(name) emails.",
-            "queue_cleanup": ["message_id": offer.identity.messageId, "query": query],
-        ]
-        guard isActive, openingWasAudible, !userSpeaking, liveInputComplete,
-              onboardingFlow == nil, endCueTask == nil, functionCallTask == nil,
-              localTriageForEmailOpening, let anchor = liveFastAnchor,
-              anchor.matches(step: standingStep, profileId: ProfileRuntime.snapshot?.profileId,
-                             revision: liveQueueRevision),
-              let adapter = transport?.liveAdapter,
-              let data = try? JSONSerialization.data(withJSONObject: arguments) else { return false }
-        let id = "local-" + UUID().uuidString
-        guard adapter.beginFastAction(callId: id, action: nil, routed: true) else { return false }
-        liveFastAnchor = nil
-        liveFastProfileId = anchor.profileId
-        toolCalledThisResponse = true
-        RealtimeLog.log("suggestedAction: \(unsubscribe ? "unsubscribe" : "archive-all") dispatched without a brain tool call")
-        runFunctionTool(callId: id, name: "dispatch", argumentsJSON: String(decoding: data, as: UTF8.self))
-        return true
-    }
-
-    /// The bare address in "Name <addr>", only when it is plainly one address.
-    nonisolated static func senderAddress(_ from: String) -> String? {
-        var address = from
-        if let open = from.lastIndex(of: "<"), let close = from.lastIndex(of: ">"), open < close {
-            address = String(from[from.index(after: open)..<close])
-        }
-        address = address.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let valid = address.range(of: #"^[a-z0-9._+%-]+@[a-z0-9.-]+\.[a-z]{2,}$"#, options: .regularExpression) != nil
-        return valid ? address : nil
-    }
-
-    nonisolated static func senderName(_ from: String) -> String? {
-        guard let open = from.firstIndex(of: "<") else { return nil }
-        let name = from[..<open].trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        return name.isEmpty ? nil : name
     }
 
     private func refuseLiveFunction(_ call: LiveSessionAdapter.Call, reason: String, output: String) {
@@ -3140,43 +3078,26 @@ final class FullDuplexVoiceClient {
     func answerCommands(callId: String, argumentsJSON: String) {
         switch Self.stringArgument("action", in: argumentsJSON) ?? "run" {
         case "list": answerCommandNames(callId: callId)
-        case "run": answerCommandList(callId: callId)
+        case "run": answerCommandRun(callId: callId, keyword: Self.stringArgument("keyword", in: argumentsJSON) ?? "")
         default: answerCommandManage(callId: callId, argumentsJSON: argumentsJSON)
         }
     }
 
-    /// `run` — every switched-on command's steps, read out of the store this phone holds. A
-    /// switched-off command is *absent* rather than flagged, so there is nothing to follow.
-    /// **No labels**: a name beside the steps was read as a second order, and done twice.
-    /// **The keyword is the yes**, and the header says so here as well as in the prompt: a
-    /// command that filed an issue stopped to read the title back and wait, because the
-    /// GitHub skill and the tool's own description both ask for that on an ordinary turn.
-    private func answerCommandList(callId: String) {
+    /// Read one enabled command; a missing keyword must not expand to the entire library.
+    private func answerCommandRun(callId: String, keyword: String) {
         let started = Date()
-        let enabled = customCommands.enabledCommands
         let output: String
-        if enabled.isEmpty {
-            output =
-                "This user has no commands switched on. If they just asked for one by "
-                + "name, say it is switched off — do not guess what it meant."
-        } else {
-            let header = "The user's commands. The numbered steps are the only "
-                + "instructions — do those, in order, and nothing else. Saying the keyword was "
-                + "the user's yes: run every step without reading it back or waiting for a "
-                + "confirming turn, then say what each one did.\n"
-            output = header + enabled.map { command in
-                let steps = command.actions.enumerated()
-                    .map { "  \($0.offset + 1). \($0.element.line)" }
-                    .joined(separator: "\n")
-                guard !steps.isEmpty else { return "• \(command.keyword)" }
-                return "• \(command.keyword)\n\(steps)"
-            }.joined(separator: "\n")
+        let failed: Bool
+        switch CustomCommandRules.run(keyword: keyword, commands: customCommands.commands) {
+        case .success(let instructions): output = instructions; failed = false
+        case .failure(let refusal): output = refusal.sentence; failed = true
         }
         finishContextTool(
             callId: callId, tool: "commands", output: output,
             ms: Date().timeIntervalSince(started) * 1000,
-            outcome: enabled.isEmpty ? "local_empty" : "local_hit",
-            query: "", detail: "\(enabled.count) enabled", subsystem: "commands")
+            outcome: failed ? "local_refused" : "local_hit",
+            query: keyword, detail: "run → \(failed ? "refused" : "found")",
+            subsystem: "commands", failed: failed)
     }
 
     /// `summarize` — the last step of a command, where the assistant says what it found. It
@@ -4058,6 +3979,7 @@ final class FullDuplexVoiceClient {
         guard calendarFeedPending else { return }
         CalendarFeedCadence.markComplete(owners: calendarFeedOwners)
         calendarFeedPending = false
+        calendarAfterCoaching = nil
         RealtimeLog.log(
             "feed: calendar completed via \(source); marked \(calendarFeedOwners.count) owner(s)")
         armTerminalFeedWrapUp(source: source)
@@ -4623,6 +4545,11 @@ extension FullDuplexVoiceClient {
     func startOnboardingDispatchForTesting(flow: EmailOnboardingFlow, callId: String, argumentsJSON: String) {
         onboardingFlow = flow
         startDispatch(callId: callId, argumentsJSON: argumentsJSON)
+    }
+
+    func activateFeedForTesting(transport: FullDuplexTransport) {
+        self.transport = transport
+        isActive = true
     }
 
     func cancelDispatchesForTesting() {

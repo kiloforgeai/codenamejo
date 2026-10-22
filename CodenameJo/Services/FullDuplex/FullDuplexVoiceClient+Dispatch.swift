@@ -255,6 +255,7 @@ extension FullDuplexVoiceClient {
     func armFeedStages(from output: String) {
         updateSlackFeed(from: output)
         calendarFeedPending = Self.feedCalendarDue(output)
+        calendarAfterCoaching = Self.interstitialPayload(in: output)?["calendarAfterCoaching"] as? String
         guard calendarFeedPending,
               Self.interstitialPayload(in: output)?["calendarEvents"] != nil else { return }
         Task { [weak self, localTriage] in

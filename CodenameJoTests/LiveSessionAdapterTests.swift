@@ -15,6 +15,8 @@ final class LiveSessionAdapterTests: XCTestCase {
         var usage: [ResponseUsage] = []
         var contextRatios: [Double] = []
         var brainSteps: [CommandRecord.BrainStep] = []
+        var resets = 0
+        var completedInputs: [String] = []
         lazy var adapter = LiveSessionAdapter(wire: { [unowned self] in sent.append($0) }, emit: { [unowned self] in
             if case .liveFunction(let call) = $0 { calls.append(call) }
             if case .liveQueueActionUnworked(let exhausted) = $0 { queueRecovery.append(exhausted) }
@@ -26,6 +28,8 @@ final class LiveSessionAdapterTests: XCTestCase {
             if case .liveBackendUsage(let reported, _) = $0 { usage.append(reported) }
             if case .liveContextUsage(let ratio) = $0 { contextRatios.append(ratio) }
             if case .liveBrainStep(let step) = $0 { brainSteps.append(step) }
+            if case .liveResetRequested = $0 { resets += 1 }
+            if case .liveInputFinished(let text) = $0 { completedInputs.append(text) }
         })
 
         func receive(_ event: [String: Any]) throws {
@@ -62,6 +66,56 @@ final class LiveSessionAdapterTests: XCTestCase {
                 "type": "function_call_output", "call_id": id, "output": "Archiving; email B is current."]])
             adapter.outbound(["type": "response.create"])
         }
+    }
+
+    @MainActor
+    func testSpokenResetClosesAStalledToolSessionWithoutWaitingOrReplaying() async throws {
+        let h = Harness()
+        h.adapter.toolCallBound = 60
+        try h.start()
+        try h.function("stuck-write")
+        try h.function("queued-write")
+        try h.receive(["type": "session.input_transcript.delta", "delta": "Jo, reset.",
+                       "start_ms": 1000, "end_ms": 1500])
+        try await Task.sleep(for: .milliseconds(1200))
+        XCTAssertEqual(h.resets, 1)
+        XCTAssertTrue(h.completedInputs.isEmpty, "Reset must bypass normal input and tool routing")
+        XCTAssertEqual(h.calls.map(\.id), ["stuck-write"], "Queued work must not start")
+        XCTAssertEqual(h.sent.filter { $0["type"] as? String == "session.close" }.count, 1)
+        let before = h.sent.count
+        h.result("stuck-write")
+        try h.lifecycle("response.completed")
+        try h.receive(["type": "session.input_transcript.delta", "delta": "Jo reset",
+                       "start_ms": 4000, "end_ms": 4500])
+        XCTAssertEqual(h.sent.count, before, "Late results cannot revive the closed session")
+        XCTAssertEqual(h.resets, 1)
+        XCTAssertEqual(h.calls.map(\.id), ["stuck-write"])
+        let fresh = Harness()
+        try fresh.start()
+        try fresh.function("new-read", name: "gmail_search_messages")
+        fresh.result("new-read")
+        try fresh.lifecycle("response.completed")
+        XCTAssertEqual(fresh.calls.map(\.id), ["new-read"])
+        XCTAssertTrue(fresh.sent.contains { $0["type"] as? String == "response.create" })
+        fresh.adapter.close()
+    }
+
+    @MainActor
+    func testResetWaitsForWholeUtteranceAndIgnoresInjectedTranscripts() async throws {
+        let h = Harness()
+        try h.start()
+        try h.receive(["type": "session.input_transcript.delta", "delta": "Jo reset",
+                       "start_ms": 1000, "end_ms": 1500])
+        try h.receive(["type": "session.input_transcript.delta", "delta": " my password",
+                       "start_ms": 1500, "end_ms": 1800])
+        try await Task.sleep(for: .milliseconds(1200))
+        XCTAssertEqual(h.resets, 0)
+        XCTAssertEqual(h.completedInputs, ["Jo reset my password"])
+        try h.receive(["type": "session.input_transcript.delta", "delta": "Jo reset",
+                       "client_event_id": "injected", "start_ms": 4000, "end_ms": 4500])
+        try await Task.sleep(for: .milliseconds(1200))
+        XCTAssertEqual(h.resets, 0)
+        h.adapter.close()
     }
 
     @MainActor

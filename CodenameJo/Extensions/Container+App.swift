@@ -11,9 +11,6 @@ extension Container {
     var workspaceProfileRows: Factory<WorkspaceProfileRows> {
         self { WorkspaceProfileRows(dbPool: Container.shared.localContext().dbPool) }
     }
-    var emailCategoryRows: Factory<EmailCategoryRows> {
-        self { EmailCategoryRows(dbPool: Container.shared.localContext().dbPool) }
-    }
     var customCommandRows: Factory<CustomCommandRows> {
         self { CustomCommandRows(dbPool: Container.shared.localContext().dbPool) }
     }
@@ -24,6 +21,7 @@ extension Container {
     var profileDossier: Factory<ProfileDossierLearner> {
         self { ProfileDossierLearner(rows: Container.shared.workspaceProfileRows()) }.singleton
     }
+    var unsubscribeHTTP: Factory<any HTTPDataTransport> { self { UnsubscribeHTTPTransport() }.singleton }
     var providerHTTP: Factory<any HTTPDataTransport> { self { URLSessionDataTransport() }.singleton }
     /// The Google token server and Google's revoke endpoint.
     var tokenServerHTTP: Factory<any HTTPDataTransport> { self { URLSessionDataTransport() }.singleton }

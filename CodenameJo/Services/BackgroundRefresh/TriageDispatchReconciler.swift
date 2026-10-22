@@ -31,11 +31,11 @@ enum TriageDispatchReconciler {
     /// Does this dispatched task's own wording clear a whole sender out of the inbox?
     static func sweepsTheSender(_ task: String) -> Bool {
         let said = task.lowercased()
-        let unsubscribeLeavesExisting = said.range(
-            of: #"\bclear_existing\s+false\b"#, options: .regularExpression
+        let unsubscribeClearsExisting = said.range(
+            of: #"\bclear_existing\s+true\b"#, options: .regularExpression
         ) != nil
         if said.range(of: #"\bunsubscrib\w*\b"#, options: .regularExpression) != nil,
-           !unsubscribeLeavesExisting { return true }
+           unsubscribeClearsExisting { return true }
         guard said.range(
             of: #"\b(all|every|everything|each|the rest|the lot)\b"#, options: .regularExpression
         ) != nil else { return false }
