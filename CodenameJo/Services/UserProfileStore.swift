@@ -105,68 +105,6 @@ final class UserProfileStore: ObservableObject {
         }
     }
 
-    /// Merge the broker's saved first-mailbox choice before another whole-profile upload.
-    func applyOnboardingMailPreference(_ preference: OnboardingMailPreference, for owner: String?) async {
-        guard backend.isSignedIn, owner != nil, backend.userId == owner,
-              UserDefaults.standard.string(forKey: EmailOnboardingContract.mailModeAccountKey) != preference.account
-        else { return }
-        await inFlightUpload?.value
-        guard backend.isSignedIn, backend.userId == owner,
-              UserDefaults.standard.string(forKey: EmailOnboardingContract.mailModeAccountKey) != preference.account
-        else { return }
-        UserDefaults.standard.set(preference.account, forKey: EmailOnboardingContract.mailModeAccountKey)
-        if let draftsOnly = preference.draftsOnly {
-            DraftsOnly.set(draftsOnly, for: preference.account)
-        }
-        if !(await flush()) {
-            RealtimeLog.log("onboarding: saved mail preference is pending local profile synchronization")
-        }
-    }
-
-    private var isChangingMailMode = false
-
-    /// Save a spoken mode choice through the same account synchronization as Settings.
-    func setMailMode(mode: String, account: String? = nil) async -> (output: String, saved: Bool) {
-        guard !isChangingMailMode else {
-            return ("A mail mode change is still being saved. Wait for its result before changing it again.", false)
-        }
-        isChangingMailMode = true
-        defer { isChangingMailMode = false }
-        let profiles = Container.shared.workspaceProfiles()
-        let owner = backend.userId
-        let snapshot = ProfileRuntime.snapshot
-        let scope = snapshot?.profileId
-        guard let scope, let accounts = snapshot?.emails, !accounts.isEmpty,
-              backend.isSignedIn, owner != nil, !profiles.isSwitching,
-              mode == "send" || mode == "drafts" else {
-            return ("Mail mode was not changed. Choose send or drafts in the active profile.", false)
-        }
-        let requested = account?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-        let mailbox: String
-        if !requested.isEmpty {
-            guard let matched = accounts.first(where: { $0.lowercased() == requested }) else {
-                return ("Mail mode was not changed. Choose an email account in the active profile: \(accounts.joined(separator: ", ")).", false)
-            }
-            mailbox = matched
-        } else {
-            guard accounts.count == 1, let only = accounts.first else {
-                return ("Mail mode was not changed. This profile has multiple inboxes. Ask which email account to change: \(accounts.joined(separator: ", ")).", false)
-            }
-            mailbox = only
-        }
-        guard await flush(), backend.userId == owner,
-              ProfileRuntime.snapshot?.profileId == scope,
-              ProfileRuntime.snapshot?.emails == accounts, !profiles.isSwitching else {
-            return ("Mail mode was not changed because the current settings could not be saved or the profile changed.", false)
-        }
-        DraftsOnly.set(mode == "drafts", for: mailbox)
-        guard await flush(), backend.userId == owner,
-              ProfileRuntime.snapshot?.profileId == scope, !profiles.isSwitching else {
-            return ("The mail mode change is not confirmed saved. Do not claim it took effect; settings synchronization needs a retry.", false)
-        }
-        return ("Saved for \(mailbox): \(mode == "drafts" ? "future mail stays in Drafts" : "future requested mail can be sent"). This applies during this call. Existing drafts were not sent.", true)
-    }
-
     // MARK: - Saving
 
     /// Upload the current settings if they differ from the last profile seen.

@@ -215,17 +215,6 @@ final class ConnectionsService: ObservableObject {
 
     // MARK: - Disconnect (one account)
 
-    /// Give every newly connected inbox its own send/draft answer, Drafts, so it never inherits the
-    /// account-wide fallback. A reconnect of an existing inbox keeps its setting.
-    private func claimNewInboxes(knownBefore: [String]) {
-        for email in gmailAccounts where !knownBefore.contains(where: {
-            $0.caseInsensitiveCompare(email) == .orderedSame
-        }) {
-            DraftsOnly.set(true, for: email)
-            RealtimeLog.log("connect: \(email) — new inbox, set to drafts only")
-        }
-    }
-
     /// Revokes the grant with Google and drops this phone's copy and cached mail — "Remove"
     /// reads as one thing.
     func disconnectGmail(_ email: String) async {
@@ -381,7 +370,6 @@ final class ConnectionsService: ObservableObject {
                 + " · scopes \(outcome.scopes.count)")
             await refresh()
             await Container.shared.workspaceProfiles().connectedEmail()
-            claimNewInboxes(knownBefore: knownBefore)
             busyConnector = nil
             // Fetch the new mailbox now; `.manual` is the trigger with no floor.
             await BackgroundMailRefresh.run(trigger: .manual)

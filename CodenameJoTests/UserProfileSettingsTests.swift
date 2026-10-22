@@ -14,8 +14,8 @@ final class UserProfileSettingsTests: XCTestCase {
         StandingRule.archiveAfterReply.storageKey,
         StandingRule.archiveAfterForward.storageKey,
         StandingRule.archiveAfterLabel.storageKey,
-        DraftsOnly.storageKey, DraftsOnly.byAccountStorageKey,
-        EmailOnboardingContract.mailModeAccountKey, ThreadQueue.storageKey,
+        DraftsOnly.byAccountStorageKey,
+        ThreadQueue.storageKey,
         TriageScope.storageKey,
         AgentLedEmailSettings.key,
         OnboardingState.storageKey,
@@ -74,7 +74,7 @@ final class UserProfileSettingsTests: XCTestCase {
     func testApplyingThenCapturingReturnsTheSameChoices() {
         var profile = UserProfile()
         profile.threadQueue = true
-        profile.draftsOnly = false
+        profile.draftsOnlySafeguardByAccount = ["work@example.test": true]
         profile.triageScope = "unread"
         profile.appearance = "dark"
 
@@ -82,7 +82,7 @@ final class UserProfileSettingsTests: XCTestCase {
         let captured = UserProfile.capturingLocalSettings()
 
         XCTAssertEqual(captured.threadQueue, true)
-        XCTAssertEqual(captured.draftsOnly, false)
+        XCTAssertEqual(captured.draftsOnlySafeguardByAccount, ["work@example.test": true])
         XCTAssertEqual(captured.triageScope, "unread")
         XCTAssertEqual(captured.appearance, "dark")
     }
@@ -107,12 +107,12 @@ final class UserProfileSettingsTests: XCTestCase {
         UserDefaults.standard.set(true, forKey: MailHeadersOnly.storageKey)
         UserDefaults.standard.set(true, forKey: ThreadQueue.storageKey)
         UserDefaults.standard.set("dark", forKey: AppearanceSetting.storageKey)
-        UserDefaults.standard.set(false, forKey: DraftsOnly.storageKey)
+        DraftsOnly.set(true, for: "work@example.test")
 
         UserProfile.clearLocalSettings()
 
         for key in [MailHeadersOnly.storageKey, ThreadQueue.storageKey,
-                    AppearanceSetting.storageKey, DraftsOnly.storageKey] {
+                    AppearanceSetting.storageKey, DraftsOnly.byAccountStorageKey] {
             XCTAssertNil(UserDefaults.standard.object(forKey: key), "\(key) survived sign-out")
         }
     }
@@ -141,19 +141,19 @@ final class UserProfileSettingsTests: XCTestCase {
 
     func testAWorkspaceReplacesItsOwnFieldsAndClearsTheOnesItOmits() throws {
         var account = UserProfile()
-        account.draftsOnly = false
+        account.draftsOnlySafeguardByAccount = ["work@example.test": false]
         account.mailFooterEnabled = true
         account.triageScope = "unread"
         account.threadQueue = true
         account.appearance = "dark"
 
         var workspace = UserProfile()
-        workspace.draftsOnly = true
+        workspace.draftsOnlySafeguardByAccount = ["work@example.test": true]
         workspace.threadQueue = false      // not a workspace field — must be ignored
 
         let effective = try account.replacingWorkspaceSettings(with: workspace)
 
-        XCTAssertEqual(effective.draftsOnly, true)
+        XCTAssertEqual(effective.draftsOnlySafeguardByAccount, ["work@example.test": true])
         XCTAssertNil(effective.mailFooterEnabled, "A workspace the field is absent from clears it")
         XCTAssertNil(effective.triageScope)
         XCTAssertEqual(effective.threadQueue, true)

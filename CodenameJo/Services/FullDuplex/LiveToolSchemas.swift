@@ -766,31 +766,10 @@ enum LiveToolSchemas {
         "strict": false,
     ]
 
-    static let setMailMode: [String: Any] = [
-        "type": "function",
-        "name": "set_mail_mode",
-        "description": "Enable or disable ongoing draft mode for one email account in the selected profile without ending this call. If multiple inboxes exist, ask which account and wait for the answer before calling; do not infer it from the feed. With exactly one inbox, account may be omitted. mode drafts enables draft mode; mode send disables it and enables future requested sends. All other inboxes and profiles are unchanged. If a different profile is requested, switch_profile first and wait for success. This never sends existing drafts or writes a message. Confirm only after success.",
-        "parameters": [
-            "type": "object",
-            "properties": [
-                "mode": [
-                    "type": "string",
-                    "enum": ["send", "drafts"],
-                ],
-                "account": [
-                    "type": "string",
-                    "description": "Exact connected email address chosen by the user in the active profile. Required when the profile has multiple inboxes; omit only for a single-inbox profile.",
-                ],
-            ],
-            "required": ["mode"],
-        ],
-        "strict": false,
-    ]
-
     static let listProfiles: [String: Any] = [
         "type": "function",
         "name": "list_profiles",
-        "description": "List the user’s named profiles, plus the active profile’s inboxes and each one’s current send or drafts mode. Never reads another profile’s mail or history.",
+        "description": "List the user’s named profiles, plus the active profile’s inboxes and whether each one has Drafts only on. Never reads another profile’s mail or history.",
         "parameters": [
             "type": "object",
             "properties": [String: Any](),
@@ -1023,45 +1002,6 @@ enum LiveToolSchemas {
                 ],
             ],
             "required": ["name"],
-        ],
-        "strict": false,
-    ]
-
-    static let triageNextOnboardingMailMode: [String: Any] = [
-        "type": "function",
-        "name": "triage_next",
-        "description": "Walk the user through one mailbox at a time, one message at a time, newest first, until they reach the end of it or stop you. Answers instantly, from the mail already on their phone. Starting with no scope uses their saved pile, with Important continuing straight into the rest of unread. An unconfigured queue does that same Important-then-unread walk; it never returns a scope question. **After you act on a message, follow that tool's result.** If it explicitly says the queue already moved and carries its next message, checkpoint or close, do not call this. Otherwise call this again in the SAME turn to move on, so the user never has to ask for the next one. It returns the current message but no mailbox count; only answer how many are unread when the user explicitly asks. This is what \"next\", \"skip\", \"move on\" and \"nothing, carry on\" all mean, and it is how you start when the user asks what is in their inbox. Use direction \"back\" when they want the one before. Use restart when they want to check for mail that has arrived since. **Use stop the moment they end it** — \"stop\", \"that's enough\", \"I'm done\" — because saying you have stopped is not what stops it. With no account, it starts the primary mailbox or continues the active one. If the user asks to switch inboxes, call this with the exact account; their current place is checkpointed and resumes when they switch back. If the result offers another mailbox, an immediate yes means call this once with that offered account, while a no means stop true. Never carry that yes past an intervening question, topic change, interruption, skip, or completed action. **Never tell the user where an answer came from.** Not the phone, not a cache, not \"locally\": they asked about their mail, so talk about their mail.",
-        "parameters": [
-            "type": "object",
-            "properties": [
-                "onboarding_mail_mode": [
-                    "type": "string",
-                    "enum": ["drafts", "send", "skip"],
-                    "description": "Only when onboarding asks: save the explicit drafts/send choice for the first mailbox. Bare yes/no is ambiguous. Skip only if explicitly requested.",
-                ],
-                "direction": [
-                    "type": "string",
-                    "enum": ["forward", "back"],
-                    "description": "Default forward. \"back\" returns the previous message.",
-                ],
-                "restart": [
-                    "type": "boolean",
-                    "description": "Rebuild from live mail, discarding the current position. For \"check again\", \"anything since?\", \"start over\".",
-                ],
-                "stop": [
-                    "type": "boolean",
-                    "description": "End the queue and close it for good. Moves nothing and marks nothing — it takes the queue away and tells you how much they had left so you can say it on the way out.",
-                ],
-                "account": [
-                    "type": "string",
-                    "description": "Exact connected mailbox to activate. Omit to continue the active mailbox. Use when the user names an inbox or immediately accepts the mailbox offered by the preceding triage_next result.",
-                ],
-                "scope": [
-                    "type": "string",
-                    "enum": ["unread", "all", "important"],
-                    "description": "Which mail to walk: \"important\" for their past week, most important first — \"what needs me\", \"anything urgent\", \"just the important ones\" — \"unread\" for all of their unread, \"all\" for everything in the inbox, read and unread. Send this when the user explicitly names a different pile; asking what is urgent mid-queue names \"important\". Otherwise leave it out: the queue uses their saved pile or its automatic inbox walk. Important continues into the rest of unread. Leave it out on every later call and the queue stays in the scope it started in; sending a different one rebuilds it and loses their place.",
-                ],
-            ],
         ],
         "strict": false,
     ]

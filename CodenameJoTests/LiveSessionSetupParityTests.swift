@@ -40,8 +40,7 @@ final class LiveSessionSetupParityTests: XCTestCase {
         var request = LiveSessionSetup.Request()
         request.opening = (raw["opening"] as? String).flatMap(SessionOpening.init(rawValue:)) ?? .none
         if let run = raw["onboardingRun"] as? [String: Any] {
-            request.onboardingRun = (run["mailMode"] as? Bool == true, run["resume"] as? Bool == true,
-                                     run["opening"] as? String ?? "")
+            request.onboardingRun = (run["resume"] as? Bool == true, run["opening"] as? String ?? "")
         }
         request.dispatch = raw["dispatch"] as? Bool == true
         request.shortcutText = raw["shortcutText"] as? Bool == true

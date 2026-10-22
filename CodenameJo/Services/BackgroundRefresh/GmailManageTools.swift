@@ -1374,8 +1374,8 @@ enum GmailManageTools {
                 + "again and pass the id from the result. Nothing has gone yet.")
         }
         if DraftsOnly.isOn(for: target) {
-            throw Refusal(text: "NOT SENT — \(target) is set to drafts only, so nothing goes out from it. "
-                + "The draft is untouched. They can switch that inbox to sending in Settings.")
+            throw Refusal(text: "NOT SENT — Drafts only is on for \(target), so nothing goes out from it. "
+                + "The draft is untouched. They can turn off Drafts only under Safeguards in Settings.")
         }
         let draft = try await GmailAPI.draftDetail(token: token, id: draftId)
         let to = draft.message?.header("To")?.trimmingCharacters(in: .whitespaces) ?? ""

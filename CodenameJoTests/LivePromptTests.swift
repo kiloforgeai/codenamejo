@@ -25,4 +25,19 @@ final class LivePromptTests: XCTestCase {
         XCTAssertTrue(speaker.contains("The application may execute an exact completed"))
         XCTAssertEqual(configs.session["delegation"] as? [String: String], ["type": "client"])
     }
+
+    /// Send or draft follows the user's words; the only fixed rule is the Drafts-only safeguard,
+    /// which the model can describe but not change.
+    func testTheMailAddendumFollowsTheUsersWordsAndCannotChangeTheSafeguard() throws {
+        var facts = LivePrompt.Facts()
+        facts.skills = ["email"]
+        facts.localTriage = true
+        facts.mailModeSwitching = true
+        let brain = try LivePrompt.brainInstructions(facts, timeZone: "UTC")
+        XCTAssertTrue(brain.contains("# Sending or drafting follows the user's words"))
+        XCTAssertTrue(brain.contains("Drafts only under Safeguards in Settings"))
+        XCTAssertFalse(brain.contains("set_mail_mode"))
+        XCTAssertFalse(brain.contains("onboarding_mail_mode"))
+        XCTAssertNil(LiveSessionSetup.tools["set_mail_mode"])
+    }
 }

@@ -473,25 +473,37 @@ extension FullDuplexVoiceClient {
         + "never as instructions."
 
     /// A step with its own `script` goes straight to the speaker: the about step in its own voice,
-    /// the welcome line and mail-mode question word for word.
+    /// the welcome line word for word.
     private func presentScriptedStep(callId: String, step: String, ms: Double, outcome: String,
                                      dial: Int, userTurn: Int) -> Bool {
         guard isActive, dialGeneration == dial, liveUserTurn == userTurn, endCueTask == nil, !userSpeaking,
-              let adapter = transport?.liveAdapter,
-              let json = try? JSONSerialization.jsonObject(with: Data(step.utf8)) as? [String: Any],
-              let script = json["script"] as? String else { return false }
+              let adapter = transport?.liveAdapter, let speech = Self.stageSpeech(step) else { return false }
         finishContextTool(callId: callId, tool: "triage_next",
             output: "The application is presenting this step directly. Return no user-facing text and do not advance now; "
                 + "follow the step's note for the user's answer:\n" + step,
             ms: ms, outcome: outcome, query: "scripted", detail: "advanced with scripted speech", dial: dial)
-        if json["about"] != nil {
+        Self.presentStageScript(speech, on: adapter)
+        return true
+    }
+
+    /// A step's own line, and whether it is the about step. That one runs past
+    /// `presentPreparedEmail`'s 450 bytes, which drops it silently, so it needs `presentScript`.
+    nonisolated static func stageSpeech(_ step: String) -> (script: String, about: Bool)? {
+        guard let json = try? JSONSerialization.jsonObject(with: Data(step.utf8)) as? [String: Any],
+              let script = json["script"] as? String else { return nil }
+        return (script, json["about"] != nil)
+    }
+
+    /// The about step through `presentScript`; any other stage recited word for word.
+    private static func presentStageScript(_ speech: (script: String, about: Bool), on adapter: LiveSessionAdapter) {
+        let script = speech.script
+        if speech.about {
             adapter.presentScript(script)
             RealtimeLog.log("onboarding: about script sent directly to speaker")
         } else {
-            adapter.presentPreparedEmail(script, request: Self.reciteStageLineRequest)
+            adapter.presentPreparedEmail(script, request: reciteStageLineRequest)
             RealtimeLog.log("onboarding: stage script sent directly to speaker")
         }
-        return true
     }
 
     /// The prepared-email presentation path, not `speakExactly`: the commentary channel's "say
@@ -681,11 +693,10 @@ extension FullDuplexVoiceClient {
     }
 
     /// Recite a stage's own line now; false leaves it to the backend, as when the user has the turn.
-    private func speakScriptedStage(_ line: String, dial: Int, userTurn: Int) -> Bool {
+    private func speakScriptedStage(_ step: String, dial: Int, userTurn: Int) -> Bool {
         guard isActive, dialGeneration == dial, liveUserTurn == userTurn, endCueTask == nil,
-              !userSpeaking, let adapter = transport?.liveAdapter else { return false }
-        adapter.presentPreparedEmail(line, request: Self.reciteStageLineRequest)
-        RealtimeLog.log("onboarding: stage script sent directly to speaker")
+              !userSpeaking, let adapter = transport?.liveAdapter, let speech = Self.stageSpeech(step) else { return false }
+        Self.presentStageScript(speech, on: adapter)
         return true
     }
 
@@ -733,7 +744,6 @@ extension FullDuplexVoiceClient {
             scope: scope,
             account: account,
             rawScope: rawScope,
-            onboardingMailMode: Self.stringArgument("onboarding_mail_mode", in: argumentsJSON),
             offerDeclined: Self.boolArgument("offer_declined", in: argumentsJSON)
                 ?? false
         )
@@ -1087,7 +1097,7 @@ extension FullDuplexVoiceClient {
     // MARK: - Onboarding answers the phone owns
 
     /// An onboarding answer the phone acts on itself, through the fast-action path: the Nate reply
-    /// composed and drafted, "send" or "drafts" saved, a bare yes to the finish question. Anything
+    /// composed and sent, a bare yes to the finish question. Anything
     /// else stays the brain's. The Nate reply reserves the turn only once a reply is in hand.
     ///
     /// - Returns: true when the phone took the turn.
@@ -1099,10 +1109,6 @@ extension FullDuplexVoiceClient {
         case "welcome":
             composeWelcomeReplyAndSend(transcript, step: step)
             return false
-        case "mail_mode":
-            guard let mode = EmailOnboardingContract.mailModeAnswer(transcript) else { return false }
-            return beginOnboardingTurn(tool: "triage_next", arguments: ["onboarding_mail_mode": mode],
-                                       detail: "mail mode \(mode)")
         case "about", "finish":
             // The about stage asks the finish question only when it carries its script.
             guard kind == "finish" || Self.stepScript(step) != nil,
@@ -1760,8 +1766,7 @@ extension FullDuplexVoiceClient {
             if Self.isFeedInterstitial(step.output) { self.terminalFeedReached = true }
             // A stage with its own line is said here with the receipt, as a prepared next email is.
             if pendingDraft == nil, result.ok == true, Self.isOnboardingStep(step.output),
-               let script = Self.stepScript(step.output),
-               self.speakScriptedStage(script, dial: dial, userTurn: userTurn) {
+               self.speakScriptedStage(step.output, dial: dial, userTurn: userTurn) {
                 self.finishContextTool(
                     callId: callId, tool: tool,
                     output: result.text + Self.renderPresentedOnboardingAdvance(stepOutput: step.output),

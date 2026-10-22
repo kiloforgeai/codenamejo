@@ -9,7 +9,7 @@ enum LiveSessionSetup {
     /// What this dial asks for.
     struct Request {
         var opening: SessionOpening = .none
-        var onboardingRun: (mailMode: Bool, resume: Bool, opening: String)?
+        var onboardingRun: (resume: Bool, opening: String)?
         var dispatch = false
         var shortcutText = false
         var shortcutRead = false
@@ -87,7 +87,6 @@ enum LiveSessionSetup {
 
         static let bundled: Catalog = {
             var schemas: [String: (Accounts) -> [String: Any]] = [
-                "triage_next.onboarding_mail_mode": { _ in LiveToolSchemas.triageNextOnboardingMailMode },
                 "find_person.worker": LiveToolSchemas.findPersonWorker,
             ]
             for (name, tool) in LiveSessionSetup.tools where tool.schema(Accounts()) != nil {
@@ -110,7 +109,6 @@ enum LiveSessionSetup {
     static let tools: [String: any LiveTool] = {
         let s = LiveToolSchemas.self
         let phone: [any LiveTool] = [
-            PhoneTool(s.setMailMode) { $0.answerSetMailMode(callId: $1.id, argumentsJSON: $1.arguments) },
             PhoneTool(s.listProfiles) { $0.answerProfiles(callId: $1.id, name: $1.name, argumentsJSON: $1.arguments) },
             PhoneTool(s.switchProfile) { $0.answerProfiles(callId: $1.id, name: $1.name, argumentsJSON: $1.arguments) },
             PhoneTool(s.createProfile) { $0.runProfileManagement(callId: $1.id, name: $1.name, argumentsJSON: $1.arguments) },
@@ -238,7 +236,6 @@ enum LiveSessionSetup {
     static func resolve(_ request: Request, _ state: State, catalog: Catalog) -> Result {
         let inboxes = state.inboxes, calendars = state.calendars
         let fiveStep = request.onboardingRun != nil
-        let onboardingMailMode = request.onboardingRun?.mailMode == true
         let unreadAccounts = request.cachedMailboxes.map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
         let cacheServesMailbox = mailboxSetsMatch(inboxes, unreadAccounts)
         let opening: SessionOpening = fiveStep ? .emailQueue
@@ -277,14 +274,14 @@ enum LiveSessionSetup {
             add("trash_message", note: " In this device-owned queue, deletion is authorized against the user's "
                 + "latest completed words before the write runs. Never use this as a fallback for archive_message or ambiguous audio.")
         }
-        add(onboardingMailMode ? "triage_next.onboarding_mail_mode" : "triage_next")
+        add("triage_next")
         add("current_time")
         // Dispatch owns web research in a permission-first coaching session.
         if !(interactiveCoaching && request.dispatch) { add("web_search") }
         add("set_rule")
         add("feed_items")
         if localCoachingDelivery { add("coach_capability") }
-        for name in ["set_mail_mode", "list_profiles", "switch_profile", "create_profile", "rename_profile",
+        for name in ["list_profiles", "switch_profile", "create_profile", "rename_profile",
                      "search_context", "list_calls", "save_context", "forget_context", "end_session", "stop_listening"] {
             add(name)
         }
@@ -307,7 +304,7 @@ enum LiveSessionSetup {
             "localCoachingDelivery": localCoachingDelivery, "localTriage": true,
             "noDeviceMail": !cacheServesMailbox, "calendar": !calendars.isEmpty,
             "dispatch": request.dispatch, "emailLinkDispatch": true, "endSession": true,
-            "onboardingMailMode": onboardingMailMode, "mailModeSwitching": true,
+            "mailModeSwitching": true,
             "drafting": inboxes.filter(state.draftsOnly), "sending": inboxes.filter { !state.draftsOnly($0) },
             "googleNeedsReauth": state.needsReauth, "googleUnreachable": state.unreachable,
             "notionNeedsReauth": state.notionNeedsReauth,

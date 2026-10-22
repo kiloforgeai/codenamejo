@@ -1,15 +1,5 @@
 import Foundation
 
-/// A sign-out asks the next onboarding to put the mail-mode question again, even to a
-/// mailbox that answered it before. Cleared once a fresh answer is saved.
-enum OnboardingMailModeReplay {
-    private static let storageKey = "onboardingMailModeReplayAfterSignOut"
-
-    static var isRequested: Bool { UserDefaults.standard.bool(forKey: storageKey) }
-    static func request() { UserDefaults.standard.set(true, forKey: storageKey) }
-    static func complete() { UserDefaults.standard.removeObject(forKey: storageKey) }
-}
-
 /// The run a call hung up on, kept whole so the next dial picks it back up where it stopped.
 /// Cleared when the arc finishes or on sign-out — never by a hang-up.
 enum OnboardingResume {
@@ -30,19 +20,6 @@ enum OnboardingResume {
         guard runId == self.runId else { return }
         UserDefaults.standard.set(step, forKey: stepKey)
     }
-    /// The question is on the floor, so a resumed call opens on it rather than replying again.
-    static func asked(runId: String) {
-        guard var flow, flow.runId == runId, let choice = flow.mailModeChoice, choice.status == "welcome" else { return }
-        flow.mailModeChoice = .init(account: choice.account, status: "pending", mode: nil)
-        save(flow)
-    }
-    /// The saved answer rides the run, so a resumed call skips the founder email and the question.
-    static func saved(_ receipt: OnboardingMailModeReceipt, mode: String, runId: String) {
-        guard var flow, flow.runId == runId, let choice = flow.mailModeChoice else { return }
-        flow.mailModeChoice = .init(account: choice.account, status: "saved", mode: mode)
-        flow.mailPreference = receipt.mailPreference
-        save(flow)
-    }
     static func finish() {
         UserDefaults.standard.removeObject(forKey: flowKey)
         UserDefaults.standard.removeObject(forKey: stepKey)
@@ -54,14 +31,14 @@ enum OnboardingResume {
     }
 }
 
-/// Builds onboarding on the phone: the bundled steps, the founder email and the mail-mode question.
+/// Builds onboarding on the phone: the bundled steps and the founder email.
 enum LocalOnboardingRun {
     static func config(bundle: Bundle = .main) -> EmailOnboardingConfig? {
         let url = bundle.bundleURL.appendingPathComponent("prompts/onboarding/config.json")
         return (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(EmailOnboardingConfig.self, from: $0) }
     }
 
-    /// A first call's run. A lone mailbox is asked its mail mode unless it has already answered.
+    /// A first call's run.
     static func begin() async -> EmailOnboardingFlow? {
         guard let config = config() else {
             RealtimeLog.log("onboarding: no bundled config — dialling without it")
@@ -72,12 +49,7 @@ enum LocalOnboardingRun {
         let welcome: EmailOnboardingItem? = if let account = accounts.first, let welcomeStep {
             await WelcomeEmail.insert(account: account, step: welcomeStep)
         } else { nil }
-        let answered = UserDefaults.standard.string(forKey: EmailOnboardingContract.mailModeAccountKey) != nil
-        let asks = welcome != nil && accounts.count == 1 && config.mailModeQuestion != nil
-            && (OnboardingMailModeReplay.isRequested || !answered)
-        let flow = EmailOnboardingFlow(version: 2, runId: UUID().uuidString, welcome: welcome,
-            mailModeChoice: asks ? .init(account: accounts[0].lowercased(), status: "welcome", mode: nil) : nil,
-            config: config)
+        let flow = EmailOnboardingFlow(version: 2, runId: UUID().uuidString, welcome: welcome, config: config)
         OnboardingResume.begin(flow)
         return flow
     }
@@ -170,8 +142,6 @@ struct EmailOnboardingFlow: Codable, Sendable {
     let version: Int
     let runId: String
     let welcome: EmailOnboardingItem?
-    var mailPreference: OnboardingMailPreference? = nil
-    var mailModeChoice: MailModeChoice? = nil
     /// v2 only: the bundled steps, snapshotted for this run.
     var config: EmailOnboardingConfig? = nil
     /// An unfinished run from an earlier call: open with `resumeLine`, not the introduction.
@@ -188,12 +158,6 @@ struct EmailOnboardingFlow: Codable, Sendable {
             }
         }
     }
-
-    struct MailModeChoice: Codable, Sendable {
-        let account: String
-        let status: String
-        let mode: String?
-    }
 }
 
 /// Flat and all-optional so an unknown kind decodes and is skipped rather than failing the mint.
@@ -205,8 +169,6 @@ struct EmailOnboardingConfig: Codable, Sendable {
         let id: String
         let kind: String
         let line: String?
-        /// What the phone says once the welcome reply is sent, ahead of the next question.
-        let receipt: String?
         let question: String?
         let query: String?
         let count: Int?
@@ -217,7 +179,6 @@ struct EmailOnboardingConfig: Codable, Sendable {
     }
 
     func step(_ number: Int) -> Step? { steps.indices.contains(number - 1) ? steps[number - 1] : nil }
-    var mailModeQuestion: String? { steps.first { $0.kind == "mail_mode" }?.question }
     var finish: Step? { steps.last { $0.kind == "finish" } }
 }
 
@@ -305,16 +266,6 @@ struct EmailOnboardingSelection: Decodable, Sendable {
     let failures: [String]
 }
 
-struct OnboardingMailPreference: Codable, Sendable {
-    let account: String
-    let draftsOnly: Bool?
-}
-
-struct OnboardingMailModeReceipt: Codable, Sendable {
-    let note: String
-    let mailPreference: OnboardingMailPreference
-}
-
 enum EmailOnboardingContract {
     /// Past the last step, as opposed to a `stop` — which leaves the arc to resume next call.
     static func finishesOnboarding(_ output: String) -> Bool {
@@ -330,30 +281,6 @@ enum EmailOnboardingContract {
 
     static let beatPrefix = "onboarding-beat:"
     static let importantLead = "Summarize this recent important email in one sentence and ask what they would like to do with it."
-    static let mailModeQuestion = "Going forward, should I send your emails, or keep them in Drafts?"
-    static let welcomeSendReceipt = "Your reply has been sent."
-    static let mailModeNote = mailModeInstruction(question: mailModeQuestion)
-    static func mailModeInstruction(question: String) -> String {
-        "Ask \"\(question)\" Wait for an explicit choice of send or drafts. A bare yes/no is ambiguous: clarify. Call triage_next with onboarding_mail_mode \"send\" or \"drafts\" only after that choice; use \"skip\" only if they explicitly skip this preference. Do not draft or send another Nate reply. Reads, questions, silence, and ordinary next calls do not save a preference or advance. Never claim it is saved before the tool succeeds."
-    }
-
-    /// Saved on the phone: `onboardingPreferenceSaved` applies it to the profile, and the run keeps it for a resume.
-    static func saveMailMode(flow: EmailOnboardingFlow, mode: String) throws -> OnboardingMailModeReceipt {
-        guard let account = flow.mailModeChoice?.account, ["send", "drafts", "skip"].contains(mode) else {
-            throw URLError(.cannotParseResponse)
-        }
-        let draftsOnly = mode == "skip" ? nil : mode != "send"
-        let note = draftsOnly.map {
-            "Got it — I’ll \($0 ? "keep your emails in Drafts" : "send your emails") for this account. You can change that anytime in Settings."
-        } ?? "Skipped — your setting is unchanged, and you can change it anytime in Settings."
-        let receipt = OnboardingMailModeReceipt(note: note, mailPreference: .init(account: account, draftsOnly: draftsOnly))
-        OnboardingResume.saved(receipt, mode: mode, runId: flow.runId)
-        OnboardingMailModeReplay.complete()
-        return receipt
-    }
-
-    static let mailModeAccountKey = "onboardingMailModeAccount"
-
     /// Observations, then what Jo can do about them. `question` is the finish step's, asked here
     /// when this is the last stage, so Live doesn't compress all three steps into one reply.
     static func aboutInstruction(_ about: EmailOnboardingItem.About, question: String?) -> String {
@@ -445,7 +372,7 @@ enum EmailOnboardingContract {
     /// Sends on the answer, and makes that the turn's only call.
     /// "to this exact thread" is what `isOnboardingWelcomeReply` matches on — don't reword it.
     static func welcomeInstruction(line: String) -> String {
-        "Say exactly \"\(line)\" Say that line even though you would not normally invite them to speak: telling them the words is what teaches them how this works. Do not ask what they want to do with it, do not ask how they want to answer him, and do not end this turn on a question. An answer can pause mid-thought: while what they have said so far trails off, keep listening without prompting them. Once they have finished, turn everything they said into a short reply, send it with send_email to this exact thread, and confirm it was sent in one clause. The send's result carries the next onboarding stage; if it does not, call triage_next in the same turn. This onboarding reply is sent regardless of the mailbox's draft/send preference. Do not read it back first and do not ask permission. You already have everything you need: the thread id is in this payload and the question is in the snippet. Do not read, search for or look up this email, and do not look for another one from Nate — reply on the thread id you were given. Archive or skip if requested. Reads and reply edits do not advance onboarding."
+        "Say exactly \"\(line)\" Say that line even though you would not normally invite them to speak: telling them the words is what teaches them how this works. Do not ask what they want to do with it, do not ask how they want to answer him, and do not end this turn on a question. An answer can pause mid-thought: while what they have said so far trails off, keep listening without prompting them. Once they have finished, turn everything they said into a short reply, send it with send_email to this exact thread, and confirm it was sent in one clause. The send's result carries the next onboarding stage; if it does not, call triage_next in the same turn. This onboarding reply is sent even if the mailbox has Drafts only on. Do not read it back first and do not ask permission. You already have everything you need: the thread id is in this payload and the question is in the snippet. Do not read, search for or look up this email, and do not look for another one from Nate — reply on the thread id you were given. Archive or skip if requested. Reads and reply edits do not advance onboarding."
     }
     /// The onboarding reply steered onto Nate's thread: a write aimed at his thread or address,
     /// or an unaddressed one, only while the welcome stage is up. Nil leaves other writes alone.
@@ -510,23 +437,6 @@ enum EmailOnboardingContract {
               let reply = (raw["reply"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !reply.isEmpty, reply.count <= 600 else { return nil }
         return reply
-    }
-
-    /// "send" or "drafts" when exactly one is named and nothing negates it, "skip" alone, else nil
-    /// and the brain clarifies.
-    static func mailModeAnswer(_ transcript: String) -> String? {
-        let spoken = transcript.lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init)
-        let words = Set(spoken)
-        // A question about the choice is not the choice.
-        guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?"),
-              !["what", "which", "how", "why", "does", "do", "is", "can", "could", "should", "would", "will", "are"]
-                .contains(spoken.first ?? ""),
-              words.isDisjoint(with: ["not", "don", "dont", "never", "no", "nope", "rather", "instead"]) else { return nil }
-        let send = !words.isDisjoint(with: ["send", "sending", "sent"])
-        let drafts = !words.isDisjoint(with: ["draft", "drafts", "drafting"])
-        if send != drafts { return send ? "send" : "drafts" }
-        if !send, words.contains("skip") { return "skip" }
-        return nil
     }
 
     static let tip = "You're in your Feed. I bring forward emails that need your attention and help you handle them by voice. Whenever you need something, just ask."

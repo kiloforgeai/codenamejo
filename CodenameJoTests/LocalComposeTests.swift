@@ -25,7 +25,7 @@ final class LocalComposeTests: XCTestCase {
     private var paths: [String] = []
 
     private static let defaultsKeys = [StandingRule.archiveAfterReply.storageKey, MailFooter.storageKey,
-                                       DraftsOnly.storageKey, DraftsOnly.byAccountStorageKey]
+                                       DraftsOnly.byAccountStorageKey]
 
     override func setUp() async throws {
         try await super.setUp()
@@ -56,7 +56,6 @@ final class LocalComposeTests: XCTestCase {
         Container.shared.localWriteNotices.register { notices }
 
         Self.defaultsKeys.forEach { UserDefaults.standard.removeObject(forKey: $0) }
-        UserDefaults.standard.set(false, forKey: DraftsOnly.storageKey)
     }
 
     override func tearDown() async throws {
@@ -368,7 +367,20 @@ final class LocalComposeTests: XCTestCase {
 
     // MARK: - Drafts only, and the first-time check
 
-    func testOnboardingReplySendsWithoutChangingTheDraftPreference() async throws {
+    /// Off is the default: an inbox nobody has set sends what the user asked to send.
+    func testAnInboxWithNoSafeguardSetSendsTheSend() async throws {
+        let scripted = gmail(dealt(Mail(id: "m1", from: dana, to: owner)))
+        let result = await run("send_email", ["thread_id": "T1", "body": "Sounds good."])
+        XCTAssertEqual(result.text, "Sent to \(dana) from \(owner).")
+        XCTAssertEqual(posts(scripted), ["messages/send"])
+
+        let draft = gmail(dealt(Mail(id: "m1", from: dana, to: owner)))
+        let drafted = await run("create_draft", ["thread_id": "T1", "body": "Sounds good."])
+        XCTAssertEqual(posts(draft), ["drafts"], "and still drafts when they ask for a draft")
+        XCTAssertFalse(drafted.text.contains("Drafts only"))
+    }
+
+    func testOnboardingReplySendsWithoutChangingTheSafeguard() async throws {
         DraftsOnly.set(true, for: owner)
         let scripted = gmail(dealt(Mail(id: "m1", from: dana, to: owner)))
         let result = await run("send_email", ["thread_id": "T1", "body": "Loved it."], onboardingReply: true)
@@ -379,24 +391,24 @@ final class LocalComposeTests: XCTestCase {
 
         let later = gmail(dealt(Mail(id: "m1", from: dana, to: owner)))
         _ = await run("send_email", ["thread_id": "T1", "body": "One more thing."])
-        XCTAssertEqual(posts(later), ["drafts"], "later replies still obey the saved preference")
+        XCTAssertEqual(posts(later), ["drafts"], "later replies still obey the safeguard")
     }
 
     func testADraftsOnlyInboxSavesTheSendAsADraftAndSaysNothingWent() async throws {
-        UserDefaults.standard.set(true, forKey: DraftsOnly.storageKey)
+        DraftsOnly.set(true, for: owner)
         UserDefaults.standard.set(true, forKey: StandingRule.archiveAfterReply.storageKey)
         let scripted = gmail(dealt(Mail(id: "m1", from: dana, to: owner)))
         let result = await run("send_email", ["thread_id": "T1", "body": "Sounds good."])
-        XCTAssertEqual(result.text, "Draft to \(dana) saved in \(owner). Archived. Nothing was sent because this inbox is "
-            + "set to drafts only.")
+        XCTAssertEqual(result.text, "Draft to \(dana) saved in \(owner). Archived. Nothing was sent because Drafts only is "
+            + "on for this inbox.")
         XCTAssertEqual(result.ok, true)
         XCTAssertEqual(result.performedTool, "create_draft")
         XCTAssertEqual(posts(scripted), ["drafts", "threads/T1/modify"])
 
         let fresh = gmail()
         let new = await run("send_email", ["to": "new@example.co", "subject": "Hi", "body": "x"])
-        XCTAssertEqual(new.text, "Draft to new@example.co saved in \(owner). Nothing was sent because this inbox is set to "
-            + "drafts only.", "a drafts-only inbox is not asked the first-time question")
+        XCTAssertEqual(new.text, "Draft to new@example.co saved in \(owner). Nothing was sent because Drafts only is on "
+            + "for this inbox.", "a drafts-only inbox is not asked the first-time question")
         XCTAssertFalse(fresh.calls.contains { $0.path == "messages" })
     }
 

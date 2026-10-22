@@ -1,2 +1,0 @@
-# Onboarding mail preference
-Send the onboarding reply to Nate with send_email. This one reply bypasses the mailbox’s draft/send preference. Follow the onboarding stage note to ask and save the first mailbox’s draft/send preference. Afterwards use send_email for requested replies and outgoing mail: it reads the saved per-account preference on every call and saves a draft when that account is in Drafts mode. Other accounts retain their own settings.

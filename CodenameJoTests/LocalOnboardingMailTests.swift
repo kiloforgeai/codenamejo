@@ -93,7 +93,7 @@ final class LocalOnboardingMailTests: XCTestCase {
     }
 
     private func step(_ kind: String, query: String? = nil, count: Int? = nil) -> EmailOnboardingConfig.Step {
-        .init(id: kind, kind: kind, line: nil, receipt: nil, question: nil, query: query, count: count,
+        .init(id: kind, kind: kind, line: nil, question: nil, query: query, count: count,
               note: nil, say: nil, then: nil, tip: nil)
     }
 

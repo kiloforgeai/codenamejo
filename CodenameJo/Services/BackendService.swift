@@ -66,7 +66,6 @@ class BackendService: ObservableObject {
     /// so sign-out lands on the first onboarding screen.
     func signOut() {
         Container.shared.workspaceProfiles().resetForSignOut()
-        OnboardingMailModeReplay.request()
         // Google's API Services User Data Policy requires deleting the mail cache on sign-out.
         // Non-blocking; a purge interrupted by app termination is repeated on next launch.
         purgeCachedMail()

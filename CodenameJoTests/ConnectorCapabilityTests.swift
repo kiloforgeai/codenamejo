@@ -63,14 +63,13 @@ final class ConnectorCapabilityTests: XCTestCase {
     // MARK: - The sending sentence follows the setting
 
     func testTheThreeSendingStatesAreDescribedThreeDifferentWays() throws {
-        UserDefaults.standard.set(true, forKey: DraftsOnly.storageKey)
-        let allDraft = try mailDetail([work, personal])
+        let allSend = try mailDetail([work, personal])
 
-        DraftsOnly.set(false, for: work)
+        DraftsOnly.set(true, for: work)
         let mixed = try mailDetail([work, personal])
 
-        DraftsOnly.set(false, for: personal)
-        let allSend = try mailDetail([work, personal])
+        DraftsOnly.set(true, for: personal)
+        let allDraft = try mailDetail([work, personal])
 
         XCTAssertNotEqual(allDraft, mixed, "one inbox that sends is not the same promise")
         XCTAssertNotEqual(mixed, allSend)
@@ -80,38 +79,27 @@ final class ConnectorCapabilityTests: XCTestCase {
     /// The hazard the computed property exists for: a chip read before the switch moved and
     /// again after it has to answer differently both times.
     func testTheChipIsReadAtThePointOfUseRatherThanCachedOnFirstAccess() throws {
-        UserDefaults.standard.set(true, forKey: DraftsOnly.storageKey)
         let before = try mailDetail([work])
 
-        DraftsOnly.set(false, for: work)
+        DraftsOnly.set(true, for: work)
         let after = try mailDetail([work])
 
         XCTAssertNotEqual(before, after)
     }
 
-    /// The sentence describes the inboxes it is handed, not the account-wide flag on its own —
-    /// which is what makes a mixed account describable at all.
-    func testTheSentenceAnswersForTheInboxesItIsGivenNotTheAccountFlag() throws {
-        UserDefaults.standard.set(false, forKey: DraftsOnly.storageKey)
+    /// The sentence describes the inboxes it is handed, which is what makes a mixed account
+    /// describable at all.
+    func testTheSentenceAnswersForTheInboxesItIsGiven() throws {
         DraftsOnly.set(true, for: work)
 
-        let namedInboxDrafts = try mailDetail([work])
-
-        UserProfile.clearLocalSettings()
-        UserDefaults.standard.set(true, forKey: DraftsOnly.storageKey)
-        let accountDrafts = try mailDetail([work])
-
-        XCTAssertEqual(
-            namedInboxDrafts, accountDrafts,
-            "an inbox set to draft reads the same however it got there")
+        XCTAssertNotEqual(try mailDetail([work]), try mailDetail([personal]))
     }
 
     func testOnlyTheMailChipMovesWithTheSendingSetting() throws {
-        UserDefaults.standard.set(true, forKey: DraftsOnly.storageKey)
-        let drafting = [ConnectorCapability].google(inboxes: [work])
-
-        DraftsOnly.set(false, for: work)
         let sending = [ConnectorCapability].google(inboxes: [work])
+
+        DraftsOnly.set(true, for: work)
+        let drafting = [ConnectorCapability].google(inboxes: [work])
 
         XCTAssertEqual(Array(drafting.dropFirst()), Array(sending.dropFirst()))
         XCTAssertNotEqual(drafting.first, sending.first)
@@ -138,15 +126,13 @@ final class ConnectorCapabilityTests: XCTestCase {
     }
 
     func testAnAccountWithNoInboxesStillDescribesItselfSafely() throws {
-        UserDefaults.standard.set(false, forKey: DraftsOnly.storageKey)
         let empty = try mailDetail([])
 
-        UserDefaults.standard.set(true, forKey: DraftsOnly.storageKey)
+        DraftsOnly.set(true, for: work)
         let drafting = try mailDetail([work])
 
         XCTAssertEqual(
             empty, drafting,
-            "no inboxes is unobservable, so it reads as the drafting answer even with "
-                + "account-wide sending switched on")
+            "no inboxes is unobservable, so it reads as the drafting answer")
     }
 }

@@ -50,11 +50,7 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
     /// key, so a view model copy would be a second source of truth.
     @AppStorage(AppearanceSetting.storageKey) private var appearance = AppearanceSetting.system
 
-    /// Must match `DraftsOnly.isOn`'s default, or the switch shows a state the session does not use.
-    @AppStorage(DraftsOnly.storageKey) private var draftsOnly = true
-
-    /// Per-inbox answers that narrow `draftsOnly`. Empty means none answered, and a missing
-    /// entry reads as the account-wide fallback.
+    /// Which inboxes have the Drafts-only safeguard on. Empty or a missing entry reads as off.
     @AppStorage(DraftsOnly.byAccountStorageKey) private var draftsOnlyByAccount = Data()
 
     /// Must match `MailHeadersOnly.isOn`'s default, or the switch describes behaviour nobody gets.
@@ -118,7 +114,7 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
                     }
                     notificationsSection
                     // Only drawn once there is a mailbox to list.
-                    if !viewModel.gmailAccounts.isEmpty { sendingSection }
+                    if !viewModel.gmailAccounts.isEmpty { safeguardsSection }
                     // The notification automation trigger this relies on is iOS 27's.
                     if #available(iOS 27, *) { messagesSection }
                     privacySection
@@ -337,52 +333,43 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
         }
     }
 
-    // MARK: - Sending
+    // MARK: - Safeguards
 
-    /// Whether each connected inbox sends mail or only writes drafts. See `DraftsOnly`.
-    /// No account-wide switch: new inboxes are answered for when they connect (`ConnectionsService.claimNewInboxes`).
-    private var sendingSection: some View {
+    /// The Drafts-only safeguard, per connected inbox. See `DraftsOnly`.
+    private var safeguardsSection: some View {
         Section {
             ForEach(viewModel.gmailAccounts, id: \.self) { email in
-                let isDrafting = DraftsOnly.isOn(
-                    for: email, in: draftsOnlyByAccount, fallback: draftsOnly)
-                Toggle(isOn: sendsBinding(for: email)) {
+                let isDrafting = DraftsOnly.isOn(for: email, in: draftsOnlyByAccount)
+                Toggle(isOn: draftsOnlyBinding(for: email)) {
                     SettingsRow.label(
                         email,
                         icon: isDrafting ? "tray.and.arrow.down" : "paperplane",
                         detail: isDrafting
-                            ? "Mail waits in your Drafts until you send it"
-                            : "Mail goes out as soon as you ask"
+                            ? "Drafts only: mail waits in your Drafts until you send it"
+                            : "Jo sends or drafts, as you ask"
                     )
                 }
                 .tint(Theme.toggleOn)
-                .accessibilityIdentifier("sendsToggle_\(email)")
+                .accessibilityIdentifier("draftsOnlyToggle_\(email)")
                 .listRowBackground(Theme.surface)
             }
         } header: {
-            SettingsRow.header("Sending")
+            SettingsRow.header("Safeguards")
         } footer: {
             SettingsRow.footer(
-                "Each inbox decides for itself. On, mail goes the moment you ask. Off, the "
-                    + "default: nothing is sent from it — replies and forwards are written into "
-                    + "that mailbox's Gmail Drafts and you send them yourself. A newly "
-                    + "connected inbox always starts off. Reading, searching, archiving and "
-                    + "labelling are unaffected either way."
+                "Drafts only, per inbox. Off, the default: Jo sends when you say send and drafts "
+                    + "when you say draft. On: nothing is sent from that inbox — replies and "
+                    + "forwards are written into its Gmail Drafts and you send them yourself. "
+                    + "Reading, searching, archiving and labelling are unaffected either way."
             )
         }
     }
 
-    /// On means the inbox sends, the inverse of the stored `draftsOnly` answer. Goes through the
-    /// `@AppStorage` value so SwiftUI registers the dependency and the row redraws.
-    private func sendsBinding(for email: String) -> Binding<Bool> {
+    /// Goes through the `@AppStorage` value so SwiftUI registers the dependency and the row redraws.
+    private func draftsOnlyBinding(for email: String) -> Binding<Bool> {
         Binding(
-            get: {
-                !DraftsOnly.isOn(for: email, in: draftsOnlyByAccount, fallback: draftsOnly)
-            },
-            set: {
-                draftsOnlyByAccount =
-                    DraftsOnly.setting(!$0, for: email, in: draftsOnlyByAccount)
-            }
+            get: { DraftsOnly.isOn(for: email, in: draftsOnlyByAccount) },
+            set: { draftsOnlyByAccount = DraftsOnly.setting($0, for: email, in: draftsOnlyByAccount) }
         )
     }
 

@@ -148,7 +148,7 @@ enum LocalCompose {
 
         if name == "create_draft" || (!onboardingReply && DraftsOnly.isOn(for: account)) {
             var receipt = "Draft to \(to) saved in \(account)\(copies)." + (files ? archivedByRule : "")
-            if name == "send_email" { receipt += " Nothing was sent because this inbox is set to drafts only." }
+            if name == "send_email" { receipt += " Nothing was sent because Drafts only is on for this inbox." }
             return try await finishDraft(name, message, receipt: receipt, account: account, token: token, files: files,
                                          deferred: deferred, conversationId: conversationId)
         }

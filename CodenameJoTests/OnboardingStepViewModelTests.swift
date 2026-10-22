@@ -3,7 +3,6 @@
 // coverage-target: CodenameJo/Onboarding/OnboardingMicrophoneView.swift
 // coverage-target: CodenameJo/Onboarding/OnboardingSpeechView.swift
 // coverage-target: CodenameJo/Onboarding/OnboardingConnectView.swift
-// coverage-target: CodenameJo/Onboarding/OnboardingDraftsView.swift
 // coverage-target: CodenameJo/Onboarding/OnboardingSayItView.swift
 // coverage-target: CodenameJo/Onboarding/OnboardingNotificationsView.swift
 
@@ -99,18 +98,6 @@ final class OnboardingStepViewModelTests: XCTestCase {
         XCTAssertFalse(model.hasMailbox, "Optional tools alone don't unlock Continue")
         model.accounts[.google] = ["a@example.com"]
         XCTAssertTrue(model.hasMailbox)
-    }
-
-    // MARK: - Drafts
-
-    /// The switch is usable immediately and the spinner is not: `isReady` guards the
-    /// account's value arriving late, `isSaving` guards the write this screen makes.
-    /// Opening them the other way round is a Continue that looks already pressed.
-    func testTheDraftsStepIsUsableBeforeTheAccountAnswersAndIsNotAlreadySaving() {
-        let model = OnboardingDraftsViewModel()
-        XCTAssertFalse(model.isReady,
-                       "The gate opens in onViewAppear; the stored value is the cautious one")
-        XCTAssertFalse(model.isSaving)
     }
 
     // MARK: - Say it

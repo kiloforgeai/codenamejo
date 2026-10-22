@@ -2,31 +2,12 @@ import Foundation
 import XCTest
 @testable import CodenameJo
 
-private extension OnboardingMailPreference {
-    /// The preference a queue result carries, if any.
-    static func decode(from output: String) -> Self? {
-        struct Result: Decodable { let mailPreference: OnboardingMailPreference? }
-        return try? JSONDecoder().decode(Result.self, from: Data(output.utf8)).mailPreference
-    }
-}
-
 final class EmailOnboardingTests: XCTestCase {
-    func testMailPreferenceReceiptAndReconnectDecode() throws {
-        let receipt = #"{"mailPreference":{"account":"first@example.test","draftsOnly":false},"onboarding":{"step":2}}"#
-        let choice = try XCTUnwrap(OnboardingMailPreference.decode(from: receipt))
-        XCTAssertEqual(choice.account, "first@example.test")
-        XCTAssertEqual(choice.draftsOnly, false)
-        let skip = try XCTUnwrap(OnboardingMailPreference.decode(from:
-            #"{"mailPreference":{"account":"first@example.test"}}"#))
-        XCTAssertNil(skip.draftsOnly)
-        XCTAssertNil(OnboardingMailPreference.decode(from: "The preference could not be saved"))
-        XCTAssertNil(OnboardingMailPreference.decode(from: #"{"onboarding":{"step":1}}"#))
+    /// A run saved by an older build, with the mail-mode question's fields, still resumes.
+    func testAFlowSavedWithTheOldMailModeFieldsStillDecodes() throws {
         let flow = try JSONDecoder().decode(EmailOnboardingFlow.self, from: Data(
-            #"{"version":1,"runId":"run","welcome":null,"mailPreference":{"account":"first@example.test","draftsOnly":true}}"#.utf8))
-        XCTAssertEqual(flow.mailPreference?.draftsOnly, true)
-        let old = try JSONDecoder().decode(EmailOnboardingFlow.self, from: Data(
-            #"{"version":1,"runId":"run","welcome":null}"#.utf8))
-        XCTAssertNil(old.mailPreference)
+            #"{"version":1,"runId":"run","welcome":null,"mailPreference":{"account":"first@example.test","draftsOnly":true},"mailModeChoice":{"account":"first@example.test","status":"pending"}}"#.utf8))
+        XCTAssertEqual(flow.runId, "run")
     }
 
     private func item(_ step: Int) -> EmailOnboardingItem {
@@ -105,12 +86,11 @@ final class EmailOnboardingTests: XCTestCase {
         await second.end()
     }
 
-    func testHangUpAfterTheNateSendResumesOnTheMailModeQuestion() async throws {
+    func testHangUpAfterTheNateSendResumesPastIt() async throws {
         OnboardingResume.finish()
         defer { OnboardingResume.finish() }
         let all = [1,2,3,4].map(item)
-        let flow = EmailOnboardingFlow(version: 1, runId: UUID().uuidString, welcome: all[0],
-            mailModeChoice: .init(account: "owner@example.test", status: "welcome", mode: nil))
+        let flow = EmailOnboardingFlow(version: 1, runId: UUID().uuidString, welcome: all[0])
         let store = MailStore(database: nil, userId: "test-user")
         let dial = { (flow: EmailOnboardingFlow) async -> LocalTriageQueue in
             let queue = LocalTriageQueue()
@@ -124,23 +104,17 @@ final class EmailOnboardingTests: XCTestCase {
         let first = await dial(flow)
         let welcome = await first.openingStep(store: store)
         XCTAssertTrue(welcome.output.contains("to this exact thread"))
-        // The reply was sent on Nate's thread, so the question is on the floor when the call drops.
-        let asked = await first.step(.init(), store: store, dealtWith: true)
-        XCTAssertTrue(asked.output.contains("Going forward"))
+        // The reply was sent on Nate's thread, so the next stage is up when the call drops.
+        let next = await first.step(.init(), store: store, dealtWith: true)
+        XCTAssertEqual(try stage(next.output), 2)
+        XCTAssertFalse(next.output.contains("Going forward"), "no send-or-drafts question")
         await first.end()
-        XCTAssertEqual(OnboardingResume.flow?.mailModeChoice?.status, "pending")
 
         let resumed = try XCTUnwrap(LocalOnboardingRun.resumed())
-        XCTAssertEqual(resumed.resume, true)
         let second = await dial(resumed)
         let opening = await second.openingStep(store: store)
-        XCTAssertTrue(opening.output.contains("Going forward"), "the question again, not a second Nate send")
-        XCTAssertFalse(opening.output.contains("to this exact thread"))
-        var choice = LocalTriageQueue.Input()
-        choice.onboardingMailMode = "drafts"
-        let saved = await second.step(choice, store: store, dealtWith: false)
-        XCTAssertEqual(try stage(saved.output), 2)
-        XCTAssertEqual(OnboardingResume.flow?.mailModeChoice?.status, "saved")
+        XCTAssertEqual(try stage(opening.output), 2)
+        XCTAssertFalse(opening.output.contains("to this exact thread"), "not a second Nate send")
         await second.end()
     }
 
@@ -149,10 +123,9 @@ final class EmailOnboardingTests: XCTestCase {
         return object["script"] as? String
     }
 
-    func testTheWelcomeAndMailModeStagesCarryTheirOwnLines() async throws {
+    func testTheWelcomeStageCarriesItsOwnLine() async throws {
         let config = try XCTUnwrap(LocalOnboardingRun.config())
-        let flow = EmailOnboardingFlow(version: 2, runId: UUID().uuidString, welcome: item(1),
-            mailModeChoice: .init(account: "owner@example.test", status: "welcome", mode: nil), config: config)
+        let flow = EmailOnboardingFlow(version: 2, runId: UUID().uuidString, welcome: item(1), config: config)
         let queue = LocalTriageQueue()
         await queue.configure(coachingPlan: nil,
             forceOnboardingFeedLesson: false, sequentialFeed: false, calendarFeedDue: false,
@@ -161,13 +134,7 @@ final class EmailOnboardingTests: XCTestCase {
         let welcome = await queue.openingStep(store: store)
         XCTAssertEqual(try script(welcome.output), config.steps[0].line)
         XCTAssertTrue(welcome.output.contains("to this exact thread"), "the note still drives the send")
-        let question = await queue.step(.init(), store: store, dealtWith: true)
-        XCTAssertEqual(try script(question.output),
-                       [config.steps[0].receipt, config.mailModeQuestion].compactMap { $0 }.joined(separator: " "))
-        XCTAssertEqual(config.steps[0].receipt, "Your reply has been sent.")
         XCTAssertTrue(welcome.output.contains("send_email"))
-        XCTAssertEqual(config.mailModeQuestion, "Going forward, should I send your emails, or keep them in Drafts?")
-        XCTAssertEqual(try stage(question.output), 1, "the question shares the welcome stage")
         await queue.end()
     }
 
@@ -178,8 +145,7 @@ final class EmailOnboardingTests: XCTestCase {
 
     func testStagesNameTheirKindForThePhone() async throws {
         let config = try XCTUnwrap(LocalOnboardingRun.config())
-        let flow = EmailOnboardingFlow(version: 2, runId: UUID().uuidString, welcome: item(1),
-            mailModeChoice: .init(account: "owner@example.test", status: "welcome", mode: nil), config: config)
+        let flow = EmailOnboardingFlow(version: 2, runId: UUID().uuidString, welcome: item(1), config: config)
         let queue = LocalTriageQueue()
         await queue.configure(coachingPlan: nil,
             forceOnboardingFeedLesson: false, sequentialFeed: false, calendarFeedDue: false,
@@ -187,25 +153,9 @@ final class EmailOnboardingTests: XCTestCase {
         let store = MailStore(database: nil, userId: "test-user")
         let welcome = await queue.openingStep(store: store)
         XCTAssertEqual(try kind(welcome.output), "welcome")
-        let question = await queue.step(.init(), store: store, dealtWith: true)
-        XCTAssertEqual(try kind(question.output), "mail_mode")
-        var choice = LocalTriageQueue.Input()
-        choice.onboardingMailMode = "drafts"
-        let finish = await queue.step(choice, store: store, dealtWith: false)
-        XCTAssertEqual(try kind(finish.output), "finish")
+        let finish = await queue.step(.init(), store: store, dealtWith: true)
+        XCTAssertEqual(try kind(finish.output), "finish", "the Nate send goes straight on")
         await queue.end()
-    }
-
-    func testTheMailModeAnswerIsReadOnThePhone() {
-        XCTAssertEqual(EmailOnboardingContract.mailModeAnswer("You can send my emails."), "send")
-        XCTAssertEqual(EmailOnboardingContract.mailModeAnswer("Keep them in drafts please"), "drafts")
-        XCTAssertEqual(EmailOnboardingContract.mailModeAnswer("Just draft them."), "drafts")
-        XCTAssertEqual(EmailOnboardingContract.mailModeAnswer("skip"), "skip")
-        XCTAssertNil(EmailOnboardingContract.mailModeAnswer("Yes"), "a bare yes is the brain's to clarify")
-        XCTAssertNil(EmailOnboardingContract.mailModeAnswer("Don't send them, keep drafts"), "both named")
-        XCTAssertNil(EmailOnboardingContract.mailModeAnswer("No, not send"), "negated")
-        XCTAssertNil(EmailOnboardingContract.mailModeAnswer("I'd rather you send them"), "hedged")
-        XCTAssertNil(EmailOnboardingContract.mailModeAnswer("What does drafts mean?"))
     }
 
     func testTheComposedReplyIsKeptOnlyWhenItAnswersNate() throws {
@@ -254,14 +204,13 @@ final class EmailOnboardingTests: XCTestCase {
                      "a name is not an address: the route refuses it and asks for the thread, as for anyone")
         XCTAssertNil(try steered(#"{"thread_id":"another-thread","body":"x","user_request":"x"}"#))
         XCTAssertNil(try steered(#"{"body":"x","user_request":"x"}"#, onStage: false))
-        // Later replies to Nate use the saved preference, just like any other email.
+        // Later replies to Nate follow the safeguard, just like any other email.
         XCTAssertNil(try steered(#"{"thread_id":"welcome-thread","body":"x","user_request":"x"}"#, onStage: false))
     }
 
     func testTheQueueSteersTheNateReplyOnlyWhileTheWelcomeStageIsUp() async throws {
         let all = [1,2,3,4].map(item)
-        let flow = EmailOnboardingFlow(version: 1, runId: UUID().uuidString, welcome: all[0],
-            mailModeChoice: .init(account: "owner@example.test", status: "welcome", mode: nil))
+        let flow = EmailOnboardingFlow(version: 1, runId: UUID().uuidString, welcome: all[0])
         let queue = LocalTriageQueue()
         await queue.configure(coachingPlan: nil,
             forceOnboardingFeedLesson: false,
@@ -273,10 +222,10 @@ final class EmailOnboardingTests: XCTestCase {
         let onStage = await queue.onboardingWelcomeReply(bare)
         XCTAssertTrue(onStage?.contains("thread-1") == true)
         _ = await queue.step(.init(), store: store, dealtWith: true)
-        let afterQuestion = await queue.onboardingWelcomeReply(bare)
-        XCTAssertNil(afterQuestion, "the question is up; an unaddressed write is not Nate's")
+        let afterWelcome = await queue.onboardingWelcomeReply(bare)
+        XCTAssertNil(afterWelcome, "the next stage is up; an unaddressed write is not Nate's")
         let aimedAtNate = await queue.onboardingWelcomeReply(#"{"thread_id":"thread-1","body":"x","user_request":"x"}"#)
-        XCTAssertNil(aimedAtNate, "the onboarding send exception ends when the question is up")
+        XCTAssertNil(aimedAtNate, "the onboarding send exception ends with the welcome stage")
         await queue.end()
     }
 
@@ -314,170 +263,6 @@ final class EmailOnboardingTests: XCTestCase {
         XCTAssertEqual(try stage(first.output), 1)
         await queue.end()
     }
-    private actor PreferenceServer {
-        var attempts = 0
-        var failNext = true
-        var draftsOnly = false
-        func save(_ mode: String) throws -> OnboardingMailModeReceipt {
-            attempts += 1
-            if failNext { failNext = false; throw URLError(.timedOut) }
-            return .init(note: "Got it, saved. You can change this anytime in Settings.",
-                         mailPreference: .init(account: "owner@example.test", draftsOnly: mode == "skip" ? nil : draftsOnly))
-        }
-        func editInSettings() { draftsOnly = true }
-    }
-
-    func testLocalPreferenceHoldsOnFailureAndAdvancesOnceAfterReceipt() async throws {
-        let queue = LocalTriageQueue()
-        let server = PreferenceServer()
-        let all = [1,2,3,4].map(item)
-        let flow = EmailOnboardingFlow(version: 1, runId: "local-choice", welcome: all[0],
-            mailModeChoice: .init(account: "owner@example.test", status: "welcome", mode: nil))
-        await queue.configure(coachingPlan: nil,
-            forceOnboardingFeedLesson: false,
-            sequentialFeed: false, calendarFeedDue: false, localCalendar: false,
-            onboardingFlow: flow, onboardingLoader: { .init(items: all, failures: []) },
-            onboardingModeSaver: { try await server.save($0) })
-        let store = MailStore(database: nil, userId: "test-user")
-        let first = await queue.openingStep(store: store)
-        XCTAssertEqual(try stage(first.output), 1)
-        var choice = LocalTriageQueue.Input()
-        choice.onboardingMailMode = "send"
-        let premature = await queue.step(choice, store: store, dealtWith: false)
-        XCTAssertNil(OnboardingMailPreference.decode(from: premature.output))
-        let pending = await queue.step(.init(), store: store, dealtWith: false)
-        XCTAssertTrue(pending.output.contains("Going forward"))
-        let held = await queue.step(.init(), store: store, dealtWith: false)
-        XCTAssertEqual(try stage(held.output), 1)
-        choice.onboardingMailMode = "yes"
-        _ = await queue.step(choice, store: store, dealtWith: false)
-        let attemptsBefore = await server.attempts
-        XCTAssertEqual(attemptsBefore, 0)
-        choice.onboardingMailMode = "send"
-        let failed = await queue.step(choice, store: store, dealtWith: false)
-        XCTAssertTrue(failed.output.contains("couldn’t confirm"))
-        XCTAssertNil(OnboardingMailPreference.decode(from: failed.output))
-        let resumed = await queue.openingStep(store: store)
-        XCTAssertTrue(resumed.output.contains("Going forward"))
-        let saved = await queue.step(choice, store: store, dealtWith: false)
-        XCTAssertEqual(try stage(saved.output), 2)
-        XCTAssertEqual(OnboardingMailPreference.decode(from: saved.output)?.draftsOnly, false)
-        XCTAssertFalse(saved.output.contains("Settings"), "Live already acknowledged the answer")
-        await server.editInSettings()
-        let duplicate = await queue.step(choice, store: store, dealtWith: false)
-        XCTAssertEqual(try stage(duplicate.output), 2)
-        XCTAssertEqual(OnboardingMailPreference.decode(from: duplicate.output)?.draftsOnly, true)
-        let next = await queue.step(.init(), store: store, dealtWith: false)
-        XCTAssertEqual(try stage(next.output), 3)
-        await queue.end()
-    }
-
-    func testSavedPreferenceDescriptorDoesNotReplayNateOnFreshQueue() async throws {
-        let queue = LocalTriageQueue()
-        let all = [1,2,3,4].map(item)
-        let flow = EmailOnboardingFlow(version: 1, runId: "saved-choice", welcome: all[0],
-            mailPreference: .init(account: "owner@example.test", draftsOnly: false),
-            mailModeChoice: .init(account: "owner@example.test", status: "saved", mode: "send"))
-        await queue.configure(coachingPlan: nil,
-            forceOnboardingFeedLesson: false,
-            sequentialFeed: false, calendarFeedDue: false, localCalendar: false,
-            onboardingFlow: flow, onboardingLoader: { .init(items: all, failures: []) })
-        let result = await queue.openingStep(store: MailStore(database: nil, userId: "test-user"))
-        XCTAssertEqual(try stage(result.output), 2)
-        XCTAssertFalse(result.output.contains("Going forward"))
-        await queue.end()
-    }
-
-    private actor TailGate {
-        var release: CheckedContinuation<Void, Never>?
-        var entered: CheckedContinuation<Void, Never>?
-        var didEnter = false
-        func wait() async {
-            await withCheckedContinuation { continuation in
-                release = continuation
-                didEnter = true
-                entered?.resume()
-                entered = nil
-            }
-        }
-        func waitForEntry() async {
-            if didEnter { return }
-            await withCheckedContinuation { entered = $0 }
-        }
-        func open() { release?.resume(); release = nil }
-    }
-
-    func testSavedReconnectDuringProfileSynchronizationAdvancesOnlyOnce() async throws {
-        let queue = LocalTriageQueue()
-        let gate = TailGate()
-        let all = [1,2,3,4].map(item)
-        let flow = EmailOnboardingFlow(version: 1, runId: "race", welcome: all[0],
-            mailModeChoice: .init(account: "owner@example.test", status: "welcome", mode: nil))
-        let receipt = OnboardingMailModeReceipt(note: "Saved. Change it in Settings.",
-            mailPreference: .init(account: "owner@example.test", draftsOnly: false))
-        await queue.configure(coachingPlan: nil,
-            forceOnboardingFeedLesson: false,
-            sequentialFeed: false, calendarFeedDue: false, localCalendar: false,
-            onboardingFlow: flow, onboardingLoader: { .init(items: all, failures: []) },
-            onboardingModeSaver: { _ in receipt }, onboardingPreferenceSaved: { _ in await gate.wait() })
-        let store = MailStore(database: nil, userId: "test-user")
-        _ = await queue.openingStep(store: store)
-        _ = await queue.step(.init(), store: store, dealtWith: false)
-        let saving = Task { await queue.step(.init(onboardingMailMode: "send"), store: store, dealtWith: false) }
-        await gate.waitForEntry()
-        let savedFlow = EmailOnboardingFlow(version: 1, runId: "race", welcome: all[0],
-            mailPreference: receipt.mailPreference,
-            mailModeChoice: .init(account: "owner@example.test", status: "saved", mode: "send"))
-        await queue.configure(coachingPlan: nil,
-            forceOnboardingFeedLesson: false,
-            sequentialFeed: false, calendarFeedDue: false, localCalendar: false,
-            onboardingFlow: savedFlow, onboardingModeSaver: { _ in receipt })
-        let busyOpening = await queue.openingStep(store: store)
-        XCTAssertTrue(busyOpening.output.contains("still being confirmed"))
-        await gate.open()
-        let saved = await saving.value
-        XCTAssertEqual(try stage(saved.output), 2)
-        let opening = await queue.openingStep(store: store)
-        XCTAssertEqual(try stage(opening.output), 2)
-        await queue.end()
-    }
-
-    private actor ReceiptSink {
-        var values: [OnboardingMailPreference] = []
-        func receive(_ preference: OnboardingMailPreference) { values.append(preference) }
-    }
-
-    func testEndingCallDuringSaveStillReconcilesPreferenceWithoutAdvancing() async throws {
-        let queue = LocalTriageQueue()
-        let gate = TailGate()
-        let sink = ReceiptSink()
-        let welcome = item(1)
-        let flow = EmailOnboardingFlow(version: 1, runId: "ended-save", welcome: welcome,
-            mailModeChoice: .init(account: "owner@example.test", status: "welcome", mode: nil))
-        await queue.configure(coachingPlan: nil,
-            forceOnboardingFeedLesson: false,
-            sequentialFeed: false, calendarFeedDue: false, localCalendar: false,
-            onboardingFlow: flow, onboardingLoader: { .init(items: [], failures: []) },
-            onboardingModeSaver: { _ in
-                await gate.wait()
-                return .init(note: "Saved", mailPreference: .init(account: "owner@example.test", draftsOnly: false))
-            }, onboardingPreferenceSaved: { await sink.receive($0) })
-        let store = MailStore(database: nil, userId: "test-user")
-        _ = await queue.openingStep(store: store)
-        _ = await queue.step(.init(), store: store, dealtWith: false)
-        let saving = Task { await queue.step(.init(onboardingMailMode: "send"), store: store, dealtWith: false) }
-        await gate.waitForEntry()
-        await queue.cancelOnboarding(runId: flow.runId)
-        await gate.open()
-        let result = await saving.value
-        let receipts = await sink.values
-        XCTAssertEqual(receipts.count, 1)
-        XCTAssertEqual(receipts.first?.draftsOnly, false)
-        XCTAssertTrue(result.output.contains("stopped"))
-        let progress = await queue.progress
-        XCTAssertNil(progress)
-    }
-
     func testTransientQueueRepliesKeepOnboardingIdentity() {
         XCTAssertFalse(EmailOnboardingContract.exitsOnboarding(#"{"note":"The inbox switch is still being confirmed. Retry this step."}"#))
         XCTAssertFalse(EmailOnboardingContract.exitsOnboarding(#"{"error":"unavailable"}"#))
@@ -576,6 +361,24 @@ final class EmailOnboardingTests: XCTestCase {
         await queue.end()
     }
 
+    /// The Nate send lands straight on the about step now that no question sits between them.
+    /// Its line is too long for `presentPreparedEmail`, which drops it without a sound, so the
+    /// speech after the write has to be routed to `presentScript` (on device, 2026-10-21).
+    func testTheNateSendLandsOnAnAboutStepRoutedToTheLongScriptSpeaker() async throws {
+        let queue = try await aboutQueue(draft: true)
+        let store = MailStore(database: nil, userId: "test-user")
+        let welcome = await queue.openingStep(store: store)
+        let welcomeSpeech = try XCTUnwrap(FullDuplexVoiceClient.stageSpeech(welcome.output))
+        XCTAssertFalse(welcomeSpeech.about, "the welcome line is recited word for word")
+
+        let about = await queue.step(.init(), store: store, dealtWith: true)
+        XCTAssertEqual(try kind(about.output), "about")
+        let speech = try XCTUnwrap(FullDuplexVoiceClient.stageSpeech(about.output))
+        XCTAssertTrue(speech.about)
+        XCTAssertTrue(speech.script.hasSuffix("Keep going?"))
+        await queue.end()
+    }
+
     func testMissingAboutDraftGoesStraightToFinish() async throws {
         let queue = try await aboutQueue(draft: false)
         let store = MailStore(database: nil, userId: "test-user")
@@ -587,25 +390,7 @@ final class EmailOnboardingTests: XCTestCase {
 
     func testTheBundledStepsAreTheShippedOnes() throws {
         let config = try XCTUnwrap(LocalOnboardingRun.config())
-        XCTAssertEqual(config.steps.map(\.kind), ["welcome", "mail_mode", "about", "finish"])
-        XCTAssertNotNil(config.mailModeQuestion)
-    }
-
-    func testASavedMailModeRidesTheRunSoAResumeSkipsTheQuestion() throws {
-        OnboardingResume.finish()
-        defer { OnboardingResume.finish() }
-        let flow = EmailOnboardingFlow(version: 2, runId: "saved-locally", welcome: item(1),
-            mailModeChoice: .init(account: "owner@example.test", status: "welcome", mode: nil))
-        OnboardingResume.begin(flow)
-        let receipt = try EmailOnboardingContract.saveMailMode(flow: flow, mode: "drafts")
-        XCTAssertEqual(receipt.mailPreference.draftsOnly, true)
-        XCTAssertTrue(receipt.note.contains("Drafts"))
-        let resumed = try XCTUnwrap(LocalOnboardingRun.resumed())
-        XCTAssertEqual(resumed.resume, true)
-        XCTAssertEqual(resumed.mailModeChoice?.status, "saved")
-        XCTAssertEqual(resumed.mailPreference?.draftsOnly, true)
-        XCTAssertNil(try EmailOnboardingContract.saveMailMode(flow: flow, mode: "skip").mailPreference.draftsOnly)
-        XCTAssertThrowsError(try EmailOnboardingContract.saveMailMode(flow: flow, mode: "yes"))
+        XCTAssertEqual(config.steps.map(\.kind), ["welcome", "about", "finish"])
     }
 
     func testAnAboutDraftKeepsOnlyBoundedLinesAndKnownCapabilities() throws {

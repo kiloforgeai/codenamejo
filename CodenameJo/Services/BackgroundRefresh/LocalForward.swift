@@ -85,7 +85,7 @@ enum LocalForward {
 
         if DraftsOnly.isOn(for: account) {
             let receipt = "Draft forward to \(to) saved in \(account)\(copies)\(droppedClause) — nothing was sent, because "
-                + "this inbox is set to drafts only." + (files ? LocalCompose.archivedByRule : "")
+                + "Drafts only is on for this inbox." + (files ? LocalCompose.archivedByRule : "")
             return await finish(receipt: receipt, deferred: deferred, conversationId: conversationId, failure: { error in
                 Manage.isThrottle(error) ? "\(Manage.throttled) No draft was saved."
                     : "that draft forward didn't save (\(Manage.detail(error))) — there is nothing in \(account)'s drafts, "
