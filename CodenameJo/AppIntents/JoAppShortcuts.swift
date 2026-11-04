@@ -17,15 +17,10 @@ struct JoAppShortcuts: AppShortcutsProvider {
             // can't appear here.
             systemImageName: "record.circle"
         )
-        // The rest start a call without opening the app, so they work with the phone locked.
+        // Starts a call without opening the app, so it works with the phone locked.
         AppShortcut(
             intent: StartVoiceHandsFreeIntent(),
-            phrases: [
-                "Start \(.applicationName)",
-                "Start a command in \(.applicationName)",
-                "New \(.applicationName) command",
-                "Ask \(.applicationName)"
-            ],
+            phrases: ["Start \(.applicationName)"],
             shortTitle: "Start Voice Command",
             systemImageName: "record.circle"
         )
