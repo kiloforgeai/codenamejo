@@ -36,12 +36,28 @@ struct AdminSection<Interactor: ViewWithModelLifecycleObserver<AdminSectionViewM
         Section {
             ProfileDossierAdminComponent.make()
             dialTimingRow
+            handsFreeStartRow
         } header: {
             SettingsRow.header("Admin")
         } footer: {
             SettingsRow.footer("Debug builds only.")
         }
         .bind(observer: interactor, viewModel: viewModel)
+    }
+
+    /// What each "Start Jo" saw.
+    private var handsFreeStartRow: some View {
+        NavigationLink {
+            AdminDetailList(title: "Siri starts") {
+                HandsFreeStartSection()
+            }
+        } label: {
+            SettingsRow.label(
+                "Siri starts",
+                icon: "lock.iphone",
+                detail: "What each \"Start Jo\" saw."
+            )
+        }
     }
 
     /// The last dial's timing, one push away.
