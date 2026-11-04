@@ -36,12 +36,28 @@ struct AdminSection<Interactor: ViewWithModelLifecycleObserver<AdminSectionViewM
         Section {
             ProfileDossierAdminComponent.make()
             dialTimingRow
+            lockedStartSpikeRow
         } header: {
             SettingsRow.header("Admin")
         } footer: {
             SettingsRow.footer("Debug builds only.")
         }
         .bind(observer: interactor, viewModel: viewModel)
+    }
+
+    /// Spike: Siri starting a call with the phone locked.
+    private var lockedStartSpikeRow: some View {
+        NavigationLink {
+            AdminDetailList(title: "Locked start spike") {
+                LockedStartSpikeSection()
+            }
+        } label: {
+            SettingsRow.label(
+                "Locked start spike",
+                icon: "lock.iphone",
+                detail: "What each \"Test Jo locked\" run saw."
+            )
+        }
     }
 
     /// The last dial's timing, one push away.

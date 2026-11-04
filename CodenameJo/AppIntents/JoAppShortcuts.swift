@@ -20,6 +20,15 @@ struct JoAppShortcuts: AppShortcutsProvider {
             // can't appear here.
             systemImageName: "record.circle"
         )
+        #if DEBUG
+        // Spike: a call Siri starts without opening the app, for testing with the phone locked.
+        AppShortcut(
+            intent: LockedStartSpikeIntent(),
+            phrases: ["Test \(.applicationName) locked"],
+            shortTitle: "Test Jo Locked",
+            systemImageName: "lock.iphone"
+        )
+        #endif
         // Workflow-only intents remain available in the Shortcuts editor, without standalone phrases.
         /*
         // The messaging bridge rides iOS 27's notification-triggered automations.
