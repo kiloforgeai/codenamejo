@@ -14,9 +14,10 @@ import UIKit
 /// card is up or the dial fails: the system stops the process once `perform()` returns, and only
 /// the call's audio session holds it up after that.
 ///
-/// Unlocked, it opens the app and dials there, like every other entry point. `isProtectedDataAvailable`
-/// is the lock signal, and it lags a lock by about ten seconds, so a start inside that window
-/// takes the foreground path.
+/// **Background only, locked or not.** Adding `.foreground(.dynamic)` so an unlocked start could
+/// open the app made Siri ask for the passcode on a locked phone before `perform()` ran: the
+/// system authenticates up front for any intent that may come forward. Unlocked, the call
+/// runs the same way, with the card in the Dynamic Island.
 ///
 /// App target only: the system runs a `LiveActivityIntent` in the app's process, and the dial
 /// needs the app's container. Verified on a locked iPhone 17 Pro on 2026-11-03: the card was up
@@ -26,7 +27,7 @@ struct StartVoiceHandsFreeIntent: AudioRecordingIntent, LiveActivityIntent {
     static var description = IntentDescription(
         "Start a Codename Jo call, even with your phone locked."
     )
-    static var supportedModes: IntentModes = [.background, .foreground(.dynamic)]
+    static var supportedModes: IntentModes = .background
     static var authenticationPolicy: IntentAuthenticationPolicy = .alwaysAllowed
 
     /// Comfortably above a cold dial, below the roughly 30 seconds a Lock Screen start is given.
@@ -34,23 +35,17 @@ struct StartVoiceHandsFreeIntent: AudioRecordingIntent, LiveActivityIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        if UIApplication.shared.isProtectedDataAvailable {
-            try await continueInForeground(alwaysConfirm: false)
-            VoiceSessionLauncher.shared.requestLaunch(source: "siri")
-            return .result()
-        }
-
         let start = Date()
         LaunchTiming.armed()
         #if DEBUG
         var run = HandsFreeStartLog.Run(
             at: start,
-            locked: true,
+            locked: !UIApplication.shared.isProtectedDataAvailable,
             appState: Self.describe(UIApplication.shared.applicationState),
             liveActivitiesEnabled: LiveVoiceActivity.isAvailable
         )
         #endif
-        RealtimeLog.log("siri-locked: start — app \(Self.describe(UIApplication.shared.applicationState)), "
+        RealtimeLog.log("siri-start: start — app \(Self.describe(UIApplication.shared.applicationState)), "
             + "live activities \(LiveVoiceActivity.isAvailable)")
 
         let realtime = Container.shared.realtimeService()
@@ -58,7 +53,7 @@ struct StartVoiceHandsFreeIntent: AudioRecordingIntent, LiveActivityIntent {
         // What the CarPlay launch does first, for the same reason: no view may ever appear.
         Container.shared.accountBootstrap().start()
         guard Container.shared.backend().isSignedIn else {
-            RealtimeLog.log("siri-locked: not signed in")
+            RealtimeLog.log("siri-start: not signed in")
             return .result()
         }
         Container.shared.voiceCall().beginVoice()
@@ -76,7 +71,7 @@ struct StartVoiceHandsFreeIntent: AudioRecordingIntent, LiveActivityIntent {
             try? await Task.sleep(for: .milliseconds(100))
         }
         let elapsedMs = Int(Date().timeIntervalSince(start) * 1000)
-        RealtimeLog.log("siri-locked: \(outcome) after \(elapsedMs)ms — state \(realtime.sessionState.label)")
+        RealtimeLog.log("siri-start: \(outcome) after \(elapsedMs)ms — state \(realtime.sessionState.label)")
         #if DEBUG
         run.outcome = outcome
         run.elapsedMs = elapsedMs
@@ -101,7 +96,7 @@ struct StartVoiceHandsFreeIntent: AudioRecordingIntent, LiveActivityIntent {
 }
 
 #if DEBUG
-/// Locked starts, kept across launches: a console cannot attach to a launch Siri started.
+/// Siri starts, kept across launches: a console cannot attach to a launch Siri started.
 enum HandsFreeStartLog {
     struct Run: Codable {
         let at: Date
@@ -129,7 +124,7 @@ enum HandsFreeStartLog {
     static func clear() { UserDefaults.standard.removeObject(forKey: key) }
 }
 
-/// Settings → Admin → Locked Siri starts.
+/// Settings → Admin → Siri starts.
 struct HandsFreeStartSection: View {
     @State private var runs = HandsFreeStartLog.runs
 
@@ -158,7 +153,7 @@ struct HandsFreeStartSection: View {
                 }
             }
         } header: {
-            SettingsRow.header("Locked Siri starts")
+            SettingsRow.header("Siri starts")
         }
         .onAppear { runs = HandsFreeStartLog.runs }
     }

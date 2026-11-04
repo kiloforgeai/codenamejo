@@ -45,17 +45,17 @@ struct AdminSection<Interactor: ViewWithModelLifecycleObserver<AdminSectionViewM
         .bind(observer: interactor, viewModel: viewModel)
     }
 
-    /// What each "Start Jo" on a locked phone saw.
+    /// What each "Start Jo" saw.
     private var handsFreeStartRow: some View {
         NavigationLink {
-            AdminDetailList(title: "Locked Siri starts") {
+            AdminDetailList(title: "Siri starts") {
                 HandsFreeStartSection()
             }
         } label: {
             SettingsRow.label(
-                "Locked Siri starts",
+                "Siri starts",
                 icon: "lock.iphone",
-                detail: "What each \"Start Jo\" on a locked phone saw."
+                detail: "What each \"Start Jo\" saw."
             )
         }
     }
