@@ -1,6 +1,6 @@
 import AppIntents
 
-/// Registers Start Voice as an App Shortcut with Siri phrases. App-target-only: the system reads
+/// Registers Start Voice as App Shortcuts with Siri phrases. App-target-only: the system reads
 /// App Shortcuts from the app bundle. `\(.applicationName)` also matches `INAlternativeAppNames`.
 struct JoAppShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
@@ -8,27 +8,27 @@ struct JoAppShortcuts: AppShortcutsProvider {
             intent: StartVoiceSessionIntent(),
             phrases: [
                 // Siri's launcher takes "launch"/"run" outright and takes "open" whenever
-                // the name resolves, so this fires only as "Open Jo"/"Open Joe".
-                "Open \(.applicationName)",
+                // the name resolves, so this fires only as "Open Jo"/"Open Joe". "Open" means
+                // the app, so it stays on the intent that opens it, Face ID and all.
+                "Open \(.applicationName)"
+            ],
+            shortTitle: "Open Voice Command",
+            // App Shortcut tiles accept only system symbol names, so the custom OrbPedestal glyph
+            // can't appear here.
+            systemImageName: "record.circle"
+        )
+        // The rest start a call without opening the app, so they work with the phone locked.
+        AppShortcut(
+            intent: StartVoiceHandsFreeIntent(),
+            phrases: [
                 "Start \(.applicationName)",
                 "Start a command in \(.applicationName)",
                 "New \(.applicationName) command",
                 "Ask \(.applicationName)"
             ],
             shortTitle: "Start Voice Command",
-            // App Shortcut tiles accept only system symbol names, so the custom OrbPedestal glyph
-            // can't appear here.
             systemImageName: "record.circle"
         )
-        #if DEBUG
-        // Spike: a call Siri starts without opening the app, for testing with the phone locked.
-        AppShortcut(
-            intent: LockedStartSpikeIntent(),
-            phrases: ["Test \(.applicationName) locked"],
-            shortTitle: "Test Jo Locked",
-            systemImageName: "lock.iphone"
-        )
-        #endif
         // Workflow-only intents remain available in the Shortcuts editor, without standalone phrases.
         /*
         // The messaging bridge rides iOS 27's notification-triggered automations.
