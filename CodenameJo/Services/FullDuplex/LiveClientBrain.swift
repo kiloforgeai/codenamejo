@@ -252,6 +252,10 @@ final class LiveClientBrain {
                     let selected = candidates.count == 1 ? candidates[0] : state
                     replyComposition = .init(source: DispatchJob.MailOrigin.captured(in: selected) ?? source,
                         selection: selected, request: text, turn: turn)
+                    if candidates.isEmpty, LiveReplyComposition.namesPriorSource(text) {
+                        replyComposition?.needsSourceSelection = true
+                        replyComposition?.clarification = "Which exact email should receive the reply? Select it and retry."
+                    }
                     if candidates.count > 1 {
                         replyComposition?.candidateSelections = candidates
                         replyComposition?.clarification = "Which account's email with this subject should receive the reply? Select it and retry."
@@ -972,7 +976,7 @@ final class LiveClientBrain {
                     var item = originalItem
                     if let name = item["name"] as? String, ["send_email", "reply_email", "create_draft"].contains(ToolNarration.canonical(name)),
                        let id = item["call_id"] as? String, let composition = replyComposition,
-                       composition.writeCall == nil, composition.recoveryJobID == nil, composition.candidateSelections.count <= 1, !LiveReplyComposition.sameSource(DispatchJob.MailOrigin.captured(in: state), composition.source),
+                       composition.writeCall == nil, composition.recoveryJobID == nil, composition.candidateSelections.count <= 1, !composition.needsSourceSelection, !LiveReplyComposition.sameSource(DispatchJob.MailOrigin.captured(in: state), composition.source),
                        let key = LiveEmailPresentation.Key.selection(composition.selection) {
                         let args = (item["arguments"] as? String).flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] } ?? [:]
                         let source = LocalCompose.ReplySource(selection: key, ownerID: Container.shared.backend().userId,
@@ -988,7 +992,7 @@ final class LiveClientBrain {
                     }
                     if let name = item["name"] as? String, let id = item["call_id"] as? String,
                        let refusal = replyComposition?.refusal(name: name, arguments: item["arguments"] as? String ?? "{}", selection: state) {
-                        if replyComposition?.candidateSelections.count ?? 0 > 1,
+                        if (replyComposition?.candidateSelections.count ?? 0 > 1 || replyComposition?.needsSourceSelection == true),
                            let args = item["arguments"] as? String, let body = ToolArguments(args).string("body") {
                             replyComposition?.recoveredBody = body
                         }
