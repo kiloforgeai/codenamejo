@@ -15,9 +15,27 @@ final class LiveClientBrain {
     var timeZone: () -> TimeZone = { .current }
     private var requestDate: Date?
     private var requestZone: TimeZone?
-    private(set) var calendarWindow: CalendarRequestWindow?
-    private var calendarReadIncomplete = false
-    private var calendarReadAt: Date?
+    private var calendar = LiveCalendarConversation()
+    private var replyComposition: LiveReplyComposition?
+    private var replyRecoveryTurns = Set<Int>()
+    var automaticNarration = true
+    var onReplyComposition: (([String: String]) -> Void)?
+    var calendarWindow: CalendarRequestWindow? { calendar.window }
+    var needsExactCalendarSpeech: Bool { calendar.checkingAvailability(for: latestUser) }
+    var onCalendarIntent: (([String: String]) -> Void)?
+    private var requestSourceState: String { calendar.sourceState(fallback: state) }
+
+    /// Only calls already accepted by this brain can keep the original scheduling source.
+    func calendarSource(for call: LiveSessionAdapter.Call) -> String? {
+        guard functionItems[call.id] != nil else { return nil }
+        return calendar.source(for: call)
+    }
+
+    private func persistCalendarIntent() {
+        guard let intent = calendar.intent else { return }
+        let store = Container.shared.dispatchJobs(), owner = Container.shared.backend().userId, profile = ProfileRuntime.snapshot?.profileId
+        Task { _ = await store.saveCalendarIntent(intent, ownerID: owner, profileID: profile) }
+    }
     private var completedJobs: [(id: UUID, result: String)] = []
     private var jobRevision = 0
     private var input: [[String: Any]] = []
@@ -45,6 +63,7 @@ final class LiveClientBrain {
     private var completedTurns = Set<Int>()
     private var currentTurn = 0
     private var latestUser = ""
+    private var userInputFinalized = true
     private var latestAssistant = ""
     private var turnHistoryIndex: Int?
     private var state = ""
@@ -90,6 +109,8 @@ final class LiveClientBrain {
     private var sourceQuestion = false
     private var releasedDecisionSources = Set<MailSelection>()
     var holdsFeedDecision: Bool {
+        if replyComposition?.holdsDecision == true { return true }
+        if calendar.holdsFeedDecision { return true }
         if investigating { return true }
         guard let key = LiveEmailPresentation.Key.selection(state) else { return false }
         let selection = MailSelection(account: key.account, messageID: key.messageId)
@@ -158,6 +179,9 @@ final class LiveClientBrain {
             context.removeAll()
             lookup = nil
             priorReplyDestination = nil
+            calendar.scopeChanged()
+            replyComposition = nil
+            replyRecoveryTurns.removeAll()
             investigating = false
             releasedDecisionSources.removeAll()
             sourceInquiry = nil
@@ -174,21 +198,47 @@ final class LiveClientBrain {
         }
         let selected = LiveSelectionGrounding.selection(state)
         if selected != previousSelection {
-            sourceInquiry = nil
+            if !calendar.focused { sourceInquiry = nil }
             lookup = nil
             investigating = false
-            calendarWindow = nil
-            calendarReadIncomplete = false
+            calendar.selectionChanged()
             invalidatePresentation(reason: "selection_changed")
             rejectingAssistantPresentation = false
             if selected.identity != nil { correctedEmptySelection = false }
         }
     }
 
-    func user(_ text: String, turn: Int) {
-        sourceQuestion = SelectedEmailInquiry.requiresSource(text)
+    func user(_ text: String, turn: Int, finalized: Bool = true) {
+        userInputFinalized = finalized
+        if finalized {
+            if let replyComposition, let call = replyComposition.writeCall,
+               LiveReplyComposition.requestsReply(text),
+               Container.shared.dispatchJobs().resolvedMailCall(call, source: replyComposition.source) {
+                self.replyComposition = nil
+            }
+            if LiveReplyComposition.cancels(text) { replyComposition = nil }
+            else if replyComposition?.active == true {
+                replyComposition?.user(text, turn: turn, selection: state)
+            } else if LiveReplyComposition.requestsReply(text), let source = DispatchJob.MailOrigin.captured(in: state) {
+                if replyComposition?.turn == turn { replyComposition?.user(text, turn: turn, selection: state) }
+                else { replyComposition = .init(source: source, selection: state, request: text, turn: turn) }
+            }
+            recordReplyComposition("reply_input")
+        }
+        calendar.user(text, selection: state, proposal: latestAssistant, newTurn: turn != currentTurn,
+                      jobs: Container.shared.dispatchJobs(), finalized: finalized)
+        var intentFields = calendar.intentDiagnostics
+        intentFields["transition"] = "calendar_intent_input"
+        intentFields["input_finalized"] = String(finalized)
+        intentFields["reason"] = CalendarConversationIntent.emailOnly(text) ? "email_composition_only" :
+            CalendarConversationIntent.accepts(text) ? (finalized ? "explicit_reply_and_invitation" : "provisional_request") : "no_combined_request"
+        onCalendarIntent?(intentFields)
+        if finalized { persistCalendarIntent() }
+        sourceQuestion = calendar.focused || SelectedEmailInquiry.requiresSource(text)
+        if replyComposition?.active == true, replyComposition?.targetConfirmed == true,
+           LiveReplyComposition.confirmsTarget(text) || LiveReplyComposition.requestsReply(text) { sourceQuestion = false }
         if sourceQuestion {
-            sourceInquiry = SelectedEmailInquiry(state: state, previous: sourceInquiry,
+            sourceInquiry = SelectedEmailInquiry(state: requestSourceState, previous: sourceInquiry,
                 headersOnly: MailHeadersOnly.withholdsBodies || ProfileRuntime.snapshot?.mailHeadersOnly == true)
         }
         if LiveFastAction.parse(text) != nil || Self.requestsDecision(text) || DispatchScope.explicitlyContinuesFeed(text) {
@@ -215,16 +265,9 @@ final class LiveClientBrain {
         if turn != currentTurn {
             requestDate = now()
             requestZone = timeZone()
-            let followup = text.range(of: #"\b(?:send|reply|draft|those|slots|times|yes)\b"#,
-                options: [.regularExpression, .caseInsensitive]) != nil
-            if !followup { calendarWindow = nil }
         }
-        let resolved = CalendarRequestWindow(request: text, reference: requestDate ?? now(), zone: requestZone ?? timeZone())
-        if let resolved, calendarWindow != resolved {
-            calendarWindow = resolved
-            calendarReadIncomplete = true
-            calendarReadAt = nil
-        }
+        calendar.resolveWindow(for: text, newTurn: turn != currentTurn,
+                               reference: requestDate ?? now(), zone: requestZone ?? timeZone())
         if LiveRequestRecovery.isFeedback(text) {
             invalidatePresentation(reason: "feedback")
         }
@@ -238,7 +281,7 @@ final class LiveClientBrain {
             latestAssistant = ""
             rejectingAssistantPresentation = false
             currentTurn = turn
-            turnState = state
+            turnState = requestSourceState
             history.append(["type": "message", "role": "user", "content": text])
             while history.count > 24 { history.removeFirst() }
             turnHistoryIndex = history.count - 1
@@ -247,6 +290,11 @@ final class LiveClientBrain {
         }
         latestUser = text
         if task != nil, requestTurn != turn { supersedeRequest() }
+    }
+
+    func finalizeUser(turn: Int) {
+        guard turn == currentTurn, !latestUser.isEmpty, !userInputFinalized else { return }
+        user(latestUser, turn: turn, finalized: true)
     }
 
     func assistant(_ delta: String) {
@@ -258,10 +306,18 @@ final class LiveClientBrain {
             return
         }
         if latestAssistant.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?") {
+            replyComposition?.question(latestAssistant)
             guard !holdsFeedDecision || Self.withoutDispositionQuestion(latestAssistant) == latestAssistant else { return }
             pendingQuestion = latestAssistant
             questionState = LiveCompactContext.selectionReference(state)
         }
+    }
+
+    private func recordReplyComposition(_ transition: String) {
+        guard let replyComposition else { return }
+        onReplyComposition?(["transition": transition, "composition_id": replyComposition.id.uuidString,
+            "composition_revision": String(replyComposition.revision), "target_confirmed": String(replyComposition.targetConfirmed),
+            "reason": replyComposition.writeCall == nil ? "preserved_request" : "write_already_attempted"])
     }
 
     private func invalidatePresentation(reason: String) {
@@ -439,8 +495,9 @@ final class LiveClientBrain {
            let id = item["call_id"] as? String, pendingCalls.contains(id) || scopeSwitchCalls.contains(id) {
             if let call = functionItems[id] { recordSearchCoverage(call, output: output) }
             if functionItems[id]?["name"] as? String == CalendarTools.list {
-                calendarReadIncomplete = !CalendarRequestWindow.completeRead(output, window: calendarWindow)
-                calendarReadAt = now()
+                calendar.recordRead(id: id, arguments: functionItems[id]?["arguments"] as? String, output: output,
+                                    accounts: CalendarTools.accounts(), now: now(), zone: timeZone())
+                if calendar.focused { persistCalendarIntent() }
             }
             attemptFields["tool_result_bytes"] = String(max(Int(attemptFields["tool_result_bytes"] ?? "0") ?? 0, output.utf8.count))
         }
@@ -487,6 +544,10 @@ final class LiveClientBrain {
                 record["origin_selection"] = LiveCompactContext.selectionReference(origin.selection)
             }
             actionRecords.append(record)
+            if calendar.intent != nil {
+                calendar.reconcile(jobs: Container.shared.dispatchJobs())
+                persistCalendarIntent()
+            }
             functionItems.removeValue(forKey: id)
             while actionRecords.count > 12 { actionRecords.removeFirst() }
         }
@@ -560,6 +621,9 @@ final class LiveClientBrain {
 
     private func startSettledDelegation() {
         guard let turn = settledTurn, turn == currentTurn, !latestUser.isEmpty else { return }
+        guard !LiveRequestRecovery.isBackchannel(latestUser), !LiveRequestRecovery.incompleteAction(latestUser) else {
+            finishQueuedAttempt(reason: "non_request"); queuedDelegation = nil; return
+        }
         guard let queued = queuedDelegation, (queued.turn == turn || queued.turn == 0), !busy else { return }
         guard !completedTurns.contains(turn) else { queuedDelegation = nil; return }
         queuedDelegation = nil
@@ -679,13 +743,15 @@ final class LiveClientBrain {
         let requestScope = scopeRevision
         let requestPresentation = presentationOnly
         let requestJobs = jobRevision
-        let requestSelection = LiveSelectionGrounding.selection(state)
+        let sourceState = requestSourceState
+        let requestSelection = LiveSelectionGrounding.selection(sourceState)
         let responseID = "jo-" + UUID().uuidString
         let readingSource = sourceQuestion && !requestPresentation
+        let comparingSources = readingSource && SelectedEmailInquiry.requestsComparison(latestUser)
         if readingSource, MailBodyCache.withheld {
             sourceInquiry?.failure = "I only have header access for this email, so I can't verify what its body says."
         }
-        if readingSource, LiveSelectionGrounding.selection(requestState) != LiveSelectionGrounding.selection(state) {
+        if readingSource, LiveSelectionGrounding.selection(requestState) != requestSelection {
             fail("The selected email changed while I was checking it. Ask about the email now in focus.", reason: "source_selection_changed", stage: "pre_request")
             return
         }
@@ -702,6 +768,11 @@ final class LiveClientBrain {
                              ["job_id": $0.id.uuidString, "state": "finished", "result": $0.result]
                          }, "applicationUpdates": context] as [String: Any]
         mandatory["selectedTask"] = Container.shared.applicationTasks().selectedContext
+        if !automaticNarration {
+            mandatory["narrationMode"] = "At computer: answer only the user's current request. Keep successful spoken-action confirmations brief. Do not introduce or summarize the next email, recap the feed, or ask for its disposition. Explicit read-aloud and factual questions still receive full answers. Background reporting rules are unchanged."
+        }
+        mandatory.merge(calendar.context(selection: state, user: latestUser, now: now())) { _, new in new }
+        attemptFields.merge(calendar.intentDiagnostics) { _, new in new }
         mandatory["emailDependencies"] = Container.shared.dispatchJobs().decisionDependencies.prefix(4).map { job in
             ["job_id": job.id.uuidString, "request": job.task, "state": job.state,
              "account": job.origin?.account ?? "", "message_id": job.origin?.messageID ?? "",
@@ -709,16 +780,35 @@ final class LiveClientBrain {
              "rule": "A source-related dependency, not approval for a later write. For an explicit follow-up such as add that email there, pass source_task_id to dispatch to retain this original email and verified destination even if selection changed. If the reference is ambiguous, ask which task. Do not substitute the new selected email or invent a destination."]
         }
         mandatory["activeLookup"] = lookup?.context
+        if replyComposition?.active == true { mandatory["pendingReply"] = replyComposition?.context }
         if readingSource, sourceInquiry?.complete == true {
             mandatory["selectedEmailEvidence"] = sourceInquiry?.context
-            mandatory["currentSelection"] = LiveCompactContext.selectionReference(state)
+            if calendar.focused, var evidence = sourceInquiry?.context {
+                evidence["rule"] = "Original email evidence for the accepted calendar request. Prefer the latest rescheduling proposal over cancelled dates in subject/quoted history. " + SelectedEmailInquiry.attributionRule
+                mandatory["selectedEmailEvidence"] = evidence
+            }
+            mandatory["currentSelection"] = LiveCompactContext.selectionReference(sourceState)
             if let source = try? JSONSerialization.jsonObject(with: Data(state.utf8)) as? [String: Any],
                let item = source["item"] as? [String: Any], let correction = item["userCorrection"] {
                 mandatory["selectedEmailUserCorrection"] = correction
                 mandatory["interpretationRule"] = source["interpretationRule"]
             }
+            // Earlier summaries, task results and the model's own claims are not evidence for
+            // this source. Keep them out of an ordinary recap, rather than merely warning it.
+            if !comparingSources && !calendar.focused {
+                for key in ["latestAssistant", "pendingQuestion", "questionSelection", "recordedActions", "completedJobs",
+                            "applicationUpdates", "selectedTask", "emailDependencies", "activeLookup"] {
+                    mandatory.removeValue(forKey: key)
+                }
+                mandatory["pendingQuestion"] = ""
+            }
+            mandatory["recapAttribution"] = comparingSources
+                ? "This is an explicit comparison. selectedEmailEvidence belongs only to the current account/message IDs. Earlier history is an unverified reference, not source evidence: retrieve each other email before comparing, label every claim with its source, and do not merge their authors or proposals."
+                : "This answer describes only selectedEmailEvidence. Do not use prior dialogue or another email as evidence. " + SelectedEmailInquiry.attributionRule
+            attemptFields["reason"] = comparingSources ? "selected_source_comparison" : "selected_source_recap"
+            onRequestTransition?(comparingSources ? "selected_source_comparison" : "selected_source_recap", "source-evidence", delegation, requestTurn)
         }
-        if let destination = priorReplyDestination {
+        if let destination = priorReplyDestination, !readingSource {
             mandatory["priorReplyDestination"] = ["account": destination.account, "thread_id": destination.threadID,
                 "reply_message_id": destination.messageID, "from": destination.sender, "subject": destination.subject,
                 "rule": "This is the last unambiguous email discussed in this profile, retained when the feed stops. It is a historical reply destination, not the current feed selection and not permission to act. Resolve explicit references such as the email we were discussing or the one back in the feed from these exact IDs. Search results and source attachments do not replace this destination. A reply uses its thread/account/message; derive recipients from that thread rather than asking which same-name contact. Never substitute a forward or new message. Honor an explicit different destination; ask once if the user's reference is still ambiguous. General this/next/archive instructions use currentSelection only."]
@@ -728,17 +818,8 @@ final class LiveClientBrain {
         }
         mandatory["clock"] = LiveSessionAdapter.clockLine(now: now(), zone: timeZone())
         mandatory["requestClock"] = LiveSessionAdapter.clockLine(now: requestDate ?? now(), zone: requestZone ?? timeZone())
-        if let calendarWindow {
-            if let calendarReadAt, now().timeIntervalSince(calendarReadAt) > CalendarTools.cacheFreshness {
-                calendarReadIncomplete = true
-            }
-            mandatory["calendarWindow"] = calendarWindow.context
-            mandatory["calendarCoverage"] = calendarReadIncomplete ? "Incomplete or stale. Do not propose availability or send scheduling times until all requested calendars have been checked." : "Use the recorded tool results; this clock is not evidence of availability."
-            attemptFields["reference_now"] = calendarWindow.stamp(calendarWindow.reference)
-            attemptFields["range_start"] = calendarWindow.stamp(calendarWindow.start)
-            attemptFields["range_end"] = calendarWindow.stamp(calendarWindow.end)
-            attemptFields["time_zone"] = calendarWindow.zone.identifier
-        }
+        mandatory.merge(calendar.windowContext(now: now())) { _, new in new }
+        attemptFields.merge(calendar.windowDiagnostics) { _, new in new }
         var optionalUpdates = context
         while !optionalUpdates.isEmpty,
               let data = try? JSONSerialization.data(withJSONObject: mandatory), data.count > 64_000 {
@@ -775,7 +856,7 @@ final class LiveClientBrain {
             questionState = ""
             fail("Jo couldn't fit this task's context into an answer. Your mailbox isn't full. The selected email and previous actions are unchanged; select a single message or skip this item.", reason: "context_limit", stage: "pre_request"); return
         }
-        let prior = history.enumerated().filter { $0.offset != turnHistoryIndex }.map(\.element)
+        let prior = readingSource && !comparingSources && !calendar.focused ? [] : history.enumerated().filter { $0.offset != turnHistoryIndex }.map(\.element)
         let requestID = UUID().uuidString
         let body: [String: Any] = ["requestId": requestID, "delegationId": delegation, "turnIndex": currentTurn, "turnID": String(currentTurn),
             "context": String(decoding: stateData, as: UTF8.self), "history": Array(prior.suffix(12)), "input": input,
@@ -793,7 +874,7 @@ final class LiveClientBrain {
         task = Task { [weak self] in
             guard let self, !Task.isCancelled else { return }
             do {
-                let response: [String: Any]
+                var response: [String: Any]
                 if let sourceCall { response = ["output": [sourceCall]] }
                 else { response = try await request(body) }
                 guard !Task.isCancelled, generation == requestGeneration else { return }
@@ -805,7 +886,7 @@ final class LiveClientBrain {
                     throw NSError(domain: "LiveClientBrain", code: 1)
                 }
                 var functions = output.filter { $0["type"] as? String == "function_call" }
-                let staleSource = readingSource && (requestSelection != LiveSelectionGrounding.selection(state) || MailBodyCache.withheld)
+                let staleSource = readingSource && (requestSelection != LiveSelectionGrounding.selection(requestSourceState) || MailBodyCache.withheld)
                 if requestTurn != currentTurn || requestRevision != transcriptRevision || staleSource
                     || requestScope != scopeRevision || (!requestPresentation && completedTurns.contains(requestTurn)) {
                     let retry = requestTurn == currentTurn && requestScope == scopeRevision && !staleSource
@@ -837,6 +918,8 @@ final class LiveClientBrain {
                                "name": GmailReadTools.search, "arguments": GmailReadTools.json(fallback)]]
                     functions = output
                 }
+                output = output.map { calendar.prepare($0, user: latestUser) }
+                functions = output.filter { $0["type"] as? String == "function_call" }
                 input += output
                 let calls = Set(functions.compactMap { $0["call_id"] as? String })
                 pendingCalls.formUnion(calls)
@@ -850,18 +933,28 @@ final class LiveClientBrain {
                 if !calls.isEmpty { armCallWatchdog(for: calls) }
                 var localResultCalls = false
                 for item in output {
-                    if calendarWindow != nil, calendarReadIncomplete, let id = item["call_id"] as? String,
-                       CalendarRequestWindow.schedulingReply(name: item["name"] as? String ?? "", arguments: item["arguments"] as? String ?? "") {
-                        self.item(["type": "function_call_output", "call_id": id,
-                            "output": "Not executed: scheduling times require complete fresh coverage across the requested calendars. Read the resolved window before proposing or sending availability."])
+                    if let name = item["name"] as? String, let id = item["call_id"] as? String,
+                       let refusal = replyComposition?.refusal(name: name, arguments: item["arguments"] as? String ?? "{}", selection: state) {
+                        recordReplyComposition("reply_write_refused")
+                        self.item(["type": "function_call_output", "call_id": id, "output": refusal])
                         localResultCalls = true
                         continue
                     }
+                    if item["type"] as? String == "message", needsExactCalendarSpeech,
+                       CalendarAvailabilityEvidence.claimsAvailability(GmailReadTools.json(item)) { continue }
+                    if item["name"] as? String == CalendarAvailabilityEvidence.toolName, let id = item["call_id"] as? String {
+                        let check = calendar.checkSlot(arguments: item["arguments"] as? String ?? "{}", now: now())
+                        if calendar.focused { persistCalendarIntent() }
+                        attemptFields["calendar_receipt_id"] = check.receiptID
+                        attemptFields["calendar_slot_status"] = check.status
+                        self.item(["type": "function_call_output", "call_id": id, "output": check.output])
+                        localResultCalls = true; continue
+                    }
                     if let name = item["name"] as? String, let id = item["call_id"] as? String,
-                       let raw = item["arguments"] as? String,
-                       let refusal = calendarWindow?.toolRefusal(name: name, arguments: raw, now: now()) {
-                        onRequestTransition?("calendar_range_refused", requestID, delegation, requestTurn)
-                        self.item(["type": "function_call_output", "call_id": id, "output": refusal])
+                       let refusal = calendar.refusal(name: name, arguments: item["arguments"] as? String,
+                                                      now: now(), jobs: Container.shared.dispatchJobs()) {
+                        if refusal.outsideRange { onRequestTransition?("calendar_range_refused", requestID, delegation, requestTurn) }
+                        self.item(["type": "function_call_output", "call_id": id, "output": refusal.message])
                         localResultCalls = true
                         continue
                     }
@@ -872,24 +965,52 @@ final class LiveClientBrain {
                         localResultCalls = true
                         continue
                     }
+                    if let name = item["name"] as? String, let id = item["call_id"] as? String,
+                       let raw = item["arguments"] as? String,
+                       let intent = calendar.preparingWrite(name: name, id: id, arguments: raw) {
+                        guard await Container.shared.dispatchJobs().saveCalendarIntent(intent,
+                            ownerID: Container.shared.backend().userId, profileID: ProfileRuntime.snapshot?.profileId),
+                            requestScope == scopeRevision, requestTurn == currentTurn else {
+                            self.item(["type": "function_call_output", "call_id": id, "output": "Not executed: the scheduling workflow could not be saved or its request changed."])
+                            localResultCalls = true; continue
+                        }
+                        calendar.acceptPreparedWrite(intent)
+                    }
+                    if let name = item["name"] as? String, ["send_email", "reply_email", "create_draft"].contains(name),
+                       let id = item["call_id"] as? String {
+                        replyComposition?.writeCall = id
+                        recordReplyComposition("reply_write_accepted")
+                    }
                     deliver(["type": "response.event", "delegation_id": delegation,
                              "event": ["type": "response.output_item.done", "response_id": responseID, "item": item]])
                 }
                 if functions.isEmpty {
-                    let text = output.flatMap { $0["content"] as? [[String: Any]] ?? [] }
+                    var text = output.flatMap { $0["content"] as? [[String: Any]] ?? [] }
                         .compactMap { $0["text"] as? String }.joined(separator: "\n")
-                    if calendarWindow != nil, calendarReadIncomplete,
-                       text.range(of: #"\b(?:available|free|slots?)\b"#, options: [.regularExpression, .caseInsensitive]) != nil {
+                    let presentation = calendar.presentation(text, user: latestUser, now: now())
+                    attemptFields.merge(presentation.diagnostics) { _, new in new }
+                    if let failure = presentation.failure {
                         finish(responseID: responseID, delegation: delegation, response: [:])
-                        fail("I couldn't confirm availability across all the requested calendars. One or more reads were incomplete or stale; no free times are confirmed.",
-                             reason: "calendar_coverage_incomplete", stage: "presentation")
+                        fail(failure.message, reason: failure.reason, stage: "presentation")
                         return
                     }
-                    if let window = calendarWindow, window.containsOutsideDate(text) {
+                    text = presentation.text
+                    if replyComposition?.active == true, replyComposition?.targetConfirmed == true,
+                       replyComposition?.writeCall == nil, Self.withoutDispositionQuestion(text) != text {
                         finish(responseID: responseID, delegation: delegation, response: [:])
-                        fail("I couldn't confirm those proposed dates. " + window.rangeExplanation + " Please ask me to recheck availability.",
-                             reason: "calendar_date_outside_range", stage: "presentation")
+                        if replyRecoveryTurns.insert(requestTurn).inserted {
+                            observe("The destination clarification is resolved. Continue pendingReply's original dictated request now using its preserved details and existing send/draft policy. Do not summarize the email or ask for disposition again.")
+                            run()
+                        } else {
+                            fail("Your reply text is preserved, but I couldn't continue it after the clarification. No message was sent.",
+                                 reason: "reply_not_completed", stage: "clarification")
+                        }
                         return
+                    }
+                    replyComposition?.question(text)
+                    recordReplyComposition("reply_response")
+                    if presentation.replaced {
+                        response["output"] = [["type": "message", "content": [["type": "output_text", "text": text]]]]
                     }
                     // An earlier receipt is history, not proof that this turn's command ran.
                     let hasCurrentAction = actionRecords.contains { record in

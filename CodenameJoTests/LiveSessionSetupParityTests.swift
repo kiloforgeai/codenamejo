@@ -1,8 +1,8 @@
 import XCTest
 @testable import CodenameJo
 
-/// The phone builds the session the server's `/api/realtime-token` and worker catalog built for
-/// the same flags. `Fixtures/live-session-parity.json` was dumped by running that server code.
+/// Session contracts retain the original server scenarios plus reviewed client-only capabilities.
+/// The fixture pins tool order, schemas, prompt facts, and capability answers for each account state.
 final class LiveSessionSetupParityTests: XCTestCase {
     private func fixture() throws -> [String: [[String: Any]]] {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "live-session-parity", withExtension: "json"))

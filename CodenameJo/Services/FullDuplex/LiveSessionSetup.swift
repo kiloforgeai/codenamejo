@@ -196,7 +196,8 @@ enum LiveSessionSetup {
                 }
             },
             PhoneTool(TaskManagementTool.schema) { client, call in
-                client.answerSettingsTool(callId: call.id, tool: call.name) { await TaskManagementTool.run(call.arguments) }
+                let request = client.latestCompletedUserUtterance
+                client.answerSettingsTool(callId: call.id, tool: call.name) { await TaskManagementTool.run(call.arguments, userRequest: request) }
             },
             PhoneTool(s.logFeedback) { client, call in
                 let feedback = Container.shared.userFeedback()

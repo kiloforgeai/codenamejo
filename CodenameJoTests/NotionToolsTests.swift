@@ -145,6 +145,38 @@ final class NotionToolsTests: XCTestCase {
         XCTAssertEqual(Set(rows.compactMap { $0["workspace"] }), ["Work", "Home"])
     }
 
+    func testAmbiguousWritesNeverFallThroughToAnotherWorkspace() async {
+        save("a", label: "Work"); save("b", label: "Home")
+        for failure in ["408", "504", "internal", "unreadable"] {
+            let server = ScriptedMCPServer { call in
+                let id = call.json["id"] ?? NSNull()
+                switch call.json["method"] as? String {
+                case "initialize": return ScriptedMCPServer.sse(id: id, result: #"{"protocolVersion":"2025-06-18"}"#)
+                case "notifications/initialized": return .init(status: 202, body: "")
+                default:
+                    if let code = Int(failure) { return .init(status: code) }
+                    if failure == "internal" {
+                        return .init(body: #"{"jsonrpc":"2.0","id":\#(id),"error":{"code":-32603,"message":"Internal error"}}"#)
+                    }
+                    return .init(body: "unreadable")
+                }
+            }
+            let result = await run("notion-update-page", ["page_id": pageId, "command": "insert_content", "content": "Synthetic update"], server: server)
+            XCTAssertEqual(result.ok, false, failure)
+            XCTAssertTrue(result.outcomeUnknown, failure)
+            XCTAssertEqual(server.calls.filter { $0.json["method"] as? String == "tools/call" }.count, 1, failure)
+        }
+    }
+
+    func testDefiniteRejectionsRemainDistinctFromUncertainWrites() {
+        XCTAssertFalse(NotionTools.uncertainWrite(RemoteMCPError.unauthorized(status: 401)))
+        XCTAssertFalse(NotionTools.uncertainWrite(RemoteMCPError.http(status: 403, body: "forbidden")))
+        XCTAssertFalse(NotionTools.uncertainWrite(RemoteMCPError.http(status: 429, body: "limited")))
+        XCTAssertFalse(NotionTools.uncertainWrite(RemoteMCPError.rpc(code: -32602, message: "invalid params")))
+        XCTAssertTrue(NotionTools.uncertainWrite(RemoteMCPError.rpc(code: -32000, message: "server error")))
+        XCTAssertTrue(NotionTools.uncertainWrite(RemoteMCPError.http(status: 408, body: "timeout")))
+    }
+
     func testAnIdIsTriedInEachWorkspaceUntilOneAnswers() async {
         save("a", label: "Work")
         save("b", label: "Home")

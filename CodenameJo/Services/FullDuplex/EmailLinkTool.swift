@@ -81,7 +81,7 @@ enum EmailLinkTool {
         }
     }
 
-    private static func collect(_ part: GmailAPI.FullPart?, html: inout [String], plain: inout [String]) {
+    static func collect(_ part: GmailAPI.FullPart?, html: inout [String], plain: inout [String]) {
         guard let part else { return }
         for child in part.parts ?? [] { collect(child, html: &html, plain: &plain) }
         guard (part.filename ?? "").isEmpty, let data = part.body?.data,

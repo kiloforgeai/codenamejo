@@ -8,7 +8,7 @@ enum MailMIME {
 
     /// One outgoing message, draft or send. `cc` and `bcc` are bare addresses or, for reply-all, the
     /// answered message's entries as written.
-    struct Outgoing: Codable, Equatable, Sendable {
+    struct Outgoing: Codable, Hashable, Sendable {
         var to: String
         var cc: [String] = []
         var bcc: [String] = []
@@ -72,6 +72,7 @@ enum MailMIME {
     /// The original message, read whole, for a forward to carry.
     struct ForwardSource: Equatable, Sendable {
         var from = ""
+        var replyTo = ""
         var date = ""
         var subject = ""
         var to = ""
@@ -109,9 +110,7 @@ enum MailMIME {
         var footer = false
     }
 
-    /// HTML originals and branded forwards include both alternatives; attachments use a mixed wrapper.
-    /// Base64 part bodies keep MIME boundaries out of the content.
-    static func forward(_ fwd: Forward, boundary: () -> String = { "b_\(UUID().uuidString.lowercased())" }) -> String {
+    static func forwardContent(_ fwd: Forward) -> (subject: String, text: String, html: String) {
         let src = fwd.source
         let stripped = src.subject.replacingOccurrences(of: #"^\s*((re|fwd?):\s*)+"#, with: "",
                                                         options: [.regularExpression, .caseInsensitive])
@@ -125,7 +124,13 @@ enum MailMIME {
         let htmlDoc = src.html.isEmpty && !fwd.footer ? "" : (note.map { "<p>\(escapeHTML($0))</p>\n" } ?? "")
             + "\(block.html)\n\(src.html.isEmpty ? plainHTML(src.text) : src.html)"
             + (fwd.footer ? "\n<p>\(htmlFooter)</p>" : "")
+        return (subject, textBody, htmlDoc)
+    }
 
+    /// MIME and the durable preview use exactly the same outgoing content.
+    static func forward(_ fwd: Forward, boundary: () -> String = { "b_\(UUID().uuidString.lowercased())" }) -> String {
+        let src = fwd.source
+        let (subject, textBody, htmlDoc) = forwardContent(fwd)
         func leaf(_ headers: [String], _ content: String) -> String { (headers + ["", content]).joined(separator: "\r\n") }
         func multipart(_ subtype: String, _ parts: [String]) -> String {
             let marker = boundary()

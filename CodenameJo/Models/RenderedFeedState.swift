@@ -41,6 +41,8 @@ struct RenderedFeedState: Equatable, Sendable {
     var sidebarSource = "session"
     var sessionPhase = "active"
     var activityID: UUID?
+    var readerSelection: MailSelection?
+    var readerState = "unknown"
 
     func diagnosticFields(session: VoiceDiagnostics.Session, revision: Int) -> [String: String] {
         var fields = ["render_revision": String(revision), "queue_revision": String(queueRevision),
@@ -54,6 +56,11 @@ struct RenderedFeedState: Equatable, Sendable {
             "queue_order": queueOrder.map { session.target($0) }.joined(separator: ","),
             "job_states": jobStates.prefix(12).joined(separator: ",")]
         fields["action_error_visible"] = String(feedActionError != nil)
+        fields["reader_state"] = readerState
+        fields["reader_target_hash"] = readerSelection.map { session.target($0.canonical) } ?? "none"
+        fields["actions_available"] = String(focus.map { permits($0, profileID: profileID) } ?? false)
+        fields["clear_reason"] = activityID != nil ? "activity_selected" : transitioning ? "selection_transition"
+            : focus == nil ? "no_email_selection" : "none"
         if let activityID { fields["activity_id"] = activityID.uuidString }
         fields["sidebar_source"] = sidebarSource
         fields["session_phase"] = sessionPhase

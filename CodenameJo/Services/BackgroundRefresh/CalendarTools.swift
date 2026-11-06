@@ -115,7 +115,18 @@ enum CalendarTools {
 
     struct Refusal: Error { let text: String }
 
-    static func run(name: String, argumentsJSON: String, diagnostics: VoiceDiagnostics.Session? = nil, callID: String? = nil) async -> (output: String, failed: Bool, effects: [GmailWriteEffect]?) {
+    static func run(name: String, argumentsJSON: String, diagnostics: VoiceDiagnostics.Session? = nil, callID: String? = nil,
+                    conversationID: String? = nil, parentJobID: UUID? = nil, origin: DispatchJob.MailOrigin? = nil) async -> (output: String, failed: Bool, effects: [GmailWriteEffect]?) {
+        if name == list { return await execute(name: name, argumentsJSON: argumentsJSON, diagnostics: diagnostics, callID: callID) }
+        let result = await CalendarActionAudit.run(name: name, argumentsJSON: argumentsJSON, callID: callID,
+            conversationID: conversationID, parentJobID: parentJobID, origin: origin) { boundArguments in
+                let result = await execute(name: name, argumentsJSON: boundArguments, diagnostics: diagnostics, callID: callID)
+                return .init(text: result.output, ok: !result.failed, effects: result.effects)
+            }
+        return (result.text, result.ok == false, result.effects)
+    }
+
+    private static func execute(name: String, argumentsJSON: String, diagnostics: VoiceDiagnostics.Session?, callID: String?) async -> (output: String, failed: Bool, effects: [GmailWriteEffect]?) {
         var args = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8))) as? [String: Any] ?? [:]
         var connected = await accounts()
         guard !connected.isEmpty else {
@@ -134,7 +145,8 @@ enum CalendarTools {
                 connected = connected.filter { $0.caseInsensitiveCompare(named) == .orderedSame }
             }
         }
-        let receipt: ([String: Any], [String: Any]) -> Void = { event, expected in
+        let receipt: ([String: Any], [String: Any]) async -> Void = { event, expected in
+            await CalendarActionContext.current?.confirmedExisting(event, expected: expected)
             var fields = CalendarWriteTiming.metadata(request: expected, event: event)
             fields["tool"] = name
             fields["call_id"] = callID
@@ -260,7 +272,7 @@ enum CalendarTools {
                         if availability && cached.events.count < 500 {
                             let intervals = busy(events, attendees: cached.attendees, account: account, window: window, offset: zone, zone: timeZone)
                             return (index, ["account": account, "availability":
-                                ["timeMin": timeMin, "timeMax": timeMax, "busy": intervals]], state.lastSyncedAt)
+                                ["timeMin": timeMin, "timeMax": timeMax, "busy": intervals], "source": "cache"], state.lastSyncedAt)
                         }
                         if !events.isEmpty {
                             let listed = events.prefix(max).map { row(account: account, $0, cached.attendees) }
@@ -273,7 +285,7 @@ enum CalendarTools {
                         if availability {
                             let busy = try await freeBusy(token: token, timeMin: timeMin, timeMax: timeMax)
                             return (index, ["account": account, "availability":
-                                ["timeMin": timeMin, "timeMax": timeMax, "busy": busy]], nil)
+                                ["timeMin": timeMin, "timeMax": timeMax, "busy": busy], "source": "live"], nil)
                         }
                         var params = ["timeMin": timeMin, "timeMax": timeMax, "singleEvents": "true",
                                       "orderBy": "startTime", "maxResults": String(max), "fields": listFields,
@@ -307,7 +319,7 @@ enum CalendarTools {
             "range_start": timeMin, "range_end": timeMax, "time_zone": timeZone.identifier,
             "calendar_count": String(rows.count), "covered_calendars": String(covered),
             "result_age_seconds": String(Int(synced.map { observed.timeIntervalSince($0) }.max() ?? 0))])
-        return GmailReadTools.json(rows.map { _, value, syncedAt in
+        let output = GmailReadTools.json(rows.map { _, value, syncedAt in
             var row = value
             row["requested_window"] = ["time_min": timeMin, "time_max": timeMax, "time_zone": timeZone.identifier]
             row["checked_at"] = ISO8601DateFormatter().string(from: observed)
@@ -316,6 +328,12 @@ enum CalendarTools {
             if availability { row["complete"] = row["availability"] != nil && row["error"] == nil }
             return row
         })
+        let evidence = CalendarAvailabilityEvidence(id: callID ?? UUID().uuidString, arguments: GmailReadTools.json(args),
+            output: output, expectedAccounts: accounts, now: observed, zone: timeZone)
+        let receipt = GmailReadTools.json(evidence.context)
+        diagnostics?.record(.turnTransition, ["transition": "calendar_availability_receipt", "call_id": evidence.id, "receipt": receipt])
+        RealtimeLog.log("calendar availability receipt: " + receipt)
+        return output
     }
 
     private static func liveEvents(params: [String: String], token: String, limit: Int) async throws
@@ -474,7 +492,7 @@ enum CalendarTools {
         "ignore", "tbd", "n/a", "none",
     ]
 
-    private static func runCreate(_ args: [String: Any], accounts: [String], receipt: ([String: Any], [String: Any]) -> Void) async throws -> String {
+    private static func runCreate(_ args: [String: Any], accounts: [String], receipt: ([String: Any], [String: Any]) async -> Void) async throws -> String {
         let target = try singleTarget(args, accounts, creating: true)
         let trim = { (key: String) in (args[key] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
         let title = trim("summary"), start = trim("start"), end = trim("end")
@@ -510,7 +528,7 @@ enum CalendarTools {
         }
         let token = try await accessToken(target, write: true, capability: "create events")
         if let existing = try await existingEvent(args, account: target, token: token) {
-            receipt(existing, args)
+            await receipt(existing, args)
             await cacheWrite(existing, account: target)
             try CalendarWriteTiming.verifyStored(request: args, event: existing)
             return "Already on the calendar; no event created and no invitations sent. "
@@ -526,14 +544,14 @@ enum CalendarTools {
             guard existing["status"] as? String != "cancelled" else {
                 throw Refusal(text: "That previously created event was cancelled. Clarify whether to restore it; no new event was created.")
             }
-            receipt(existing, args)
+            await receipt(existing, args)
             await cacheWrite(existing, account: target)
             try CalendarWriteTiming.verifyStored(request: args, event: existing)
             return "This event was already created; no invitations were sent again. " + CalendarWriteTiming.receipt(existing)
         } catch CalendarAPI.Failure.unauthorized {
             throw Refusal(text: reconnect(target, "create events"))
         }
-        receipt(created, args)
+        await receipt(created, args)
         await cacheWrite(created, account: target)
         try CalendarWriteTiming.verifyStored(request: args, event: created)
         let id = created["id"] as? String ?? ""
@@ -602,7 +620,7 @@ enum CalendarTools {
         throw Refusal(text: "Could not finish checking for an existing event. Nothing was created; retry the calendar lookup.")
     }
 
-    private static func runUpdate(_ args: [String: Any], accounts: [String], receipt: ([String: Any], [String: Any]) -> Void) async throws -> String {
+    private static func runUpdate(_ args: [String: Any], accounts: [String], receipt: ([String: Any], [String: Any]) async -> Void) async throws -> String {
         let target = try singleTarget(args, accounts)
         let eventId = (args["event_id"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !eventId.isEmpty else {
@@ -673,6 +691,7 @@ enum CalendarTools {
             let selfNote = merge.refusedSelfRemoval
                 ? " You can't take yourself off an event this way — decline it instead, which tells the organizer." : ""
             if changed.isEmpty {
+                await receipt(event, args)
                 return "\"\(reported)\" is already like that on \(target). Nothing changed and no one was notified.\(selfNote)\(scope)"
             }
             let patched = try await CalendarAPI.json("PATCH", path: path, query: ["sendUpdates": "all"], body: body, token: token)
@@ -681,7 +700,7 @@ enum CalendarTools {
                 expected["start"] = timing.start
                 expected["end"] = timing.end
             }
-            receipt(patched, expected)
+            await receipt(patched, expected)
             await cacheWrite(patched, account: target)
             try CalendarWriteTiming.verifyStored(request: expected, event: patched)
             let guests = merge.attendees.filter { $0["self"] as? Bool != true }.count

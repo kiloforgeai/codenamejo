@@ -1,12 +1,21 @@
 import Foundation
 
 /// A relative calendar range is resolved once from the user's request, never from an email's date.
-struct CalendarRequestWindow: Codable, Equatable, Sendable {
+struct CalendarRequestWindow: Codable, Hashable, Sendable {
     let reference: Date
     let zone: TimeZone
     let start: Date
     let end: Date
     let allCalendars: Bool
+
+    init?(checkedArguments: String, reference: Date, zone: TimeZone) {
+        let args = ToolArguments(checkedArguments)
+        guard let from = args.string("time_min").flatMap(CalendarTools.instant),
+              let to = args.string("time_max").flatMap(CalendarTools.instant), to > from else { return nil }
+        self.reference = reference; self.zone = zone
+        start = Date(timeIntervalSince1970: from / 1000); end = Date(timeIntervalSince1970: to / 1000)
+        allCalendars = args.string("account") == nil
+    }
 
     init?(request: String, reference: Date, zone: TimeZone) {
         guard request.range(of: #"\bnext\s+week\b"#, options: [.regularExpression, .caseInsensitive]) != nil else { return nil }
@@ -39,11 +48,11 @@ struct CalendarRequestWindow: Codable, Equatable, Sendable {
         label.locale = Locale(identifier: "en_US_POSIX")
         label.timeZone = zone
         label.dateFormat = "EEEE yyyy-MM-dd"
-        return ["phrase": "next week", "reference": stamp(reference), "time_zone": zone.identifier,
+        return ["phrase": "resolved calendar window", "reference": stamp(reference), "time_zone": zone.identifier,
             "start_inclusive": stamp(start), "end_exclusive": stamp(end),
             "all_calendars": allCalendars,
             "days": (0..<7).compactMap { calendar.date(byAdding: .day, value: $0, to: start).map { label.string(from: $0) } },
-            "rule": "Use this resolved Monday-to-Monday window for reads, proposed slots and speech. Compute each date's own time-zone offset. Old email dates and examples are not the clock. Availability requires complete fresh coverage across all requested calendars; partial or failed reads cannot establish that a slot is free."]
+            "rule": "Use this resolved window for reads, proposed slots and speech. Compute each date's own time-zone offset. Old email dates and examples are not the clock. Availability requires complete fresh coverage across all requested calendars; partial or failed reads cannot establish that a slot is free."]
     }
 
     func contains(start from: Date, end to: Date) -> Bool {
@@ -51,7 +60,7 @@ struct CalendarRequestWindow: Codable, Equatable, Sendable {
     }
 
     var rangeExplanation: String {
-        "Next week means \(stamp(start)) through \(stamp(end)) exclusive, in \(zone.identifier)."
+        "The requested calendar window is \(stamp(start)) through \(stamp(end)) exclusive, in \(zone.identifier)."
     }
 
     static func schedulingReply(name: String, arguments: String) -> Bool {
@@ -76,7 +85,7 @@ struct CalendarRequestWindow: Codable, Equatable, Sendable {
                   let to = last.flatMap(CalendarTools.instant).map({ Date(timeIntervalSince1970: $0 / 1000) })
                     ?? calendar.date(byAdding: .second, value: 1, to: from),
                   contains(start: from, end: to) else {
-                return "Not executed: the requested dates fall outside the user's resolved week. " + rangeExplanation
+                return "Not executed: the requested dates fall outside the user's resolved calendar window. " + rangeExplanation
             }
             do {
                 try CalendarWriteTiming.validate(first.replacingOccurrences(of: "Z", with: "+00:00"), zone: zone)

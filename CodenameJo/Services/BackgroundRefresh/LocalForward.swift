@@ -12,13 +12,15 @@ enum LocalForward {
     /// Decoded bytes, ~24 MB once base64'd, under Gmail's 25 MB ceiling.
     static let attachmentCap = 18_000_000
 
-    /// - Parameter defer: the caller advances on the receipt, so the Gmail call may land after it.
-    static func run(argumentsJSON: String, defer deferred: Bool, conversationId: String? = nil) async
+    /// Forwards return only after the durable receipt records the provider outcome.
+    static func run(argumentsJSON: String, defer deferred: Bool, conversationId: String? = nil,
+                    userRequest: String? = nil, parentJobID: UUID? = nil, callID: String? = nil) async
         -> FullDuplexBroker.ToolResult {
         let args = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8))) as? [String: Any] ?? [:]
         let started = Date()
         do {
-            let result = try await forward(args, deferred: deferred, conversationId: conversationId)
+            let result = try await forward(args, conversationId: conversationId, userRequest: userRequest,
+                                           parentJobID: parentJobID, callID: callID)
             RealtimeLog.log("localForward: \(result.ok == true ? "ok" : "not ok") in "
                 + "\(Int(Date().timeIntervalSince(started) * 1000))ms — \(result.text.prefix(80))")
             return result
@@ -31,8 +33,10 @@ enum LocalForward {
         }
     }
 
-    private static func forward(_ given: [String: Any], deferred: Bool,
-                                conversationId: String?) async throws -> FullDuplexBroker.ToolResult {
+    private static func forward(_ given: [String: Any], conversationId: String?, userRequest: String?,
+                                parentJobID: UUID?, callID: String?) async throws -> FullDuplexBroker.ToolResult {
+        let owner = await MainActor.run { Container.shared.backend().userId }
+        let profile = ProfileRuntime.snapshot
         let (args, targets) = try await Manage.bind(name: name, given)
         // Before the original is looked up: a forward with nowhere to go refuses in one hop.
         let to = (args["to"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -51,6 +55,7 @@ enum LocalForward {
 
         let located = try await locate(targets, args)
         let (account, token, messageId, source) = (located.account, located.token, located.messageId, located.source)
+        let resolution = try ForwardRecipient.resolve(to, source: source, userRequest: userRequest)
         // In the source's own order, greedily: a scan too big to ride along must not take the invoice behind it too.
         var kept: [MailMIME.Attachment] = []
         var dropped: [MailMIME.Attachment] = []
@@ -79,68 +84,80 @@ enum LocalForward {
         let droppedClause = dropped.isEmpty ? ""
             : ", without \(LocalCompose.speakList(dropped.map { "\($0.filename) (\(Manage.describeSize($0.size)))" })) "
                 + "— too big to send on"
-        let raw = MailMIME.forward(.init(to: to, cc: cc, note: note, source: source, attachments: attachments,
-                                         footer: MailFooter.isOn))
+        let forward = MailMIME.Forward(to: to, cc: cc, note: note, source: source, attachments: attachments,
+                                      footer: MailFooter.isOn)
+        let raw = MailMIME.forward(forward)
         let threadId = source.threadId.isEmpty ? nil : source.threadId
-
-        if DraftsOnly.isOn(for: account) {
-            let receipt = "Draft forward to \(to) saved in \(account)\(copies)\(droppedClause) — nothing was sent, because "
-                + "Drafts only is on for this inbox." + (files ? LocalCompose.archivedByRule : "")
-            return await finish(receipt: receipt, deferred: deferred, conversationId: conversationId, failure: { error in
-                Manage.isThrottle(error) ? "\(Manage.throttled) No draft was saved."
-                    : "that draft forward didn't save (\(Manage.detail(error))) — there is nothing in \(account)'s drafts, "
-                        + "so it needs asking for again."
-            }) { effects in
-                try await LocalCompose.saveDraft(token, raw: raw, threadId: threadId)
-                if files { await LocalCompose.fileByRule(token, account: account, threadId: threadId, effects) }
-            }
-        }
-        // A forward's `to` is always the model's choice, never the thread's, so it is always checked.
-        if strictJSONBool(args["recipient_confirmed"]) != true,
+        let draft = DraftsOnly.isOn(for: account)
+        if !draft, strictJSONBool(args["recipient_confirmed"]) != true,
            !(try await LocalCompose.hasCorresponded(to, account: account, token: token)) {
             throw Refusal(text: "NOT SENT — first time you've mailed \(to). Ask the user \"is that the right person?\" "
                 + "and if they say yes, call this again with recipient_confirmed: true. Nothing has gone yet.")
         }
-        let receipt = "Forwarded to \(to) from \(account)\(copies)\(droppedClause)."
+        let receipt = (draft
+            ? "Draft forward to \(to) saved in \(account)\(copies)\(droppedClause) — nothing was sent, because Drafts only is on for this inbox."
+            : "Forwarded to \(to) from \(account)\(copies)\(droppedClause).")
             + (files ? LocalCompose.archivedByRule : "")
-        // Never retried: `messages/send` has no idempotency key, so a retry could forward it twice.
-        return await finish(receipt: receipt, deferred: deferred, conversationId: conversationId, failure: { error in
-            Manage.isThrottle(error) ? "\(Manage.throttled) Nothing went out."
-                : "that didn't forward (\(Manage.detail(error))) — nothing went out, so it needs asking for again."
-        }) { effects in
-            await GmailQuota.shared.spend(100)
-            var body: [String: Any] = ["raw": raw]
-            if let threadId { body["threadId"] = threadId }
-            _ = try await GmailAPI.call("POST", path: "messages/send", body: body, token: token)
-            await Container.shared.contactStore().recordSent(account: account, email: LocalCompose.bareAddress(to))
-            if files { await LocalCompose.fileByRule(token, account: account, threadId: threadId, effects) }
+        guard let owner, !owner.isEmpty else {
+            throw Refusal(text: "Nothing was sent or saved. Sign in so the forward can be recorded under your account.")
         }
-    }
-
-    /// The write after the receipt: deferred when the caller can carry the receipt, inline otherwise.
-    private static func finish(receipt: String, deferred: Bool, conversationId: String?,
-                               failure: @escaping @Sendable (Error) -> String,
-                               _ write: @escaping @Sendable (Manage.Effects) async throws -> Void) async
-        -> FullDuplexBroker.ToolResult {
-        guard !deferred else {
-            Task.detached {
-                let effects = Manage.Effects()
-                do {
-                    try await write(effects)
-                    await LocalCompose.applyEffects(effects.list)
-                } catch {
-                    Container.shared.localWriteNotices().push(failure(error), conversation: conversationId)
-                }
-            }
-            return .init(text: receipt, ok: true, deferred: true)
+        let content = MailMIME.forwardContent(forward)
+        let outgoing = MailMIME.Outgoing(to: to, cc: cc, subject: content.subject, body: content.text,
+            threadId: threadId, inReplyTo: source.rfcMessageId, attachments: attachments.map {
+                .init(filename: $0.ref.filename, mimeType: $0.ref.mimeType, bytes: $0.bytes)
+            })
+        let key = callID.map { (parentJobID?.uuidString ?? conversationId ?? "foreground") + ":" + $0 }
+        var action = MailActionReceipt(kind: draft ? .draftForward : .forward, account: account, message: outgoing,
+            replyMessageID: messageId, parentJobID: parentJobID, requestKey: key)
+        action.forwardResolution = resolution
+        action.forwardNote = note
+        action.forwardHTML = content.html.isEmpty ? nil : content.html
+        action.omittedAttachments = dropped.map {
+            .init(filename: $0.filename, mimeType: $0.mimeType, size: $0.size, reason: "Exceeds attachment limit")
         }
+        action.archiveState = files ? "pending" : nil
+        let store = await MainActor.run { Container.shared.dispatchJobs() }
+        let origin = DispatchJob.MailOrigin(account: account, messageID: messageId, threadID: source.threadId,
+                                             sender: source.from, subject: source.subject)
+        #if targetEnvironment(macCatalyst)
+        if draft {
+            return try await LocalDraftReview.stage(action: action, message: outgoing, originalRaw: raw,
+                owner: owner, profile: profile?.profileId, conversation: conversationId, origin: origin,
+                archiveAfterSave: files, attachmentAccounts: attachments.isEmpty ? [] : [account])
+        }
+        #endif
+        let (job, created) = try await store.beginMailAction(action, ownerID: owner, profileID: profile?.profileId,
+                                                           conversationID: conversationId, origin: origin)
+        guard created else { return MailActionAudit.replay(job) }
         let effects = Manage.Effects()
         do {
-            try await write(effects)
+            let warning = try await MailActionAudit.write(job, receipt: receipt.replacingOccurrences(of: LocalCompose.archivedByRule, with: ""),
+                validate: {
+                    try Task.checkCancellation()
+                    guard ProfileRuntime.snapshot?.membershipRevision == profile?.membershipRevision,
+                          ProfileRuntime.allowedMailAccounts(GoogleAccountStore.mailAccounts()).contains(where: {
+                              $0.caseInsensitiveCompare(account) == .orderedSame
+                          }) else { throw Refusal(text: "Nothing was sent or saved. The source inbox changed.") }
+                }) {
+                    if draft { return try await LocalCompose.saveDraft(token, raw: raw, threadId: threadId) }
+                    await GmailQuota.shared.spend(100)
+                    var body: [String: Any] = ["raw": raw]
+                    if let threadId { body["threadId"] = threadId }
+                    return try await GmailAPI.call("POST", path: "messages/send", body: body, token: token)
+                }
+            if !draft { await Container.shared.contactStore().recordSent(account: account, email: LocalCompose.bareAddress(to)) }
+            if files {
+                await LocalCompose.fileByRule(token, account: account, threadId: threadId, effects)
+                let archived = effects.list.contains { $0.removeLabelIds?.contains("INBOX") == true }
+                _ = await store.recordMailArchive(job.id, state: archived ? "confirmed" : "unconfirmed")
+            }
+            let result = LocalCompose.confirmed(receipt, effects.list) + warning
+            await MailActionAudit.update(job, result: result)
+            return .init(text: result, ok: true, effects: effects.list)
         } catch {
-            return .init(text: failure(error), ok: false)
+            return .init(text: await MailActionAudit.result(job, fallback: Manage.detail(error)),
+                         ok: false, outcomeUnknown: error is MailActionAudit.Failure)
         }
-        return .init(text: LocalCompose.confirmed(receipt, effects.list), ok: true, effects: effects.list)
     }
 
     // MARK: - Finding the original
@@ -191,7 +208,7 @@ enum LocalForward {
                                                from: JSONSerialization.data(withJSONObject: json))
         let payload = message.payload
         let header = { (name: String) in message.header(name) ?? "" }
-        return MailMIME.ForwardSource(from: header("From"), date: header("Date"), subject: header("Subject"),
+        return MailMIME.ForwardSource(from: header("From"), replyTo: header("Reply-To"), date: header("Date"), subject: header("Subject"),
             to: header("To"), cc: header("Cc"), rfcMessageId: header("Message-ID"), threadId: message.threadId,
             text: payload.map(flattened)?.text ?? "", html: payload.map(html) ?? "",
             attachments: payload.map(attachments) ?? [])

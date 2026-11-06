@@ -9,25 +9,26 @@ you through your mail. It:
 - puts things on your calendar
 - hands longer jobs to a background worker, so the conversation keeps moving
 
-**Fully client-executed.** Every tool, ranking, summary and decision runs on your phone, on
+**Fully client-executed.** Every tool, ranking, summary and decision runs on your device, on
 your own OpenAI key. The only server is a thin, stateless Google connection shim that adds
 our verified client's secret to Google's token calls. It stores nothing and never sees your
 mail.
 
-This repository is the iOS app (SwiftUI), with a watchOS companion and a Live Activity.
+This repository contains the iPhone app and Mac Catalyst workspace, sharing the same client core,
+with a watchOS companion and an iPhone Live Activity.
 
 ## What runs where
 
 | Piece | Where it runs |
 |---|---|
-| Voice session (`gpt-live-1`) and the reasoning model behind it (`gpt-5.6-luna`) | OpenAI, called straight from the phone with your API key |
-| Gmail and Calendar reads and writes | The phone, calling Google's APIs directly |
-| Ranking your mail by importance, email summaries, per-category playbooks | The phone, which asks OpenAI on your key |
-| The mail queue, profiles, history, settings | The phone's local database |
-| Your Google, Notion, Granola, Slack, GitHub and custom MCP credentials | The phone's Keychain |
+| Voice session (`gpt-live-1`) and the reasoning model behind it (`gpt-5.6-luna`) | OpenAI, called straight from the device with your API key |
+| Gmail and Calendar reads and writes | The device, calling Google's APIs directly |
+| Ranking your mail by importance, email summaries, per-category playbooks | The device, which asks OpenAI on your key |
+| The mail queue, profiles, history, settings | The device's local database |
+| Your Google, Notion, Granola, Slack, GitHub and custom MCP credentials | The device's Keychain |
 | Google sign-in and token refresh | Our hosted token shim, which adds the web client's secret to Google's token request and returns the result. It has no database and never logs tokens |
 
-What leaves your phone, and to whom:
+What leaves your device, and to whom:
 
 - **To OpenAI, on your key:** your voice, and the mail, calendar and connector content Jo
   needs to answer you. That means senders, subjects and previews, plus full message bodies
@@ -52,7 +53,7 @@ There is no analytics, telemetry, push, call recording or feedback upload.
 | **GitHub** | Settings → Connections, by entering a short code on github.com (device flow) | Pull requests, checks, issues, commits, notifications and workflow runs. Merging, editing issues and starting workflows only happen after you confirm, unless one of your own saved commands does them |
 | **Custom MCP** | Settings → Connections → Custom MCP, by entering any MCP server's https address. Sign in with OAuth, paste a token, or connect with no credential | Every tool the server lists, as `mcp_<server>_<tool>`. Jo lists them when you add the server and again behind each call |
 
-The phone talks to each service directly:
+The app talks to each service directly:
 - **Notion and Granola** through their own hosted MCP servers.
 - **Custom MCP servers** through the endpoint you entered, over streamable HTTP.
 - **Slack** through its Web API.
@@ -114,6 +115,18 @@ account-scoped logs with their session reference; Jo does not upload them or ope
 The workspace's log export includes only the signed-in user's feedback and lifecycle records.
 Settings also offers a speaker sample, and onboarding can continue when no microphone is connected.
 
+Start a work session to walk the feed. Settings lets you enable and reorder important mail,
+other mail, calendar, and connector sections. The sidebar refreshes in the background and
+prefetches across inboxes; clicking an item brings it into focus. The center shows the full
+email or thread, with clickable links and a separate conversation pane below it.
+
+Use the action buttons for common commands, or edit your saved commands in Settings. Longer
+jobs keep their source and receipts in Activity; selecting one opens it in the center workspace.
+Drafts are reviewed there before you choose to save them to Gmail. Browser jobs use an isolated
+embedded browser; open its task panel to inspect the page and approve a specific pending action.
+Opening the page alone does not approve a submission. Narration controls let you keep a session
+quiet or have Jo speak as it goes.
+
 ```bash
 xcodebuild test -project CodenameJo.xcodeproj -scheme JoDesktop \
   -destination 'platform=macOS,variant=Mac Catalyst' -allowProvisioningUpdates \
@@ -127,7 +140,7 @@ These are build requirements; the app deployment minimum remains 26.4.
 ## Your OpenAI key
 
 Jo runs on **your** OpenAI account, and you pay OpenAI directly for what it uses. Create a
-key at <https://platform.openai.com/api-keys>. The key stays in the phone's Keychain and is
+key at <https://platform.openai.com/api-keys>. The key stays in the device's Keychain and is
 sent only to OpenAI. Nothing calls a model until a key is saved. Deleting the app forgets
 the key, so a reinstall asks for it again.
 
@@ -139,7 +152,7 @@ the key, so a reinstall asks for it again.
   it, and nothing is fetched or prepared overnight.
 - **History keeps the last 30 days.**
 - **Slack checks at most 50 conversations per sweep,** to stay inside Slack's rate limits.
-- **Profiles and settings live on one phone.** They don't sync between devices.
+- **Profiles and settings live on one device.** They don't sync between devices.
 
 ## Tests
 

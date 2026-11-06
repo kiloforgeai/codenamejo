@@ -1,7 +1,59 @@
+import FactoryKit
 import XCTest
 @testable import CodenameJo
 
 final class SessionExportRegressionTests: XCTestCase {
+    @MainActor
+    func testRetainedConversationsExportAllProfilesWithReceiptsButNeverOtherUsers() async throws {
+        Container.shared.manager.push()
+        let previousProfile = ProfileRuntime.snapshot
+        ProfileRuntime.install(nil)
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let context = LocalContextStore(url: folder.appendingPathComponent("context.sqlite"))
+        defer {
+            try? context.dbPool?.close(); try? FileManager.default.removeItem(at: folder)
+            Scope.singleton.reset(); Container.shared.manager.pop(); ProfileRuntime.install(previousProfile)
+        }
+        let backend = BackendService(restoringSession: false)
+        backend.userId = "owner"
+        Container.shared.backend.register { backend }
+        let turns = TurnStore(database: context.dbPool)
+        let conversations = [UUID(), UUID(), UUID()]
+        let log = VoiceDiagnostics(directory: folder.appendingPathComponent("logs"))
+        var records: [CommandRecord] = [], jobs: [DispatchJob] = []
+        for (index, conversation) in conversations.enumerated() {
+            let session = log.begin(conversationID: conversation, engine: "live", userID: "owner")
+            let record = CommandRecord(commandText: "Private request", responseText: "Private result", status: .success, conversationId: conversation)
+            records.append(record)
+            try await turns.save(.init(record, userId: index == 0 ? "owner" : "owner:profile:p" + String(index)))
+            session.record(.toolFinished, ["call_id": record.id.uuidString, "outcome": "success"])
+            session.record(.sessionEnded)
+            _ = try await log.saveFeedback("Private feedback", source: .button, userID: "owner",
+                context: .init(sessionID: session.id, conversationID: conversation, turnID: record.id.uuidString))
+            jobs.append(.init(id: UUID(), task: "Private task", state: "done", userId: "owner", conversationId: conversation,
+                turnId: record.id.uuidString, receipts: [.init(callId: record.id.uuidString, tool: "archive_message", outcome: "success")]))
+        }
+        let intruder = CommandRecord(commandText: "Other user's secret", status: .success, conversationId: conversations[0])
+        try await turns.save(.init(intruder, userId: "owner-other:profile:p1"))
+        jobs.append(.init(id: UUID(), task: "Other user's secret", state: "done", userId: "other", conversationId: conversations[0]))
+        let file = folder.appendingPathComponent("jobs.json")
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(jobs).write(to: file)
+        let store = DispatchJobStore(url: file)
+        let logs = try await log.snapshot(userID: "owner")
+        let ids = try SessionExport.retainedConversationIDs(in: logs)
+        let history = try await turns.diagnosticHistory(userID: "owner", conversations: ids)
+        let receipts = store.diagnosticHistory(conversations: ids)
+        XCTAssertEqual(Set(history.map(\.id)), Set(records.map(\.id)))
+        XCTAssertEqual(receipts.count, 3)
+        let full = String(decoding: try SessionExport.append(records: history, jobs: receipts, to: logs, includeContent: true), as: UTF8.self)
+        let safe = String(decoding: try SessionExport.append(records: history, jobs: receipts, to: logs, includeContent: false), as: UTF8.self)
+        for id in conversations { XCTAssertTrue(full.contains(id.uuidString)); XCTAssertTrue(safe.contains(id.uuidString)) }
+        XCTAssertTrue(full.contains("Private feedback")); XCTAssertTrue(full.contains("Private request"))
+        XCTAssertFalse(full.contains("Other user's secret")); XCTAssertFalse(safe.contains("Private"))
+        XCTAssertTrue(safe.contains("diagnostic_conversation_ids")); XCTAssertTrue(safe.contains("retention_state"))
+    }
+
     func testDefaultExportRemovesFeedbackAndOperationContentButKeepsCorrelation() throws {
         let conversation = UUID(), turn = UUID(), job = UUID()
         var record = CommandRecord(id: turn, commandText: "Private request", responseText: "Private answer",

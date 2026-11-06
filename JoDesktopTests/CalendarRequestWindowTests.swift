@@ -4,6 +4,37 @@ import XCTest
 @MainActor
 final class CalendarRequestWindowTests: XCTestCase {
     private func date(_ value: String) -> Date { ISO8601DateFormatter().date(from: value)! }
+
+    func testSlotEvidenceRequiresCompleteFreshCoverageAndUsesStrictOverlapAcrossZones() throws {
+        let now = date("2026-11-03T20:00:00Z"), zone = TimeZone(identifier: "America/Los_Angeles")!
+        let args = #"{"time_min":"2026-11-09T00:00:00-08:00","time_max":"2026-11-10T00:00:00-08:00","time_zone":"America/Los_Angeles"}"#
+        func row(_ account: String, busy: [[String: String]]) -> [String: Any] {
+            ["account": account, "complete": true, "coverage": "complete", "source": "cache", "result_age_seconds": 0,
+             "availability": ["timeMin": "2026-11-09T00:00:00-08:00", "timeMax": "2026-11-10T00:00:00-08:00", "busy": busy]]
+        }
+        let accounts = ["one@example.test", "two@example.test"]
+        let boundary = [["start": "2026-11-09T20:00:00Z", "end": "2026-11-09T21:00:00Z"]]
+        let rows = [row(accounts[0], busy: boundary), row(accounts[1], busy: boundary)]
+        let evidence = CalendarAvailabilityEvidence(id: "read-one", arguments: args, output: GmailReadTools.json(rows), expectedAccounts: accounts, now: now, zone: zone)
+        let free = evidence.assess(receiptID: evidence.id, start: "2026-11-09T15:00:00-06:00", end: "2026-11-09T16:00:00-06:00", now: now)
+        XCTAssertEqual(free.status, "free", "The prior busy interval ends exactly when this slot begins")
+        XCTAssertTrue(free.spoken.contains("1:00 PM"))
+        XCTAssertFalse(GmailReadTools.json(evidence.context).contains("one@example.test"), "Diagnostics keep hashed coverage, never account names or event content")
+        XCTAssertEqual(evidence.assess(receiptID: "wrong", start: free.start, end: free.end, now: now).status, "unverified")
+        XCTAssertEqual(evidence.assess(receiptID: evidence.id, start: free.start, end: free.end, now: now.addingTimeInterval(CalendarTools.cacheFreshness + 1)).status, "unverified")
+        let missing = CalendarAvailabilityEvidence(id: "missing", arguments: args, output: GmailReadTools.json([rows[0]]), expectedAccounts: accounts, now: now, zone: zone)
+        XCTAssertFalse(missing.complete)
+        let partial = CalendarAvailabilityEvidence(id: "partial", arguments: args, output: GmailReadTools.json([rows[0], ["account": accounts[1], "error": "revoked"]]), expectedAccounts: accounts, now: now, zone: zone)
+        XCTAssertEqual(partial.assess(receiptID: partial.id, start: free.start, end: free.end, now: now).status, "unverified")
+        let changed = CalendarAvailabilityEvidence(id: "new-check", arguments: args,
+            output: GmailReadTools.json([row(accounts[0], busy: [["start": "2026-11-09T21:30:00Z", "end": "2026-11-09T22:00:00Z"]]), rows[1]]),
+            expectedAccounts: accounts, now: now, zone: zone)
+        let busy = changed.assess(receiptID: changed.id, start: free.start, end: free.end, now: now)
+        XCTAssertEqual(busy.status, "busy")
+        XCTAssertTrue(busy.spoken.contains("1:30 PM"))
+        XCTAssertNotEqual(busy.receiptID, free.receiptID)
+        XCTAssertEqual(try JSONDecoder().decode(CalendarAvailabilityEvidence.self, from: JSONEncoder().encode(changed)), changed)
+    }
     private func window(_ stamp: String = "2026-10-29T10:00:00-07:00", zone: String = "America/Los_Angeles") -> CalendarRequestWindow {
         CalendarRequestWindow(request: "Check next week across all three calendars", reference: date(stamp), zone: TimeZone(identifier: zone)!)!
     }

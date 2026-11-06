@@ -35,6 +35,7 @@ enum DispatchWorker {
         var holdsDecision: Bool? = nil
         var dependencyID: UUID? = nil
         var linkChoice: String? = nil
+        var userRequest: String? = nil
     }
 
     typealias Request = ([String: Any]) async throws -> [[String: Any]]
@@ -44,7 +45,7 @@ enum DispatchWorker {
     }
     private struct PendingStep: Error { let message: String }
     private struct LinkChoiceRequired: Error { let choices: [DispatchJob.InputChoice] }
-    private struct BrowserInputRequired: Error { let message: String }
+    private struct TaskInputRequired: Error { let message: String }
     typealias Execution = (output: String, failed: Bool, write: Bool, pending: Bool)
 
     static let maxRounds = 16
@@ -65,6 +66,10 @@ enum DispatchWorker {
             job.calendarWindow = CalendarRequestWindow(request: job.task, reference: job.authoredAt ?? Date(), zone: job.authoredTimeZone ?? .current)
         }
         let store = Container.shared.dispatchJobs()
+        let capturedOrigin = job.scope == .independent ? nil : DispatchJob.MailOrigin.captured(in: job.standingOnJSON)
+        if (job.scope == .currentEmail || job.holdsDecision == true), capturedOrigin == nil {
+            return .init(text: "Not started: this related task has no captured email source. Select the original email before retrying.", ok: false, status: .failed)
+        }
         if let retry = job.command, let previousID = retry.retryOf {
             let source = DispatchJob.MailOrigin.from(target(standingOnJSON: job.standingOnJSON, facts: job.facts))
             guard let previous = store.latestCommandAttempt(from: previousID), previous.id == previousID,
@@ -108,7 +113,7 @@ enum DispatchWorker {
             }
         }
         await store.begin(id: job.id, task: job.task, profileId: job.profileId, conversationId: job.diagnostics?.conversationID, turnId: job.turnID, operation: job.operation,
-            origin: job.scope == .independent ? nil : DispatchJob.MailOrigin.from(target(standingOnJSON: job.standingOnJSON, facts: job.facts)), command: job.command)
+            origin: capturedOrigin, command: job.command)
         let started = Date()
         job.diagnostics?.record(.jobStarted, ["job_id": job.id.uuidString, "task_revision": String(job.revision ?? 1), "input_source": job.inputSource, "turn_id": job.turnID ?? "unknown"])
         var outcome = "unknown"
@@ -148,7 +153,13 @@ enum DispatchWorker {
                 }
                 try Task.checkCancellation()
                 let result = await FullDuplexBroker.runTool(name: operation.tool, argumentsJSON: operation.arguments,
-                    profileId: job.profileId)
+                    profileId: job.profileId, mailJobID: job.id, mailCallID: callID)
+                if result.localDraftID != nil {
+                    _ = await store.markOperation(job.id, revision: job.revision, callID: nil)
+                    await store.finish(job.id, state: "awaiting_input", result: result.text,
+                        reportBack: true, historyStatus: .pending, revision: job.revision)
+                    return .init(text: result.text, ok: nil, reportBack: true, status: .pending)
+                }
                 let pending = result.pendingArchive != nil || result.pendingDraft != nil || result.deferred
                 if pending {
                     let text = "This action is queued for retry; Gmail has not confirmed completion yet. Check its outcome before retrying."
@@ -193,7 +204,7 @@ enum DispatchWorker {
             await store.finish(job.id, state: saved ? "awaiting_input" : "failed", result: question,
                 reportBack: true, historyStatus: saved ? .pending : .failed, revision: job.revision)
             return .init(text: question, ok: saved ? nil : false, reportBack: true, status: saved ? .pending : .failed)
-        } catch let pending as BrowserInputRequired {
+        } catch let pending as TaskInputRequired {
             outcome = "pending"
             await store.finish(job.id, state: "awaiting_input", result: pending.message, reportBack: true, historyStatus: .pending, revision: job.revision)
             return .init(text: pending.message, ok: nil, reportBack: true, status: .pending)
@@ -391,6 +402,9 @@ enum DispatchWorker {
                         : "Use this stored instruction to form its arguments: \(step.detail)")])
                 choice = step.web ? ["type": "allowed_tools", "mode": "required", "tools": [["type": "web_search"]]]
                     : ["type": "function", "name": step.actual]
+                // A Notion destination can be missing or ambiguous. Keep the stored
+                // step pending rather than forcing the model to invent a parent ID.
+                if NotionTools.names.contains(step.actual) { choice = "auto" }
             } else if finalCommandRound {
                 input.append(["role": "user", "content": "Every required saved-command tool step has completed. "
                     + "Do not call another tool. Return the final answer now. \(finalInstruction)"])
@@ -420,6 +434,14 @@ enum DispatchWorker {
             if let refusal = job.validate?() { throw StepFailure(message: refusal) }
             input += output
             let calls = output.filter { $0["type"] as? String == "function_call" }
+            if let step, NotionTools.names.contains(step.actual), calls.isEmpty {
+                let text = output.flatMap { $0["content"] as? [[String: Any]] ?? [] }
+                    .compactMap { $0["text"] as? String }.joined(separator: "\n")
+                if let value = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
+                   value["status"] as? String == "needs_input", let question = value["report"] as? String, !question.isEmpty {
+                    throw TaskInputRequired(message: question + " The source email is retained. Clarify this task to continue its unfinished steps.")
+                }
+            }
             if let step, step.web {
                 let searches = output.filter { $0["type"] as? String == "web_search_call" }
                 guard searches.count == 1, searches[0]["status"] as? String == "completed" else {
@@ -506,7 +528,8 @@ enum DispatchWorker {
                         }
                         try Task.checkCancellation()
                         result = await execute(name, json, relayNames: relayNames, cursor: cursor, standingOn: target,
-                                               profileId: job.profileId, diagnostics: job.diagnostics, callID: callId, ownerID: job.ownerID, parentJobID: job.id)
+                                               profileId: job.profileId, diagnostics: job.diagnostics, callID: callId, ownerID: job.ownerID,
+                                               parentJobID: job.id, userRequest: job.userRequest)
                     }
                 } else {
                     result = ("Could not read those arguments as JSON. Call the tool again.", true, false, false)
@@ -514,12 +537,12 @@ enum DispatchWorker {
                 #if targetEnvironment(macCatalyst)
                 if name == BackgroundBrowserStore.toolName,
                    let browser = Container.shared.backgroundBrowsers().sessions[job.id], browser.needsInput, browser.phase != .unknown {
-                    throw BrowserInputRequired(message: browser.message + " Open this activity to inspect the same browser and continue.")
+                    throw TaskInputRequired(message: browser.message + " Open this activity to inspect the same browser and continue.")
                 }
                 if name == BackgroundBrowserStore.toolName,
                    let pending = (try? JSONSerialization.jsonObject(with: Data(result.output.utf8))) as? [String: Any],
                    pending["status"] as? String == "needs_input", !result.pending {
-                    throw BrowserInputRequired(message: pending["notice"] as? String ?? "Open this activity to continue the browser task.")
+                    throw TaskInputRequired(message: pending["notice"] as? String ?? "Open this activity to continue the browser task.")
                 }
                 #endif
                 if name == EmailLinkTool.name {
@@ -532,6 +555,15 @@ enum DispatchWorker {
                 }
                 if name == CalendarTools.list {
                     calendarReadAt = !result.failed && CalendarRequestWindow.completeRead(result.output, window: job.calendarWindow) ? Date() : nil
+                }
+                if let preview = await Container.shared.dispatchJobs().history().first(where: {
+                    $0.mailAction?.state == .review && $0.mailAction?.parentJobID == job.id
+                        && $0.mailAction?.requestKey == job.id.uuidString + ":" + callId
+                }) {
+                    _ = await Container.shared.dispatchJobs().markOperation(job.id, revision: job.revision, callID: nil)
+                    job.diagnostics?.record(.toolFinished, ["job_id": job.id.uuidString, "call_id": callId,
+                        "tool": name, "outcome": "awaiting_review"])
+                    return GmailReadTools.json(["status": "needs_input", "report": preview.result ?? LocalDraftReview.notice])
                 }
                 if result.pending {
                     job.diagnostics?.record(.toolFinished, ["job_id": job.id.uuidString, "call_id": callId,
@@ -640,7 +672,7 @@ enum DispatchWorker {
     static func execute(_ name: String, _ arguments: String, relayNames: Set<String>,
                                 cursor: GmailManageTools.Cursor?, standingOn: [String: Any]?, profileId: String?,
                                 diagnostics: VoiceDiagnostics.Session? = nil, callID: String? = nil, ownerID: String? = nil,
-                                parentJobID: UUID? = nil)
+                                parentJobID: UUID? = nil, userRequest: String? = nil)
         async -> Execution {
         var arguments = arguments
         #if targetEnvironment(macCatalyst)
@@ -659,7 +691,7 @@ enum DispatchWorker {
         }
         if NotionTools.names.contains(name), relayNames.contains(name) {
             let result = await FullDuplexBroker.runTool(name: name, argumentsJSON: arguments, profileId: profileId)
-            return (result.text, result.ok == false, NotionTools.writes.contains(name), result.deferred)
+            return (result.text, result.ok == false, NotionTools.writes.contains(name), result.deferred || result.outcomeUnknown)
         }
         // The live call's connectors, each on the job profile's own grant.
         if GranolaTools.names.contains(name), relayNames.contains(name) {
@@ -693,7 +725,8 @@ enum DispatchWorker {
             return (result.output, result.failed, !readOnlyManage.contains(name), false)
         }
         if CalendarTools.names.contains(name) {
-            let result = await CalendarTools.run(name: name, argumentsJSON: arguments, diagnostics: diagnostics, callID: callID)
+            let result = await CalendarTools.run(name: name, argumentsJSON: arguments, diagnostics: diagnostics, callID: callID,
+                parentJobID: parentJobID, origin: DispatchJob.MailOrigin.from(standingOn))
             return (result.output, result.failed, name != CalendarTools.list, false)
         }
         if name == EmailLinkTool.name {
@@ -711,10 +744,29 @@ enum DispatchWorker {
         // Drafts and sends run on this phone (`LocalCompose`); `runTool` routes them there.
         if relayNames.contains(name) {
             let owner = await MainActor.run { ownerID ?? Container.shared.backend().userId }
+            let mailStore = await MainActor.run { Container.shared.mailStore() }
             let source = cursor.map { GmailManageTools.WriteSource(cursor: $0, ownerID: owner, profileID: profileId) }
             let result = await FullDuplexBroker.runTool(name: name, argumentsJSON: arguments, profileId: profileId, mailSource: source,
-                                                       mailJobID: parentJobID, mailCallID: callID)
-            return (result.text, result.ok == false, !readOnlyRelays.contains(name),
+                                                       mailJobID: parentJobID, mailCallID: callID, userRequest: userRequest,
+                                                       calendarOrigin: DispatchJob.MailOrigin.from(standingOn))
+            if let effects = result.effects, !effects.isEmpty {
+                let currentOwner = await MainActor.run { Container.shared.backend().userId }
+                if currentOwner == owner, ProfileRuntime.snapshot?.profileId == profileId {
+                    let queue = Container.shared.localTriage()
+                    let before = await queue.progress?.position
+                    _ = await queue.applyConfirmedEffects(effects, store: mailStore)
+                    let after = await queue.progress?.position
+                    RealtimeLog.log("dispatch: confirmed mail effects applied job=\(parentJobID?.uuidString ?? "none") call=\(callID ?? "none") count=\(effects.count) position=\(before ?? 0)->\(after ?? 0)")
+                } else {
+                    // The receipt still belongs in its original owner's cache, but cannot
+                    // alter a different profile's live selection.
+                    for effect in effects {
+                        let ids = await mailStore.confirmedEffectIDs(effect)
+                        await mailStore.applyConfirmedEffect(effect, ids: ids)
+                    }
+                }
+            }
+            return (result.text, result.ok == false, result.localDraftID == nil && !readOnlyRelays.contains(name),
                 result.outcomeUnknown || result.deferred || result.pendingArchive != nil || result.pendingDraft != nil)
         }
         return ("There is no tool called \(name). Use only the tools you were given.", true, false, false)

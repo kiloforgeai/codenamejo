@@ -128,6 +128,7 @@ enum LivePrompt {
 
     static func speakerInstructions(fastActions: Bool, toolNames: Set<String>, text: Text = .bundled) throws -> String {
         var out = try text("speaker")
+        out += "\nEmail introductions use only the application's supplied exact line. Never improvise a later recap from remembered conversation. Delegate explicit recaps, paraphrases, factual follow-ups and comparisons so the client reads the selected source. A backchannel such as hmm does not ask for a recap. Keep each sender, mailbox and proposal separate; preserve who is asked to act."
         if fastActions { out += try "\n" + text("fast-actions") }
         let abilities = (toolNames.contains("read_texts") ? ["check unread SMS/iMessage texts"] : [])
             + (toolNames.contains("send_text") ? ["send SMS/iMessage texts"] : [])

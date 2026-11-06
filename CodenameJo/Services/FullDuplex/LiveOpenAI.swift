@@ -70,6 +70,7 @@ enum LiveOpenAI {
             request["instructions"] = (request["instructions"] as? String ?? "") + "\nThis request is presentation-only. The application already performed the action. Present its recorded outcome and current queue item; retrieve selected email bodies if needed. Never repeat a write, dispatch or queue advance. If the result says the application is presenting it, return no user-facing text."
         }
         var tools = request["tools"] as? [[String: Any]] ?? []
+        tools.append(CalendarAvailabilityEvidence.definition)
         tools.append(["type": "function", "name": "read_tool_result",
             "description": "Read the next bounded page of a retained tool result. This reads local data and never reexecutes the original tool. Use the source_call_id and next_offset supplied by a partial result.",
             "parameters": ["type": "object", "properties": ["source_call_id": ["type": "string"], "offset": ["type": "integer", "minimum": 0]],

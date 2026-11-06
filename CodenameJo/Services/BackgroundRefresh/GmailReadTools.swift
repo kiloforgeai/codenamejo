@@ -406,6 +406,7 @@ enum GmailReadTools {
         }
         var out: [String: Any] = ["id": message.id, "threadId": message.threadId,
             "from": message.header("From") ?? "", "to": message.header("To") ?? "",
+            "replyTo": message.header("Reply-To") ?? "",
             "subject": message.header("Subject") ?? "", "date": message.header("Date") ?? "", "body": body,
             "bodyComplete": bodyComplete]
         out["attachments"] = files.map { file -> [String: Any] in

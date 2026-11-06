@@ -11,9 +11,19 @@ enum LocalCalendarWrites {
     typealias Refusal = CalendarTools.Refusal
     private static let answers = ["accepted", "declined", "tentative"]
 
-    /// - Parameter defer: the caller has spoken the receipt, so the Google write may land after it.
+    /// Calendar writes always await Google's result so the durable receipt cannot claim an early success.
     static func run(name: String, argumentsJSON: String, defer deferred: Bool,
-                    conversationId: String? = nil) async -> FullDuplexBroker.ToolResult {
+                    conversationId: String? = nil, callID: String? = nil, parentJobID: UUID? = nil,
+                    origin: DispatchJob.MailOrigin? = nil) async -> FullDuplexBroker.ToolResult {
+        await CalendarActionAudit.run(name: name, argumentsJSON: argumentsJSON, callID: callID,
+            conversationID: conversationId, parentJobID: parentJobID, origin: origin) { boundArguments in
+                // A durable outcome must follow the provider response, including cancellation.
+                await execute(name: name, argumentsJSON: boundArguments, deferred: false, conversationId: conversationId)
+            }
+    }
+
+    private static func execute(name: String, argumentsJSON: String, deferred: Bool,
+                                conversationId: String?) async -> FullDuplexBroker.ToolResult {
         var args = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8))) as? [String: Any] ?? [:]
         let started = Date()
         var connected = await CalendarTools.accounts()
@@ -77,6 +87,7 @@ enum LocalCalendarWrites {
         let when = start(event).map { " (\($0))" } ?? ""
         let scope = CalendarTools.isInstanceId(eventId) ? " This was that one occurrence, not the whole recurring series." : ""
         if me["responseStatus"] as? String == response {
+            await CalendarActionContext.current?.confirmedExisting(event, expected: args)
             let receipt = FullDuplexBroker.ToolResult(text: "\"\(title)\"\(when) was already \(response) on \(target). Nothing changed and nobody was notified again.\(scope)", ok: true)
             return await InvitationArchive.finish(receipt, args: args, event: event, account: target)
         }

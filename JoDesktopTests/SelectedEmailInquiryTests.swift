@@ -218,4 +218,78 @@ final class SelectedEmailInquiryTests: XCTestCase {
         XCTAssertTrue((requests[0]["context"] as? String)?.contains(Self.answer) == true)
         XCTAssertEqual(calls.count, 1)
     }
+
+    func testLaterRecapExcludesEarlierProposalAcrossAccountsAndExplicitRevisitReadsOriginal() async throws {
+        let h = Harness(); defer { h.brain.close() }
+        let proposal = "You could review document X using the audit tool."
+        h.brain.updateState(Self.state(id: "A", body: proposal, complete: true), scope: "source-profile")
+        h.brain.user("Could you recap this?", turn: 1)
+        h.brain.begin("first", live: true, turn: 1); h.brain.settle(turn: 1)
+        try await wait { h.speech.count == 1 }
+        h.brain.assistant("Sender A offers to review document X using the audit tool.")
+        h.brain.observe("Earlier email: " + proposal)
+        h.brain.jobCompleted(id: UUID(), result: "Earlier lookup: " + proposal)
+        for id in ["unrelated-1", "unrelated-2"] {
+            h.brain.updateState(Self.state(id: id), scope: "source-profile")
+        }
+        let b = Self.state(id: "B", body: "The audit market grew this quarter. No request for work.", complete: true)
+            .replacingOccurrences(of: Self.account, with: "second@example.test")
+        h.brain.updateState(b, scope: "source-profile")
+        h.brain.user("hmm", turn: 2)
+        XCTAssertFalse(h.brain.needsSelectedSource)
+        h.brain.user("Remind me what this is about", turn: 3)
+        h.brain.begin("later", live: true, turn: 3); h.brain.settle(turn: 3)
+        try await wait { h.requests.count == 2 }
+        let request = h.requests[1]
+        let serialized = GmailReadTools.json(request)
+        XCTAssertFalse(serialized.contains(proposal), serialized)
+        XCTAssertFalse(serialized.contains("Sender A offers"), serialized)
+        XCTAssertTrue(serialized.contains("second@example.test"))
+        XCTAssertTrue(serialized.contains("The audit market grew"))
+        XCTAssertTrue((request["history"] as? [[String: Any]])?.isEmpty == true)
+        h.brain.updateState(Self.state(id: "A", body: proposal, complete: true), scope: "source-profile")
+        h.brain.user("Recap this again", turn: 4)
+        h.brain.begin("revisit", live: true, turn: 4); h.brain.settle(turn: 4)
+        try await wait { h.requests.count == 3 }
+        let revisited = GmailReadTools.json(h.requests[2])
+        XCTAssertTrue(revisited.contains(proposal))
+        XCTAssertFalse(revisited.contains("The audit market grew"))
+        XCTAssertTrue(revisited.contains("Preserve who proposes"))
+    }
+
+    func testExplicitComparisonLabelsHistoricalClaimsAsUnverifiedAndRetainsCurrentEvidence() async throws {
+        let h = Harness(); defer { h.brain.close() }
+        h.brain.updateState(Self.state(id: "A"), scope: "source-profile")
+        h.brain.user("Remember the earlier audit proposal", turn: 1)
+        h.brain.updateState(Self.state(id: "B", body: "Only market news.", complete: true), scope: "source-profile")
+        h.brain.user("Compare this with the earlier email", turn: 2)
+        h.brain.begin("compare", live: true, turn: 2); h.brain.settle(turn: 2)
+        try await wait { h.requests.count == 1 }
+        let body = GmailReadTools.json(h.requests[0])
+        XCTAssertTrue(body.contains("Only market news."))
+        XCTAssertTrue(body.contains("retrieve each other email before comparing"))
+        XCTAssertTrue(body.contains("Earlier history is an unverified reference"))
+    }
+
+    func testBackchannelDoesNotDelegateARecapAndExplicitRecapReadsSource() async throws {
+        var sent: [[String: Any]] = []
+        var calls: [LiveSessionAdapter.Call] = []
+        let adapter = LiveSessionAdapter(wire: { sent.append($0) }, emit: {
+            if case .liveFunction(let call) = $0 { calls.append(call) }
+        })
+        defer { adapter.close() }
+        adapter.clientBrainState = { (Self.state(id: "B"), "source-profile") }
+        adapter.enableClientDelegation { _ in XCTFail("Must read source first"); return [:] }
+        func input(_ text: String, _ start: Double) throws {
+            adapter.receive(try JSONSerialization.data(withJSONObject: ["type": "session.input_transcript.delta",
+                "delta": text, "start_ms": start, "end_ms": start + 100]))
+        }
+        adapter.receive(try JSONSerialization.data(withJSONObject: ["type": "session.started"]))
+        try input("hmm", 100)
+        try await wait { sent.contains { ($0["content"] as? String)?.contains("not a request. Stay quiet") == true } }
+        XCTAssertTrue(calls.isEmpty)
+        try input("Could you recap this email?", 10000)
+        try await wait { calls.count == 1 }
+        XCTAssertEqual(ToolArguments(calls[0].arguments).string("message_id"), "B")
+    }
 }

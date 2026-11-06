@@ -120,7 +120,7 @@ final class TaskReceiptTests: XCTestCase {
             XCTAssertEqual(receipt.state, state)
             let spoken = try XCTUnwrap(receipt.spokenReceipt)
             XCTAssertTrue(spoken.contains("Original D"))
-            XCTAssertTrue(spoken.contains("original@example.test"))
+            XCTAssertFalse(spoken.contains("original@example.test"))
             XCTAssertFalse(spoken.contains("Current F"))
             XCTAssertFalse(spoken.contains("running"))
         }
@@ -147,7 +147,9 @@ final class TaskReceiptTests: XCTestCase {
         let first = await finished("done", account: "first@example.test", sender: "First sender")
         let client = FullDuplexVoiceClient()
         for (id, account) in [(second, "second@example.test"), (first, "first@example.test")] {
-            XCTAssertTrue(client.currentTaskReceipt(report(id))?.spokenReceipt?.contains(account) == true)
+            let receipt = try XCTUnwrap(client.currentTaskReceipt(report(id)))
+            XCTAssertEqual(receipt.origin?.account, account)
+            XCTAssertTrue(receipt.spokenReceipt?.contains(receipt.origin!.sender) == true)
         }
     }
 
@@ -172,11 +174,19 @@ final class TaskReceiptTests: XCTestCase {
         XCTAssertFalse(speech.contains("Still running"))
         XCTAssertTrue(delivered.isEmpty)
         adapter.observePlayback(0.1)
+        XCTAssertTrue(delivered.isEmpty, "The first audio frame must not mark the answer delivered")
+        let line = try XCTUnwrap(store.existing(id)?.spokenReceipt)
+        client.handle(.event(.assistantTranscriptDelta(itemId: "answer", delta: line, spoken: true)))
+        client.handle(.event(.assistantTranscriptDone(itemId: "answer", transcript: line)))
+        XCTAssertTrue(delivered.isEmpty, "The transcript alone does not prove playback completed")
+        client.handle(.event(.outputAudioStopped))
+        client.handle(.event(.outputAudioStopped))
         XCTAssertEqual(delivered, [id])
         XCTAssertFalse(wire.contains { $0["type"] as? String == "response.create" })
         let log = String(decoding: try await diagnostics.snapshot(), as: UTF8.self)
         XCTAssertTrue(log.contains("speech_enqueued"))
         XCTAssertTrue(log.contains("jobSpeechStarted"))
+        XCTAssertTrue(log.contains("jobSpeechCompleted"))
         XCTAssertFalse(log.contains("Original D"))
         XCTAssertFalse(log.contains("example.test"))
         adapter.close()
@@ -201,6 +211,66 @@ final class TaskReceiptTests: XCTestCase {
         XCTAssertFalse(wire.contains { $0["type"] as? String == "session.commentary.append" })
         XCTAssertNil(client.pendingJobSpeech)
         adapter.close()
+    }
+
+    func testAnswerLeadsSpeechWithoutInternalInstructionsAndFullResultStaysInCard() async throws {
+        let id = UUID()
+        let task = String(repeating: "Search internal constraints in account hidden@example.test; query SECRET. ", count: 100)
+        let answer = "I found the destination under [the project page](https://example.test/private/path). "
+            + String(repeating: "Additional verified detail. ", count: 100)
+        await store.begin(id: id, task: task, profileId: nil)
+        await store.finish(id, state: "done", result: answer, reportBack: true)
+        let job = try XCTUnwrap(store.existing(id))
+        let spoken = try XCTUnwrap(job.spokenReceipt)
+        XCTAssertTrue(spoken.hasPrefix("I found the destination under the project page."))
+        XCTAssertFalse(spoken.contains("SECRET"))
+        XCTAssertFalse(spoken.contains("hidden@example.test"))
+        XCTAssertFalse(spoken.contains("https://"))
+        XCTAssertLessThan(spoken.count, 660)
+        XCTAssertEqual(job.result, answer, "The result card retains the complete answer and link")
+        XCTAssertEqual(DispatchJob(id: UUID(), task: task, state: "done", result: "Filed the note and archived the email.").spokenReceipt,
+            "Filed the note and archived the email.")
+        XCTAssertTrue(DispatchJob(id: UUID(), task: task, state: "partial", result: "Filed the note; archive failed.")
+            .spokenReceipt?.contains("only partially completed. Filed the note; archive failed.") == true)
+    }
+
+    func testTruncatedOrInterruptedSpeechKeepsAnswerAvailableWithoutRepeatingWork() async throws {
+        let id = await finished("done")
+        let client = FullDuplexVoiceClient()
+        var delivered: [UUID] = []
+        client.onJobDelivered = { delivered.append($0) }
+        client.injectDispatchReport(report(id), speak: true)
+        client.handle(.event(.outputAudioStarted))
+        client.handle(.event(.assistantTranscriptDelta(itemId: "partial", delta: "The task completed.", spoken: true)))
+        client.handle(.event(.assistantTranscriptDone(itemId: "partial", transcript: "The task completed.")))
+        client.handle(.event(.outputAudioStopped))
+        XCTAssertTrue(delivered.isEmpty)
+        client.handle(.liveUserActivity)
+        XCTAssertNil(client.pendingJobSpeech)
+        XCTAssertNotNil(client.currentTaskReceipt(report(id)))
+        let saved = try XCTUnwrap(store.existing(id))
+        XCTAssertNil(saved.deliveredAt)
+        XCTAssertEqual(saved.result, "Verified result for Original D.")
+    }
+
+    func testPlaybackEndingBeforeFinalTranscriptStillDeliversOnceAndQuietResultDoesNotSpeak() async throws {
+        let id = await finished("done")
+        let client = FullDuplexVoiceClient()
+        var delivered: [UUID] = []
+        client.onJobDelivered = { delivered.append($0) }
+        client.injectDispatchReport(report(id), speak: true)
+        let line = try XCTUnwrap(store.existing(id)?.spokenReceipt)
+        client.handle(.event(.outputAudioStarted))
+        client.handle(.event(.assistantTranscriptDelta(itemId: "answer", delta: line, spoken: true)))
+        client.handle(.event(.outputAudioStopped))
+        XCTAssertTrue(delivered.isEmpty)
+        client.handle(.event(.assistantTranscriptDone(itemId: "answer", transcript: line)))
+        client.handle(.event(.assistantTranscriptDone(itemId: "answer", transcript: line)))
+        XCTAssertEqual(delivered, [id])
+        let quiet = await finished("done", sender: "Quiet result")
+        client.injectDispatchReport(report(quiet), speak: false)
+        XCTAssertNil(client.pendingJobSpeech)
+        XCTAssertEqual(delivered, [id, quiet])
     }
 
     func testFeedbackTurnDropsQueuedGuardedSpeech() throws {

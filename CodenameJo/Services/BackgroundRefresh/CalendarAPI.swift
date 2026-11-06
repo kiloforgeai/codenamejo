@@ -87,13 +87,23 @@ enum CalendarAPI {
         body: [String: Any]? = nil, token: String
     ) async throws -> [String: Any] {
         await CalendarQuota.shared.spend()
-        let data = try await send(method, path: path, query: query,
-            body: try body.map { try JSONSerialization.data(withJSONObject: $0) }, token: token)
-        if data.isEmpty { return [:] }
-        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            throw Failure.decoding("\(path) — \(String(decoding: data.prefix(200), as: UTF8.self))")
+        let audit = CalendarActionContext.current
+        let writes = ["POST", "PATCH", "DELETE"].contains(method)
+        do {
+            if writes { try await audit?.beforeWrite(method, path: path, query: query, body: body) }
+            let data = try await send(method, path: path, query: query,
+                body: try body.map { try JSONSerialization.data(withJSONObject: $0) }, token: token)
+            let object: [String: Any]
+            if data.isEmpty { object = [:] }
+            else if let decoded = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] { object = decoded }
+            else { throw Failure.decoding("Calendar returned an unreadable response.") }
+            if writes { await audit?.received(object, method: method) }
+            else { await audit?.observedEvent(object) }
+            return object
+        } catch {
+            if writes { await audit?.failed(error) }
+            throw error
         }
-        return object
     }
 
     // MARK: - Transport

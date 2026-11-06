@@ -15,7 +15,7 @@ final class AppCoreContractTests: XCTestCase {
         }
         let data = try JSONSerialization.data(withJSONObject: catalogs, options: [.sortedKeys])
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        XCTAssertEqual(digest, "0d83bd7bf24ffd8eaec9c4a2f64f5278f82848dc3daaba177fd3cfbf99c2b059",
+        XCTAssertEqual(digest, "8442f62452cfe284ee2c468d4b87dc09768c212435909f9c9fb07ec0415a7843",
                        "Tool contract changes require deliberate review, including account-scoped wording")
     }
 
@@ -53,7 +53,7 @@ final class AppCoreContractTests: XCTestCase {
         _ = history.complete(first)
         let merged = history.complete(.init(id: id, commandText: first.commandText, responseText: "Complete reply",
             status: .partial, durationSeconds: 3, conversationId: conversation, brainSteps: [.init(ms: 30)]))
-        XCTAssertEqual(merged.durationSeconds, 5)
+        XCTAssertEqual(merged.durationSeconds, 3)
         XCTAssertEqual(merged.issuedAt, issued)
         XCTAssertEqual(merged.toolSteps, first.toolSteps)
         XCTAssertEqual(merged.latency, first.latency)
@@ -63,6 +63,37 @@ final class AppCoreContractTests: XCTestCase {
         XCTAssertNil(unrelated.toolSteps)
         XCTAssertNil(unrelated.latency)
         XCTAssertNil(unrelated.brainSteps)
+    }
+
+    func testTurnTelemetryCannotLeakAcrossCancellationRestartOrDuplicateFinalization() throws {
+        var telemetry = TurnTelemetry(), history = TurnHistory()
+        let cancelled = UUID(), reply = UUID(), sniff = UUID()
+        let base = Date(timeIntervalSince1970: 100)
+        telemetry.begin(cancelled, at: base)
+        telemetry.end(cancelled, at: base.addingTimeInterval(3))
+        telemetry.begin(reply, at: base.addingTimeInterval(10))
+        let step = CommandRecord.BrainStep(ms: 200, tools: ["send_email"], inputTokens: 100, outputTokens: 12,
+            responseID: "response-send", turnID: reply.uuidString)
+        telemetry.record(step, for: reply); telemetry.record(step, for: reply)
+        telemetry.finish(reply, reply: "Sent", at: base.addingTimeInterval(15))
+        telemetry.finish(reply, reply: "Sent", at: base.addingTimeInterval(80))
+        telemetry.begin(sniff, at: base.addingTimeInterval(20))
+        telemetry.record(step, for: reply) // Late callback still names its original turn.
+        XCTAssertEqual(telemetry.entries[cancelled]?.duration(at: base.addingTimeInterval(9000)), 3)
+        XCTAssertEqual(telemetry.entries[reply]?.duration(at: base.addingTimeInterval(9000)), 5)
+        XCTAssertTrue(telemetry.entries[sniff]?.brainSteps.isEmpty == true)
+        let record = CommandRecord(id: reply, commandText: "Send", responseText: "Sent", durationSeconds: 5,
+            brainSteps: telemetry.entries[reply]?.brainSteps)
+        _ = history.complete(record)
+        let repeated = history.complete(record)
+        XCTAssertEqual(repeated.durationSeconds, 5)
+        XCTAssertEqual(repeated.brainSteps?.count, 1)
+        telemetry = TurnTelemetry()
+        let greeting = UUID(), restarted = base.addingTimeInterval(9000)
+        telemetry.begin(greeting, at: restarted)
+        telemetry.finish(greeting, reply: "Hello", at: restarted.addingTimeInterval(16.4))
+        XCTAssertEqual(try XCTUnwrap(telemetry.entries[greeting]?.duration(at: restarted.addingTimeInterval(9000))), 16.4, accuracy: 0.001)
+        XCTAssertNil(telemetry.entries[cancelled])
     }
 
     func testLateBackgroundHistoryReplyKeepsItsOriginAndOnlyUpdatesDispatchOutcome() throws {

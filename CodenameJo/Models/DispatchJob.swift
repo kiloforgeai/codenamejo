@@ -30,6 +30,51 @@ struct DispatchJob: Codable, Identifiable, Hashable {
     var completionPreference: CompletionPreference? = nil
     var inputChoices: [InputChoice]? = nil
     var mailAction: MailActionReceipt? = nil
+    var calendarAction: CalendarActionReceipt? = nil
+    var draftReview: MailDraftReview? = nil
+    var calendarIntent: CalendarConversationIntent? = nil
+    var quickMailAction: QuickMailAction? = nil
+    var resolution: Resolution? = nil
+    var browserState: BrowserState? = nil
+    var browserURL: String? = nil
+
+    enum BrowserState: String, Codable {
+        case unsubmitted, unavailable, userControlled, submitting, confirmed, unknown
+    }
+
+    var browserOutcomeUncertain: Bool {
+        state == "unknown" || inFlightOperation != nil || [.submitting, .unknown, .userControlled].contains(browserState)
+    }
+
+    struct QuickMailAction: Codable, Hashable {
+        let tool: String
+        let arguments: String
+
+        static func captured(tool: String, arguments: [String: Any], origin: MailOrigin?) -> Self? {
+            guard ["archive_message", "mark_spam", "trash_message", "label_message"].contains(tool),
+                  let origin else { return nil }
+            var args = arguments
+            args["account"] = origin.account.lowercased()
+            args["message_id"] = origin.messageID
+            guard let data = try? JSONSerialization.data(withJSONObject: args, options: [.sortedKeys]) else { return nil }
+            return .init(tool: tool, arguments: String(decoding: data, as: UTF8.self))
+        }
+    }
+
+    struct Resolution: Codable, Hashable {
+        let jobID: UUID
+        let at: Date
+        let reason: String
+    }
+
+    var reconcilableMailAction: QuickMailAction? {
+        if let quickMailAction { return quickMailAction }
+        guard command == nil, context?.input == "button", context?.expects == "receipt",
+              let origin, let receipts, receipts.count == 1,
+              ["archive_message", "mark_spam", "trash_message"].contains(receipts[0].tool),
+              task == LiveFastAction(rawValue: receipts[0].tool)?.title else { return nil }
+        return .captured(tool: receipts[0].tool, arguments: [:], origin: origin)
+    }
 
     struct InputChoice: Codable, Hashable, Identifiable {
         let id: String
@@ -52,12 +97,16 @@ struct DispatchJob: Codable, Identifiable, Hashable {
     var ownsFeedSource: Bool { context?.parksSource == true && origin != nil && state != "cancelled" }
     var sourceSelection: MailSelection? { origin.map { .init(account: $0.account, messageID: $0.messageID) } }
     var needsReview: Bool {
+        guard resolution == nil else { return false }
+        if mailAction?.state == .review { return true }
         guard deliveredAt == nil, !isRunning else { return false }
         if ["awaiting_input", "failed", "partial", "unknown"].contains(state) { return true }
         return isDone && effectivePreference == .bringBack && (context != nil || completionPreference != nil)
     }
 
     var belongsInWorkQueue: Bool {
+        guard resolution == nil else { return false }
+        if draftReview != nil || mailAction?.state == .discarded { return false }
         if needsReview { return true }
         guard deliveredAt == nil, effectivePreference != .quiet else { return false }
         return context?.expects == "answer" || completionPreference == .bringBack
@@ -77,12 +126,14 @@ struct DispatchJob: Codable, Identifiable, Hashable {
         var dependencyID: UUID? = nil
         var linkChoice: String? = nil
         var deferredFeedbackArchive: Bool? = nil
+        var userRequest: String? = nil
     }
 
     var taskRevision: Int { context?.revision ?? 1 }
     var hasCommittedWrites: Bool { receipts?.contains { $0.outcome == "success" } == true }
 
     var spokenReceipt: String? {
+        if resolution != nil { return "This attempt failed, but a later confirmed retry resolved it. Both attempts remain in Activity." }
         guard !isRunning else { return nil }
         let status: String
         switch state {
@@ -94,9 +145,33 @@ struct DispatchJob: Codable, Identifiable, Hashable {
         case "cancelled": status = "was cancelled"
         default: return nil
         }
-        let source = origin.map { "For the email “\($0.subject)” from \($0.sender) in \($0.account), " }
-            ?? "For your request “\(task)”, "
-        return source + "the task " + status + ". " + (result ?? "Review its result in Background activity.")
+        let answer = Self.spokenResult(result ?? "")
+        var line = answer.isEmpty ? "The task \(status). Review its result in Background activity."
+            : (state == "done" ? answer : "The task \(status). " + answer)
+        if let origin {
+            let sender = Self.spokenResult(origin.sender.replacingOccurrences(of: #"<[^>]+>"#,
+                with: "", options: .regularExpression)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let subject = String(Self.spokenResult(origin.subject).prefix(80))
+            line += " This is for “\(subject)”" + (sender.isEmpty ? "." : " from \(sender).")
+        }
+        return line
+    }
+
+    /// The card retains the full result and links; speech starts with the answer, never execution instructions.
+    private static func spokenResult(_ text: String) -> String {
+        var text = text.replacingOccurrences(of: #"\[([^\]]+)\]\(https?://[^\s)]+\)"#,
+            with: "$1", options: .regularExpression)
+        text = text.replacingOccurrences(of: #"https?://[^\s<>]+"#, with: "the link in the result card", options: .regularExpression)
+        text = text.replacingOccurrences(of: #"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}"#,
+            with: "the address in the result card", options: [.regularExpression, .caseInsensitive])
+        text = text.replacingOccurrences(of: #"[*`#]"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.count > 600 {
+            let prefix = String(text.prefix(600))
+            text = String(prefix.prefix(upTo: prefix.lastIndex(of: " ") ?? prefix.endIndex)) + "… More detail is in the result card."
+        }
+        return text
     }
 
     struct CommandRun: Codable, Hashable, Sendable {
@@ -119,6 +194,9 @@ struct DispatchJob: Codable, Identifiable, Hashable {
         }
         guard didFail, let command, command.keyword == saved.keyword else {
             throw RetryRefusal(message: "This is not a failed run of that command. No action was repeated.")
+        }
+        guard state != "unknown", inFlightOperation == nil else {
+            throw RetryRefusal(message: "A previous command write has an unknown outcome. Reconcile it with the provider before retrying; no action was repeated.")
         }
         guard saved.enabled, command.completedSteps >= 0,
               command.completedSteps < saved.actions.count,
@@ -150,6 +228,24 @@ struct DispatchJob: Codable, Identifiable, Hashable {
                 subject: target["subject"] as? String ?? "")
         }
 
+        /// Provenance identifies the committed feed item, even when that item contains
+        /// several messages. This is deliberately separate from resolving a write target.
+        static func captured(in source: String?) -> Self? {
+            guard let source,
+                  let root = try? JSONSerialization.jsonObject(with: Data(source.utf8)) as? [String: Any] else { return nil }
+            let item = root["item"] as? [String: Any] ?? root
+            guard root["done"] as? Bool != true,
+                  let account = item["account"] as? String, !account.trimmingCharacters(in: .whitespaces).isEmpty,
+                  let id = item["id"] as? String, !id.isEmpty,
+                  let thread = item["threadId"] as? String, !thread.isEmpty else { return nil }
+            if let members = item["messages"] as? [Any] {
+                let ids = members.compactMap { ($0 as? [String: Any])?["id"] as? String }
+                guard ids.count == members.count, ids.contains(id), ids.allSatisfy({ !$0.isEmpty }) else { return nil }
+            }
+            return .init(account: account.trimmingCharacters(in: .whitespaces).lowercased(), messageID: id,
+                threadID: thread, sender: item["from"] as? String ?? "", subject: item["subject"] as? String ?? "")
+        }
+
         var about: LocalTriageQueue.Outcome.About {
             .init(account: account, id: messageID, threadId: threadID, from: sender, subject: subject)
         }
@@ -165,7 +261,7 @@ struct DispatchJob: Codable, Identifiable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, task, state, result, receipts, historyOwner, operation, foregroundContinuation, origin, command, context, inFlightOperation, completionPreference, inputChoices, mailAction
+        case id, task, state, result, receipts, historyOwner, operation, foregroundContinuation, origin, command, context, inFlightOperation, completionPreference, inputChoices, mailAction, calendarAction, draftReview, calendarIntent, quickMailAction, resolution, browserState, browserURL
         case userId = "user_id"
         case conversationId = "conversation_id"
         case turnId = "turn_id"
@@ -198,6 +294,10 @@ struct DispatchJob: Codable, Identifiable, Hashable {
 
     /// Whether this job has something to say, and what, with the stale-`running` case in one place.
     func recoveredAnswer(asOf now: Date = Date()) -> String? {
+        guard resolution == nil else { return nil }
+        if state == "awaiting_input" {
+            return "An earlier task needs input: \(task). Inspect its current state with manage_task before describing a form or requesting approval. Saved browser text is not evidence that the form is still open."
+        }
         if isDone && reportBack == false { return nil }
         if isRunning {
             // Still inside its budget — it may yet finish and be recovered on a

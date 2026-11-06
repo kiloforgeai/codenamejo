@@ -202,6 +202,14 @@ class DesktopWorkspaceModel: ViewModel {
             queueRevision: sessionFeed.revision, queueScope: sessionFeed.scope,
             response: response, previousResponse: previousResponse, focusMode: focusMode)
         state.responseItemID = responseItemID
+        state.readerSelection = emailReader.request?.selection
+        switch emailReader {
+        case .idle: state.readerState = "idle"
+        case .loading: state.readerState = "loading"
+        case .ready: state.readerState = "ready"
+        case .failed: state.readerState = "failed"
+        case .headersOnly: state.readerState = "headers_only"
+        }
         state.feedActionError = feedActionError
         state.rawFocus = presentation.rawSelection
         state.transitioning = presentation.isTransitioning
@@ -245,6 +253,17 @@ class DesktopWorkspaceModel: ViewModel {
     @Published var focusMode = false
     @Published var filter = "All"
     @Published var selectedJob: DispatchJob?
+
+    func applyTaskSelection(_ job: DispatchJob?) {
+        guard job?.id != selectedJob?.id else { return }
+        selectedJob = job
+        resultSelectionError = nil
+        taskCorrection = ""
+    }
+
+    var pendingBrowserJobs: [DispatchJob] {
+        jobs.filter { $0.state == "awaiting_input" && (browserTasks[$0.id]?.needsInput == true || $0.browserState != nil) }
+    }
     @Published var selectingResult = false
     @Published var selectingFeedItem = false
     @Published var feedSelectionError: String?
@@ -294,6 +313,13 @@ class DesktopWorkspaceModel: ViewModel {
         return "≈\(count + tasks)"
     }
     var returnedTasks: [DispatchJob] { jobs.filter(\.needsReview) }
+    func applyJobs(_ incoming: [DispatchJob]) {
+        let known = Set(jobs.map(\.id))
+        let newPreview = incoming.first { $0.mailAction?.state == .review && $0.draftReview != nil && !known.contains($0.id) }
+        jobs = incoming
+        if let newPreview { selectedJob = newPreview }
+        else if let selectedJob { self.selectedJob = incoming.first { $0.id == selectedJob.id } }
+    }
     var workQueueTasks: [DispatchJob] {
         jobs.filter(\.belongsInWorkQueue).sorted {
             if $0.startedAt == $1.startedAt { return $0.id.uuidString < $1.id.uuidString }
@@ -309,6 +335,9 @@ class DesktopWorkspaceModel: ViewModel {
         }
     }
     var runningJobs: [DispatchJob] { jobs.filter { $0.isRunning && !$0.hasStopped() } }
+    var activityReviewCount: Int {
+        Set((returnedTasks + activityJobs.filter(\.activityNeedsAttention)).map(\.id)).count
+    }
     var finishedJobs: [DispatchJob] { jobs.filter { $0.hasStopped() } }
     var feedComplete: Bool {
         inSession && sessionFeed.status == .complete && sessionFeed.rows.isEmpty

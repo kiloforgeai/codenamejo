@@ -79,6 +79,9 @@ enum LocalVoiceCalendar {
     nonisolated static func allowsCancel(_ transcript: String) -> Bool {
         LocalModel.usesTuned
             || said(transcript, any: ["cancel", "delete", "remove", "scrap", "take off", "get rid", "decline"])
+            || (said(transcript, any: ["take"])
+                && words(transcript).joined(separator: " ").range(
+                    of: #"\btake\b.+\boff (?:my|the) calendar\b"#, options: .regularExpression) != nil)
     }
 
     /// "Decline" on someone else's invitation answers no, which tells the organizer; a cancel
@@ -100,7 +103,9 @@ enum LocalVoiceCalendar {
                 let named = wanted.allSatisfy(Set(have).contains) || have.joined().contains(wanted.joined())
                 guard named else { return false }
                 guard hour >= 0, let start = event.startEpochMs else { return true }
-                return calendar.component(.hour, from: Date(timeIntervalSince1970: Double(start) / 1000)) == hour
+                let time = Date(timeIntervalSince1970: Double(start) / 1000)
+                return calendar.component(.hour, from: time) == hour
+                    && (!wanted.isEmpty || calendar.component(.minute, from: time) == 0)
             }
             .sorted { ($0.startEpochMs ?? 0) < ($1.startEpochMs ?? 0) }
     }

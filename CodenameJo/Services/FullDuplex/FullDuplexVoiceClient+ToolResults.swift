@@ -100,9 +100,11 @@ extension FullDuplexVoiceClient {
         FullDuplexTrace.note("!! function call \(name) — running on the phone")
         onToolUse?(name)
         functionCallTask?.cancel()
+        let userRequest = latestCompletedUserUtterance
         functionCallTask = Task { [weak self] in
             let result = await FullDuplexBroker.runTool(
-                name: name, argumentsJSON: argumentsJSON, conversationId: self?.conversationId(), mailCallID: callId)
+                name: name, argumentsJSON: argumentsJSON, conversationId: self?.conversationId(), mailCallID: callId,
+                userRequest: userRequest)
             guard let self, self.isActive else { return }
             guard !Task.isCancelled else {
                 // `functionCallTask` now belongs to whoever cancelled this one; only the answer is owed.

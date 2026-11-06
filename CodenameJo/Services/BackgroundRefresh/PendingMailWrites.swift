@@ -449,6 +449,14 @@ actor PendingMailWrites {
 
     /// The default `Settled`: confirmed effects reach the cache and the queue; a failure is told and shown again.
     @Sendable static func report(_ job: PendingMailWrite, _ outcome: Outcome) async {
+        if job.operation == "archive_message" {
+            let store = await MainActor.run { Container.shared.dispatchJobs() }
+            let owner = await MainActor.run { Container.shared.backend().userId }
+            if owner == job.user_id {
+                await store.recordCalendarArchive(conversationID: job.conversationId, account: job.account,
+                    messageID: job.messageId, state: outcome.isSuccess ? "confirmed" : "unconfirmed — archive failed")
+            }
+        }
         if case .failed(let sentence) = outcome, let queued = job.payload.flatMap({ try? JSONDecoder().decode(PendingMailWrite.QueuedDraft.self, from: Data($0.utf8)) }),
            let id = queued.mailActionID {
             let store = await MainActor.run { Container.shared.dispatchJobs() }

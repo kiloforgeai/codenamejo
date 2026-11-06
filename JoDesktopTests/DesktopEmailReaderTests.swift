@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 @testable import CodenameJo
 
 @MainActor
@@ -269,6 +270,51 @@ final class DesktopEmailReaderTests: XCTestCase {
         reader.show(selected)
         let calls = await gate.calls
         XCTAssertEqual(calls, 2)
+    }
+
+    func testSameSourceRefreshKeepsReaderMountedUntilNewContentArrives() async throws {
+        let gate = ReaderGate()
+        let reader = DesktopEmailReader(loader: { try await gate.load($0) }, allowed: { _ in true })
+        let selected = request()
+        reader.show(selected)
+        try await waitFor { await gate.contains(selected) }
+        await gate.finish(selected, with: .success(content("selected")))
+        try await waitFor { reader.state == .ready(selected, self.content("selected")) }
+        reader.show(selected, retry: true)
+        XCTAssertEqual(reader.state, .ready(selected, content("selected")))
+        try await waitFor { await gate.contains(selected) }
+        await gate.finish(selected, with: .success(content("selected")))
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(reader.state, .ready(selected, content("selected")))
+        reader.show(request("other"))
+        XCTAssertEqual(reader.state, .loading(request("other")), "Different sources must not retain old content")
+        try await waitFor { await gate.contains(self.request("other")) }
+        reader.show(nil)
+        await gate.finish(request("other"), with: .success(content("other")))
+    }
+
+    func testNativeSelectionSurvivesUpdatesButCannotCarryAcrossSources() throws {
+        let view = DesktopReaderTextView()
+        let body = try DesktopEmailReader.linkedBody("🙂 Café — selected text\nhttps://example.test/details\n> Quoted history")
+        func display(_ identity: String, size: CGFloat = 16) {
+            view.display(body, identity: identity, size: size, weight: .regular, secondary: false, lineSpacing: 5)
+        }
+        display("first")
+        let selection = (view.text as NSString).range(of: "Café — selected text")
+        view.selectedRange = selection
+        for _ in 0..<20 { display("first") }
+        XCTAssertEqual(view.selectedRange, selection)
+        display("first", size: 18)
+        XCTAssertEqual(view.selectedRange, selection)
+        XCTAssertEqual((view.text as NSString).substring(with: view.selectedRange), "Café — selected text")
+        let link = (view.text as NSString).range(of: "https://example.test/details")
+        XCTAssertEqual(view.attributedText.attribute(.link, at: link.location, effectiveRange: nil) as? URL,
+                       URL(string: "https://example.test/details"))
+        XCTAssertTrue(view.isSelectable)
+        XCTAssertFalse(view.isEditable)
+        XCTAssertFalse(view.isScrollEnabled, "The outer reader owns scrolling")
+        display("second")
+        XCTAssertEqual(view.selectedRange.length, 0)
     }
 
     func testStartingConversationReusesLoadedBodyOnlyWithinItsAuthorizedScope() async throws {

@@ -5,6 +5,7 @@ enum MailActionAudit {
     struct Failure: Error { let text: String }
 
     static func replay(_ job: DispatchJob) -> FullDuplexBroker.ToolResult {
+        if job.mailAction?.state == .review { return LocalDraftReview.result(job) }
         let action = job.mailAction
         return .init(text: (job.result ?? "This action is already recorded.") + " No duplicate write was attempted.",
             ok: action?.confirmed == true ? true : false,
@@ -37,20 +38,20 @@ enum MailActionAudit {
         } catch {
             let state = MailActionReceipt.failureState(error, attempted: true)
             let text = state == .unknown
-                ? "Gmail did not confirm this \(action.kind == .send ? "send" : "draft"). Its outcome is unknown. Check Gmail before trying again; Jo will not repeat it automatically."
-                : "Gmail refused this \(action.kind == .send ? "send" : "draft"): \(GmailManageTools.detail(error))."
+                ? "Gmail did not confirm this \(action.kind.isDraft ? "draft" : "send"). Its outcome is unknown. Check Gmail before trying again; Jo will not repeat it automatically."
+                : "Gmail refused this \(action.kind.isDraft ? "draft" : "send"): \(GmailManageTools.detail(error))."
             await store.recordMailAction(job.id, state: state, result: text)
             if state == .unknown { throw Failure(text: text) }
             throw error
         }
-        let saved = await store.recordMailAction(job.id, state: action.kind == .send ? .sent : .draft,
+        let saved = await store.recordMailAction(job.id, state: action.kind.isDraft ? .draft : .sent,
                                                 result: receipt, provider: provider)
         return saved ? "" : " Gmail confirmed the action, but its local history could not be saved. Do not repeat it."
     }
 
     @MainActor static func update(_ job: DispatchJob, result: String) async {
         guard let kind = job.mailAction?.kind else { return }
-        await Container.shared.dispatchJobs().recordMailAction(job.id, state: kind == .send ? .sent : .draft, result: result)
+        await Container.shared.dispatchJobs().recordMailAction(job.id, state: kind.isDraft ? .draft : .sent, result: result)
     }
 
     @MainActor static func result(_ job: DispatchJob, fallback: String) -> String {

@@ -79,8 +79,15 @@ enum LocalMailWrites {
             args["account"] = owner
         }
         let account = try Manage.single(accounts)
+        let calendarReceipts = await MainActor.run { Container.shared.dispatchJobs() }
+        func recordCalendarArchive(_ state: String) async {
+            guard name == "archive_message" else { return }
+            await calendarReceipts.recordCalendarArchive(conversationID: conversationId, account: account,
+                messageID: messageId, state: state)
+        }
         if deferred {
             let pending = try await enqueue(name, account: account, messageId: messageId, conversationId: conversationId)
+            await recordCalendarArchive("pending")
             return .init(text: queuedText[name] ?? "", ok: true, pendingArchive: pending)
         }
 
@@ -105,12 +112,15 @@ enum LocalMailWrites {
                let pending = try? await enqueue(name, account: account, messageId: messageId,
                     threadId: effects.list.first?.threadId, conversationId: conversationId,
                     delay: PendingMailWritePolicy.delay(attempt: 1)) {
+                await recordCalendarArchive("pending")
                 return .init(text: "Archiving. The archive is queued for background retry. Say exactly \"Archiving\" "
                     + "and continue; do not wait or claim it has finished.", ok: true, pendingArchive: pending)
             }
+            await recordCalendarArchive("unconfirmed — archive failed")
             return .init(text: failure(error, account: account, operation: name, threadStep: threadStep), ok: false,
                          effects: effects.list.isEmpty ? nil : effects.list)
         }
+        await recordCalendarArchive("confirmed")
         return .init(text: receipt(name, account: account), ok: true, effects: effects.list)
     }
 

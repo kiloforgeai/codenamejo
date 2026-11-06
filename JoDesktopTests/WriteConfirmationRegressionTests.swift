@@ -47,6 +47,8 @@ final class WriteConfirmationRegressionTests: XCTestCase {
                      "start_ms": 3000, "end_ms": 3300])
         try input("Correct, go ahead.", at: 5000)
         try delegate("confirmation-b", at: 5000)
+        // Writes now require a settled authorization, including short confirmations.
+        try await Task.sleep(for: .milliseconds(1100))
         try call("confirmed-archive", delegation: "confirmation-b", tool: "archive_message", message: "booking-b")
         XCTAssertEqual(calls.map(\.id), ["confirmed-archive"])
         finish("confirmed-archive", output: "Not completed: provider unavailable.")

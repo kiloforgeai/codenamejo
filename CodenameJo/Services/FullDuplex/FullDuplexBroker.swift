@@ -395,6 +395,7 @@ enum FullDuplexBroker {
         var deferred: Bool = false
         var performedTool: String? = nil
         var outcomeUnknown = false
+        var localDraftID: UUID? = nil
     }
 
     /// Run one client-executed write on this phone and return the text for the `function_call_output` item.
@@ -405,7 +406,9 @@ enum FullDuplexBroker {
         name: String, argumentsJSON: String,
         conversationId: String? = nil, deferArchive: Bool = false, deferDraft: Bool = false, deferSpam: Bool = false, deferTrash: Bool = false, deferSend: Bool = false, deferCalendar: Bool = false, deferLabel: Bool = false,
         profileId: String? = ProfileRuntime.snapshot?.profileId, onboardingReply: Bool = false, mailSource: GmailManageTools.WriteSource? = nil,
-        mailJobID: UUID? = nil, mailCallID: String? = nil
+        mailJobID: UUID? = nil, mailCallID: String? = nil, userRequest: String? = nil,
+        replySource: LocalCompose.ReplySource? = nil, diagnostics: VoiceDiagnostics.Session? = nil,
+        calendarOrigin: DispatchJob.MailOrigin? = nil
     ) async -> ToolResult {
         // Notion's MCP, called from this phone with the profile's own grant.
         if NotionTools.names.contains(name) {
@@ -422,14 +425,15 @@ enum FullDuplexBroker {
         if LocalCompose.names.contains(name) {
             return await LocalCompose.run(name: name, argumentsJSON: argumentsJSON,
                                           defer: name == "create_draft" ? deferDraft : inCall, conversationId: conversationId,
-                                          onboardingReply: onboardingReply, parentJobID: mailJobID, callID: mailCallID)
+                                          onboardingReply: onboardingReply, parentJobID: mailJobID, callID: mailCallID, replySource: replySource, diagnostics: diagnostics)
         }
         if name == LocalForward.name {
-            return await LocalForward.run(argumentsJSON: argumentsJSON, defer: inCall, conversationId: conversationId)
+            return await LocalForward.run(argumentsJSON: argumentsJSON, defer: inCall, conversationId: conversationId,
+                                          userRequest: userRequest, parentJobID: mailJobID, callID: mailCallID)
         }
         if LocalCalendarWrites.names.contains(name) {
             return await LocalCalendarWrites.run(name: name, argumentsJSON: argumentsJSON, defer: deferCalendar,
-                                                 conversationId: conversationId)
+                conversationId: conversationId, callID: mailCallID, parentJobID: mailJobID, origin: calendarOrigin)
         }
         // Every github_ name goes here so one outside ALLOWED_TOOLS is refused there, not reported as unknown.
         if GitHubTools.isGitHubTool(name) {

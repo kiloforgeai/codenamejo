@@ -2,6 +2,15 @@ import CryptoKit
 import Foundation
 
 enum SessionExport {
+    static func retainedConversationIDs(in diagnostics: Data) throws -> Set<String> {
+        Set(try diagnostics.split(separator: 0x0a).compactMap { raw in
+            let row = try JSONSerialization.jsonObject(with: Data(raw)) as? [String: Any]
+            guard row?["event"] as? String == "sessionManifest",
+                  (row?["fields"] as? [String: String])?["retention_state"] == "retained" else { return nil }
+            return row?["conversation_id"] as? String
+        })
+    }
+
     static func append(records: [CommandRecord], jobs: [DispatchJob], to diagnostics: Data,
                        includeContent: Bool) throws -> Data {
         let encoder = JSONEncoder()
@@ -27,6 +36,12 @@ enum SessionExport {
             try line(["event": event, "schema_version": 2, "record": record])
         }
         try append("export_manifest", ["includes_content": includeContent,
+            "diagnostic_conversation_ids": try retainedConversationIDs(in: diagnostics).sorted(),
+            "diagnostic_retention": ["recent_conversations": VoiceDiagnostics.retainedConversations,
+                "additional_active_conversations": VoiceDiagnostics.retainedConversations,
+                "auxiliary_traces": VoiceDiagnostics.retainedAuxiliaryTraces,
+                "traces_per_conversation": VoiceDiagnostics.retainedTracesPerConversation,
+                "eviction_tombstones": VoiceDiagnostics.retainedTombstones],
             "app_version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown",
             "app_build": Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown",
             "source_revision": Bundle.main.infoDictionary?["JoSourceRevision"] as? String ?? "unknown",
@@ -46,6 +61,11 @@ enum SessionExport {
                 }
                 if let fields = value["fields"] as? [String: String] {
                     value["fields"] = VoiceDiagnostics.safeFields(fields)
+                }
+                if let snapshot = original["render_snapshot"] as? [String: Any] {
+                    var safe = scope(snapshot.filter { diagnosticKeys.contains($0.key) })
+                    safe["fields"] = VoiceDiagnostics.safeFields(snapshot["fields"] as? [String: String] ?? [:])
+                    value["render_snapshot"] = safe
                 }
                 try line(value)
             }
@@ -75,7 +95,7 @@ enum SessionExport {
 
     private static let diagnosticKeys: Set<String> = ["event", "timestamp", "elapsed_ms", "sequence", "session_sequence", "core_sequence",
         "session_id", "conversation_id", "app_version", "schema_version", "source_revision", "fields",
-        "feedback_id", "fragment_turn_ids", "source", "engine", "session_state", "render_revision", "turn_id", "user_id", "profile_id"]
+        "feedback_id", "fragment_turn_ids", "source", "engine", "session_state", "render_revision", "render_snapshot_status", "render_context_reason", "turn_id", "user_id", "profile_id"]
     private static let historyKeys: Set<String> = ["id", "serviceName", "serviceIcon", "status", "durationSeconds",
         "issuedAt", "profile_id", "conversationId", "toolSteps", "latency", "brainSteps", "feedbackID"]
     private static let jobKeys: Set<String> = ["id", "state", "receipts", "user_id", "conversation_id", "turn_id",

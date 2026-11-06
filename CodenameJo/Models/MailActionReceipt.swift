@@ -2,11 +2,17 @@ import CryptoKit
 import Foundation
 
 struct MailActionReceipt: Codable, Hashable, Sendable {
-    enum Kind: String, Codable, Sendable { case send, draft }
+    enum Kind: String, Codable, Sendable {
+        case send, draft, forward, draftForward
+        var isDraft: Bool { self == .draft || self == .draftForward }
+        var isForward: Bool { self == .forward || self == .draftForward }
+    }
     enum State: String, Codable, Sendable {
-        case pending, queued, sent, draft, failed, unknown
+        case review, discarded, pending, queued, sent, draft, failed, unknown
         var label: String {
             switch self {
+            case .review: return "Review draft"
+            case .discarded: return "Draft discarded"
             case .pending, .queued: return "Pending"
             case .sent: return "Sent"
             case .draft: return "Draft saved"
@@ -27,8 +33,8 @@ struct MailActionReceipt: Codable, Hashable, Sendable {
     let to: String
     let cc: [String]
     let bcc: [String]
-    let subject: String
-    let body: String
+    var subject: String
+    var body: String
     let threadID: String?
     let replyMessageID: String?
     let inReplyTo: String?
@@ -38,6 +44,18 @@ struct MailActionReceipt: Codable, Hashable, Sendable {
     var providerID: String?
     var providerMessageID: String?
     var providerThreadID: String?
+    var forwardResolution: ForwardRecipient.Resolution?
+    var forwardNote: String?
+    var forwardHTML: String?
+    var omittedAttachments: [OmittedAttachment]?
+    var archiveState: String?
+
+    struct OmittedAttachment: Codable, Hashable, Sendable {
+        let filename: String
+        let mimeType: String
+        let size: Int
+        let reason: String
+    }
 
     init(kind: Kind, account: String, message: MailMIME.Outgoing, replyMessageID: String?,
          parentJobID: UUID? = nil, requestKey: String? = nil) {
@@ -50,8 +68,14 @@ struct MailActionReceipt: Codable, Hashable, Sendable {
     }
 
     var confirmed: Bool { state == .sent || state == .draft }
-    var tool: String { kind == .send ? "send_email" : "create_draft" }
+    var tool: String { kind.isForward ? "forward_email" : kind.isDraft ? "create_draft" : "send_email" }
+    var statusLabel: String {
+        if kind.isForward && state == .sent { return "Forwarded" }
+        if kind.isForward && state == .draft { return "Draft forward saved" }
+        return state.label
+    }
     var title: String {
+        if kind.isForward { return statusLabel + " · " + to }
         if state == .sent { return (threadID == nil ? "Sent to " : "Replied to ") + to }
         return state.label + " · " + to
     }

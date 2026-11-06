@@ -21,6 +21,14 @@ final class UnansweredCommandTests: XCTestCase {
         func input(_ text: String, start: Double = 100, end: Double = 200) throws {
             try receive(["type": "session.input_transcript.delta", "delta": text, "start_ms": start, "end_ms": end])
         }
+        func waitForInputFinished(_ text: String, file: StaticString = #filePath, line: UInt = #line) async throws {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+            func finished() -> Bool {
+                signals.contains { if case .liveInputFinished(let value) = $0 { return value == text }; return false }
+            }
+            while !finished(), .now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+            XCTAssertTrue(finished(), "The command must settle before attempting its action", file: file, line: line)
+        }
         var errors: [String] { signals.compactMap { if case .event(.error(_, let code)) = $0 { return code }; return nil } }
     }
 
@@ -36,6 +44,27 @@ final class UnansweredCommandTests: XCTestCase {
             XCTAssertFalse(h.signals.contains { if case .liveFunction = $0 { return true }; return false })
             XCTAssertEqual(h.errors, ["live_input_unanswered"], "Unheard model text cannot silently finish the turn")
         }
+    }
+
+    func testNonverbalFragmentsAndIncompleteForwardDoNotResumeDesktopOrRecoverHistory() async throws {
+        let h = Harness(); try h.start(); defer { h.adapter.close() }
+        h.adapter.beginDesktopInteraction(origin: "archive", revision: 8)
+        for (index, text) in ["[sniff", "ing]", "[sighs]", "forward, an"].enumerated() {
+            let start = index < 2 ? Double(100 + index * 100) : Double(index * 3_000)
+            try h.input(text, start: start, end: start + 100)
+            try await Task.sleep(for: .milliseconds(1050))
+            XCTAssertTrue(h.adapter.desktopQuiet, text)
+            XCTAssertFalse(h.adapter.allowsNewDispatch, text)
+            XCTAssertTrue(h.requests.isEmpty, text)
+        }
+        try h.input("Forward this one to the same person too", start: 20_000, end: 20_100)
+        try await h.waitForInputFinished("Forward this one to the same person too")
+        XCTAssertFalse(h.adapter.desktopQuiet)
+        XCTAssertTrue(h.adapter.allowsNewDispatch)
+        for text in ["sniffing", "[breath]", "[coughing]", "forward, an", "please forward to", "go ahead"] {
+            XCTAssertNotNil(LiveRequestRecovery.dispatchRefusal(text), text)
+        }
+        XCTAssertNil(LiveRequestRecovery.dispatchRefusal("Retry that failed forward"))
     }
 
     func testFragmentedPhraseWaitsForFullInputAndLongUnansweredPauseStartsNewTurn() async throws {
@@ -74,6 +103,64 @@ final class UnansweredCommandTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(1250))
         XCTAssertTrue(h.requests.isEmpty)
         XCTAssertTrue(h.errors.isEmpty)
+    }
+
+    func testCompletedReplyBackchannelsNeverRecoverTheOldSendButNewRequestsDo() async throws {
+        for acknowledgment in ["Mm.", "[chuckles]", "Thanks."] {
+            let h = Harness(); try h.start(); defer { h.adapter.close() }
+            h.adapter.silentInputRecoveryDelay = 10
+            try h.input("Reply to this email with thanks, see you tomorrow.")
+            try await h.waitForInputFinished("Reply to this email with thanks, see you tomorrow.")
+            XCTAssertTrue(h.adapter.beginFastAction(callId: "sent-once", action: nil, routed: true))
+            h.adapter.silentInputRecoveryDelay = 0.05
+            h.adapter.outbound(["type": "conversation.item.create", "item": ["type": "function_call_output",
+                "call_id": "sent-once", "output": "Sent. Gmail confirmation: fixture-sent-1. Queue advanced to email B."]])
+            try h.receive(["type": "session.output_transcript.delta", "delta": "Sent your reply.", "start_ms": 500, "end_ms": 900])
+            try h.input(acknowledgment, start: 14_000, end: 14_100)
+            try await Task.sleep(for: .milliseconds(1250))
+            XCTAssertTrue(h.requests.isEmpty, acknowledgment)
+            XCTAssertTrue(h.errors.isEmpty, acknowledgment)
+            XCTAssertFalse(h.adapter.beginFastAction(callId: "repeat", action: .archive))
+            XCTAssertFalse(h.adapter.beginFastAction(callId: "stale-routed", action: nil, routed: true))
+            try h.input("Show me the reply that was sent.", start: 20_000, end: 20_100)
+            try await Task.sleep(for: .milliseconds(1250))
+            XCTAssertEqual(h.requests.count, 1)
+            XCTAssertEqual((h.requests.first?["input"] as? [[String: Any]])?.last?["content"] as? String,
+                "Show me the reply that was sent.")
+        }
+    }
+
+    func testDelayedAndUnknownReceiptsCannotTurnAcknowledgmentIntoAnotherAction() async throws {
+        for receipt in ["Sent. Gmail confirmation: fixture-sent-1.", "Outcome unknown. Check Gmail before trying again.", "Gmail refused this send."] {
+            let h = Harness(); try h.start(); defer { h.adapter.close() }
+            h.adapter.silentInputRecoveryDelay = 10
+            try h.input("Reply to this email with thanks.")
+            try await h.waitForInputFinished("Reply to this email with thanks.")
+            XCTAssertTrue(h.adapter.beginFastAction(callId: "attempt", action: nil, routed: true))
+            h.adapter.silentInputRecoveryDelay = 0.05
+            try h.input("Mm.", start: 3_000, end: 3_100)
+            h.adapter.outbound(["type": "conversation.item.create", "item": ["type": "function_call_output",
+                "call_id": "attempt", "output": receipt]])
+            try await Task.sleep(for: .milliseconds(1250))
+            XCTAssertTrue(h.requests.isEmpty, receipt)
+            XCTAssertTrue(h.errors.isEmpty, receipt)
+            XCTAssertFalse(h.adapter.hasUnresolvedQueueAction)
+        }
+    }
+
+    func testStandaloneAndDesktopAcknowledgmentsDoNotResumeOldWork() async throws {
+        for desktop in [false, true] {
+            let h = Harness(); try h.start(); defer { h.adapter.close() }
+            if desktop { h.adapter.beginDesktopInteraction(origin: "test", revision: 1) }
+            try h.input("Thank you.")
+            try await Task.sleep(for: .milliseconds(1250))
+            XCTAssertTrue(h.requests.isEmpty)
+            XCTAssertTrue(h.errors.isEmpty)
+            XCTAssertEqual(h.adapter.desktopQuiet, desktop)
+        }
+        for request in ["Yes", "Okay, reply to Dana", "Thanks, archive this", "What did you send?", "Reply to the other email"] {
+            XCTAssertFalse(LiveRequestRecovery.isBackchannel(request), request)
+        }
     }
 
     func testSupersededAndEndedUnansweredHistoryIsTerminalWithoutInventingAReply() {

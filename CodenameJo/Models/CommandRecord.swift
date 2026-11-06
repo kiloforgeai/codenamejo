@@ -65,6 +65,12 @@ struct CommandRecord: Codable, Identifiable, Hashable {
         /// The user's last word to the hand-off; first step of a delegation only.
         var handoffMs: Int?
         var userSpokeMs: Int?
+        var responseID: String? = nil
+        var delegationID: String? = nil
+        var turnID: String? = nil
+        var inputTurn: Int? = nil
+        var requestStartedAt: Date? = nil
+        var requestFinishedAt: Date? = nil
     }
     var brainSteps: [BrainStep]?
     var feedbackID: UUID? = nil

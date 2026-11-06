@@ -235,6 +235,23 @@ struct TurnStore: Sendable {
         let rows = try await dbPool.read { db in
             try Turn.filter(Column("user_id") == owner).order(Column("issued_at").desc).fetchAll(db)
         }
+        return Self.records(rows)
+    }
+
+    /// Explicit diagnostic export may join the retained conversations across this user's
+    /// profiles. Ordinary History and agent recall retain their existing profile boundary.
+    func diagnosticHistory(userID: String, conversations: Set<String>) async throws -> [CommandRecord] {
+        guard let dbPool, !userID.isEmpty, !conversations.isEmpty else { return [] }
+        let prefix = userID + ":profile:"
+        let rows = try await dbPool.read { db in
+            try Turn.filter(sql: "user_id = ? OR substr(user_id, 1, ?) = ?", arguments: [userID, prefix.count, prefix])
+                .filter(conversations.contains(Column("conversation_id")))
+                .order(Column("issued_at").desc).fetchAll(db)
+        }
+        return Self.records(rows)
+    }
+
+    private static func records(_ rows: [Turn]) -> [CommandRecord] {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return rows.map { row in

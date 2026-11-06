@@ -9,7 +9,7 @@ enum ReplyAttachments {
         let attachment_id: String?
     }
 
-    struct File: Codable, Equatable, Sendable {
+    struct File: Codable, Hashable, Sendable {
         let filename: String
         let mimeType: String
         let bytes: Data

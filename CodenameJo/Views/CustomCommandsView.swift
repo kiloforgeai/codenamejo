@@ -251,7 +251,7 @@ class CustomCommandsViewModel: ViewModel {
             .sorted { Self.actionTitle($0) < Self.actionTitle($1) }
     }
     static func actionTitle(_ tool: String) -> String {
-        tool.replacingOccurrences(of: "_", with: " ").capitalized
+        tool.replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: "-", with: " ").capitalized
     }
 }
 

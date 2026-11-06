@@ -8,6 +8,7 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
     @StateObject var interactor: Interactor
     @ObservedObject private var localSpeech = Container.shared.localSpeech()
     @ObservedObject private var commands = Container.shared.customCommands()
+    @AppStorage(WorkSessionMode.storageKey) private var narrationMode = WorkSessionMode.away
 
     var body: some View {
         VStack(spacing: 0) {
@@ -73,6 +74,7 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             }.frame(width: 680, height: 600)
         }
         .onChange(of: viewModel.feedActionContext) { _, _ in viewModel.feedActionError = nil }
+        .onChange(of: narrationMode) { _, mode in interactor.setNarrationMode(mode) }
         .sheet(isPresented: $viewModel.showingHistory) {
             NavigationStack { HistoryViewComponent.make(onClose: { viewModel.showingHistory = false }) }
                 .frame(minWidth: 680, minHeight: 600)
@@ -108,6 +110,16 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             DesktopToolbarButton(title: viewModel.focusMode ? "Show feed" : "Hide feed", symbol: "sidebar.left",
                                  active: !viewModel.focusMode) { viewModel.focusMode.toggle() }
             Text("Workspace").font(.system(size: 14, weight: .medium))
+            if viewModel.pendingBrowserJobs.count == 1, let job = viewModel.pendingBrowserJobs.first {
+                Button("View form", systemImage: "globe") { viewModel.applyTaskSelection(job) }
+                    .buttonStyle(.bordered).accessibilityIdentifier("viewPendingBrowser")
+            } else if !viewModel.pendingBrowserJobs.isEmpty {
+                Menu("Forms to review", systemImage: "globe") {
+                    ForEach(viewModel.pendingBrowserJobs) { job in
+                        Button(job.task) { viewModel.applyTaskSelection(job) }
+                    }
+                }.accessibilityIdentifier("viewPendingBrowsers")
+            }
             Spacer()
             if let receipt = viewModel.feedbackReceipt {
                 Label(receipt, systemImage: "checkmark.circle").font(.caption).foregroundStyle(.secondary)
@@ -186,28 +198,15 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
     private var feedActions: some View {
         let context = viewModel.feedActionContext
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 12) {
-                ForEach([LiveFastAction.archive, .next], id: \.rawValue) { action in
-                    Button {
-                        if let context { interactor.performFeedAction(action, context: context) }
-                    } label: { Label(action.title, systemImage: action.symbol).padding(.vertical, 5) }
-                        .buttonStyle(.bordered).help(action.explanation)
-                        .accessibilityIdentifier("feedAction-\(action.rawValue)")
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 20) {
+                    frequentFeedActions(context)
+                    additionalFeedActions(context)
                 }
-                Menu("More", systemImage: "ellipsis") {
-                    ForEach([LiveFastAction.trash, .spam], id: \.rawValue) { action in
-                        Button(role: .destructive) {
-                            if let context { interactor.performFeedAction(action, context: context) }
-                        } label: { Label(action.title, systemImage: action.symbol) }
-                    }
-                }.menuStyle(.borderlessButton).fixedSize()
-                Menu("Run command", systemImage: "command") {
-                    ForEach(commands.commands.filter(\.enabled)) { command in
-                        Button(command.title) {
-                            if let context { interactor.submitTask(command.title, commandID: command.id, context: context) }
-                        }
-                    }
-                }.menuStyle(.borderlessButton).fixedSize()
+                VStack(alignment: .leading, spacing: 10) {
+                    frequentFeedActions(context)
+                    additionalFeedActions(context)
+                }
             }
             .disabled(context == nil)
             HStack {
@@ -227,6 +226,39 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                 Text(origin.account).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             if let receipt = viewModel.taskReceipt { Text(receipt).font(.caption).foregroundStyle(.secondary) }
+        }
+    }
+
+    private func frequentFeedActions(_ context: FeedActionContext?) -> some View {
+        HStack(spacing: 12) {
+            ForEach([LiveFastAction.archive, .next, .spam], id: \.rawValue) { action in
+                Button(role: action == .spam ? .destructive : nil) {
+                    if let context { interactor.performFeedAction(action, context: context) }
+                } label: {
+                    Label(action == .spam ? "Mark as spam" : action.title, systemImage: action.symbol)
+                        .padding(.vertical, 5)
+                }
+                .buttonStyle(.bordered).help(action.explanation).fixedSize()
+                .padding(.leading, action == .spam ? 8 : 0)
+                .accessibilityIdentifier("feedAction-\(action.rawValue)")
+            }
+        }
+    }
+
+    private func additionalFeedActions(_ context: FeedActionContext?) -> some View {
+        HStack(spacing: 16) {
+            Menu("More", systemImage: "ellipsis") {
+                Button(role: .destructive) {
+                    if let context { interactor.performFeedAction(.trash, context: context) }
+                } label: { Label(LiveFastAction.trash.title, systemImage: LiveFastAction.trash.symbol) }
+            }.menuStyle(.borderlessButton).fixedSize()
+            Menu("Run command", systemImage: "command") {
+                ForEach(commands.commands.filter(\.enabled)) { command in
+                    Button(command.title) {
+                        if let context { interactor.submitTask(command.title, commandID: command.id, context: context) }
+                    }
+                }
+            }.menuStyle(.borderlessButton).fixedSize()
         }
     }
 
@@ -256,6 +288,11 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             }
             Spacer()
             if viewModel.inSession {
+                Picker("Narration", selection: $narrationMode) {
+                    ForEach(WorkSessionMode.allCases) { mode in Text(mode.label).tag(mode) }
+                }.pickerStyle(.segmented).frame(width: 215)
+                    .accessibilityIdentifier("workSessionMode")
+                    .help("At computer: answer requests without reading each email automatically. Away: narrate the feed.")
                 Button(action: interactor.toggleMute) {
                     Label(viewModel.muted ? "Unmute" : "Mute", systemImage: viewModel.muted ? "mic.slash" : "mic")
                 }.buttonStyle(.bordered)
