@@ -45,6 +45,7 @@ final class ConnectionsService: ObservableObject {
         /// The active profile's Slack workspaces, by name, from the Keychain. `slackAvailable` is
         /// whether this build has a Slack app at all (`JO_SLACK_CLIENT_ID`).
         var slackAccounts: [String] = []
+        var slackTeamIDs: [String] = []
         var slackAvailable = false
         /// Workspaces whose refresh Slack refused, or whose refresh token passed its 30 days.
         var slackNeedsReauth: [String] = []
@@ -278,6 +279,7 @@ final class ConnectionsService: ObservableObject {
         let grants = SlackGrantStore.inProfile()
         status.slackAvailable = SlackConfig.isConfigured
         status.slackAccounts = grants.map(\.teamName)
+        status.slackTeamIDs = grants.map(\.teamId)
         status.slackNeedsReauth = grants.filter { $0.needsReauth == true }.map(\.teamName)
     }
 

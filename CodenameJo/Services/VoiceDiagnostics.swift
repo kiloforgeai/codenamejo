@@ -10,8 +10,8 @@ final class VoiceDiagnostics: @unchecked Sendable {
         case fallbackSelected, fallbackReady, fallbackFailed, audioReleased, turnStarted, turnFailed
         case speechRequested, speechStarted, speechFinished, speechCancelled, speechFailed
         case turnTransition, toolStarted, toolFinished, brainRequest, brainResponse
-        case jobStarted, jobFinished, jobDeferred, jobInjected, queueRecovery, calendarReceipt, modelAvailability, audioRouteChanged
-        case workspaceRendered
+        case jobStarted, jobFinished, jobDeferred, jobInjected, jobSpeechStarted, jobSpeechCancelled, queueRecovery, calendarReceipt, modelAvailability, audioRouteChanged
+        case workspaceRendered, presentationBound, playbackBoundary, offerTransition, resultSelected
     }
 
     struct Session: Sendable {
@@ -63,19 +63,20 @@ final class VoiceDiagnostics: @unchecked Sendable {
 
     private static let allowedFields: Set<String> = [
         "engine", "model", "brain_model", "reason", "resource", "error_domain", "error_code",
-        "http_status", "request_id", "provider_code", "event_type", "sample_rate", "output_ports",
+        "http_status", "request_id", "provider_code", "event_type", "sample_rate", "output_ports", "output_channels",
         "utterance_id", "characters", "voice_id", "phase", "response_status", "ice_candidates",
-        "turn_id", "delegation_id", "call_id", "job_id", "tool", "target_hash", "outcome", "duration_ms",
+        "turn_id", "input_turn", "delegation_id", "call_id", "job_id", "tool", "target_hash", "outcome", "duration_ms",
         "queue_revision", "transition", "input_tokens", "cached_tokens", "output_tokens", "instructions_bytes",
         "tools_bytes", "context_bytes", "input_bytes", "pending_calls", "pending_responses", "time_zone",
         "requested_start", "requested_end", "stored_start", "stored_end", "available", "provider_request_id", "provider_response_id",
         "render_revision", "queue_scope", "observation_phase", "window_id", "profile_hash", "response_hash",
-        "response_role", "focus_mode", "visible_count", "queue_target_hash", "queue_order", "mismatch"
+        "response_role", "focus_mode", "visible_count", "queue_target_hash", "queue_order", "mismatch",
+        "response_item_id", "playback_id", "selection_state", "displayed_position", "displayed_total", "job_states", "attribution"
     ]
 
     static func safeFields(_ fields: [String: String]) -> [String: String] {
         fields.filter { key, value in
-            allowedFields.contains(key) && !value.isEmpty && value.count <= (key == "queue_order" ? 4096 : 160)
+            allowedFields.contains(key) && !value.isEmpty && value.count <= (["queue_order", "job_states"].contains(key) ? 4096 : 160)
                 && (key != "queue_order" || value.range(of: "^[a-f0-9,]+$", options: .regularExpression) != nil)
                 && !value.lowercased().contains("sk-") && !value.lowercased().contains("bearer")
                 && value.range(of: "^[A-Za-z0-9_.:/(), +-]+$", options: .regularExpression) != nil

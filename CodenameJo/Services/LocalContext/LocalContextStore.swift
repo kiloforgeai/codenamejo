@@ -662,6 +662,8 @@ final class LocalContextStore: Sendable {
         }
         migrator.registerMigration("v50-mailbox-feed-order", migrate: WorkspaceProfileRows.addFeedOrder)
         migrator.registerMigration("v51-turn-job-outcomes", migrate: TurnStore.createJobOutcomes)
+        migrator.registerMigration("v52-feed-sections", migrate: WorkspaceProfileRows.addFeedSections)
+        migrator.registerMigration("v53-feed-progress", migrate: WorkspaceProfileRows.addFeedProgress)
         return migrator
     }
 }

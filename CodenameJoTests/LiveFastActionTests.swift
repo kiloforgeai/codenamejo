@@ -28,7 +28,7 @@ final class LiveFastActionTests: XCTestCase {
         }
     }
 
-    func testReportedArchivePhrasesDoNotNeedDelegation() {
+    func testExplicitArchivePhrasesUseTheGuardedFastPath() {
         for text in ["Archive this one for me, please", "You can archive this one as well",
                      "Awesome. Can you archive this one for me, please",
                      "Can you archive it for me, please", "Please archive it for me",

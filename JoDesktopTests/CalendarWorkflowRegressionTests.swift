@@ -91,6 +91,44 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
         XCTAssertEqual(provider.creates, 0)
     }
 
+    func testProviderTimeShiftIsNotReportedAsRequestedTimeSaved() async {
+        provider.emptyCalendar = true
+        provider.shiftCreatedTime = true
+        let result = await CalendarTools.run(name: CalendarTools.create, argumentsJSON: GmailReadTools.json(create))
+        XCTAssertTrue(result.failed)
+        XCTAssertTrue(result.output.contains("does not match"), result.output)
+        XCTAssertTrue(result.output.contains("11:00:00-08:00"), result.output)
+        let retry = await CalendarTools.run(name: CalendarTools.create, argumentsJSON: GmailReadTools.json(create))
+        XCTAssertTrue(retry.failed)
+        XCTAssertTrue(retry.output.contains("does not match"), retry.output)
+        XCTAssertEqual(provider.creates, 1, "A committed event must not be silently recreated")
+    }
+
+    func testProviderIgnoringAnUpdateDoesNotProduceAChangedReceipt() async throws {
+        provider.patchStartOnly = true
+        let diagnostics = VoiceDiagnostics(directory: folder.appendingPathComponent("time-diagnostics"))
+        let session = diagnostics.begin(engine: "live", userID: "timing-user")
+        let result = await CalendarTools.run(name: CalendarTools.update, argumentsJSON: GmailReadTools.json([
+            "event_id": "event-a", "account": "owner@example.test", "start": "2026-11-02T14:00:00-08:00",
+            "time_zone": "America/Los_Angeles"]), diagnostics: session, callID: "timing-update")
+        XCTAssertTrue(result.failed)
+        XCTAssertTrue(result.output.contains("does not match"), result.output)
+        XCTAssertEqual(provider.patches, 1)
+        let exported = String(decoding: try await diagnostics.snapshot(userID: "timing-user"), as: UTF8.self)
+        XCTAssertTrue(exported.contains("time_mismatch"))
+        XCTAssertTrue(exported.contains("2026-11-02T15:00:00-08:00"), "The derived requested end must be recorded")
+        XCTAssertFalse(exported.contains("owner@example.test"))
+    }
+
+    func testStoredTimeVerificationAcceptsEquivalentInstantsAndRejectsMissingTimes() {
+        let request: [String: Any] = ["start": "2026-11-02T12:00:00-08:00", "end": "2026-11-02T13:00:00-08:00"]
+        XCTAssertTrue(CalendarWriteTiming.matches(request: request, event: [
+            "start": ["dateTime": "2026-11-02T15:00:00-05:00"], "end": ["dateTime": "2026-11-02T16:00:00-05:00"]]))
+        XCTAssertFalse(CalendarWriteTiming.matches(request: request, event: [:]))
+        XCTAssertFalse(CalendarWriteTiming.matches(request: request, event: [
+            "start": ["dateTime": "2026-11-02T12:00:00-07:00"], "end": ["dateTime": "2026-11-02T13:00:00-07:00"]]))
+    }
+
     func testInvitationResolutionPreservesOriginalDespiteDifferentTitle() async {
         var args = create
         args["ical_uid"] = "original-invite"
@@ -110,6 +148,39 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
         XCTAssertTrue(rows?.allSatisfy { $0["source"] as? String == "live" && $0["complete"] as? Bool == true } == true)
     }
 
+    func testInvitationOnSecondPageIsFoundAndNeverRecreated() async throws {
+        provider.emptyFirstCalendarPage = true
+        let result = await CalendarTools.run(name: CalendarTools.list, argumentsJSON: GmailReadTools.json([
+            "time_min": "2026-11-02T00:00:00-08:00", "time_max": "2026-11-03T00:00:00-08:00", "ical_uid": "original-invite"]))
+        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(result.output.utf8)) as? [[String: Any]])
+        XCTAssertEqual(rows.count, 2)
+        for row in rows {
+            XCTAssertEqual(row["complete"] as? Bool, true)
+            XCTAssertEqual((row["events"] as? [[String: Any]])?.first?["id"] as? String, "event-a")
+        }
+        var args = create; args["ical_uid"] = "original-invite"
+        let repeated = await CalendarTools.run(name: CalendarTools.create, argumentsJSON: GmailReadTools.json(args))
+        XCTAssertFalse(repeated.failed, repeated.output)
+        XCTAssertTrue(repeated.output.contains("original-meeting-link"))
+        XCTAssertEqual(provider.creates, 0)
+        XCTAssertTrue(provider.calls.filter { $0.url?.path.hasSuffix("/events") == true }.allSatisfy {
+            URLComponents(url: $0.url!, resolvingAgainstBaseURL: false)?.queryItems?
+                .contains { $0.name == "showHiddenInvitations" && $0.value == "true" } == true
+        })
+    }
+
+    func testIncompleteCalendarPaginationCannotClaimAbsenceOrCreate() async throws {
+        provider.repeatedCalendarPage = true
+        let result = await CalendarTools.run(name: CalendarTools.list, argumentsJSON: GmailReadTools.json([
+            "time_min": "2026-11-02T00:00:00-08:00", "time_max": "2026-11-03T00:00:00-08:00", "ical_uid": "original-invite"]))
+        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(result.output.utf8)) as? [[String: Any]])
+        XCTAssertTrue(rows.allSatisfy { $0["complete"] as? Bool == false })
+        XCTAssertEqual(provider.calls.count, 4, "A repeated continuation token must stop both mailbox reads")
+        let write = await CalendarTools.run(name: CalendarTools.create, argumentsJSON: GmailReadTools.json(create))
+        XCTAssertTrue(write.failed)
+        XCTAssertEqual(provider.creates, 0)
+    }
+
     func testAcceptArchivesOnlyOriginalInvitationAfterConfirmedRSVPAndRetryIsIdempotent() async {
         let result = await rsvp(accept)
         XCTAssertEqual(result.ok, true, result.text)
@@ -121,6 +192,30 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
         XCTAssertEqual(again.ok, true, again.text)
         XCTAssertEqual(provider.patches, 1)
         XCTAssertEqual(provider.archived, ["invite-a"])
+        XCTAssertEqual(again.effects?.first?.messageIds, ["invite-a"])
+        XCTAssertEqual(again.effects?.first?.account, "owner@example.test")
+        XCTAssertEqual(again.effects?.first?.removeLabelIds, ["INBOX"])
+    }
+
+    func testCalendarOnlyAcceptanceDoesNotGuessAnEmailToArchive() async {
+        var args = accept
+        args.removeValue(forKey: "source_message_id")
+        args.removeValue(forKey: "source_account")
+        let result = await rsvp(args)
+        XCTAssertEqual(result.ok, true)
+        XCTAssertTrue(provider.archived.isEmpty)
+        XCTAssertFalse(provider.calls.contains { $0.url?.path.contains("/gmail/") == true })
+    }
+
+    func testCancelledAcceptanceDoesNotPatchOrArchive() async {
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await rsvp(accept)
+        }
+        let result = await task.value
+        XCTAssertEqual(result.ok, false)
+        XCTAssertEqual(provider.patches, 0)
+        XCTAssertTrue(provider.archived.isEmpty)
     }
 
     func testRSVPFailureKeepsEmailAndKeepInInboxSkipsArchive() async {
@@ -155,6 +250,34 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
         .init(id: UUID(), task: "Follow up this email", account: "owner@example.test",
               standingOnJSON: #"{"id":"invite-a","threadId":"thread-a","account":"owner@example.test","from":"sender@example.test"}"#,
               expects: .receipt, commandSteps: steps)
+    }
+
+    func testBackgroundInvitationCannotReplaceConfirmedBookingInWorker() async {
+        var job = commandJob(steps: [.init(tool: "archive_message", detail: "Archive the confirmed booking")])
+        job.standingOnJSON = #"{"id":"booking-b","threadId":"thread-b","account":"owner@example.test"}"#
+        let wrong = await DispatchWorker.run(job) { _ in
+            [["type": "function_call", "name": "archive_message", "call_id": "stale-invitation",
+              "arguments": #"{"message_id":"invite-a","account":"owner@example.test"}"#]]
+        }
+        XCTAssertEqual(wrong.status, .failed)
+        XCTAssertFalse(provider.calls.contains { $0.httpMethod == "POST" })
+        job.id = UUID()
+        job.standingOnJSON = #"{"id":"booking-b","threadId":"thread-b","account":"owner@example.test","from":"booking@example.test"}"#
+        let stale = await DispatchWorker.run(job) { _ in
+            [["type": "function_call", "name": "archive_message", "call_id": "stale-with-valid-context",
+              "arguments": #"{"message_id":"invite-a","account":"owner@example.test"}"#]]
+        }
+        XCTAssertEqual(stale.status, .failed)
+        XCTAssertFalse(provider.calls.contains { $0.httpMethod == "POST" })
+        job.id = UUID()
+        let confirmed = await DispatchWorker.run(job) { _ in
+            [["type": "function_call", "name": "archive_message", "call_id": "confirmed-booking",
+              "arguments": #"{"message_id":"booking-b","account":"owner@example.test"}"#]]
+        }
+        XCTAssertEqual(confirmed.status, .success, confirmed.text)
+        XCTAssertEqual(Set(provider.archived), ["booking-b"])
+        let history = await Container.shared.dispatchJobs().history()
+        XCTAssertEqual(history.first { $0.id == job.id }?.receipts?.map(\.outcome), ["success"])
     }
 
     func testSavedCommandExecutesEveryStoredStepWithoutAnExtraReceiptRound() async {
@@ -272,7 +395,7 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
                                  served: served, dial: client.dialGeneration)
             }
             step("C", served: [])
-            model.queueCurrent = old
+            model.sessionFeed = .init(current: old)
             let job = UUID()
             var random = UInt64(seed + 1)
             var events = [0, 1, 2, 3]
@@ -283,7 +406,7 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
             for event in events {
                 switch event {
                 case 0: step("D", served: [job])
-                case 1: model.queueCurrent = next
+                case 1: model.sessionFeed = .init(current: next)
                 case 2:
                     model.focus = client.feedFocusTracker.refreshEmailProgress(.init(
                         account: "owner@example.test", position: 3, queued: 12, remaining: 10, done: false,
@@ -296,9 +419,9 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
                     XCTAssertEqual(email.position, 4, "seed \(seed): stale C progress must not label D")
                 }
                 let spoken = LiveEmailPresentation.Key.step(client.standingStep ?? "")?.messageId
-                if spoken == "D", model.queueCurrent == old {
+                if spoken == "D", model.sessionFeed.current == old {
                     XCTAssertFalse(model.renderedState.permits(next, profileID: "work"), "seed \(seed): queue still on C")
-                } else if spoken == "C", model.queueCurrent == next {
+                } else if spoken == "C", model.sessionFeed.current == next {
                     XCTAssertFalse(model.renderedState.permits(old, profileID: "work"), "seed \(seed): view still on C")
                 }
             }
@@ -307,6 +430,110 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
             XCTAssertTrue(delivered.contains(job))
             XCTAssertEqual(LiveEmailPresentation.Key.step(client.standingStep ?? "")?.messageId, "D")
         }
+    }
+
+    func testReleaseExportCorrelatesConfirmedArchiveWithoutExposingItsTarget() async throws {
+        let log = VoiceDiagnostics(directory: folder.appendingPathComponent("logs"))
+        let conversation = UUID(), turn = UUID()
+        let trace = log.begin(conversationID: conversation, engine: "live", userID: "regression-user")
+        var job = commandJob(steps: [])
+        job.commandSteps = nil
+        job.operation = .init(tool: "archive_message", account: "owner@example.test", messageID: "invite-a")
+        job.diagnostics = trace
+        job.turnID = turn.uuidString
+        let result = await DispatchWorker.run(job) { _ in XCTFail("The direct archive needs no reasoning round"); return [] }
+        XCTAssertEqual(result.status, .success)
+        let logs = try await log.snapshot(userID: "regression-user")
+        let jobs = await Container.shared.dispatchJobs().history()
+        let data = try SessionExport.append(records: [.init(id: turn, commandText: "Archive this email",
+            status: .success, conversationId: conversation)], jobs: jobs, to: logs, includeContent: false)
+        let text = String(decoding: data, as: UTF8.self)
+        let rows = try text.split(separator: "\n").map {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])
+        }
+        for event in ["jobStarted", "toolStarted", "toolFinished", "jobFinished", "history_metadata", "job_metadata"] {
+            XCTAssertTrue(rows.contains { $0["event"] as? String == event }, event)
+        }
+        let tool = try XCTUnwrap(rows.first { $0["event"] as? String == "toolStarted" }?["fields"] as? [String: String])
+        XCTAssertEqual(tool["target_hash"], jobs.first?.receipts?.first?.targetHash)
+        XCTAssertTrue(text.contains(turn.uuidString))
+        XCTAssertTrue(text.contains(conversation.uuidString))
+        XCTAssertTrue(text.contains(job.id.uuidString))
+        XCTAssertFalse(text.contains("owner@example.test"))
+        XCTAssertFalse(text.contains("invite-a"))
+        XCTAssertFalse(text.contains("Archive this email"))
+    }
+
+    func testConfirmedArchiveWithForegroundContinuationIsSuccessfulAndReceiptIsIdempotent() async throws {
+        var job = commandJob(steps: [])
+        job.commandSteps = nil
+        var rounds = 0
+        let result = await DispatchWorker.run(job) { _ in
+            rounds += 1
+            if rounds == 1 {
+                return [["type": "function_call", "name": "archive_message", "call_id": "confirmed-archive",
+                         "arguments": #"{"message_id":"invite-a","account":"owner@example.test"}"#]]
+            }
+            return [["type": "message", "content": [["type": "output_text",
+                "text": #"{"completed":false,"remaining_work":"foreground_queue","report":"Archived; queue advance remains."}"#]]]]
+        }
+        XCTAssertEqual(result.status, .success)
+        XCTAssertEqual(result.ok, true)
+        let store = Container.shared.dispatchJobs()
+        await store.receipt(job.id, callId: "confirmed-archive", tool: "archive_message", failed: true)
+        await store.settle(job.id)
+        let firstDelivery = await store.history().first { $0.id == job.id }?.deliveredAt
+        await store.settle(job.id)
+        let history = await store.history()
+        let saved = try XCTUnwrap(history.first { $0.id == job.id })
+        XCTAssertEqual(saved.state, "done")
+        XCTAssertEqual(saved.foregroundContinuation, true)
+        XCTAssertEqual(saved.receipts?.count, 1)
+        XCTAssertEqual(saved.receipts?.first?.outcome, "success")
+        XCTAssertEqual(saved.receipts?.first?.targetHash?.count, 64)
+        XCTAssertEqual(saved.deliveredAt, firstDelivery)
+        let writes = provider.calls.filter { $0.httpMethod == "POST" }.count
+        let replay = await DispatchWorker.run(job) { _ in XCTFail("Do not repeat a receipt-bearing job"); return [] }
+        XCTAssertEqual(replay.status, .success)
+        XCTAssertEqual(provider.calls.filter { $0.httpMethod == "POST" }.count, writes)
+    }
+
+    func testAbandonedJobWithCommittedReceiptIsPartialRatherThanStillRunning() async throws {
+        var job = commandJob(steps: [])
+        job.commandSteps = nil
+        let row = DispatchJob(id: job.id, task: job.task, state: "running",
+            startedAt: Date().addingTimeInterval(-DispatchJob.runningTolerance - 1),
+            profileId: job.profileId, userId: "regression-user",
+            receipts: [.init(callId: "committed", tool: "archive_message", outcome: "success")])
+        let file = folder.appendingPathComponent("abandoned.json")
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode([row]).write(to: file)
+        let restored = DispatchJobStore(url: file)
+        Container.shared.dispatchJobs.register { restored }
+        let result = await DispatchWorker.run(job) { _ in XCTFail("Never replay a committed archive"); return [] }
+        XCTAssertEqual(result.status, .partial)
+        XCTAssertFalse(provider.calls.contains { $0.httpMethod == "POST" })
+    }
+
+    func testCancellationAfterCommittedArchivePreservesReceiptAndDoesNotRepeatIt() async throws {
+        var job = commandJob(steps: [])
+        job.commandSteps = nil
+        var rounds = 0
+        let result = await DispatchWorker.run(job) { _ in
+            rounds += 1
+            if rounds > 1 { throw CancellationError() }
+            return [["type": "function_call", "name": "archive_message", "call_id": "before-cancel",
+                     "arguments": #"{"message_id":"invite-a","account":"owner@example.test"}"#]]
+        }
+        XCTAssertEqual(result.status, .partial)
+        let history = await Container.shared.dispatchJobs().history()
+        let saved = try XCTUnwrap(history.first { $0.id == job.id })
+        XCTAssertEqual(saved.state, "partial")
+        XCTAssertEqual(saved.receipts?.map(\.outcome), ["success"])
+        let writes = provider.calls.filter { $0.httpMethod == "POST" }.count
+        let replay = await DispatchWorker.run(job) { _ in XCTFail("A cancelled job must preserve its committed write"); return [] }
+        XCTAssertEqual(replay.status, .partial)
+        XCTAssertEqual(provider.calls.filter { $0.httpMethod == "POST" }.count, writes)
     }
 
     func testSavedCommandStopsAtFailureAndStoresPartialReceipts() async throws {
@@ -340,6 +567,60 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
         XCTAssertEqual(actions[1].tool, "archive_message")
         let cleaned = try CustomCommandRules.clean(actions).get()
         XCTAssertEqual(cleaned[0].resolvedLabel, actions[0].resolvedLabel)
+        for message in ["invite-a", "booking-b"] {
+            let restarted = CustomCommandStore()
+            await restarted.refresh()
+            var job = commandJob(steps: try XCTUnwrap(restarted.commands.first?.actions))
+            job.standingOnJSON = GmailReadTools.json(["id": message, "account": "owner@example.test",
+                                                    "from": "sender@example.test", "threadId": message])
+            var names: [String] = []
+            let result = await DispatchWorker.run(job) { body in
+                let name = (body["tool_choice"] as? [String: Any])?["name"] as? String ?? "unexpected"
+                names.append(name)
+                return [["type": "function_call", "name": name, "call_id": UUID().uuidString,
+                    "arguments": GmailReadTools.json(["message_id": message, "account": "owner@example.test", "label": "#follow up"])]]
+            }
+            XCTAssertEqual(result.status, .success, result.text)
+            XCTAssertEqual(names, ["label_message", "archive_message"])
+            let history = await Container.shared.dispatchJobs().history()
+            XCTAssertEqual(history.first { $0.id == job.id }?.receipts?.map(\.outcome), ["success", "success"])
+        }
+        XCTAssertFalse(provider.calls.contains { $0.url?.path.hasSuffix("/labels") == true && $0.httpMethod == "POST" },
+                       "A corrected command must reuse the existing label instead of creating another")
+    }
+
+    func testLabelCorrectionCannotFollowAProfileSwitch() async throws {
+        let store = CustomCommandStore()
+        guard case .saved = await store.save(keyword: "follow up", label: "Follow up", actions: [
+            .init(tool: "label_message", detail: "#follow up"), .init(tool: "archive_message", detail: "this")]) else { return XCTFail("save failed") }
+        provider.onLabelsRead = {
+            ProfileRuntime.install(.init(profileId: "other-profile", isDefault: false, emails: ["owner@example.test"]))
+        }
+        guard case .refused = await store.correctLabel(keyword: "follow up", name: "#Followup", account: "owner@example.test") else {
+            return XCTFail("A profile change must not save a correction")
+        }
+        let rows = Container.shared.customCommandRows()
+        let original = try await rows.all(userId: "regression-user", profileId: "")
+        let other = try await rows.all(userId: "regression-user", profileId: "other-profile")
+        XCTAssertNil(original.first?.actions.first?.resolvedLabel)
+        XCTAssertTrue(other.isEmpty)
+    }
+
+    func testLabelCorrectionDoesNotOverwriteANewerCommandOrRecreateADeletedOne() async throws {
+        let rows = Container.shared.customCommandRows()
+        let original = try await rows.save(userId: "regression-user", profileId: "", keyword: "follow up",
+            spoken: "Follow up", label: "Follow up", actions: [.init(tool: "label_message", detail: "old")])
+        let changed = try await rows.save(userId: "regression-user", profileId: "", keyword: "follow up",
+            spoken: "Follow up", label: "New meaning", actions: [.init(tool: "archive_message", detail: "this")])
+        let stale = try await rows.correctLabel(userId: "regression-user", profileId: "", expected: original,
+                                               actions: [.init(tool: "label_message", detail: "corrected")])
+        XCTAssertNil(stale)
+        _ = try await rows.delete(userId: "regression-user", profileId: "", keyword: "follow up")
+        let deleted = try await rows.correctLabel(userId: "regression-user", profileId: "", expected: changed,
+                                                 actions: original.actions)
+        XCTAssertNil(deleted)
+        let remaining = try await rows.all(userId: "regression-user", profileId: "")
+        XCTAssertTrue(remaining.isEmpty)
     }
 }
 
@@ -347,6 +628,9 @@ private final class IssueProvider: HTTPDataTransport, @unchecked Sendable {
     var calls: [URLRequest] = []
     var creates = 0, patches = 0
     var archived: [String] = []
+    var onLabelsRead: (() -> Void)?
+    var emptyFirstCalendarPage = false, repeatedCalendarPage = false
+    var shiftCreatedTime = false, patchStartOnly = false
     var emptyCalendar = false, accepted = false, readFailure = false, patchFailure = false, archiveFailure = false, archiveThrottled = false
     private let lock = NSLock()
     private var created: [String: Any]?
@@ -359,12 +643,37 @@ private final class IssueProvider: HTTPDataTransport, @unchecked Sendable {
         let url = request.url!, method = request.httpMethod ?? "GET"
         if url.path.contains("/calendar/") {
             if method == "GET", readFailure { return (500, [:]) }
-            if method == "PATCH" { patches += 1; if patchFailure { return (404, [:]) }; accepted = true; return (200, event) }
-            if method == "POST" { creates += 1; created = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data())) as? [String: Any]; return (200, created ?? [:]) }
-            if url.path.hasSuffix("/events") { return (200, ["items": created.map { [$0] } ?? (emptyCalendar ? [] : [event])]) }
+            if method == "PATCH" {
+                patches += 1
+                if patchFailure { return (404, [:]) }
+                accepted = true
+                var result = event
+                if patchStartOnly {
+                    let body = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data())) as? [String: Any]
+                    result["start"] = body?["start"]
+                }
+                return (200, result)
+            }
+            if method == "POST" {
+                if created != nil { return (409, [:]) }
+                creates += 1
+                created = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data())) as? [String: Any]
+                if shiftCreatedTime { created?["start"] = ["dateTime": "2026-11-02T11:00:00-08:00"] }
+                return (200, created ?? [:])
+            }
+            if url.path.hasSuffix("/events") {
+                let page = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "pageToken" }?.value
+                if repeatedCalendarPage || (emptyFirstCalendarPage && page == nil) {
+                    return (200, ["items": [], "nextPageToken": "next-page"])
+                }
+                return (200, ["items": created.map { [$0] } ?? (emptyCalendar ? [] : [event])])
+            }
             return (200, created ?? event)
         }
-        if url.path.hasSuffix("/labels") { return (200, ["labels": [["id": "Label_42", "name": "#Followup", "type": "user"]]]) }
+        if url.path.hasSuffix("/labels") {
+            onLabelsRead?()
+            return (200, ["labels": [["id": "Label_42", "name": "#Followup", "type": "user"]]])
+        }
         let message = url.path.contains("invite-a") ? "invite-a" : "booking-b"
         if method == "POST" {
             let body = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data())) as? [String: Any] ?? [:]

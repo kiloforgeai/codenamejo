@@ -847,6 +847,11 @@ extension FullDuplexVoiceClient {
                     + "calendar pending=\(calendarFeedPending)")
         }
         for jobId in served {
+            if let report = heldOutcomes[jobId]?.report {
+                pendingJobSpeech = .init(id: jobId, finishedAt: report.finishedAt)
+                diagnostics?.record(.jobInjected, ["job_id": jobId.uuidString, "outcome": "queue_result",
+                    "duration_ms": String(Int(Self.seconds(since: report.finishedAt) * 1000))])
+            }
             heldOutcomes[jobId]?.watchdog.cancel()
             heldOutcomes[jobId] = nil
             onJobDelivered?(jobId)
@@ -1298,10 +1303,20 @@ extension FullDuplexVoiceClient {
     ///
     /// - Returns: true when the phone took the turn.
     /// Live answered the yes in words and never delegated, so the walk never started (#1112).
+    static func resolveFeedOffer(_ pending: inout PendingFeedOffer?, transcript: String,
+                                 kind: String, diagnostics: VoiceDiagnostics.Session?) -> PendingFeedOffer.Resolution {
+        guard var offer = pending else { return .expired }
+        let result = offer.resolve(transcript)
+        pending = offer.consumed ? nil : offer
+        diagnostics?.record(.offerTransition, ["request_id": offer.id.uuidString,
+            "phase": kind, "outcome": result.rawValue,
+            "transition": result == .accepted ? "queue_step_requested" : "no_queue_step"])
+        return result
+    }
+
     func tryNothingImportantAnswer(_ transcript: String) -> Bool {
         guard nothingImportantOfferStanding, isActive, !userSpeaking, functionCallTask == nil else { return false }
-        nothingImportantOfferStanding = false
-        guard FeedOfferAnswer.answer(to: transcript) == .accepted else { return false }
+        guard Self.resolveFeedOffer(&cleanupOffer, transcript: transcript, kind: "cleanup", diagnostics: diagnostics) == .accepted else { return false }
         RealtimeLog.log("localTriage: cleanup accepted after nothing important — stepping the queue")
         let started = Date()
         let dial = dialGeneration
@@ -1350,8 +1365,7 @@ extension FullDuplexVoiceClient {
     /// Anything other than a plain yes is still the model's.
     func tryFeedOfferAcceptance(_ transcript: String) -> Bool {
         guard feedOfferStanding, isActive, !userSpeaking, functionCallTask == nil else { return false }
-        feedOfferStanding = false
-        guard FeedOfferAnswer.answer(to: transcript) == .accepted else { return false }
+        guard Self.resolveFeedOffer(&inboxOffer, transcript: transcript, kind: "inbox", diagnostics: diagnostics) == .accepted else { return false }
         RealtimeLog.log("localTriage: feed offer accepted — stepping the queue here")
         feedOfferAcceptedAt = .now
         let started = Date()
@@ -1402,6 +1416,9 @@ extension FullDuplexVoiceClient {
     func tryFeedOfferAnswer(_ transcript: String) -> Bool {
         guard let completion = pendingFeedCompletion, let answer = completion.answer(to: transcript),
               let nextProfile = completion.nextProfile else { return false }
+        diagnostics?.record(.offerTransition, ["request_id": completion.pendingOffer.id.uuidString,
+            "phase": "profile", "outcome": String(describing: answer),
+            "transition": answer == .accepted ? "profile_switch_requested" : "no_queue_step"])
         switch answer {
         case .accepted:
             RealtimeLog.log("feed: offer accepted — \(nextProfile)")
@@ -1479,6 +1496,15 @@ extension FullDuplexVoiceClient {
             transport?.sendContextItem("The onboarding stage advanced. Follow its note and wait "
                 + "at its question. Do not call triage_next again this turn.\n" + step.output,
                 role: "system")
+        } else if let section = Self.interstitialPayload(in: step.output)?["configuredSection"] as? String,
+                  section == "calendar" || section == "complete" {
+            terminalFeedReached = section == "complete"
+            transport?.sendContextItem("Follow this authoritative configured feed section.\n" + step.output, role: "system")
+            if speakNow {
+                transport?.createResponse(instructions: section == "calendar"
+                    ? "Summarize the supplied calendar, then call triage_next to continue. Do not ask whether to continue."
+                    : "The enabled feed sections are finished. Say so briefly and ask whether they need anything else. Do not claim the whole inbox is empty.")
+            }
         } else if Self.isFeedInterstitial(step.output) {
             terminalFeedReached = true
             transport?.sendContextItem(

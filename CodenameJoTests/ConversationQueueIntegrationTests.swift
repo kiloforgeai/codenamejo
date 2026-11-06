@@ -39,6 +39,160 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         }
     }
 
+    func testAnnotatedYesThroughAdapterConsumesOneOfferAndPresentsFirstQueueItem() async throws {
+        let fixture = try StoreFixture()
+        defer { fixture.close() }
+        let rows = [row("first", thread: "first", date: 20, sender: "Fixture"),
+                    row("second", thread: "second", date: 10, sender: "Fixture")]
+        try await fixture.seed(rows, unread: Set(rows.map(\.id)))
+        let queue = makeQueue()
+        let client = FullDuplexVoiceClient(localTriage: queue)
+        client.sequentialFeed = true
+        var focus: FeedFocus?
+        client.onFeedFocus = { focus = $0 }
+        var offer: PendingFeedOffer? = PendingFeedOffer()
+        var advances = 0
+        var tasks: [Task<Void, Never>] = []
+        var original = ""
+        let adapter = LiveSessionAdapter(wire: { _ in }, emit: { event in
+            guard case .liveInputFinished(let text) = event else { return }
+            original = text
+            guard FullDuplexVoiceClient.resolveFeedOffer(&offer, transcript: text, kind: "inbox", diagnostics: nil) == .accepted else { return }
+            advances += 1
+            tasks.append(Task {
+                let step = await queue.step(.init(), store: fixture.store)
+                let progress = await queue.progress
+                let standing = await queue.standing
+                client.applyStep(step.output, progress: progress, standing: standing, served: [], dial: client.dialGeneration)
+            })
+        })
+        func input(_ text: String, start: Double) throws {
+            adapter.receive(try JSONSerialization.data(withJSONObject: ["type": "session.input_transcript.delta",
+                "delta": text, "start_ms": start, "end_ms": start + 100]))
+        }
+        try input(" [inhale ]", start: 0)
+        try input("Yes", start: 100)
+        try await Task.sleep(for: .seconds(1.1))
+        for task in tasks { await task.value }
+        XCTAssertEqual(original, " [inhale ]Yes", "Routing must preserve the original transcript")
+        XCTAssertEqual(advances, 1)
+        if case .email(let mail) = focus { XCTAssertEqual(mail.messageId, "first") }
+        else { XCTFail("First email was not projected") }
+        try input("Yes", start: 2_000)
+        try await Task.sleep(for: .seconds(1.1))
+        XCTAssertEqual(advances, 1)
+        adapter.close()
+        await queue.end()
+    }
+
+    func testReturnedResultSelectionArchivesItsOriginThenResumesHeldInboxWithoutSkipping() async throws {
+        let fixture = try StoreFixture()
+        defer { fixture.close() }
+        let rows = [row("A", thread: "A", date: 20, sender: "Same sender"),
+                    row("B", thread: "B", date: 10, sender: "Same sender")]
+        try await fixture.seed(rows, unread: ["A", "B"])
+        let queue = makeQueue()
+        _ = await queue.step(.init(scope: .unread), store: fixture.store)
+        let result = LocalTriageQueue.Outcome(jobId: UUID(), task: "Research R", text: "Research returned",
+            ok: true, expects: .answer, about: .init(account: account, id: "R", threadId: "R", from: "Same sender", subject: "Same subject"))
+        let output = await queue.selectReturnedResult(result, profileID: nil)
+        let selected = try XCTUnwrap(output)
+        XCTAssertEqual(LiveEmailPresentation.Key.step(selected)?.messageId, "R")
+        #if targetEnvironment(macCatalyst)
+        let snapshot = await queue.desktopSnapshot()
+        XCTAssertEqual(snapshot.currentID, "R")
+        XCTAssertEqual(snapshot.items.prefix(3).map(\.id), ["R", "A", "B"])
+        #endif
+        let standingOnResult = await queue.standingOn(messageId: "R", account: account)
+        let standingOnHeld = await queue.standingOn(messageId: "A", account: account)
+        XCTAssertTrue(standingOnResult)
+        XCTAssertFalse(standingOnHeld, "The suspended inbox item is not the conversational selection")
+        let wrong = GmailWriteEffect(account: "other@example.test", scope: "message", threadId: "R",
+            messageIds: ["R"], messageIdsComplete: true, operation: "modify", removeLabelIds: ["INBOX"])
+        let wrongResult = await queue.applyConfirmedEffects([wrong], store: fixture.store)
+        XCTAssertNil(wrongResult)
+        let effect = GmailWriteEffect(account: account, scope: "message", threadId: "R",
+            messageIds: ["R"], messageIdsComplete: true, operation: "modify", removeLabelIds: ["INBOX"])
+        let finished = await queue.applyConfirmedEffects([effect], store: fixture.store)
+        XCTAssertEqual(finished, "R")
+        let resumed = await queue.step(.init(), store: fixture.store)
+        XCTAssertEqual(try current(resumed.output)["id"] as? String, "A")
+        let duplicate = await queue.applyConfirmedEffects([effect], store: fixture.store)
+        XCTAssertNil(duplicate)
+        let next = await queue.step(.init(), store: fixture.store)
+        XCTAssertEqual(try current(next.output)["id"] as? String, "B")
+        await queue.end()
+    }
+
+    func testAutomaticReturnedResultReceiptMatchesDisplayedOriginThenReleasesHeldAdvance() async throws {
+        let fixture = try StoreFixture()
+        defer { fixture.close() }
+        try await fixture.seed([row("A", thread: "A", date: 20, sender: "Same sender"),
+                                row("B", thread: "B", date: 10, sender: "Same sender")], unread: ["A", "B"])
+        let queue = makeQueue()
+        _ = await queue.step(.init(scope: .unread), store: fixture.store)
+        let result = LocalTriageQueue.Outcome(jobId: UUID(), task: "Research R", text: "Returned",
+            ok: true, expects: .answer, about: .init(account: account, id: "R", threadId: "R", from: "Same sender", subject: "Same subject"))
+        _ = await queue.hold(result)
+        let presentation = await queue.step(.init(direction: "next"), store: fixture.store, dealtWith: false)
+        XCTAssertEqual(LiveEmailPresentation.Key.step(presentation.output)?.messageId, "R")
+        let displayed = await queue.currentId
+        XCTAssertEqual(displayed, "R")
+        let receipt = GmailWriteEffect(account: account, scope: "message", threadId: "R",
+            messageIds: ["R"], messageIdsComplete: true, operation: "modify", removeLabelIds: ["INBOX"])
+        let finished = await queue.applyConfirmedEffects([receipt], store: fixture.store)
+        XCTAssertEqual(finished, displayed, "Receipt must match the displayed compare-and-step token")
+        let resumed = await queue.step(.init(), store: fixture.store, dealtWith: true)
+        XCTAssertEqual(try current(resumed.output)["id"] as? String, "B")
+        let ledger = await queue.dealtWith
+        XCTAssertFalse(ledger.contains(LocalTriageQueue.messageKey(account: account, id: "A")),
+            "Completing research must preserve the suspended read-only step's disposition")
+        await queue.end()
+    }
+
+    func testReturnedResultAfterQueueEndIsSelectableAndReturnsToNoSelection() async throws {
+        let fixture = try StoreFixture()
+        defer { fixture.close() }
+        let queue = makeQueue()
+        await queue.end()
+        let result = LocalTriageQueue.Outcome(jobId: UUID(), task: "Unresolved research", text: "Could not verify",
+            ok: false, expects: .answer, about: .init(account: account, id: "R", threadId: "R", from: "Sender", subject: "Subject"))
+        let invalid = await queue.selectReturnedResult(result, profileID: "different-profile")
+        XCTAssertNil(invalid)
+        let selected = await queue.selectReturnedResult(result, profileID: nil)
+        XCTAssertNotNil(selected)
+        #if targetEnvironment(macCatalyst)
+        let snapshot = await queue.desktopSnapshot()
+        XCTAssertEqual(snapshot.currentID, "R")
+        XCTAssertEqual(snapshot.status, .ready)
+        #endif
+        let resolution = await queue.resolveActionOutcome(id: "R", threadId: nil, as: "label_message")
+        XCTAssertEqual(resolution?.cursorId, "R")
+        let resumed = await queue.step(.init(), store: fixture.store, dealtWith: false)
+        XCTAssertEqual(try object(resumed.output)["done"] as? Bool, true)
+        let id = await queue.currentId
+        XCTAssertNil(id)
+        await queue.end()
+    }
+
+    func testSelectingResultForCurrentItemAdvancesOnlyThatItem() async throws {
+        let fixture = try StoreFixture()
+        defer { fixture.close() }
+        try await fixture.seed([row("A", thread: "A", date: 20, sender: "Same sender"),
+                                row("B", thread: "B", date: 10, sender: "Same sender")], unread: ["A", "B"])
+        let queue = makeQueue()
+        _ = await queue.step(.init(scope: .unread), store: fixture.store)
+        let result = LocalTriageQueue.Outcome(jobId: UUID(), task: "Research", text: "Returned",
+            ok: true, expects: .answer, about: .init(account: account, id: "A", threadId: "A", from: "Same sender", subject: "Same subject"))
+        _ = await queue.selectReturnedResult(result, profileID: nil)
+        let effect = GmailWriteEffect(account: account, scope: "message", threadId: "A",
+            messageIds: ["A"], messageIdsComplete: true, operation: "modify", removeLabelIds: ["INBOX"])
+        _ = await queue.applyConfirmedEffects([effect], store: fixture.store)
+        let next = await queue.step(.init(), store: fixture.store)
+        XCTAssertEqual(try current(next.output)["id"] as? String, "B")
+        await queue.end()
+    }
+
     func testRunwayRefillsBelowTwelveWithoutMovingCurrentOrDuplicatingRows() async throws {
         let fixture = try StoreFixture()
         defer { fixture.close() }
@@ -58,6 +212,43 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         XCTAssertEqual(prepared.first?.id, pinned)
         XCTAssertEqual(Set(prepared.map(\.id)).count, prepared.count)
         #endif
+        await queue.end()
+    }
+
+    func testOffPageArchiveSurvivesStaleCacheAndDoesNotRetireAnotherAccount() async throws {
+        let fixture = try StoreFixture()
+        defer { fixture.close() }
+        UserDefaults.standard.set(false, forKey: ThreadQueue.storageKey)
+        let messages = (0..<40).map { row("offpage-\($0)", thread: "thread-\($0)", date: Int64(40 - $0) * 1000, sender: "Same sender") }
+        try await fixture.seed(messages, unread: Set(messages.map(\.id)))
+        let queue = makeQueue()
+        _ = await queue.step(.init(scope: .unread), store: fixture.store)
+        let effect = GmailWriteEffect(account: account, scope: "message", threadId: "thread-35",
+            messageIds: ["offpage-35"], messageIdsComplete: true, operation: "modify", removeLabelIds: ["INBOX"])
+        let finished = await queue.applyConfirmedEffects([effect], store: fixture.store)
+        XCTAssertNil(finished, "A receipt for a future item must not finish the current item")
+        let ledger = await queue.dealtWith
+        XCTAssertTrue(ledger.contains(LocalTriageQueue.messageKey(account: account, id: "offpage-35")))
+        XCTAssertFalse(ledger.contains(LocalTriageQueue.messageKey(account: "other@example.test", id: "offpage-35")))
+        // A refresh that began before the write can return its old Inbox membership.
+        try await fixture.database.write { db in
+            try MailStore.Label(user_id: "test-user", messageId: "offpage-35", account: self.account,
+                label: "INBOX").insert(db)
+        }
+        var presented = Set<String>()
+        for _ in 0..<38 {
+            let next = await queue.step(.init(), store: fixture.store, dealtWith: true)
+            if let mail = try object(next.output)["item"] as? [String: Any], let id = mail["id"] as? String {
+                XCTAssertNotEqual(id, "offpage-35")
+                XCTAssertTrue(presented.insert(id).inserted, "Handled messages must not reappear")
+            }
+        }
+        XCTAssertTrue(presented.contains("offpage-36"), "The queue must reach work after the archived item")
+        let restore = GmailWriteEffect(account: account, scope: "message", threadId: "thread-35",
+            messageIds: ["offpage-35"], messageIdsComplete: true, operation: "modify", addLabelIds: ["INBOX"])
+        _ = await queue.applyConfirmedEffects([restore], store: fixture.store)
+        let restored = await queue.dealtWith
+        XCTAssertFalse(restored.contains(LocalTriageQueue.messageKey(account: account, id: "offpage-35")))
         await queue.end()
     }
 

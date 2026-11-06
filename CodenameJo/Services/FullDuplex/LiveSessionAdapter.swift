@@ -83,6 +83,10 @@ final class LiveSessionAdapter {
         + "Tell the user briefly that it did not confirm, then wait for their next instruction."
     private var runningResponses: Set<String> = []
     private var backendStarting = false
+    var canSelectReturnedWork: Bool {
+        started && !closed && !backendRunning && !continuationOwed && activeCall == nil
+            && activeFastCall == nil && calls.isEmpty
+    }
     private var backendRunning: Bool { backendStarting || !runningResponses.isEmpty }
     var isWorkSettled: Bool {
         started && !closed && !backendRunning && activeCall == nil && activeFastCall == nil
@@ -114,6 +118,9 @@ final class LiveSessionAdapter {
     private var assistantID = UUID().uuidString
     private var assistantText = ""
     var historyIDForTurn: ((Int) -> String?)?
+    /// The meter observes playout, while transcript items provide the join when available.
+    var onPlaybackBoundary: ((String, String?, String) -> Void)?
+    private var observedPlayback: (id: String, item: String?)?
     var diagnostics: VoiceDiagnostics.Session?
     private var toolStartedAt: [String: TimeInterval] = [:]
     private var inputID = UUID().uuidString
@@ -194,6 +201,28 @@ final class LiveSessionAdapter {
             stopQueueActionRecovery()
             emit(.event(.error(message: message, code: "live_client_brain_failed")))
         })
+        clientBrain?.onRequestTransition = { [weak self] reason, request, delegation, turn in
+            self?.diagnostics?.record(.turnTransition, ["transition": reason, "request_id": request,
+                "delegation_id": delegation, "input_turn": String(turn)])
+        }
+        clientBrain?.onPresentationInvalidated = { [weak self] reason, selection in
+            guard let self else { return }
+            diagnostics?.record(.turnTransition, ["transition": "presentation_invalidated",
+                "reason": reason, "input_turn": String(inputTurn),
+                "selection": selection.map { self.diagnostics?.target($0) ?? "unknown" } ?? "none"])
+            guard reason == "unsupported_spoken_introduction" else { return }
+            cancelPreparedEmail()
+            recoverySpeech = ""
+            speechAfterInput = ""
+            append("Stop the unsupported email introduction. No email is selected. Correct this once: "
+                + LiveSelectionGrounding.correction
+                + " Do not repeat its description or ask what to do with it. Wait for an application-selected item.",
+                type: "session.instructions.append")
+        }
+    }
+
+    func jobCompleted(id: UUID, result: String) {
+        clientBrain?.jobCompleted(id: id, result: result)
     }
 
     private func refreshBrainState() {
@@ -248,6 +277,38 @@ final class LiveSessionAdapter {
         "okay", "ok", "sure", "yes", "yeah", "yep", "of", "course", "got", "it", "good", "great",
         "question", "thing", "alright", "right", "absolutely", "that", "s", "a", "hmm", "let", "me", "see",
     ]
+
+    /// A click owns a new turn. It cannot inherit unfinished speech or overtake another tool.
+    func beginButtonAction(callId: String, action: LiveFastAction) -> Bool {
+        guard canSelectReturnedWork, farewell == nil, !hasUnresolvedQueueAction, !unworkedPending,
+              pendingFunctionOutputs.isEmpty, pendingContext.isEmpty,
+              inputTurn == 0 || finalizedInput else { return false }
+        inputFinalizer?.cancel()
+        finishTranscript()
+        cancelPreparedEmail()
+        completedDelegation = nil
+        recoverySpeech = ""
+        speechAfterInput = ""
+        lastTranscriptAt = nil
+        idlePending = false
+        unworkedPending = false
+        stopQueueActionRecovery()
+        inputID = UUID().uuidString
+        inputText = ""
+        inputTurn += 1
+        finalizedInput = true
+        authorizationText = ""
+        activeFastCall = (callId, inputTurn, callId)
+        delegationTurns[callId] = inputTurn
+        turnsWithTools.insert(inputTurn)
+        turnsWithQueueActions.insert(inputTurn)
+        emit(.liveUserActivity)
+        emit(.liveDelegation(callId, userTurn: inputTurn))
+        refreshBrainState()
+        clientBrain?.user(action.requestText, turn: inputTurn)
+        trace("button_action_started", call: callId, delegation: callId)
+        return true
+    }
 
     /// `action` nil is a local action that is not one of the four quick ones (a dispatch the
     /// phone starts for an accepted suggestion); it must be `routed`.
@@ -825,6 +886,7 @@ final class LiveSessionAdapter {
             }
             outputEnd = event["end_ms"] as? Double ?? start
             farewell?.appendTranscript(delta, at: ProcessInfo.processInfo.systemUptime)
+            refreshBrainState()
             clientBrain?.assistant(delta)
             assistantText += delta
             emit(.event(.assistantTranscriptDelta(itemId: assistantID, delta: delta, spoken: true)))
@@ -841,9 +903,15 @@ final class LiveSessionAdapter {
                 && lastSettledInput.lowercased().trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("go")
                 && suffix == "ahead"
             if finishesAssent { inputText = lastSettledInput + " " }
-            let newIntent = LiveRequestRecovery.isFeedback(delta) || LiveRequestRecovery.requiresQueueAction(delta) || LiveRequestRecovery.isQuestion(delta)
+            let newIntent = LiveRequestRecovery.isFeedback(delta) || LiveRequestRecovery.requiresQueueAction(delta)
+                || LiveRequestRecovery.isQuestion(delta) || LiveRequestRecovery.isCorrection(delta)
             let answered = !speechAfterInput.isEmpty || turnsWithTools.contains(inputTurn) || resolvedInputTurns.contains(inputTurn)
-            if inputText.isEmpty || (finalizedInput && !finishesAssent && (newIntent || (answered && start - inputEnd > 1000))) {
+            let unfinishedPrefix = LiveRequestRecovery.hasUnfinishedAuthorizationPrefix(authorizationText)
+            let backchannel = finalizedInput && !authorizationText.isEmpty && LiveRequestRecovery.isBackchannel(delta)
+            let startsTurn = inputText.isEmpty || (finalizedInput && !finishesAssent && !unfinishedPrefix
+                && !backchannel && (newIntent || (answered && start - inputEnd > 1000)))
+            if startsTurn {
+                if queueActionRecovery?.finished == false { trace("queue_action_superseded") }
                 finishTranscript()
                 // Caption pauses and backchannels do not finish the user's authorization.
                 // A new request cannot inherit permission to repeat an earlier failed write.
@@ -866,12 +934,17 @@ final class LiveSessionAdapter {
                 emit(.liveUserActivity)
                 trace("input_started")
             }
+            if finalizedInput, !startsTurn, inputText.last?.isLetter == true, delta.first?.isLetter == true {
+                inputText += " "
+            }
             finalizedInput = false
             inputEnd = event["end_ms"] as? Double ?? start
             inputText += delta
-            authorizationText = inputText
-            refreshBrainState()
-            clientBrain?.user(authorizationText, turn: inputTurn)
+            if !backchannel {
+                authorizationText = inputText
+                refreshBrainState()
+                clientBrain?.user(authorizationText, turn: inputTurn)
+            } else { trace("queue_action_backchannel_preserved") }
             emit(.liveInputText(inputText))
             inputFinalizer?.cancel()
             let settle = LiveFastAction.parse(inputText) != nil || answersPendingOffer?(inputText) == true
@@ -894,8 +967,12 @@ final class LiveSessionAdapter {
                 }
                 if LiveRequestRecovery.requiresQueueAction(self.authorizationText),
                    !self.turnsWithQueueActions.contains(self.inputTurn),
-                   !self.resolvedInputTurns.contains(self.inputTurn) {
+                   !self.resolvedInputTurns.contains(self.inputTurn), self.queueActionRecovery == nil {
                     self.queueActionRecovery = LiveQueueActionRecovery(now: ProcessInfo.processInfo.systemUptime)
+                    self.trace("queue_action_armed_explicit_request")
+                } else if !self.turnsWithQueueActions.contains(self.inputTurn) {
+                    self.trace(LiveRequestRecovery.isFeedback(self.authorizationText)
+                        ? "queue_action_not_requested_feedback" : "queue_action_not_requested")
                 }
                 if LiveRequestRecovery.isQuestion(self.authorizationText) { self.questionTurn = self.inputTurn }
                 self.trace("input_settled")
@@ -937,6 +1014,13 @@ final class LiveSessionAdapter {
         guard activeCall == nil, activeFastCall == nil, !calls.isEmpty else { return }
         let call = calls.removeFirst()
         activeCall = call
+        if LiveWriteTarget.requiresCurrentRequest(call.name),
+           delegationTurns[call.delegation] != inputTurn || LiveRequestRecovery.isFeedback(inputText) {
+            trace("write_request_superseded", call: call.id, delegation: call.delegation)
+            outbound(["type": "conversation.item.create", "item": ["type": "function_call_output",
+                "call_id": call.id, "output": "Not executed: this action belongs to an earlier request or the current request is feedback. Do not revive it, retry it, or advance the feed. Handle only the user's latest request."]])
+            return
+        }
         if presentationDelegations.contains(call.delegation),
            !["gmail_get_message", "gmail_get_thread", "get_message", "get_thread"].contains(call.name) {
             outbound(["type": "conversation.item.create", "item": ["type": "function_call_output",
@@ -1045,10 +1129,14 @@ final class LiveSessionAdapter {
             if !audible {
                 audible = true
                 speechRequestedAt = nil
+                let playback = (UUID().uuidString, assistantText.isEmpty ? nil : assistantID)
+                observedPlayback = playback
+                onPlaybackBoundary?(playback.0, playback.1, "started")
                 emit(.event(.outputAudioStarted))
             }
         } else if audible && Date().timeIntervalSince(lastAudio) > 0.8 {
             audible = false
+            finishObservedPlayback(phase: "stopped")
             finishTranscript()
             emit(.event(.outputAudioStopped))
         }
@@ -1057,6 +1145,12 @@ final class LiveSessionAdapter {
         emitUnworkedTurnIfSettled()
         speakWaitBeatIfOverdue()
         if farewellFinished { emit(.liveFarewellFinished) }
+    }
+
+    private func finishObservedPlayback(phase: String) {
+        guard let playback = observedPlayback else { return }
+        observedPlayback = nil
+        onPlaybackBoundary?(playback.id, playback.item, phase)
     }
 
     /// Live says nothing while delegated work runs, so after a quiet stretch the user hears one presence line.
@@ -1225,6 +1319,7 @@ final class LiveSessionAdapter {
 
     func close() {
         guard !closed else { return }
+        finishObservedPlayback(phase: "closed")
         finishTranscript()
         trace("closed")
         closed = true

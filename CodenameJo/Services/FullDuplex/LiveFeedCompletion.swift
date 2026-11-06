@@ -7,7 +7,10 @@ struct LiveFeedCompletion: Equatable {
     let nextProfile: String?
     /// Set once the current question has been put to the user, so it is neither repeated nor
     /// answered before it was heard.
-    var asked = false
+    var asked = false {
+        didSet { if asked && !oldValue { pendingOffer = PendingFeedOffer() } }
+    }
+    var pendingOffer = PendingFeedOffer()
 
     static let wrapUpQuestion = "You're done with your Feed now. Would you like me to wrap up?"
     static let offerPrefix = "Would you like to go through "
@@ -58,12 +61,12 @@ struct LiveFeedCompletion: Equatable {
 
     func answer(to transcript: String) -> Answer? {
         guard offer != nil, asked else { return nil }
-        switch LiveCoachingAnswer.parse(transcript) {
+        var offer = pendingOffer
+        switch offer.resolve(transcript) {
         case .accepted: return .accepted
         case .declined: return .declined
-        case nil:
-            let words = transcript.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
-            return words.count >= 3 ? .cancelled : nil
+        case .superseded, .expired: return .cancelled
+        case .waiting: return nil
         }
     }
 

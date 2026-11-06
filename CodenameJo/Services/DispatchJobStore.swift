@@ -63,35 +63,49 @@ class DispatchJobStore {
         await save()
     }
 
+    /// Only the current owner/profile can restore a stopped job's unambiguous source email.
+    func selectableResult(_ id: UUID, allowedAccounts: [String]) -> DispatchJob? {
+        visible.first { job in
+            guard job.id == id, job.hasStopped(), let origin = job.origin else { return false }
+            return allowedAccounts.contains { $0.caseInsensitiveCompare(origin.account) == .orderedSame }
+        }
+    }
+
+    func jobWithCommittedWrite(_ id: UUID, profileID: String?) -> DispatchJob? {
+        jobs.first { $0.id == id && $0.userId == backend.userId && $0.profileId == profileID
+            && $0.receipts?.contains(where: { $0.outcome == "success" }) == true }
+    }
+
     func previousOperation(_ operation: DispatchMailOperation, profileID: String?) -> DispatchJob? {
         jobs.last { $0.userId == backend.userId && $0.profileId == profileID && $0.operation == operation
             && ($0.isDone || $0.isRunning || $0.state == "unknown") }
     }
 
     /// A job has started; a retried memo reuses its id and starts its row again.
-    func begin(id: UUID, task: String, profileId: String?, conversationId: UUID? = nil, turnId: String? = nil, operation: DispatchMailOperation? = nil) async {
+    func begin(id: UUID, task: String, profileId: String?, conversationId: UUID? = nil, turnId: String? = nil, operation: DispatchMailOperation? = nil, origin: DispatchJob.MailOrigin? = nil) async {
         jobs.removeAll { $0.id == id }
         let profiles = Container.shared.workspaceProfiles()
         let defaultProfile = profileId == nil || profiles.profiles.first(where: { $0.id == profileId })?.isDefault == true
         let owner = backend.userId.map { $0 + (defaultProfile ? "" : ":profile:" + (profileId ?? "")) }
         jobs.append(DispatchJob(id: id, task: task, state: "running", startedAt: Date(), profileId: profileId,
-            userId: backend.userId, conversationId: conversationId, turnId: turnId, historyOwner: owner, operation: operation))
+            userId: backend.userId, conversationId: conversationId, turnId: turnId, historyOwner: owner, operation: operation, origin: origin))
         await save()
         await recordHistoryOutcome(jobs.first { $0.id == id }, status: .pending)
     }
 
-    func receipt(_ id: UUID, callId: String, tool: String, failed: Bool) async {
+    func receipt(_ id: UUID, callId: String, tool: String, failed: Bool, targetHash: String? = nil) async {
         guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
         var receipts = jobs[index].receipts ?? []
         guard !receipts.contains(where: { $0.callId == callId }) else { return }
-        receipts.append(.init(callId: callId, tool: tool, outcome: failed ? "failed" : "success"))
+        receipts.append(.init(callId: callId, tool: tool, outcome: failed ? "failed" : "success", targetHash: targetHash))
         jobs[index].receipts = receipts
         await save()
     }
 
-    func finish(_ id: UUID, state: String, result: String, reportBack: Bool? = nil, historyStatus: CommandRecord.CommandStatus? = nil) async {
+    func finish(_ id: UUID, state: String, result: String, reportBack: Bool? = nil, historyStatus: CommandRecord.CommandStatus? = nil, foregroundContinuation: Bool? = nil) async {
         guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
         jobs[index].state = state
+        jobs[index].foregroundContinuation = foregroundContinuation
         jobs[index].result = result
         jobs[index].completedAt = Date()
         jobs[index].reportBack = reportBack

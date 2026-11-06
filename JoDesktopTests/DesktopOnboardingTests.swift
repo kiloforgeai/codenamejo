@@ -93,4 +93,17 @@ final class DesktopOnboardingTests: XCTestCase {
         subscription.cancel()
         subscriptions.forEach { $0.cancel() }
     }
+
+    func testQuickActionWithoutMicrophoneShowsActionableError() async {
+        let model = DesktopWorkspaceModel()
+        let interactor = DesktopWorkspaceInteractor(hasMicrophone: { false })
+        let subscriptions = interactor.onLoad(viewModel: model)
+        let shown = expectation(description: "Missing input alert for quick action")
+        let subscription = model.$showMicUnavailable.dropFirst().filter { $0 }.sink { _ in shown.fulfill() }
+        interactor.quickAction()
+        await fulfillment(of: [shown], timeout: 2)
+        XCTAssertFalse(model.inSession)
+        subscription.cancel()
+        subscriptions.forEach { $0.cancel() }
+    }
 }

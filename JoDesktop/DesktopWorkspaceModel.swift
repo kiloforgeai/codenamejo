@@ -3,57 +3,77 @@ import Combine
 import FactoryKit
 import Foundation
 
-struct DesktopFeedRow: Identifiable, Equatable {
-    let id: String
-    let source: String
-    let title: String
-    let detail: String
-    let reason: String?
-    var selection: MailSelection? = nil
-    var symbol: String { source == "Slack" ? "number" : "envelope" }
+enum DesktopSessionIntent {
+    case feed
+    case quickAction
+
+    var opening: SessionOpening {
+        switch self {
+        case .feed: return .emailQueue
+        case .quickAction: return .none
+        }
+    }
 }
 
 @MainActor
 class DesktopWorkspaceModel: ViewModel {
     @Published var state: SessionState = .disconnected
     @Published var inSession = false
+    @Published var sessionIntent: DesktopSessionIntent = .feed
     @Published var muted = false
     @Published var micLive = false
     @Published var focus: FeedFocus?
     @Published var response = ""
     @Published var previousResponse = false
+    @Published var responseItemID: String?
+    @Published var responseTurnID: String?
     @Published var userWords = ""
     @Published var steps: [TurnStep] = []
     @Published var jobs: [DispatchJob] = []
-    @Published var queue: [DesktopFeedRow] = []
-    @Published var queueStatus: LocalTriageQueue.DesktopStatus = .idle
-    @Published var queueScope = ""
-    @Published var queueRevision = 0
-    @Published var queueCurrent: MailSelection?
+    @Published var sessionFeed = DesktopSessionFeed()
+    @Published var feedPreview: DesktopFeedPreview.Snapshot?
+    @Published var previewRefreshing = false
     @Published var conversationID: UUID?
     @Published var profileID: String?
 
     var selectionIsTransitioning: Bool {
         guard case .email(let email) = focus, let id = email.messageId else { return false }
-        return queueCurrent?.matches(account: email.account, messageID: id) != true
+        return sessionFeed.current?.matches(account: email.account, messageID: id) != true
+    }
+
+    var presentedSelection: MailSelection? {
+        if !selectionIsTransitioning, case .email(let email) = focus, let id = email.messageId {
+            return MailSelection(account: email.account, messageID: id)
+        }
+        return nil
     }
 
     var renderedState: RenderedFeedState {
-        let selected: MailSelection?
-        if !selectionIsTransitioning, case .email(let email) = focus, let id = email.messageId {
-            selected = MailSelection(account: email.account, messageID: id)
-        } else { selected = nil }
-        return RenderedFeedState(profileID: profileID, conversationID: conversationID, focus: selected,
-            queueCurrent: queueCurrent, queueOrder: queue.map { $0.selection?.canonical ?? $0.id }, queueRevision: queueRevision,
-            queueScope: queueScope, response: response, previousResponse: previousResponse, focusMode: focusMode)
+        var state = RenderedFeedState(profileID: profileID, conversationID: conversationID, focus: presentedSelection,
+            queueCurrent: sessionFeed.current, queueOrder: sessionFeed.rows.map { $0.selection?.canonical ?? $0.id },
+            queueRevision: sessionFeed.revision, queueScope: sessionFeed.scope,
+            response: response, previousResponse: previousResponse, focusMode: focusMode)
+        state.responseItemID = responseItemID
+        state.responseTurnID = responseTurnID
+        if !selectionIsTransitioning, case .email(let email) = focus {
+            state.position = email.displayedPosition; state.total = email.displayedTotal
+        }
+        state.jobStates = (runningJobs + finishedJobs).prefix(12).map { $0.id.uuidString + ":" + $0.state }
+        return state
     }
     @Published var showMicDenied = false
     @Published var showMicUnavailable = false
     @Published var showingSettings = false
+    @Published var showingCommands = false
+    @Published var feedActionError: String?
+    @Published var requestedActionContext: FeedActionContext?
+    var feedActionContext: FeedActionContext? { inSession ? FeedActionContext(renderedState) : nil }
     @Published var showingHistory = false
     @Published var focusMode = false
     @Published var filter = "All"
     @Published var selectedJob: DispatchJob?
+    @Published var selectingResult = false
+    @Published var resultSelectionError: String?
     @Published var startedAt: Date?
     @Published var voiceNotice: String?
     @Published var diagnosticsDocument = VoiceDiagnosticsDocument()
@@ -67,13 +87,18 @@ class DesktopWorkspaceModel: ViewModel {
 
     var canSaveFeedback: Bool { !savingFeedback && (try? FeedbackText.validated(feedbackText)) != nil }
 
+    var feedRows: [DesktopFeedRow] { inSession ? sessionFeed.rows : feedPreview?.rows ?? [] }
     var filteredQueue: [DesktopFeedRow] {
-        filter == "All" ? queue : queue.filter { $0.source == filter }
+        filter == "All" ? feedRows : feedRows.filter { $0.source == filter }
+    }
+    var feedCountLabel: String {
+        inSession ? String(filteredQueue.count) : feedPreview?.countLabel(filter: filter) ?? "—"
     }
     var runningJobs: [DispatchJob] { jobs.filter { $0.isRunning && !$0.hasStopped() } }
     var finishedJobs: [DispatchJob] { jobs.filter { $0.hasStopped() } }
     var feedComplete: Bool {
-        inSession && queueStatus == .complete && queue.isEmpty && runningJobs.isEmpty && focus?.isComplete == true
+        inSession && sessionFeed.status == .complete && sessionFeed.rows.isEmpty
+            && runningJobs.isEmpty && focus?.isComplete == true
     }
     var status: String {
         if case .error = state { return "Connection needs attention" }
@@ -90,14 +115,16 @@ class DesktopWorkspaceModel: ViewModel {
 
 protocol DesktopWorkspaceHandler {
     func toggleSession()
+    func quickAction()
     func toggleMute()
     func stopSpeaking()
-    func refresh(viewModel: DesktopWorkspaceModel)
     func exportDiagnostics()
     func exportHistory()
     func showFeedback()
     func saveFeedback()
     func rendered(_ state: RenderedFeedState)
+    func selectReturnedResult(_ id: UUID)
+    func performFeedAction(_ action: LiveFastAction, context: FeedActionContext)
 }
 
 @MainActor
@@ -115,6 +142,7 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
     @Injected(\.localSpeech) private var localSpeech
     @Injected(\.userFeedback) private var feedback
     @Injected(\.backend) private var backend
+    @Injected(\.desktopFeedPreview) private var feedPreview
     private var feedbackSubmission: UserFeedback.Submission?
     private let hasMicrophone: @Sendable () -> Bool
     private weak var model: DesktopWorkspaceModel?
@@ -158,13 +186,23 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
                 guard let viewModel else { return }
                 self?.refresh(viewModel: viewModel)
             }
+        feedPreview.$snapshot.combineLatest(feedPreview.$refreshing)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak viewModel] snapshot, refreshing in
+                viewModel?.feedPreview = snapshot
+                viewModel?.previewRefreshing = refreshing
+            }
+    }
+
+    override func onViewDisappear(viewModel: DesktopWorkspaceModel) {
+        super.onViewDisappear(viewModel: viewModel)
+        feedPreview.pause()
     }
 
     @CancellableBuilder
     override func onViewAppear(viewModel: DesktopWorkspaceModel) -> [AnyCancellable] {
         super.onViewAppear(viewModel: viewModel)
         copySession(to: viewModel)
-        refresh(viewModel: viewModel)
         Task { await realtime.connect() }
         Task { await connections.refresh(); await history.refresh() }
         Timer.publish(every: 3, on: .main, in: .common).autoconnect()
@@ -184,6 +222,8 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
         model.focus = realtime.feedFocus
         model.response = realtime.responseText
         model.previousResponse = realtime.answerIsStale
+        model.responseItemID = realtime.responseItemID
+        model.responseTurnID = realtime.responseTurnID
         model.userWords = realtime.lastCommandText
         model.steps = realtime.turnSteps
         model.voiceNotice = realtime.voiceNotice
@@ -192,7 +232,26 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
         refresh(viewModel: model)
     }
 
+    func selectReturnedResult(_ id: UUID) {
+        guard let model, !model.selectingResult else { return }
+        model.selectingResult = true
+        model.resultSelectionError = nil
+        Task { [weak self, weak model] in
+            guard let self, let model else { return }
+            defer { model.selectingResult = false }
+            model.resultSelectionError = await realtime.selectReturnedResult(id)
+            if model.resultSelectionError == nil, model.selectedJob?.id == id { model.selectedJob = nil }
+            copySession(to: model)
+        }
+    }
+
     func rendered(_ state: RenderedFeedState) { realtime.recordRenderedWorkspace(state) }
+
+    func performFeedAction(_ action: LiveFastAction, context: FeedActionContext) {
+        guard let model else { return }
+        model.feedActionError = realtime.performFeedAction(action, context: context)
+        if model.feedActionError == nil { model.requestedActionContext = context }
+    }
 
     func exportDiagnostics() { exportSession(includeContent: false) }
     func exportHistory() { exportSession(includeContent: true) }
@@ -239,7 +298,15 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
         }
     }
 
-    func refresh(viewModel: DesktopWorkspaceModel) {
+    private func refresh(viewModel: DesktopWorkspaceModel) {
+        let scope = ProfileRuntime.snapshot
+        let context = backend.userId.flatMap { owner in
+            scope.flatMap { scope in scope.emails.map { emails in
+                DesktopFeedPreview.Context(userID: owner, profileID: scope.profileId, emails: emails,
+                    slackTeams: connections.status.slackTeamIDs.sorted(), sections: scope.feedSections)
+            } }
+        }
+        feedPreview.update(context: context, inSession: realtime.isConversing)
         guard !loading else { refreshPending = true; return }
         loading = true
         let profile = ProfileRuntime.snapshot?.profileId
@@ -256,18 +323,7 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
             let slack = await slackQueue.desktopPreparedItems()
             let jobs = await dispatchJobs.history()
             guard let viewModel, ProfileRuntime.snapshot?.profileId == profile else { return }
-            viewModel.queueStatus = mail.status
-            viewModel.queueScope = mail.scope
-            viewModel.queueRevision = mail.revision
-            viewModel.queueCurrent = mail.currentID.flatMap { id in mail.account.map { MailSelection(account: $0, messageID: id) } }
-            viewModel.queue = mail.items.map {
-                DesktopFeedRow(id: "mail:\($0.account):\($0.id)", source: "Email",
-                    title: $0.subject.isEmpty ? "No subject" : $0.subject,
-                    detail: $0.from, reason: $0.importanceWhy, selection: .init(account: $0.account, messageID: $0.id))
-            } + slack.map {
-                DesktopFeedRow(id: "slack:\($0.teamId):\($0.channelId)", source: "Slack",
-                    title: $0.label, detail: $0.teamName, reason: $0.why.isEmpty ? nil : $0.why)
-            }
+            viewModel.sessionFeed = .init(mail: mail, slack: slack)
             viewModel.jobs = jobs
             if let selected = viewModel.selectedJob {
                 viewModel.selectedJob = jobs.first { $0.id == selected.id }
@@ -279,21 +335,31 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
         if realtime.isConversing { realtime.endConversation() }
         else { startSession() }
     }
-    private func startSession() {
-        guard !checkingMicrophone else { return }
+    func quickAction() { startSession(intent: .quickAction) }
+
+    private func startSession(intent: DesktopSessionIntent = .feed) {
+        guard !checkingMicrophone, !realtime.isConversing else { return }
         localSpeech.stop()
         checkingMicrophone = true
         Task { [weak self] in
             guard let self else { return }
-            defer { checkingMicrophone = false }
             do {
                 let available = try await audioQueue.run("desktop input availability", hasMicrophone)
                 guard available else {
+                    checkingMicrophone = false
                     model?.showMicUnavailable = true
                     return
                 }
-                voiceCall.withMicPermission { [voiceCall] in voiceCall.beginVoice() }
+                voiceCall.withMicPermission(onDenied: { [weak self] in
+                    self?.checkingMicrophone = false
+                }) { [weak self] in
+                    guard let self else { return }
+                    checkingMicrophone = false
+                    model?.sessionIntent = intent
+                    voiceCall.beginVoice(opening: intent.opening)
+                }
             } catch {
+                checkingMicrophone = false
                 RealtimeLog.log("desktop: input availability failed: \(error.localizedDescription)")
                 model?.showMicUnavailable = true
             }

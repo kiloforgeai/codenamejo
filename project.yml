@@ -447,6 +447,10 @@ targets:
       - CodenameJoTests/LocalProfilesTests.swift
       - CodenameJoTests/ConversationQueueIntegrationTests.swift
       - CodenameJoTests/EmailPreviewTests.swift
+      - CodenameJoTests/LiveFeedCompletionTests.swift
+      - CodenameJoTests/DispatchQueueReturnPolicyTests.swift
+      - CodenameJoTests/LiveEmailPresentationTests.swift
+      - CodenameJoTests/CustomCommandStoreTests.swift
     configFiles:
       Debug: Config/Version.xcconfig
       Release: Config/Version.xcconfig

@@ -66,9 +66,8 @@ final class FullDuplexVoiceClient {
     /// own words are deliberately not drawn (#301); this is what moves the *orb*.
     var onMicLive: (() -> Void)?
 
-    /// The user's utterance has been committed — a new turn is starting, so
-    /// anything on screen describing the last one is now stale.
-    var onUserTurnCommitted: (() -> Void)?
+    var onHistoryCheckpoint: ((UUID, String) -> Void)?
+    var onHistoryReply: ((LiveHistoryReply) -> Void)?
     /// Hang up — the model called `end_session` and its goodbye has finished playing.
     ///
     /// **The same operation as the red button, `SpokenCommand`'s phrase match and the
@@ -163,10 +162,18 @@ final class FullDuplexVoiceClient {
     /// where the cursor actually is at the moment a report lands.
     var standingStep: String?
     /// The opening asked "want to do some cleanup?"; a yes steps the queue here, not via the model.
-    var nothingImportantOfferStanding = false
+    var cleanupOffer: PendingFeedOffer?
+    var nothingImportantOfferStanding: Bool {
+        get { cleanupOffer != nil }
+        set { cleanupOffer = newValue ? (cleanupOffer ?? PendingFeedOffer()) : nil }
+    }
     /// The opening asked "want me to go through your inbox?" on a session whose queue is on this
     /// phone; a yes steps the queue here, not via a delegation and a model-called `triage_next`.
-    var feedOfferStanding = false
+    var inboxOffer: PendingFeedOffer?
+    var feedOfferStanding: Bool {
+        get { inboxOffer != nil }
+        set { inboxOffer = newValue ? (inboxOffer ?? PendingFeedOffer()) : nil }
+    }
     /// When that yes was taken here, so the wait until Jo is audible again can be logged.
     var feedOfferAcceptedAt: ContinuousClock.Instant?
     var dispatchScopeRequired = false
@@ -416,20 +423,7 @@ final class FullDuplexVoiceClient {
     /// one starts building.
     var assistantTurns: [String: String] = [:]
     var currentAssistantItem: String?
-    /// The response whose transcript has already gone out as final.
-    ///
-    /// **One response, one final.** `.responseDone` and `.responseCancelled` both
-    /// deliver it, and a barge-in produces exactly that pair — so the same words
-    /// were handed over twice for one answer. `RealtimeService.finalizeTurn` files
-    /// a History row per final, and the second one landed a duplicate turn with no
-    /// duration (its `commandStartTime` had already been cleared), which is 469 of
-    /// the 744 duplicate rows in the store as of 2026-08-14.
-    ///
-    /// Keyed on the item rather than reset per turn because that is what identifies
-    /// one answer: `.responseCreated` clears `currentAssistantItem` and the next
-    /// answer's deltas set a new one, so a fresh response is never mistaken for a
-    /// repeat of the last.
-    private var finalizedAssistantItem: String?
+    private var finalizedAssistantTexts: [String: String] = [:]
     /// The last real, completed utterance, used exactly once to authorize a queue count.
     /// Keeping this in the transport makes the decision synchronous with the function call.
     var latestCompletedUserUtterance = ""
@@ -642,7 +636,7 @@ final class FullDuplexVoiceClient {
         stoppedAssistantItem = nil
         userAnsweringQuestion = false
         assistantSpeechThisTurn = ""
-        finalizedAssistantItem = nil
+        finalizedAssistantTexts.removeAll()
         // A queue advance is owed only inside the call whose write created it. A
         // hang-up before response.done must not carry that debt into the next dial.
         queueFinisherAwaitingAdvance = nil
@@ -685,6 +679,8 @@ final class FullDuplexVoiceClient {
         isBackgroundHistory = false
         historyIDsByInput.removeAll()
         historyTranscripts.removeAll()
+        assistantHistoryOrigins.removeAll()
+        assistantPresentationFields.removeAll()
         historyJobOutcomes.removeAll()
         dispatchHistory.removeAll()
         liveQueueRevision = 0
@@ -863,6 +859,7 @@ final class FullDuplexVoiceClient {
                 dynamicSlackFeed: session.profileSlackFeed && session.localSlackTriage,
                 importantSlackStage: session.importantSlackStage && session.localSlackTriage,
                 localCalendar: session.localCalendar,
+                feedSections: ProfileRuntime.snapshot?.feedSections,
                 onboardingFlow: session.localTriage ? session.onboardingFlow : nil,
                 preparationChanged: { [weak self] in
                     await self?.refreshPreparedQueueProgress()
@@ -891,6 +888,9 @@ final class FullDuplexVoiceClient {
                             ProfileRuntime.snapshot?.profileId)
                 }
                 adapter.diagnostics = diagnostics
+                adapter.onPlaybackBoundary = { [weak self] id, item, phase in
+                    self?.recordPlaybackBoundary(id: id, item: item, phase: phase)
+                }
                 adapter.historyIDForTurn = { [weak self] in self?.historyIDsByInput[$0]?.uuidString }
                 adapter.enableClientDelegation { [weak self] body in
                     guard let self, self.isActive, self.dialGeneration == mintDial else { throw CancellationError() }
@@ -1067,6 +1067,50 @@ final class FullDuplexVoiceClient {
     /// went). A *spoken* interruption needs none of this — the server cancels on
     /// `interrupt_response` and `speechStarted` clears the buffer — but a tap has
     /// no speech behind it, so both halves have to be asked for.
+    /// A clicked result is a new visible selection, not authorization to repeat its operation.
+    func selectReturnedResult(_ id: UUID) async -> String? {
+        guard isActive, !openingHold, !userSpeaking, functionCallTask == nil,
+              transport?.liveAdapter?.canSelectReturnedWork == true else {
+            return "Let the current request finish, then select this result."
+        }
+        let dial = dialGeneration
+        let profile = ProfileRuntime.snapshot?.profileId
+        let turn = liveUserTurn
+        let accounts = await localTriage.resultSelectionAccounts()
+        guard isActive, dial == dialGeneration, profile == ProfileRuntime.snapshot?.profileId,
+              turn == liveUserTurn, !userSpeaking, functionCallTask == nil,
+              transport?.liveAdapter?.canSelectReturnedWork == true else {
+            return "The conversation changed. Select the result again when Jo is ready."
+        }
+        guard let job = dispatchJobs.selectableResult(id, allowedAccounts: accounts), let origin = job.origin else {
+            diagnostics?.record(.resultSelected, ["job_id": id.uuidString, "outcome": "refused", "reason": "source_scope_unavailable"])
+            return "This result has no saved source in the connected accounts for this profile."
+        }
+        interrupt()
+        liveFastAnchor = nil
+        liveQueueActionAnchor = nil
+        liveFastProfileId = nil
+        let outcome = LocalTriageQueue.Outcome(jobId: job.id, task: job.task,
+            text: job.result ?? "This work has no confirmed result.", ok: job.isDone ? true : false,
+            expects: .answer, about: origin.about)
+        guard let step = await localTriage.selectReturnedResult(outcome, profileID: profile),
+              isActive, dial == dialGeneration, profile == ProfileRuntime.snapshot?.profileId else {
+            return "The profile changed before the result could be selected."
+        }
+        let progress = await localTriage.progress
+        let standing = await localTriage.standing
+        applyStep(step, progress: progress, standing: standing, served: [], dial: dial)
+        // The user selected the visible card. The render guard still waits for it to appear.
+        unheardPresentation = nil
+        transport?.sendContextItem("The user explicitly selected returned work. The item below is now selected. "
+            + "Earlier actions are history, not new authorization. Wait for the user's next request. "
+            + "The next triage_next resumes the held feed.\n" + step, role: "system")
+        diagnostics?.record(.resultSelected, ["job_id": id.uuidString, "outcome": "selected",
+            "target_hash": diagnostics?.target(MailSelection(account: origin.account, messageID: origin.messageID).canonical) ?? "unknown",
+            "queue_revision": String(liveQueueRevision)])
+        return nil
+    }
+
     func interrupt() {
         guard isActive else { return }
         // The first greeting is never interrupted — a product decision, 2026-08-25. The
@@ -1192,6 +1236,9 @@ final class FullDuplexVoiceClient {
     }
 
     private func teardown(reason: String) {
+        cancelJobSpeech(reason: "session_ended")
+        checkpointHistory()
+        emitFinalTranscript(responseCompleted: false)
         resetAcknowledgementPending = false
         modelRoute?.task.cancel()
         modelRoute = nil
@@ -1294,7 +1341,7 @@ final class FullDuplexVoiceClient {
 
     // MARK: - Signals
 
-    private func handle(_ signal: RealtimeSignal) {
+    func handle(_ signal: RealtimeSignal) {
         switch signal {
         case .liveResetRequested:
             guard isActive, endCueTask == nil else { return }
@@ -1422,6 +1469,8 @@ final class FullDuplexVoiceClient {
             _ = resumeFeedAfterLessonIfSettled()
             emitFinalTranscript(responseCompleted: false)
         case .liveUserActivity:
+            cancelJobSpeech(reason: "user_started")
+            checkpointHistory()
             historyTurnID = UUID()
             historyUserText = ""
             isBackgroundHistory = false
@@ -1431,6 +1480,7 @@ final class FullDuplexVoiceClient {
             unspokenHandoffThisTurn = false
             liveUserTurn += 1
             historyIDsByInput[liveUserTurn] = historyTurnID
+            diagnostics?.record(.turnStarted, ["turn_id": historyTurnID.uuidString, "input_turn": String(liveUserTurn)])
             liveInputComplete = false
             liveFastProfileId = nil
             liveFastAnchor = nil
@@ -1485,13 +1535,14 @@ final class FullDuplexVoiceClient {
             latestCompletedUserUtterance = text
             historyUserText = text
             onUserTranscript?(text, false)
+            checkpointHistory()
             routeWithModel(text)
         case .liveInputFinished(let text):
             userSpeaking = false
             latestCompletedUserUtterance = text
             historyUserText = text
             onUserTranscript?(text, true)
-            onUserTurnCommitted?()
+            checkpointHistory()
             liveInputComplete = true
             if tryOnboardingAnswer(text) {
                 // An onboarding answer the phone acts on itself; see `tryOnboardingAnswer`.
@@ -1510,6 +1561,7 @@ final class FullDuplexVoiceClient {
         switch event {
 
         case .outputAudioStarted:
+            recordJobSpeechStarted()
             assistantAudible = true
             audibleSince = ContinuousClock.now
             // The opening deadline bounds silence before Jo speaks. Once the first frame is
@@ -1579,6 +1631,7 @@ final class FullDuplexVoiceClient {
             }
             noteLatency(\.toFirstTokenMs)
             currentAssistantItem = itemId
+            captureAssistantOrigin(itemId)
             // **Recorded on the first token, not on the finished turn.** The turn that
             // caused this on 2026-08-20 was still speaking when the tool list landed, so
             // a check at `.responseDone` would have run with `toolsReachable` already true
@@ -1600,6 +1653,7 @@ final class FullDuplexVoiceClient {
 
         case .assistantTranscriptDone(let itemId, let transcript):
             currentAssistantItem = itemId
+            captureAssistantOrigin(itemId)
             let text = transcript.isEmpty ? (assistantTurns[itemId] ?? "") : transcript
             noteCoachingLessonSpoken(in: text, itemId: itemId)
             noteFeedQuestionSpoken(in: text)
@@ -2113,13 +2167,6 @@ final class FullDuplexVoiceClient {
             : "opening: mic live — the user has the floor")
     }
 
-    /// Hand the finished answer over, once.
-    ///
-    /// Both events that end a response deliver the same text from the same item, and
-    /// a barge-in raises both — see `finalizedAssistantItem`. The listener files a
-    /// History row per final, so a second one is a duplicate turn rather than a
-    /// second answer. Whichever event arrives first wins; the other finds the item
-    /// already spent and says nothing.
     private var historyIDsByInput: [Int: UUID] = [:]
     var historyTurnID = UUID()
     var historyUserText = ""
@@ -2127,19 +2174,64 @@ final class FullDuplexVoiceClient {
     var historyJobOutcomes: [UUID: CommandRecord.CommandStatus] = [:]
     var dispatchHistory: [UUID: (id: UUID, text: String)] = [:]
     private var historyTranscripts: [UUID: TurnTranscript] = [:]
+    private var assistantHistoryOrigins: [String: LiveHistoryOrigin] = [:]
+    private var assistantPresentationFields: [String: [String: String]] = [:]
+
+    var currentAssistantTurnID: String? {
+        currentAssistantItem.flatMap { assistantHistoryOrigins[$0]?.id.uuidString }
+    }
+
+    func recordPlaybackBoundary(id: String, item: String?, phase: String) {
+        var fields = item.flatMap { assistantPresentationFields[$0] } ?? ["attribution": "unknown"]
+        fields["playback_id"] = id
+        fields["response_item_id"] = item ?? "unknown"
+        fields["phase"] = phase
+        diagnostics?.record(.playbackBoundary, fields)
+    }
+
+    func checkpointHistory() {
+        guard !isBackgroundHistory, !historyUserText.isEmpty else { return }
+        onHistoryCheckpoint?(historyTurnID, historyUserText)
+    }
+
+    private func captureAssistantOrigin(_ item: String) {
+        if assistantHistoryOrigins[item] == nil {
+            assistantHistoryOrigins[item] = .init(id: historyTurnID, userText: historyUserText,
+                                                  background: isBackgroundHistory)
+            // This binds the context at transcript onset, not a claim that every word
+            // describes that email. Background answers intentionally have no foreground target.
+            var fields = ["response_item_id": item, "turn_id": historyTurnID.uuidString,
+                "queue_revision": String(liveQueueRevision),
+                "attribution": isBackgroundHistory ? "background_context" : "foreground_context"]
+            if let diagnostics {
+                fields["profile_hash"] = diagnostics.target(ProfileRuntime.snapshot?.profileId ?? "default")
+                if !isBackgroundHistory, let key = standingStep.flatMap(LiveEmailPresentation.Key.step) {
+                    fields["target_hash"] = diagnostics.target(MailSelection(account: key.account, messageID: key.messageId).canonical)
+                }
+            }
+            if assistantPresentationFields.count >= 256 { assistantPresentationFields.removeAll() }
+            assistantPresentationFields[item] = fields
+            diagnostics?.record(.presentationBound, fields)
+        }
+    }
 
     func emitFinalTranscript(responseCompleted: Bool = true) {
-        guard let id = currentAssistantItem, id != finalizedAssistantItem,
-              let text = assistantTurns[id], !text.isEmpty else { return }
-        finalizedAssistantItem = id
+        guard let id = currentAssistantItem, let text = assistantTurns[id],
+              !text.isEmpty, finalizedAssistantTexts[id] != text else { return }
+        finalizedAssistantTexts[id] = text
         if responseCompleted, sequentialFeed, terminalFeedReached,
            pendingCoaching == nil, !calendarFeedPending, !slackFeedPending,
            pendingFeedCompletion == nil || pendingFeedCompletion?.asked == true {
             onFeedFocus?(feedFocusTracker.finishTerminalResponse())
             terminalFeedReached = false
         }
-        let transcript = historyTranscripts[historyTurnID, default: TurnTranscript()].finish(item: id, text: text)
-        onAssistantTranscript?(transcript, true)
+        captureAssistantOrigin(id)
+        guard let origin = assistantHistoryOrigins[id] else { return }
+        let transcript = historyTranscripts[origin.id, default: TurnTranscript()].finish(item: id, text: text)
+        let userText = origin.id == historyTurnID ? historyUserText : origin.userText
+        onHistoryReply?(.init(origin: .init(id: origin.id, userText: userText,
+                                           background: origin.background), text: transcript))
+        if origin.id == historyTurnID { onAssistantTranscript?(transcript, true) }
     }
 
     /// Error codes that describe a no-op rather than a broken session, so they are
@@ -2309,6 +2401,12 @@ final class FullDuplexVoiceClient {
     /// A refused handoff leaves the stall recovery enabled.
     var unspokenHandoffThisTurn = false
 
+    struct PendingJobSpeech {
+        let id: UUID
+        let finishedAt: ContinuousClock.Instant
+    }
+    var pendingJobSpeech: PendingJobSpeech?
+
     /// An answer or an outcome waiting to be spoken.
     struct DispatchReport {
         /// Which mechanism produced this, because the two need different framing and
@@ -2350,6 +2448,7 @@ final class FullDuplexVoiceClient {
         /// When it *landed*, which is what the speak-window is measured from. See
         /// `reportSpeakWindow`.
         var landedAt: ContinuousClock.Instant
+        var finishedAt: ContinuousClock.Instant = .now
         /// When it was first held back because the user owed Jo an answer.
         var heldForAnswerSince: ContinuousClock.Instant? = nil
         /// Queue-origin reports wait for a real gap when no later queue step exists.
@@ -2667,6 +2766,45 @@ final class FullDuplexVoiceClient {
         return true
     }
 
+    func performFeedAction(_ action: LiveFastAction, context: FeedActionContext) -> String? {
+        let realtime = Container.shared.realtimeService()
+        guard isActive, !openingHold, !userSpeaking, onboardingFlow == nil,
+              endCueTask == nil, functionCallTask == nil, localTriageForEmailOpening,
+              liveConfiguration?.fastActions?.contains(action.rawValue) == true,
+              let adapter = transport?.liveAdapter else {
+            return "Let the current request finish, then try this action in a Live feed session."
+        }
+        guard realtime.activeConversationId == context.conversationID,
+              ProfileRuntime.snapshot?.profileId == context.profileID,
+              realtime.renderedWorkspace.flatMap(FeedActionContext.init) == context,
+              let step = standingStep, let key = LiveEmailPresentation.Key.step(step),
+              context.selection.matches(account: key.account, messageID: key.messageId),
+              action == .next || key.selectedIDs.count == 1 else {
+            return "The selected email changed. Wait for the current email to appear, then try again."
+        }
+        let id = "button-" + UUID().uuidString
+        guard adapter.beginButtonAction(callId: id, action: action) else {
+            return "Jo is finishing another request. Try again when it finishes."
+        }
+        interrupt()
+        // The visible selection authorizes this click, even if its spoken introduction was interrupted.
+        liveQueueActionAnchor = context.profileID.map { .init(step: step, profileId: $0, revision: liveQueueRevision) }
+        liveFastAnchor = nil
+        liveFastProfileId = context.profileID
+        liveUnheardDelegations.remove(id)
+        liveTurnsBeforeHearing.remove(liveUserTurn)
+        userSpeaking = false
+        liveInputComplete = true
+        toolCalledThisResponse = true
+        latestCompletedUserUtterance = action.requestText
+        historyUserText = action.title + " (button)"
+        onUserTranscript?(historyUserText, true)
+        checkpointHistory()
+        let arguments = action == .next ? [:] : ["message_id": key.messageId, "account": key.account]
+        runFunctionTool(callId: id, name: action.rawValue, argumentsJSON: GmailReadTools.json(arguments))
+        return nil
+    }
+
     private func refuseLiveFunction(_ call: LiveSessionAdapter.Call, reason: String, output: String) {
         diagnostics?.record(.toolFinished, ["call_id": call.id, "tool": call.name, "outcome": "refused",
             "reason": reason, "queue_revision": String(liveQueueRevision), "delegation_id": call.delegation])
@@ -2693,8 +2831,7 @@ final class FullDuplexVoiceClient {
                 output: "Not executed: the current request is to record feedback. Use log_feedback. Earlier mail or calendar actions are not authorized by this feedback request.")
             return
         }
-        if LiveRequestRecovery.refersToCurrentMessage(latestCompletedUserUtterance),
-           let step = liveQueueActionAnchor?.step, let key = LiveEmailPresentation.Key.step(step),
+        if let step = liveQueueActionAnchor?.step, let key = LiveEmailPresentation.Key.step(step),
            let refusal = LiveWriteTarget.refusal(tool: call.name, arguments: call.arguments,
                                                  messageID: key.messageId, account: key.account) {
             refuseLiveFunction(call, reason: "target_mismatch", output: refusal)
@@ -3259,7 +3396,10 @@ final class FullDuplexVoiceClient {
         case .saved(let command):
             let name = command?.keyword ?? keyword
             switch action {
-            case "save", "correct_label":
+            case "correct_label":
+                output = "Saved the label correction to \"\(name)\". Its remaining steps are unchanged. "
+                    + "Confirm the correction is saved; do not ask the same label question again or claim the email has been processed."
+            case "save":
                 output = "Saved. \"\(name)\" is now a command. Say the keyword back "
                     + "to the user and confirm it is ready to use."
             case "delete":

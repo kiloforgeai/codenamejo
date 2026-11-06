@@ -80,6 +80,52 @@ struct CustomCommandRows: Sendable {
         }
     }
 
+    func correctLabel(userId: String, profileId: String, expected: CustomCommand,
+                      actions: [CommandAction]) async throws -> CustomCommand? {
+        let json = String(decoding: try JSONEncoder().encode(actions), as: UTF8.self)
+        return try await pool().write { db in
+            guard var row = try Row.fetchOne(db, sql: """
+                SELECT * FROM custom_command WHERE user_id = ? AND profile_id = ? AND id = ?
+                """, arguments: [userId, profileId, expected.id]), row.value == expected else { return nil }
+            row.actions = json
+            try row.update(db)
+            return row.value
+        }
+    }
+
+    enum EditError: LocalizedError {
+        case changed, duplicate
+        var errorDescription: String? {
+            switch self {
+            case .changed: return "This command changed while you were editing. Reopen it to see the latest version."
+            case .duplicate: return "Another command already uses that phrase. Choose a different phrase."
+            }
+        }
+    }
+
+    func edit(userId: String, profileId: String, expected: CustomCommand?, keyword: String,
+              spoken: String, label: String, actions: [CommandAction]) async throws -> CustomCommand {
+        let json = String(decoding: try JSONEncoder().encode(actions), as: UTF8.self)
+        return try await pool().write { db in
+            let existing = try Row.fetchOne(db, sql: """
+                SELECT * FROM custom_command WHERE user_id = ? AND profile_id = ? AND id = ?
+                """, arguments: [userId, profileId, expected?.id ?? ""])
+            if let expected, existing?.value != expected { throw EditError.changed }
+            let collision = try Row.fetchOne(db, sql: """
+                SELECT * FROM custom_command WHERE user_id = ? AND profile_id = ? AND keyword = ?
+                """, arguments: [userId, profileId, keyword])
+            if let collision, collision.id != expected?.id { throw EditError.duplicate }
+            var row = existing ?? Row(user_id: userId, profile_id: profileId, id: UUID().uuidString,
+                keyword: keyword, spoken: spoken, instruction: label, actions: json, enabled: true, created_at: Date())
+            row.keyword = keyword
+            row.spoken = spoken
+            row.instruction = label
+            row.actions = json
+            try row.save(db)
+            return row.value
+        }
+    }
+
     /// Exact keyword only. Nil when nothing matched — the caller refuses rather than reporting success.
     func delete(userId: String, profileId: String, keyword: String) async throws -> CustomCommand? {
         try await pool().write { db in

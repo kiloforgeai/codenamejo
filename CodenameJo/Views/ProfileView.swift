@@ -106,12 +106,12 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
                     accountHeaderSection
                     #if targetEnvironment(macCatalyst)
                     Section {
-                        NavigationLink { ProfileConnectionsSummaryComponent.make() } label: {
+                        NavigationLink { DesktopConnectionsComponent.make() } label: {
                             SettingsRow.label("Connections", icon: "link", detail: "Manage your email, Slack, and other connected services.")
                         }
                             .accessibilityIdentifier("settings_connections")
                         NavigationLink { FeedOrderComponent.make() } label: {
-                            SettingsRow.label("Feed order", icon: "line.3.horizontal.decrease", detail: "Drag your inboxes into the order you want to work through them.")
+                            SettingsRow.label("Feed sections", icon: "line.3.horizontal.decrease", detail: "Choose which mail, calendar, and Slack sections appear, and drag them into order.")
                         }.accessibilityIdentifier("settings_feed_order")
                     } header: {
                         SettingsRow.header("Your workspace")
@@ -128,7 +128,7 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
                         NavigationLink("Commands") { CustomCommandsComponent.make() }
                             .accessibilityIdentifier("settings_commands")
                     } footer: {
-                        Text("Words you've saved by voice, and the steps each one runs.")
+                        Text("View built-in actions. Add, edit, or pause your saved commands.")
                     }
                     notificationsSection
                     // Only drawn once there is a mailbox to list.

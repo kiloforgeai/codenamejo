@@ -2,6 +2,46 @@ import XCTest
 @testable import CodenameJo
 
 final class LiveRequestRecoveryTests: XCTestCase {
+    func testAskingAboutAnActionDoesNotRequestThatAction() {
+        for text in ["How can you archive this?", "Can you explain how to delete an email?",
+                     "Could you tell me what archive means?", "What is next?", "No archive", "Okay, no archive",
+                     "Uh, so what w- what's his email?", "Can I create a new command?",
+                     "Please record feedback: archive did not work."] {
+            XCTAssertFalse(LiveRequestRecovery.requiresQueueAction(text), text)
+        }
+        for text in ["Can you archive this?", "Could you please archive this?", "Just archive that",
+                     "You can delete it", "Okay, let's archive this", "Go ahead and archive it",
+                     "I want you to label this", "Move on", "Go to next email"] {
+            XCTAssertTrue(LiveRequestRecovery.requiresQueueAction(text), text)
+        }
+        XCTAssertTrue(LiveRequestRecovery.isCorrection("No, skip it"))
+        XCTAssertTrue(LiveRequestRecovery.isCorrection("Actually, don't do that"))
+        XCTAssertFalse(LiveRequestRecovery.isCorrection("Can you explain this?"))
+    }
+
+    @MainActor
+    func testInformationAndFeedbackNeverArmTheLiveMailWatchdog() async throws {
+        for question in ["How can you archive this?", "Uh, so what w- what's his email?",
+                         "Can I create a new command?", "Feedback: archive did not work"] {
+            let adapter = LiveSessionAdapter(wire: { _ in }, emit: { _ in })
+            adapter.receive(try JSONSerialization.data(withJSONObject: ["type": "session.started"]))
+            adapter.receive(try JSONSerialization.data(withJSONObject: ["type": "session.input_transcript.delta",
+                "delta": question, "start_ms": 100, "end_ms": 500]))
+            try await Task.sleep(for: .milliseconds(1100))
+            XCTAssertFalse(adapter.hasUnresolvedQueueAction, question)
+            adapter.observePlayback(0)
+            XCTAssertFalse(adapter.hasUnresolvedQueueAction, question)
+            adapter.close()
+        }
+        let adapter = LiveSessionAdapter(wire: { _ in }, emit: { _ in })
+        defer { adapter.close() }
+        adapter.receive(try JSONSerialization.data(withJSONObject: ["type": "session.started"]))
+        adapter.receive(try JSONSerialization.data(withJSONObject: ["type": "session.input_transcript.delta",
+            "delta": "Please archive this", "start_ms": 100, "end_ms": 500]))
+        try await Task.sleep(for: .milliseconds(1100))
+        XCTAssertTrue(adapter.hasUnresolvedQueueAction, "An unhandled explicit write still needs recovery")
+    }
+
     func testOnlyStandaloneNoiseCanExpireWithoutAssessment() {
         for text in ["Mm-hmm", "�", "Um.", "Hmm"] {
             XCTAssertTrue(LiveRequestRecovery.isBackchannel(text), text)

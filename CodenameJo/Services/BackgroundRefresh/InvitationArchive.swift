@@ -39,7 +39,11 @@ enum InvitationArchive {
                 return .init(text: receipt.text + " The email was kept: its invitation did not match the accepted event.", ok: false)
             }
             if mail.labelIds?.contains("INBOX") == false {
-                return .init(text: receipt.text + " The invitation email is already archived.", ok: true)
+                // A previous write may have committed before its response was lost. Reconcile
+                // the queue from the verified provider state without issuing another mutation.
+                let effect = GmailWriteEffect(account: source, scope: "message", threadId: mail.threadId,
+                    messageIds: [message], messageIdsComplete: true, operation: "modify", removeLabelIds: ["INBOX"])
+                return .init(text: receipt.text + " The invitation email is already archived.", ok: true, effects: [effect])
             }
             try Task.checkCancellation()
             let effects = GmailManageTools.Effects()

@@ -12,7 +12,8 @@ final class SessionExportRegressionTests: XCTestCase {
             profileId: "private-profile", userId: "private-owner@example.test", conversationId: conversation,
             turnId: turn.uuidString, receipts: [.init(callId: "call-1", tool: "archive_message", outcome: "success", targetHash: target)],
             historyOwner: "private-owner@example.test:profile:private-profile",
-            operation: .init(tool: "archive_message", account: "private-owner@example.test", messageID: "private-message-id"))
+            operation: .init(tool: "archive_message", account: "private-owner@example.test", messageID: "private-message-id"),
+            foregroundContinuation: true)
         let feedback: [String: Any] = ["event": "userFeedback", "feedback_id": "feedback-1",
             "conversation_id": conversation.uuidString, "user_id": "private-owner@example.test",
             "profile_id": "private-profile", "message": "Private feedback about an email", "source": "button",
@@ -34,6 +35,7 @@ final class SessionExportRegressionTests: XCTestCase {
         let jobRow = try XCTUnwrap(rows.first { $0["event"] as? String == "job_metadata" }?["record"] as? [String: Any])
         XCTAssertEqual(note["owner_hash"] as? String, jobRow["owner_hash"] as? String)
         XCTAssertEqual(note["profile_hash"] as? String, jobRow["profile_hash"] as? String)
+        XCTAssertEqual(jobRow["foregroundContinuation"] as? Bool, true)
         let full = String(decoding: try SessionExport.append(records: [record], jobs: [work], to: logs, includeContent: true), as: UTF8.self)
         XCTAssertTrue(full.contains("Private feedback"))
         XCTAssertTrue(full.contains("Private request"))

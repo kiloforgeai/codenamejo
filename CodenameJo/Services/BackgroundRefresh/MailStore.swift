@@ -1024,6 +1024,27 @@ struct MailStore: Sendable {
         }
     }
 
+    /// The exact important section, scoped to a mailbox even when Gmail IDs collide.
+    func importantFeedIDs(among ids: [String], account: String) async -> Set<String>? {
+        guard !ids.isEmpty else { return [] }
+        guard let dbPool else { return nil }
+        do {
+            return try await dbPool.read { db in
+                Set(try String.fetchAll(db, sql: """
+                    SELECT m.id FROM \(Message.databaseTableName) m
+                    WHERE m.user_id = \(ownerSQL) AND lower(m.account) = lower(?)
+                      AND m.id IN (\(ids.map { _ in "?" }.joined(separator: ",")))
+                      AND m.importanceBand = 'high' AND \(Self.importantWeekSQL)
+                      AND EXISTS (SELECT 1 FROM \(Label.databaseTableName) l
+                          WHERE l.user_id = m.user_id AND l.account = m.account AND l.messageId = m.id AND l.label = 'INBOX')
+                    """, arguments: StatementArguments([account] + ids + [String(Self.importantSince())])))
+            }
+        } catch {
+            RealtimeLog.log("feed: importance lookup failed — \(error.localizedDescription)")
+            return nil
+        }
+    }
+
     /// Which of these are still in the important scope, so a restored queue skips archived, answered or aged-out mail.
     func importantIds(among ids: [String]) async -> Set<String>? {
         guard !ids.isEmpty else { return [] }

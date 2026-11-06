@@ -6,6 +6,33 @@ enum LiveFastAction: String {
     case spam = "mark_spam"
     case next = "triage_next"
 
+    static let buttons: [Self] = [.archive, .next, .trash, .spam]
+    var requestText: String { self == .trash ? "trash this" : title }
+    var title: String {
+        switch self {
+        case .archive: return "Archive"
+        case .next: return "Next"
+        case .trash: return "Move to Trash"
+        case .spam: return "Mark as Spam"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .archive: return "archivebox"
+        case .next: return "forward.end"
+        case .trash: return "trash"
+        case .spam: return "exclamationmark.shield"
+        }
+    }
+    var explanation: String {
+        switch self {
+        case .archive: return "Archive the current email and continue through the feed."
+        case .next: return "Continue to the next email without changing this one."
+        case .trash: return "Move the current email to Trash."
+        case .spam: return "Mark the current email as spam."
+        }
+    }
+
     static func parse(_ transcript: String) -> Self? {
         var text = transcript.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         let requestQuestion = text.hasSuffix("?") && ["can you ", "could you ", "would you "]
@@ -24,12 +51,12 @@ enum LiveFastAction: String {
         while let prefix = prefixes.first(where: { text.hasPrefix($0) }) {
             text.removeFirst(prefix.count)
         }
-        while let suffix = [" please", " for me", " as well", " too"].first(where: { text.hasSuffix($0) }) {
+        while let suffix = [" please", " for me", " as well", " too", " now"].first(where: { text.hasSuffix($0) }) {
             text.removeLast(suffix.count)
         }
         switch text {
         case "archive", "archive it", "archive this", "archive that", "archive this one", "archive that one",
-             "archive this email", "archive that email": return .archive
+             "archive this email", "archive that email", "archive this message", "archive that message": return .archive
         case "mark as spam", "mark it as spam", "mark this as spam", "mark that as spam",
              "mark this email as spam", "mark that email as spam", "report spam", "report it as spam",
              "report this as spam", "report this email as spam", "this is spam", "that's spam",

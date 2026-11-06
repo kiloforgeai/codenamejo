@@ -49,6 +49,15 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             Button("OK") { viewModel.diagnosticsError = nil }
         } message: { Text(viewModel.diagnosticsError ?? "") }
         .sheet(isPresented: $viewModel.showingFeedback) { feedbackSheet }
+        .sheet(isPresented: $viewModel.showingCommands) {
+            NavigationStack {
+                CustomCommandsComponent.make()
+                    .toolbar { ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { viewModel.showingCommands = false }
+                    } }
+            }.frame(minWidth: 700, idealWidth: 760, minHeight: 660)
+        }
+        .onChange(of: viewModel.feedActionContext) { _, _ in viewModel.feedActionError = nil }
         .sheet(isPresented: $viewModel.showingSettings) {
             NavigationStack { ProfileViewComponent.make(onClose: { viewModel.showingSettings = false }) }
                 .frame(minWidth: 760, idealWidth: 840, minHeight: 700, idealHeight: 820)
@@ -57,6 +66,7 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             NavigationStack { HistoryViewComponent.make(onClose: { viewModel.showingHistory = false }) }
                 .frame(minWidth: 680, minHeight: 600)
         }
+        .onChange(of: viewModel.selectedJob?.id) { _, _ in viewModel.resultSelectionError = nil }
         .sheet(item: $viewModel.selectedJob) { job in
             NavigationStack {
                 ScrollView {
@@ -64,6 +74,29 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                         Text(job.task).font(.title2.weight(.medium))
                         Label(jobStatus(job), systemImage: job.didFail ? "exclamationmark.triangle" : "bolt.horizontal.circle")
                             .foregroundStyle(.secondary)
+                        if let origin = job.origin {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Source email").font(.caption).foregroundStyle(.secondary)
+                                Text(origin.subject).font(.headline)
+                                Text(origin.sender).textSelection(.enabled)
+                                Text(origin.account).font(.caption).foregroundStyle(.secondary)
+                                if job.hasStopped() {
+                                    Button("Work on this email") { interactor.selectReturnedResult(job.id) }
+                                        .buttonStyle(.borderedProminent)
+                                        .disabled(!viewModel.inSession || viewModel.selectingResult)
+                                        .accessibilityIdentifier("workOnReturnedEmail")
+                                    Text(viewModel.inSession
+                                        ? "Your place in the feed is kept while you work on this result."
+                                        : "Start a session, then select this email to continue its work.")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                            }.padding(20).frame(maxWidth: .infinity, alignment: .leading)
+                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                        } else if job.hasStopped() {
+                            Text("This result has no saved source email. Select the intended email before acting.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        if let error = viewModel.resultSelectionError { Text(error).foregroundStyle(.red) }
                         Text(job.result ?? (job.hasStopped()
                             ? "This job stopped reporting. Its outcome is unknown. Ask Jo to check before trying it again."
                             : "This job is still running. Its result will appear here."))
@@ -110,6 +143,8 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             }.buttonStyle(.borderless).padding(.leading, 16)
             Button { viewModel.showingSettings = true } label: { Image(systemName: "gearshape").padding(8) }
                 .buttonStyle(.plain).accessibilityLabel("Settings and connections")
+            Button { viewModel.showingCommands = true } label: { Label("Commands", systemImage: "command") }
+                .buttonStyle(.borderless).accessibilityIdentifier("desktopCommands")
             Button(action: interactor.showFeedback) { Label("Feedback", systemImage: "bubble.left.and.text.bubble.right") }
                 .buttonStyle(.borderless).accessibilityIdentifier("desktopFeedback")
                 .help("Leave feedback about Jo")
@@ -159,24 +194,49 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             HStack {
                 Text("WORK FEED").font(.system(size: 11, weight: .semibold)).tracking(1.8)
                 Spacer()
-                Text("\(viewModel.queue.count)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                if !viewModel.inSession && viewModel.previewRefreshing {
+                    ProgressView().controlSize(.mini).accessibilityLabel("Refreshing work feed")
+                }
+                Text(viewModel.feedCountLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    .accessibilityIdentifier("desktopFeedCount")
+                    .help(viewModel.inSession ? "Items prepared for this session" : "Approximate inbox messages and unread Slack conversations. The preview shows a limited selection.")
             }.padding(.horizontal, 22).padding(.top, 25).padding(.bottom, 18)
             Picker("Filter prepared work", selection: $viewModel.filter) {
                 Text("All").tag("All")
                 Text("Email").tag("Email")
                 Text("Slack").tag("Slack")
-            }.pickerStyle(.segmented).padding(.horizontal, 18).padding(.bottom, 18)
+                Text("Calendar").tag("Calendar")
+            }.pickerStyle(.menu).padding(.horizontal, 18).padding(.bottom, 18)
+            if !viewModel.inSession {
+                Text(viewModel.feedPreview?.incomplete == true
+                     ? "Some sources couldn’t refresh. Showing available work; counts may be incomplete."
+                     : "Inbox preview · refreshes every 2 min")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .padding(.horizontal, 22).padding(.bottom, 14)
+                    .accessibilityIdentifier("desktopFeedPreviewStatus")
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
                     if viewModel.filteredQueue.isEmpty {
                         feedEmptyState
                     }
-                    ForEach(viewModel.filteredQueue) { row in
+                    ForEach(Array(viewModel.filteredQueue.enumerated()), id: \.element.id) { index, row in
+                        if let section = row.section,
+                           index == 0 || viewModel.filteredQueue[index - 1].section?.id != section.id {
+                            VStack(alignment: .leading, spacing: 5) {
+                                if index > 0 { Divider().padding(.vertical, 8) }
+                                Label(section.title, systemImage: section.symbol)
+                                    .font(.system(size: 12, weight: .semibold))
+                                if let account = section.account {
+                                    Text(account).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                }
+                            }.padding(.horizontal, 5).padding(.top, 6).padding(.bottom, 5)
+                                .accessibilityIdentifier("feedSection_\(section.id)")
+                        }
                         VStack(alignment: .leading, spacing: 8) {
                             Label(row.source, systemImage: row.symbol)
                                 .font(.system(size: 10, weight: .semibold)).foregroundStyle(Desk.accent)
-                            if case .email(let email) = viewModel.focus,
-                               row.selection?.matches(account: email.account, messageID: email.messageId ?? "") == true {
+                            if let selected = viewModel.presentedSelection, row.selection == selected {
                                 Text("CURRENT").font(.caption2.weight(.semibold)).foregroundStyle(Desk.accent)
                             }
                             Text(row.title).font(.system(size: 14, weight: .medium)).lineLimit(2)
@@ -201,18 +261,21 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
 
     private var feedEmptyState: some View {
         let done = viewModel.feedComplete
-        let unavailable = viewModel.queueStatus == .unavailable
-        let filtered = !viewModel.queue.isEmpty
+        let unavailable = viewModel.inSession ? viewModel.sessionFeed.status == .unavailable : viewModel.feedPreview?.incomplete == true
+        let filtered = !viewModel.feedRows.isEmpty
+        let loading = viewModel.inSession || viewModel.feedPreview == nil
         return VStack(alignment: .leading, spacing: 14) {
             Image(systemName: done ? "checkmark.seal.fill" : unavailable ? "exclamationmark.triangle" : "tray")
                 .font(.system(size: done ? 42 : 26)).foregroundStyle(done ? Desk.accent : Color.secondary)
-            Text(done ? "You’re done." : unavailable ? "Couldn’t load the feed" : filtered ? "No \(viewModel.filter.lowercased()) here" : viewModel.inSession ? "Preparing your feed" : "A little room to think.")
+            Text(done ? "You’re done." : unavailable ? "Couldn’t refresh the feed" : filtered ? "No \(viewModel.filter.lowercased()) here" : loading ? "Checking your work" : "Nothing waiting.")
                 .font(.system(size: done ? 26 : 16, weight: .medium, design: done ? .serif : .default))
             Text(done ? "Nice work. You’ve worked through the selected feed. Take a breath."
-                 : unavailable ? "Your place is saved. Ask Jo to try loading the next items again."
+                 : unavailable ? (viewModel.inSession ? "Your place is saved. Ask Jo to try loading the next items again."
+                    : "Check your connections in Settings. Jo will try again in the background.")
                  : filtered ? "Choose All to see the rest of your prepared work."
-                 : viewModel.inSession ? "Next items are loading in the background."
-                 : "Start a session to bring your email, Slack, and unfinished work into focus.")
+                 : loading ? (viewModel.inSession ? "Next items are loading in the background."
+                    : "Your feed is loading in the background. You can start a session whenever you’re ready.")
+                 : "Your connected inboxes and Slack have no work waiting. Jo will keep checking in the background.")
                 .font(.system(size: 13)).foregroundStyle(.secondary).lineSpacing(4)
         }.padding(18).accessibilityIdentifier(done ? "feedComplete" : "feedEmptyState")
     }
@@ -224,8 +287,9 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                     Label(viewModel.inSession ? "IN FOCUS" : "LET’S GET TO IT", systemImage: "viewfinder")
                         .font(.system(size: 10, weight: .semibold)).tracking(1.7).foregroundStyle(Desk.accent)
                     Spacer()
-                    if !viewModel.selectionIsTransitioning, case .email(let email) = viewModel.focus {
-                        Text("\(email.position)\(email.total.map { " / \($0)" } ?? "")")
+                    if !viewModel.selectionIsTransitioning, case .email(let email) = viewModel.focus,
+                       let position = email.displayedPosition {
+                        Text("\(position)\(email.displayedTotal.map { " / \($0)" } ?? "")")
                             .font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary)
                     }
                 }
@@ -243,15 +307,26 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                         Text(viewModel.inSession ? "One thing at a time." : "Less clicking.\nMore getting it done.")
                             .font(.system(size: 42, weight: .regular, design: .serif)).tracking(-1.1)
                         Text(viewModel.inSession
-                            ? "Tell Jo what you want to work through. Your current task and its context will appear here."
-                            : "Jo brings you the next task. Talk it through, let Jo do the work, and keep moving.")
+                            ? (viewModel.sessionIntent == .feed
+                                ? "Jo is getting your next feed item ready. Its details will appear here."
+                                : "Tell Jo what you need done. Your request and its context will appear here.")
+                            : "Start a session to go straight into your feed. Jo brings you the next task, and you talk it through together.")
                             .font(.system(size: 16)).foregroundStyle(.secondary).lineSpacing(6).frame(maxWidth: 460, alignment: .leading)
                     }.padding(.vertical, 20)
                     if !viewModel.inSession {
-                        Button(action: interactor.toggleSession) {
-                            Label("Start a work session", systemImage: "waveform")
-                                .font(.system(size: 14, weight: .semibold)).padding(.horizontal, 16).padding(.vertical, 9)
-                        }.buttonStyle(.borderedProminent)
+                        HStack(spacing: 12) {
+                            Button(action: interactor.toggleSession) {
+                                Label("Start a work session", systemImage: "waveform")
+                                    .font(.system(size: 14, weight: .semibold)).padding(.horizontal, 16).padding(.vertical, 9)
+                            }.buttonStyle(.borderedProminent)
+                                .accessibilityIdentifier("desktopStartFeed")
+                            Button(action: interactor.quickAction) {
+                                Label("Quick action", systemImage: "bolt")
+                                    .font(.system(size: 14, weight: .medium)).padding(.vertical, 9)
+                            }.buttonStyle(.bordered)
+                                .help("Ask Jo for one thing without starting the feed.")
+                                .accessibilityIdentifier("desktopQuickAction")
+                        }
                         HStack(spacing: 22) {
                             Label("Email", systemImage: "envelope")
                             Label("Slack", systemImage: "number")
@@ -259,6 +334,7 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                         }.font(.system(size: 12)).foregroundStyle(.secondary).padding(.top, 12)
                     }
                 }
+                if viewModel.inSession, case .email = viewModel.focus { feedActions }
                 if !viewModel.userWords.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         caption("YOU")
@@ -285,6 +361,35 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                 }
                 Spacer(minLength: 25)
             }.padding(36).frame(maxWidth: 820, alignment: .leading).frame(maxWidth: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private var feedActions: some View {
+        let context = viewModel.feedActionContext
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                ForEach([LiveFastAction.archive, .next], id: \.rawValue) { action in
+                    Button {
+                        if let context { interactor.performFeedAction(action, context: context) }
+                    } label: { Label(action.title, systemImage: action.symbol).padding(.vertical, 5) }
+                        .buttonStyle(.bordered).help(action.explanation)
+                        .accessibilityIdentifier("feedAction-\(action.rawValue)")
+                }
+                Menu("More", systemImage: "ellipsis") {
+                    ForEach([LiveFastAction.trash, .spam], id: \.rawValue) { action in
+                        Button(role: .destructive) {
+                            if let context { interactor.performFeedAction(action, context: context) }
+                        } label: { Label(action.title, systemImage: action.symbol) }
+                    }
+                }.menuStyle(.borderlessButton).fixedSize()
+            }
+            .disabled(context == nil || viewModel.state == .processing)
+            if let error = viewModel.feedActionError {
+                Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.red).font(.callout)
+            } else if context != nil, viewModel.requestedActionContext == context {
+                Text("Action requested · follow its result in Live Activity").font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -383,7 +488,9 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     if viewModel.steps.isEmpty {
-                        Label(viewModel.inSession ? "Ready for your direction" : "Nothing running yet", systemImage: "circle.dotted")
+                        Label(viewModel.inSession
+                            ? (viewModel.sessionIntent == .feed ? "Preparing your feed" : "Ready for your request")
+                            : "Nothing running yet", systemImage: "circle.dotted")
                             .font(.system(size: 13)).foregroundStyle(.secondary)
                     }
                     ForEach(viewModel.steps) { step in
@@ -457,6 +564,8 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                 .accessibilityIdentifier("desktopTestSpeaker")
                 Button(action: interactor.toggleSession) { Label("Start session", systemImage: "play.fill") }
                     .buttonStyle(.borderedProminent)
+                    .help("Begin working through your feed.")
+                    .accessibilityIdentifier("desktopStartFeedBar")
             }
         }.padding(.horizontal, 26).frame(height: 88).background(Desk.inset.opacity(0.3))
     }

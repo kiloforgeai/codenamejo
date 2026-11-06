@@ -70,6 +70,12 @@ extension Container {
 
     var workspaceProfiles: Factory<WorkspaceProfileStore> { self { MainActor.assumeIsolated { WorkspaceProfileStore() } }.singleton }
 
+    #if targetEnvironment(macCatalyst)
+    var desktopFeedPreview: Factory<DesktopFeedPreview> {
+        self { MainActor.assumeIsolated { DesktopFeedPreview() } }.singleton
+    }
+    #endif
+
     var contactStore: Factory<ContactStore> {
         self { ContactStore(database: Container.shared.localContext().dbPool) }
     }

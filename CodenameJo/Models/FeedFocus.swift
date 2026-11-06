@@ -24,6 +24,9 @@ enum FeedFocus: Hashable, Sendable {
         var threadId: String? = nil
         var isBackgroundResult = false
 
+        var displayedPosition: Int? { isBackgroundResult ? nil : position }
+        var displayedTotal: Int? { isBackgroundResult ? nil : total }
+
         var pageTotal: Int? {
             guard let total, total > 0 else { return nil }
             let pageEnd = ((max(position, 1) - 1) / LocalTriageQueue.pageSize + 1)

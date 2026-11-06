@@ -37,8 +37,9 @@ final class DispatchWorkerTests: XCTestCase {
     }
 
     func testReceiptsNeedAnExplicitCompletionRecord() {
-        XCTAssertEqual(DispatchWorker.actionResult(#"{"completed":true,"report":"  Archived it.\n"}"#, writeFailed: false).text, "Archived it.")
-        XCTAssertTrue(DispatchWorker.actionResult(#"{"completed":true,"report":"Archived it."}"#, writeFailed: false).ok)
+        XCTAssertEqual(DispatchWorker.actionResult(#"{"completed":true,"report":"  Archived it.\n"}"#, writeFailed: false, writeSucceeded: true).text, "Archived it.")
+        XCTAssertTrue(DispatchWorker.actionResult(#"{"completed":true,"report":"Archived it."}"#, writeFailed: false, writeSucceeded: true).ok)
+        XCTAssertFalse(DispatchWorker.actionResult(#"{"completed":true,"report":"Archived it."}"#, writeFailed: false).ok)
         XCTAssertFalse(DispatchWorker.actionResult(#"{"completed":true,"report":"Sent."}"#, writeFailed: true).ok)
         XCTAssertFalse(DispatchWorker.actionResult(#"{"completed":false,"report":"Need the address."}"#, writeFailed: false).ok)
         for raw in [#"{"completed":true,"report":"#, "Done.", "", "null", "[]", "true", #"{"completed":true,"report":" "}"#] {

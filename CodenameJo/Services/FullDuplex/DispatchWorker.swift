@@ -48,6 +48,12 @@ enum DispatchWorker {
     @MainActor
     static func run(_ job: Job, request: Request? = nil) async -> FullDuplexBroker.DispatchOutcome {
         let store = Container.shared.dispatchJobs()
+        if let previous = store.jobWithCommittedWrite(job.id, profileID: job.profileId) {
+            let status: CommandRecord.CommandStatus = previous.isDone ? .success : previous.isRunning && !previous.hasStopped() ? .pending : .partial
+            return .init(text: (previous.result ?? "This job already recorded a completed external write.")
+                + " Do not repeat its committed actions. Check only any remaining work.",
+                ok: previous.isDone ? true : nil, reportBack: previous.reportBack ?? !previous.isDone, status: status)
+        }
         if let operation = job.operation,
            let previous = store.previousOperation(operation, profileID: job.profileId) {
             if previous.isRunning, !previous.hasStopped() {
@@ -62,7 +68,7 @@ enum DispatchWorker {
                     query: ["format": "minimal", "fields": "id,labelIds"], token: token)
                 if let labels = current["labelIds"] as? [String], !labels.contains("INBOX") {
                     if !previous.isDone {
-                        await store.receipt(previous.id, callId: "reconciled-" + previous.id.uuidString, tool: operation.tool, failed: false)
+                        await store.receipt(previous.id, callId: "reconciled-" + previous.id.uuidString, tool: operation.tool, failed: false, targetHash: receiptTarget(job, operation.arguments))
                         await store.finish(previous.id, state: "done", result: "Gmail confirms that email is archived.", reportBack: false)
                     }
                     job.diagnostics?.record(.jobInjected, ["job_id": previous.id.uuidString, "outcome": "reused_receipt"])
@@ -76,7 +82,8 @@ enum DispatchWorker {
                     ok: nil, status: .unknown)
             }
         }
-        await store.begin(id: job.id, task: job.task, profileId: job.profileId, conversationId: job.diagnostics?.conversationID, turnId: job.turnID, operation: job.operation)
+        await store.begin(id: job.id, task: job.task, profileId: job.profileId, conversationId: job.diagnostics?.conversationID, turnId: job.turnID, operation: job.operation,
+            origin: job.scope == .independent ? nil : DispatchJob.MailOrigin.from(target(standingOnJSON: job.standingOnJSON, facts: job.facts)))
         let started = Date()
         job.diagnostics?.record(.jobStarted, ["job_id": job.id.uuidString, "turn_id": job.turnID ?? "unknown"])
         var outcome = "unknown"
@@ -108,7 +115,7 @@ enum DispatchWorker {
                     return .init(text: text, ok: nil, status: .pending)
                 }
                 let failed = result.ok != true
-                await store.receipt(job.id, callId: callID, tool: operation.tool, failed: failed)
+                await store.receipt(job.id, callId: callID, tool: operation.tool, failed: failed, targetHash: receiptTarget(job, operation.arguments))
                 if failed, result.effects?.isEmpty == false {
                     performed.append(.init(tool: operation.tool, summary: "Gmail confirmed part of the archive",
                         failed: false, target: VoiceDiagnostics.targetIdentity(arguments: operation.arguments)))
@@ -147,7 +154,7 @@ enum DispatchWorker {
                 + "\(Int(Date().timeIntervalSince(started) * 1000))ms — \(error.localizedDescription)")
             // An unreachable OpenAI or a missing key, with nothing done, leaves no row: a note retries later.
             let unreached = !cancelled && !wrote && (error is URLError || error is LiveOpenAI.MissingKey)
-            if unreached { await store.discard(job.id) } else { await store.finish(job.id, state: wrote ? "partial" : "failed", result: row) }
+            if unreached { await store.discard(job.id) } else { await store.finish(job.id, state: wrote ? "partial" : "failed", result: row, historyStatus: status) }
             return FullDuplexBroker.DispatchOutcome(text: row + relay, ok: false, recorded: !unreached, status: status)
         }
     }
@@ -163,7 +170,7 @@ enum DispatchWorker {
                 result.text += " Action record: " + performed.map { $0.failed ? "\($0.summary) failed" : $0.summary }
                     .joined(separator: "; ") + "."
             }
-            await store.finish(job.id, state: result.ok ? "done" : performed.contains(where: { !$0.failed }) ? "partial" : "failed", result: result.text, reportBack: !result.ok)
+            await store.finish(job.id, state: result.ok ? "done" : performed.contains(where: { !$0.failed }) ? "partial" : "failed", result: result.text, reportBack: !result.ok, foregroundContinuation: result.foregroundQueue)
             RealtimeLog.log("dispatch: \(job.id) \(result.ok ? "done silently" : "failed") in \(ms)ms")
             return FullDuplexBroker.DispatchOutcome(text: result.text, ok: result.ok, reportBack: !result.ok, status: result.ok ? .success : performed.contains(where: { !$0.failed }) ? .partial : .failed)
         }
@@ -198,18 +205,27 @@ enum DispatchWorker {
     }
 
     /// A receipt job's structured report; anything unparseable must surface as unfinished.
-    static func actionResult(_ raw: String, writeFailed: Bool, writeSucceeded: Bool = false) -> (text: String, ok: Bool) {
+    static func actionResult(_ raw: String, writeFailed: Bool, writeSucceeded: Bool = false) -> (text: String, ok: Bool, foregroundQueue: Bool) {
         if let data = raw.data(using: .utf8),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let completed = json["completed"] as? Bool,
            let report = (json["report"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !report.isEmpty {
             let queueOnly = json["remaining_work"] as? String == "foreground_queue"
             if queueOnly, writeSucceeded, !writeFailed {
-                return ("The external action completed. Foreground queue continuation remains with the live session.", true)
+                return ("The external action completed. Foreground queue continuation remains with the live session.", true, true)
             }
-            return (report, completed && !writeFailed)
+            if completed, !writeSucceeded {
+                return ("No confirmed external write was recorded. This job's completion claim needs checking before retrying.", false, queueOnly)
+            }
+            return (report, completed && writeSucceeded && !writeFailed, queueOnly)
         }
-        return ("That job did not confirm that all the requested work finished. Its outcome needs checking.", false)
+        return ("That job did not confirm that all the requested work finished. Its outcome needs checking.", false, false)
+    }
+
+    private static func receiptTarget(_ job: Job, _ arguments: String) -> String? {
+        guard let identity = VoiceDiagnostics.targetIdentity(arguments: arguments) else { return nil }
+        return job.diagnostics?.target(identity) ?? SHA256.hash(data: Data((job.id.uuidString + identity).utf8))
+            .map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: - The loop
@@ -338,6 +354,7 @@ enum DispatchWorker {
                 let callId = call["call_id"] as? String ?? ""
                 let raw = call["arguments"] as? String ?? "{}"
                 let result: Execution
+                var executedArguments = raw
                 let toolStarted = ProcessInfo.processInfo.systemUptime
                 job.diagnostics?.record(.toolStarted, ["job_id": job.id.uuidString, "call_id": callId, "tool": name,
                     "target_hash": job.diagnostics?.target(VoiceDiagnostics.targetIdentity(arguments: raw) ?? "unspecified") ?? "unknown"])
@@ -357,7 +374,12 @@ enum DispatchWorker {
                         args["account"] = label.account
                     }
                     let json = String(decoding: (try? JSONSerialization.data(withJSONObject: args)) ?? Data("{}".utf8), as: UTF8.self)
-                    if let cursor, let refusal = LiveWriteTarget.refusal(tool: name, arguments: json,
+                    executedArguments = json
+                    if LiveWriteTarget.mailWrites.contains(ToolNarration.canonical(name)),
+                       job.scope != .independent, target == nil,
+                       job.standingOnJSON != nil || job.facts.contains(where: { $0.hasPrefix("Current queue context, not a resolved action target.") }) {
+                        result = ("Not executed: the job's confirmed email context is invalid. Do not replace it with another message.", true, true, false)
+                    } else if let cursor, let refusal = LiveWriteTarget.refusal(tool: name, arguments: json,
                         messageID: cursor.messageId, account: cursor.account) {
                         result = (refusal, true, true, false)
                     } else {
@@ -373,9 +395,9 @@ enum DispatchWorker {
                     throw PendingStep(message: "This action is queued for retry and has not been confirmed. Later command steps were not run. " + result.output)
                 }
                 if result.write {
-                    await Container.shared.dispatchJobs().receipt(job.id, callId: callId, tool: name, failed: result.failed)
+                    await Container.shared.dispatchJobs().receipt(job.id, callId: callId, tool: name, failed: result.failed, targetHash: receiptTarget(job, executedArguments))
                     let line = result.output.split(separator: "\n").first.map(String.init) ?? name
-                    performed(Performed(tool: name, summary: String(line.prefix(200)), failed: result.failed, target: VoiceDiagnostics.targetIdentity(arguments: raw)))
+                    performed(Performed(tool: name, summary: String(line.prefix(200)), failed: result.failed, target: VoiceDiagnostics.targetIdentity(arguments: executedArguments)))
                 }
                 job.diagnostics?.record(.toolFinished, ["job_id": job.id.uuidString, "call_id": callId, "tool": name,
                     "outcome": result.failed ? "failed" : "success",

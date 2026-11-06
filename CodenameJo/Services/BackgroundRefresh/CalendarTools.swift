@@ -133,11 +133,11 @@ enum CalendarTools {
                 connected = connected.filter { $0.caseInsensitiveCompare(named) == .orderedSame }
             }
         }
-        let receipt: ([String: Any]) -> Void = { event in
-            var fields = CalendarWriteTiming.metadata(request: args, event: event)
+        let receipt: ([String: Any], [String: Any]) -> Void = { event, expected in
+            var fields = CalendarWriteTiming.metadata(request: expected, event: event)
             fields["tool"] = name
             fields["call_id"] = callID
-            fields["outcome"] = "confirmed"
+            fields["outcome"] = CalendarWriteTiming.matches(request: expected, event: event) ? "confirmed" : "time_mismatch"
             fields["target_hash"] = diagnostics?.target(GmailReadTools.json([
                 "account": args["account"] as? String ?? "", "event_id": event["id"] as? String ?? ""]))
             diagnostics?.record(.calendarReceipt, fields)
@@ -275,10 +275,10 @@ enum CalendarTools {
                                       "showHiddenInvitations": "true"]
                         if let uid { params["iCalUID"] = uid }
                         else if !query.isEmpty { params["q"] = query }
-                        let data = try await CalendarAPI.json("GET", path: "calendars/primary/events", query: params, token: token)
-                        let events = (data["items"] as? [[String: Any]] ?? []).map { summary(account: account, $0) }
+                        let listed = try await liveEvents(params: params, token: token, limit: max)
+                        let events = listed.events.map { summary(account: account, $0) }
                         return (index, ["account": account, "events": events, "count": events.count,
-                                        "source": "live", "complete": data["nextPageToken"] == nil], nil)
+                                        "source": "live", "complete": listed.complete], nil)
                     } catch let refusal as Refusal {
                         return (index, ["account": account, "error": refusal.text], nil)
                     } catch {
@@ -297,6 +297,25 @@ enum CalendarTools {
             Task { await BackgroundCalendarRefresh.run(trigger: .staleRead) }
         }
         return GmailReadTools.json(rows.map { $0.1 })
+    }
+
+    private static func liveEvents(params: [String: String], token: String, limit: Int) async throws
+        -> (events: [[String: Any]], complete: Bool) {
+        var query = params
+        var events: [[String: Any]] = []
+        var ids = Set<String>(), pages = Set<String>()
+        for _ in 0..<8 {
+            let data = try await CalendarAPI.json("GET", path: "calendars/primary/events", query: query, token: token)
+            for event in data["items"] as? [[String: Any]] ?? [] {
+                if let id = event["id"] as? String, !ids.insert(id).inserted { continue }
+                events.append(event)
+            }
+            let next = (data["nextPageToken"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if next.isEmpty { return (Array(events.prefix(limit)), events.count <= limit) }
+            guard events.count < limit, pages.insert(next).inserted else { break }
+            query["pageToken"] = next
+        }
+        return (Array(events.prefix(limit)), false)
     }
 
     /// Whether the last full pass walked the whole window.
@@ -433,7 +452,7 @@ enum CalendarTools {
         "ignore", "tbd", "n/a", "none",
     ]
 
-    private static func runCreate(_ args: [String: Any], accounts: [String], receipt: ([String: Any]) -> Void) async throws -> String {
+    private static func runCreate(_ args: [String: Any], accounts: [String], receipt: ([String: Any], [String: Any]) -> Void) async throws -> String {
         let target = try singleTarget(args, accounts, creating: true)
         let trim = { (key: String) in (args[key] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
         let title = trim("summary"), start = trim("start"), end = trim("end")
@@ -469,8 +488,9 @@ enum CalendarTools {
         }
         let token = try await accessToken(target, write: true, capability: "create events")
         if let existing = try await existingEvent(args, account: target, token: token) {
-            receipt(existing)
+            receipt(existing, args)
             await cacheWrite(existing, account: target)
+            try CalendarWriteTiming.verifyStored(request: args, event: existing)
             return "Already on the calendar; no event created and no invitations sent. "
                 + GmailReadTools.json(summary(account: target, existing)) + " " + CalendarWriteTiming.receipt(existing)
         }
@@ -484,14 +504,16 @@ enum CalendarTools {
             guard existing["status"] as? String != "cancelled" else {
                 throw Refusal(text: "That previously created event was cancelled. Clarify whether to restore it; no new event was created.")
             }
-            receipt(existing)
+            receipt(existing, args)
             await cacheWrite(existing, account: target)
+            try CalendarWriteTiming.verifyStored(request: args, event: existing)
             return "This event was already created; no invitations were sent again. " + CalendarWriteTiming.receipt(existing)
         } catch CalendarAPI.Failure.unauthorized {
             throw Refusal(text: reconnect(target, "create events"))
         }
-        receipt(created)
+        receipt(created, args)
         await cacheWrite(created, account: target)
+        try CalendarWriteTiming.verifyStored(request: args, event: created)
         let id = created["id"] as? String ?? ""
         let link = created["htmlLink"] as? String ?? ""
         let invited = (attendees ?? []).isEmpty ? "" : " Invited \((attendees ?? []).joined(separator: ", "))."
@@ -558,7 +580,7 @@ enum CalendarTools {
         throw Refusal(text: "Could not finish checking for an existing event. Nothing was created; retry the calendar lookup.")
     }
 
-    private static func runUpdate(_ args: [String: Any], accounts: [String], receipt: ([String: Any]) -> Void) async throws -> String {
+    private static func runUpdate(_ args: [String: Any], accounts: [String], receipt: ([String: Any], [String: Any]) -> Void) async throws -> String {
         let target = try singleTarget(args, accounts)
         let eventId = (args["event_id"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !eventId.isEmpty else {
@@ -632,8 +654,14 @@ enum CalendarTools {
                 return "\"\(reported)\" is already like that on \(target). Nothing changed and no one was notified.\(selfNote)\(scope)"
             }
             let patched = try await CalendarAPI.json("PATCH", path: path, query: ["sendUpdates": "all"], body: body, token: token)
-            receipt(patched)
+            var expected = args
+            if timing.phrase != nil {
+                expected["start"] = timing.start
+                expected["end"] = timing.end
+            }
+            receipt(patched, expected)
             await cacheWrite(patched, account: target)
+            try CalendarWriteTiming.verifyStored(request: expected, event: patched)
             let guests = merge.attendees.filter { $0["self"] as? Bool != true }.count
             let told = guests > 0 ? " The \(guests == 1 ? "guest was" : "\(guests) guests were") notified." : ""
             return "Updated \"\(reported)\" on \(target) — \(changed.joined(separator: "; ")). \(CalendarWriteTiming.receipt(patched))\(told)\(selfNote)\(scope)"

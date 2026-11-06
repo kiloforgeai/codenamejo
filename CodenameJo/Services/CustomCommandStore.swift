@@ -44,6 +44,29 @@ class CustomCommandStore: ObservableObject {
         case failed(String)
     }
 
+    struct EditScope: Equatable {
+        let owner: String
+        let profile: String
+    }
+    var editScope: EditScope? { backend.userId.map { .init(owner: $0, profile: Self.profileKey) } }
+
+    func edit(expected: CustomCommand?, scope: EditScope, keyword: String,
+              label: String, actions: [CommandAction]) async -> Outcome {
+        guard editScope == scope else { return .refused("The active profile changed. Reopen Commands before saving.") }
+        let checked: (keyword: String, actions: [CommandAction])
+        switch CustomCommandRules.validateSave(keyword: keyword, actions: actions) {
+        case .failure(let error): return .refused(error.sentence)
+        case .success(let value): checked = value
+        }
+        do {
+            let command = try await rows.edit(userId: scope.owner, profileId: scope.profile, expected: expected,
+                keyword: checked.keyword, spoken: keyword.trimmingCharacters(in: .whitespacesAndNewlines),
+                label: label.trimmingCharacters(in: .whitespacesAndNewlines), actions: checked.actions)
+            await refresh()
+            return .saved(command)
+        } catch { return .failed(error.localizedDescription) }
+    }
+
     /// Save a command, or change what an existing keyword does.
     func save(keyword: String, label: String, actions: [CommandAction]) async -> Outcome {
         let checked: (keyword: String, actions: [CommandAction])
@@ -60,17 +83,19 @@ class CustomCommandStore: ObservableObject {
     }
 
     func correctLabel(keyword: String, name: String, account: String) async -> Outcome {
-        await refresh()
-        guard let command = commands.first(where: { $0.keyword == CustomCommandRules.normalise(keyword) }) else {
-            return .refused("That command does not exist. Read the command list first.")
-        }
-        let indices = command.actions.indices.filter {
-            ["label_message", "gmail_label_message"].contains(command.actions[$0].tool)
-        }
-        guard indices.count == 1 else {
-            return .refused("The command must have exactly one label step to correct it; save the full command otherwise.")
-        }
+        guard let owner = backend.userId else { return .failed("Not signed in.") }
+        let profile = Self.profileKey
         do {
+            let saved = try await rows.all(userId: owner, profileId: profile)
+            guard let command = saved.first(where: { $0.keyword == CustomCommandRules.normalise(keyword) }) else {
+                return .refused("That command does not exist. Read the command list first.")
+            }
+            let indices = command.actions.indices.filter {
+                ["label_message", "gmail_label_message"].contains(command.actions[$0].tool)
+            }
+            guard indices.count == 1 else {
+                return .refused("The command must have exactly one label step to correct it; save the full command otherwise.")
+            }
             let accounts = try GmailReadTools.targets(account.isEmpty ? [:] : ["account": account])
             let target = try GmailManageTools.single(accounts)
             let token = try await GmailReadTools.token(target)
@@ -80,8 +105,15 @@ class CustomCommandStore: ObservableObject {
             var actions = command.actions
             actions[indices[0]].resolvedLabel = .init(id: label.id, name: label.name, account: target)
             actions[indices[0]].detail = "Apply the saved label \(label.name)."
-            return await save(keyword: command.spoken.isEmpty ? command.keyword : command.spoken,
-                              label: command.instruction, actions: actions)
+            guard backend.userId == owner, Self.profileKey == profile else {
+                return .refused("The active profile changed. The command correction was not saved.")
+            }
+            guard let corrected = try await rows.correctLabel(userId: owner, profileId: profile,
+                                                              expected: command, actions: actions) else {
+                return .refused("The command changed while its label was being checked. Read it again before correcting it.")
+            }
+            await refresh()
+            return .saved(corrected)
         } catch { return .failed("The command correction did not save: \(error.localizedDescription)") }
     }
 

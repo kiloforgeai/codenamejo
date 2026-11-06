@@ -27,7 +27,7 @@ final class VoiceCallCoordinator {
     // MARK: - State
 
     /// A tap that arrived while the session was down. Dialled when it comes up.
-    private var pendingDial = false
+    private var pendingDial: SessionOpening?
 
     /// The last turn written, by its own id. A `@Published` re-subscription redelivers its
     /// current value, which would otherwise re-file that turn.
@@ -80,17 +80,17 @@ final class VoiceCallCoordinator {
     ///
     /// `.connecting` while `connect()` builds the client queues the tap; `.connecting` for a
     /// dial in flight must not, or the flag would redial after the user hangs up.
-    func beginVoice() {
+    func beginVoice(opening: SessionOpening = .freshConversation()) {
         switch realtimeService.sessionState {
         case .ready:
-            dial()
+            dial(opening: opening)
         case .disconnected, .error:
-            pendingDial = true
+            pendingDial = opening
             Task { await self.realtimeService.connect() }
         case .connecting:
             if !realtimeService.isConversing {
                 RealtimeLog.log("dial: tapped while the session was still coming up — queued")
-                pendingDial = true
+                pendingDial = opening
             }
         case .listening, .processing, .responding:
             break
@@ -233,12 +233,12 @@ final class VoiceCallCoordinator {
             Task { await self.saveFailedCommand(message) }
         }
         if current == .disconnected {
-            pendingDial = false
+            pendingDial = nil
         }
         // The cold-start dial: the tap arrived while disconnected and `connect()` has since resolved.
-        if current == .ready, pendingDial {
-            pendingDial = false
-            dial()
+        if current == .ready, let opening = pendingDial {
+            pendingDial = nil
+            dial(opening: opening)
         }
     }
 

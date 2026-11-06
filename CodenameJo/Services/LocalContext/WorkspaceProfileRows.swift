@@ -74,6 +74,49 @@ struct WorkspaceProfileRows: Sendable {
         }
     }
 
+    static func addFeedSections(_ db: Database) throws {
+        try db.alter(table: Profile.databaseTableName) {
+            $0.add(column: "feed_sections", .text)
+        }
+    }
+
+    static func addFeedProgress(_ db: Database) throws {
+        try db.alter(table: Profile.databaseTableName) { $0.add(column: "feed_progress", .blob) }
+    }
+
+    func feedProgress(userId: String, profileId: String) async throws -> Data? {
+        try await pool().read { db in
+            try Data.fetchOne(db, sql: "SELECT feed_progress FROM workspace_profile WHERE user_id = ? AND id = ?",
+                              arguments: [userId, profileId])
+        }
+    }
+
+    func saveFeedProgress(_ data: Data, userId: String, profileId: String) async throws {
+        try await pool().write { db in
+            try db.execute(sql: "UPDATE workspace_profile SET feed_progress = ? WHERE user_id = ? AND id = ?",
+                           arguments: [data, userId, profileId])
+        }
+    }
+
+    func feedSections(userId: String, profileId: String) async throws -> [FeedSection] {
+        let json = try await pool().read { db in
+            try String.fetchOne(db, sql: "SELECT feed_sections FROM workspace_profile WHERE user_id = ? AND id = ?",
+                                arguments: [userId, profileId])
+        }
+        let saved = try json.map { try JSONDecoder().decode([FeedSection].self, from: Data($0.utf8)) }
+        return FeedSection.resolved(saved, accounts: try await mailboxes(userId: userId, profileId: profileId))
+    }
+
+    func saveFeedSections(_ sections: [FeedSection], userId: String, profileId: String) async throws {
+        let json = String(decoding: try JSONEncoder().encode(sections), as: UTF8.self)
+        try await pool().write { db in
+            guard try Profile.fetchOne(db, key: ["user_id": userId, "id": profileId]) != nil
+            else { throw WorkspaceProfileError.notFound }
+            try db.execute(sql: "UPDATE workspace_profile SET feed_sections = ? WHERE user_id = ? AND id = ?",
+                           arguments: [json, userId, profileId])
+        }
+    }
+
     private func pool() throws -> DatabasePool {
         guard let dbPool else { throw WorkspaceProfileError.unavailable }
         return dbPool

@@ -21,6 +21,30 @@ struct DispatchJob: Codable, Identifiable, Hashable {
     var receipts: [Receipt]? = nil
     var historyOwner: String? = nil
     var operation: DispatchMailOperation? = nil
+    var foregroundContinuation: Bool? = nil
+    /// Captured from the authorized handoff, never reconstructed from result prose or a subject.
+    var origin: MailOrigin? = nil
+
+    struct MailOrigin: Codable, Hashable, Sendable {
+        let account: String
+        let messageID: String
+        let threadID: String
+        let sender: String
+        let subject: String
+
+        static func from(_ target: [String: Any]?) -> Self? {
+            guard let target, let account = target["account"] as? String, !account.isEmpty,
+                  let id = target["id"] as? String, !id.isEmpty,
+                  ((target["messages"] as? [Any])?.count ?? 1) == 1 else { return nil }
+            return .init(account: account.lowercased(), messageID: id,
+                threadID: target["threadId"] as? String ?? "", sender: target["from"] as? String ?? "",
+                subject: target["subject"] as? String ?? "")
+        }
+
+        var about: LocalTriageQueue.Outcome.About {
+            .init(account: account, id: messageID, threadId: threadID, from: sender, subject: subject)
+        }
+    }
 
     struct Receipt: Codable, Hashable {
         let callId: String
@@ -30,7 +54,7 @@ struct DispatchJob: Codable, Identifiable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, task, state, result, receipts, historyOwner, operation
+        case id, task, state, result, receipts, historyOwner, operation, foregroundContinuation, origin
         case userId = "user_id"
         case conversationId = "conversation_id"
         case turnId = "turn_id"

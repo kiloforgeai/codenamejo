@@ -65,11 +65,13 @@ enum LiveIntentRouter {
     }
 
     static var isAvailable: Bool {
-        availability.read(now: ProcessInfo.processInfo.systemUptime) {
+        availability.read(now: ProcessInfo.processInfo.systemUptime, onChange: { available in
+            diagnostics?.record(.modelAvailability, ["available": String(available), "engine": "foundation_models",
+                "reason": available ? "local_router_ready" : "local_router_unavailable"])
+        }) {
             let available: Bool
             if case .available = SystemLanguageModel.default.availability { available = true }
             else { available = false }
-            diagnostics?.record(.modelAvailability, ["available": String(available), "engine": "foundation_models"])
             if !available { prewarmed = false }
             return available
         }
@@ -85,17 +87,29 @@ enum LiveIntentRouter {
         guard isAvailable, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         let session = LanguageModelSession(instructions: instructions)
         let start = ContinuousClock.now
-        let intent = try? await session.respond(to: text, generating: LiveSpokenRoute.self,
-                                                options: GenerationOptions(sampling: .greedy)).content.intent
+        let intent: LiveSpokenIntent
+        do {
+            intent = try await session.respond(to: text, generating: LiveSpokenRoute.self,
+                options: GenerationOptions(sampling: .greedy)).content.intent
+        } catch {
+            guard !Task.isCancelled, !(error is CancellationError) else { return nil }
+            prewarmed = false
+            if availability.suppress(now: ProcessInfo.processInfo.systemUptime) {
+                diagnostics?.record(.modelAvailability, VoiceDiagnostics.failure(error).merging([
+                    "available": "false", "engine": "foundation_models", "reason": "routing_failed_retry_after_cooldown"
+                ]) { _, new in new })
+            }
+            return nil
+        }
         let elapsed = start.duration(to: .now).components
         let ms = elapsed.seconds * 1000 + elapsed.attoseconds / 1_000_000_000_000_000
-        RealtimeLog.log("fmRouter: '\(text)' → \(intent?.rawValue ?? "error") in \(ms) ms")
+        RealtimeLog.log("fmRouter: \(intent.rawValue) in \(ms) ms")
         switch intent {
         case .archive: return .archive
         case .spam: return .spam
         case .trash: return .trash
         case .next: return .next
-        case .other?, nil: return nil
+        case .other: return nil
         }
     }
 }

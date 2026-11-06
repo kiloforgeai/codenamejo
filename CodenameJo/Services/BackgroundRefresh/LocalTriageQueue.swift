@@ -26,6 +26,8 @@ actor LocalTriageQueue {
     private var preparationChanged: (@Sendable () async -> Void)?
 
     private let mailAccounts: @Sendable () async -> [String]
+    private let feedSectionLoader: (@Sendable (FeedSection) async -> [Item]?)?
+    private let profileRows: WorkspaceProfileRows
     private let unreadOpeningLoader: @Sendable (String) async -> [MailStore.Ingest]?
     private var enrichmentTasks: [String: Task<Void, Never>] = [:]
     private var enrichmentRequestedAgain: Set<String> = []
@@ -34,11 +36,11 @@ actor LocalTriageQueue {
     private var preparingDailySnapshot = false
     private var presentedTopicKeys: Set<String> = []
 
-    init(liveFeatures: Bool = false, mailAccounts: @escaping @Sendable () async -> [String] = {
+    init(liveFeatures: Bool = false, profileRows: WorkspaceProfileRows = Container.shared.workspaceProfileRows(), mailAccounts: @escaping @Sendable () async -> [String] = {
         // Only the active profile's inboxes. Snapshots are account-keyed, so each profile
         // resumes its own cursor.
         return ProfileRuntime.allowedMailAccounts(GoogleAccountStore.mailAccounts())
-    }, unreadOpeningLoader: @escaping @Sendable (String) async -> [MailStore.Ingest]? = { account in
+    }, feedSectionLoader: (@Sendable (FeedSection) async -> [Item]?)? = nil, unreadOpeningLoader: @escaping @Sendable (String) async -> [MailStore.Ingest]? = { account in
         guard case .success(let token) = await GoogleCredential.token(for: account) else { return nil }
         do {
             let refs = try await GmailAPI.recentMessageIds(
@@ -51,6 +53,8 @@ actor LocalTriageQueue {
             return nil
         }
     }) {
+        self.feedSectionLoader = feedSectionLoader
+        self.profileRows = profileRows
         self.mailAccounts = mailAccounts
         self.unreadOpeningLoader = unreadOpeningLoader
         self.liveFeatures = liveFeatures
@@ -67,6 +71,17 @@ actor LocalTriageQueue {
         feedProfileId = current?.id
         profileHandoff.configure(current: current, profiles: profiles, enabled: enabled)
         if !newCall { feedEligible = sequentialFeed }
+        if !newCall, sequentialFeed, ProfileRuntime.snapshot?.feedSections != nil, profileChanged {
+            configuredSections = ProfileRuntime.snapshot?.feedSections
+            configuredProfileID = ProfileRuntime.snapshot?.profileId
+            cancelSectionPreparation()
+            activeFeedSection = nil
+            completedFeedSections = []
+            feedProgressLoaded = false
+            calendarAgendaPrefetch?.cancel()
+            calendarAgendaPrefetch = nil
+            calendarAgendaPrepared = nil
+        }
         if dynamicSlackFeed && (newCall || profileChanged) {
             slackFeedPrefetch?.cancel()
             slackFeedPrefetched = nil
@@ -130,10 +145,12 @@ actor LocalTriageQueue {
         var scope: String
         var status: DesktopStatus
         var revision: Int = 0
+        var sections: [DesktopFeedSection]? = nil
     }
     private var lastDesktopSnapshot: DesktopSnapshot?
 
     func desktopSnapshot() -> DesktopSnapshot {
+        if configuredSections != nil { return configuredDesktopSnapshot() }
         let accounts = ProfileRuntime.allowedMailAccounts(walkAccounts ?? [])
         let current = desktopPreparedItems()
         let future = inboxAheadFirst(Self.refillTarget) + accounts.filter {
@@ -143,11 +160,11 @@ actor LocalTriageQueue {
         var seen = Self.messageKeys(current)
         let upcoming = future.compactMap { item in
             item.keeping(item.conversation.filter {
-                !gmailWalkDealtWith.contains(Self.messageKey(account: item.account, id: $0.id))
+                !gmailWalkDealtWith.union(navigationExcludedIDs).contains(Self.messageKey(account: item.account, id: $0.id))
                     && seen.insert(Self.messageKey(account: item.account, id: $0.id)).inserted
             })
         }
-        let status: DesktopStatus = stalled ? .unavailable : offeredAccount != nil ? .nextInbox
+        let status: DesktopStatus = actionOutcome != nil ? .ready : stalled ? .unavailable : offeredAccount != nil ? .nextInbox
             : running ? (current.isEmpty ? .loading : .ready)
             : feedEmitted && !more && !stalled ? .complete : .idle
         var snapshot = DesktopSnapshot(items: Array((current + upcoming).prefix(36)), currentID: actionOutcome?.messageId ?? currentId,
@@ -157,9 +174,54 @@ actor LocalTriageQueue {
         return snapshot
     }
 
+    private func configuredDesktopSnapshot() -> DesktopSnapshot {
+        let plan = activeFeedSection.map { [$0] } ?? []
+        var seen = Set<String>()
+        var count = 0
+        let sections = (plan + upcomingFeedSections).compactMap { section -> DesktopFeedSection? in
+            var rows: [DesktopFeedRow] = []
+            if section.isMail {
+                let activeRows = configuredSections?.contains(where: { $0.id == section.id && $0.enabled }) == true
+                    ? desktopPreparedItems() : Array(desktopPreparedItems().prefix(1))
+                let prepared = section.id == activeFeedSection?.id ? activeRows
+                    : preparedFeedSections[section.id]?.stage.items ?? []
+                rows = prepared.compactMap { item in
+                    guard let kept = item.keeping(item.conversation.filter({ member in
+                        let key = Self.messageKey(account: item.account, id: member.id)
+                        return !gmailWalkDealtWith.union(navigationExcludedIDs).contains(key) && seen.insert(key).inserted
+                    })) else { return nil }
+                    return .email(account: kept.account, messageID: kept.id, subject: kept.subject,
+                                  sender: kept.from, reason: kept.importanceWhy, section: section)
+                }
+            } else if section.kind == .calendar, let agenda = calendarAgendaPrepared {
+                rows = CalendarSearch.remaining(agenda).events.map(DesktopFeedRow.calendar)
+            } else if section.kind == .slack {
+                rows = (slackFeedPrefetched?.loaded?.queue?.items ?? []).map {
+                    var row = DesktopFeedRow.slack($0)
+                    row.section = section
+                    return row
+                }
+            }
+            rows = Array(rows.prefix(max(0, 36 - count)))
+            count += rows.count
+            return rows.isEmpty ? nil : .init(section: section, rows: rows)
+        }
+        var snapshot = DesktopSnapshot(items: desktopPreparedItems(),
+            currentID: activeFeedSection?.isMail == true ? actionOutcome?.messageId ?? currentId : nil,
+            account: activeAccount, scope: activeFeedSection?.id ?? "feed",
+            status: stalled ? .unavailable : feedEmitted && upcomingFeedSections.isEmpty ? .complete
+                : sections.isEmpty ? .loading : .ready,
+            revision: lastDesktopSnapshot?.revision ?? 0, sections: sections)
+        if snapshot != lastDesktopSnapshot { snapshot.revision += 1; lastDesktopSnapshot = snapshot }
+        return snapshot
+    }
+
     func desktopPreparedItems() -> [Item] {
-        guard running else { return [] }
-        return Array(items.dropFirst(max(0, position - 1)).filter { $0.acted == nil }.prefix(36))
+        let queued = running ? Array(items.dropFirst(max(0, position - 1)).filter { $0.acted == nil }.prefix(36)) : []
+        guard let presented = actionOutcome else { return queued }
+        return [presented.item] + queued.filter {
+            $0.id != presented.messageId || $0.account.lowercased() != presented.about.account.lowercased()
+        }
     }
     #endif
 
@@ -532,7 +594,7 @@ actor LocalTriageQueue {
     private var running = false
     /// Stage crossings replace `items`. Retain completed stages so voice navigation can cross
     /// those otherwise destructive boundaries.
-    private struct NavigationStage {
+    private struct NavigationStage: Codable, Sendable {
         var items: [Item]
         let grouping: Bool
         let topicGrouping: Bool
@@ -565,8 +627,31 @@ actor LocalTriageQueue {
         /// Whether the intercepted step may finish the cursor message. False for an answer-shaped
         /// dispatch, which must not mark an email read just because the user asked about it.
         let dealtWith: Bool
+        var jobId: UUID? = nil
+        var explicitSelection = false
+        var resumeCurrent = false
+
+        var item: Item {
+            .init(account: about.account, id: messageId, threadId: threadId, from: about.from,
+                subject: about.subject, date: "", snippet: "Returned work", internalDate: 0, acted: nil)
+        }
     }
     private var actionOutcome: ActionOutcome?
+
+    func resultSelectionAccounts() async -> [String] { await mailAccounts() }
+
+    /// An explicit user selection overlays the inbox cursor; it never moves that cursor.
+    func selectReturnedResult(_ outcome: Outcome, profileID: String?) -> String? {
+        guard ProfileRuntime.snapshot?.profileId == profileID, let about = outcome.about,
+              !about.id.isEmpty, !about.account.isEmpty,
+              ProfileRuntime.allowedMailAccounts([about.account]).contains(where: {
+                  $0.caseInsensitiveCompare(about.account) == .orderedSame
+              }) else { return nil }
+        let sameCursor = queueCursorId == about.id && currentMailbox?.lowercased() == about.account.lowercased()
+        actionOutcome = ActionOutcome(about: about, messageId: about.id, threadId: about.threadId,
+            dealtWith: false, jobId: outcome.jobId, explicitSelection: true, resumeCurrent: !sameCursor)
+        return Self.json(Self.presentedFields(outcome, item: nil))
+    }
 
     struct ActionOutcomeResolution: Sendable, Equatable {
         let cursorId: String
@@ -656,6 +741,7 @@ actor LocalTriageQueue {
     private(set) var inlinedCalendarEvents: [CalendarStore.Event] = []
     /// The Feed reaches Slack for the active profile; the sweep starts with the call.
     private var dynamicSlackFeed = false
+    private var slackFeedAvailable = false
     private var slackFeedPrefetch: Task<SlackQueueCache.Loaded?, Never>?
     /// The prefetch's answer once it has landed. Read by the important-Slack stage, which
     /// runs mid-walk and must never wait on the network to serve the next email.
@@ -966,6 +1052,7 @@ actor LocalTriageQueue {
         dynamicSlackFeed: Bool = false,
         importantSlackStage: Bool = false,
         localCalendar: Bool,
+        feedSections: [FeedSection]? = nil,
         onboardingFlow: EmailOnboardingFlow? = nil,
         onboardingLoader: (@Sendable () async -> EmailOnboardingSelection)? = nil,
         preparationChanged: (@Sendable () async -> Void)? = nil
@@ -984,13 +1071,20 @@ actor LocalTriageQueue {
         self.localCoachingDelivery = localCoachingDelivery
         self.forceOnboardingFeedLesson = forceOnboardingFeedLesson
         self.sequentialFeed = sequentialFeed
+        cancelSectionPreparation()
+        configuredSections = sequentialFeed && onboardingFlow == nil ? feedSections : nil
+        configuredProfileID = ProfileRuntime.snapshot?.profileId
+        feedProgressLoaded = false
+        activeFeedSection = nil
+        completedFeedSections = []
+        sectionFilter = nil
         feedEligible = sequentialFeed
         feedEmitted = false
         pageFeedPresented = false
         self.calendarFeedDue = calendarFeedDue
         calendarAgendaPrefetch?.cancel()
         calendarAgendaPrepared = nil
-        calendarAgendaPrefetch = calendarFeedDue && sequentialFeed
+        calendarAgendaPrefetch = feedSectionLoader == nil && (configuredSections?.contains { $0.kind == .calendar && $0.enabled } ?? calendarFeedDue) && sequentialFeed
             ? Task {
                 let granted = GoogleAccountStore.all()
                     .filter { GoogleCredential.calendarScopes.allSatisfy($0.scopes.contains) }
@@ -1003,7 +1097,8 @@ actor LocalTriageQueue {
             }
             : nil
         inlinedCalendarEvents = []
-        self.dynamicSlackFeed = dynamicSlackFeed
+        self.slackFeedAvailable = dynamicSlackFeed
+        self.dynamicSlackFeed = dynamicSlackFeed && (configuredSections?.contains { $0.kind == .slack && $0.enabled } ?? true)
         self.importantSlackStage = importantSlackStage
         RealtimeLog.log("localTriage: important Slack stage \(importantSlackStage ? "on" : "off")")
         importantSlackServed = false
@@ -1158,7 +1253,7 @@ actor LocalTriageQueue {
     /// a row written minutes ago. Modelled on `prefetchInboxStage`: one mailbox at a time, so the
     /// Gmail quota is shared with the walk in front of the user rather than contended for.
     private func prefetchOtherMailboxes(store: MailStore) {
-        guard prefetchesOtherMailboxes, !mailboxAheadSettled, running, position >= 1, onboardingFlow == nil,
+        guard configuredSections == nil, prefetchesOtherMailboxes, !mailboxAheadSettled, running, position >= 1, onboardingFlow == nil,
               !preparingDailySnapshot, mailboxAheadTask == nil else { return }
         let current = (activeAccount ?? snapshotAccount ?? items.first?.account)?.lowercased()
         let lifetime = reconciliationLifetime
@@ -1268,9 +1363,14 @@ actor LocalTriageQueue {
 
     /// Where the queue is, or nil when none is running. Read by the chip.
     var progress: Progress? {
+        if let presented = actionOutcome, !running {
+            return Progress(account: presented.about.account, position: 1, queued: 1, remaining: 1,
+                done: false, displayPosition: nil, displayQueued: nil, displayRemaining: nil,
+                messageId: presented.messageId, threadId: presented.threadId)
+        }
         guard running else { return nil }
         return Progress(
-            account: activeAccount ?? snapshotAccount ?? items.first?.account,
+            account: actionOutcome?.about.account ?? activeAccount ?? snapshotAccount ?? items.first?.account,
             position: messageOrdinal,
             queued: items.reduce(0) { $0 + count($1) },
             remaining: items.dropFirst(max(0, position - 1)).reduce(0) { $0 + count($1) },
@@ -1279,8 +1379,8 @@ actor LocalTriageQueue {
             displayQueued: topicGrouping && scope == .unread ? items.count : nil,
             displayRemaining: topicGrouping && scope == .unread
                 ? items.dropFirst(max(0, position - 1)).count : nil,
-            messageId: items.indices.contains(position - 1) ? items[position - 1].id : nil,
-            threadId: items.indices.contains(position - 1) ? items[position - 1].threadId : nil
+            messageId: actionOutcome?.messageId ?? (items.indices.contains(position - 1) ? items[position - 1].id : nil),
+            threadId: actionOutcome?.threadId ?? (items.indices.contains(position - 1) ? items[position - 1].threadId : nil)
         )
     }
 
@@ -1298,6 +1398,298 @@ actor LocalTriageQueue {
         return await mailAccounts().first {
             $0.caseInsensitiveCompare(wanted) == .orderedSame
         }
+    }
+
+    // MARK: - Configured feed sections
+
+    private struct PreparedFeedSection: Codable, Sendable {
+        let stage: NavigationStage
+        let band: String?
+        let score: Int?
+        let beforeID: String?
+        let preparedAt: Date
+    }
+    private struct FeedProgress: Codable {
+        let day: String
+        let section: FeedSection?
+        let page: PreparedFeedSection?
+        let completed: Set<String>
+    }
+    private var feedProgressLoaded = false
+    private var configuredSections: [FeedSection]?
+    private var configuredProfileID: String?
+    private var activeFeedSection: FeedSection?
+    private var completedFeedSections = Set<String>()
+    private var sectionFilter: FeedSection.Kind?
+    private var preparedFeedSections: [String: PreparedFeedSection] = [:]
+    private var sectionPreparation: Task<Void, Never>?
+    private var sectionPreparationID = UUID()
+    private var sectionLoads: [String: Task<PreparedFeedSection, Never>] = [:]
+
+    func updateFeedSections(_ sections: [FeedSection], profileID: String, store: MailStore) {
+        guard configuredSections != nil, configuredProfileID == profileID else { return }
+        configuredSections = sections
+        cancelSectionPreparation()
+        prepareFeedSections(store: store)
+        let slackEnabled = slackFeedAvailable && sections.contains { $0.kind == .slack && $0.enabled }
+        if !slackEnabled { slackFeedPrefetch?.cancel(); slackFeedPrefetch = nil; slackFeedPrefetched = nil }
+        if slackEnabled && !dynamicSlackFeed {
+            let scope = ProfileRuntime.snapshot
+            slackFeedPrefetch = Task {
+                let loaded = await SlackQueueRefresh.forFeed(scope: scope)
+                if !Task.isCancelled { self.slackFeedPrefetched = (scope?.profileId, loaded) }
+                return loaded
+            }
+        }
+        dynamicSlackFeed = slackEnabled
+        if !sections.contains(where: { $0.kind == .calendar && $0.enabled }) {
+            calendarAgendaPrefetch?.cancel(); calendarAgendaPrefetch = nil; calendarAgendaPrepared = nil
+        }
+    }
+
+    private func checkpointFeedProgress(store: MailStore) async {
+        guard let profileID = configuredProfileID, store.database != nil else { return }
+        let page = activeFeedSection?.isMail == true ? PreparedFeedSection(stage: navigationStage(), band: band,
+            score: beforeScore, beforeID: beforeID, preparedAt: Date()) : nil
+        let progress = FeedProgress(day: Self.localDay(), section: activeFeedSection, page: page, completed: completedFeedSections)
+        do {
+            try await profileRows.saveFeedProgress(JSONEncoder().encode(progress),
+                userId: store.userId, profileId: profileID)
+        } catch { RealtimeLog.log("feed: could not save position — \(error.localizedDescription)") }
+    }
+
+    private func validPreparedMail(_ source: [Item], store: MailStore) async -> [Item]? {
+        var kept: [Item] = []
+        for item in source {
+            let inbox: Set<String>
+            if feedSectionLoader != nil { inbox = Set(item.ids) }
+            else if let found = await store.inboxIds(among: item.ids, account: item.account) { inbox = found }
+            else { return nil }
+            let excluded = gmailWalkDealtWith.union(navigationExcludedIDs).union(dealtAt.keys)
+            if let valid = item.keeping(item.conversation.filter {
+                inbox.contains($0.id) && !excluded.contains(Self.messageKey(account: item.account, id: $0.id))
+            }) { kept.append(valid) }
+        }
+        return await Self.refreshFacts(kept, store: store)
+    }
+
+    private func restoreFeedProgress(store: MailStore) async -> Bool {
+        guard !feedProgressLoaded else { return false }
+        feedProgressLoaded = true
+        guard let profileID = configuredProfileID, store.database != nil else { return false }
+        let token = sectionPreparationID
+        do {
+            guard let data = try await profileRows.feedProgress(userId: store.userId, profileId: profileID),
+                  let saved = try? JSONDecoder().decode(FeedProgress.self, from: data), saved.day == Self.localDay(),
+                  let section = saved.section, let page = saved.page,
+                  token == sectionPreparationID, configuredProfileID == profileID,
+                  configuredSections?.contains(where: { $0.id == section.id && $0.enabled }) == true else { return false }
+            activeFeedSection = section
+            sectionFilter = section.kind
+            completedFeedSections = saved.completed
+            activeAccount = section.account
+            snapshotAccount = section.account
+            walkAccounts = await mailAccounts()
+            restoreNavigationStage(page.stage)
+            band = page.band; beforeScore = page.score; beforeID = page.beforeID
+            rankedPending = false; nothingImportantCheck = false
+            let tail = Array(items.dropFirst(max(0, position - 1)))
+            ordinalOffset += max(0, position - 1)
+            if let valid = await validPreparedMail(tail, store: store) { items = valid }
+            else { items = []; stalled = true; more = true }
+            position = items.isEmpty ? 0 : 1
+            prepareFeedSections(store: store)
+            maintainRunway(store: store)
+            return items.indices.contains(position - 1)
+        } catch {
+            RealtimeLog.log("feed: could not restore position — \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func cancelSectionPreparation() {
+        sectionPreparationID = UUID()
+        sectionPreparation?.cancel()
+        sectionPreparation = nil
+        preparedFeedSections = [:]
+        for task in sectionLoads.values { task.cancel() }
+        sectionLoads = [:]
+    }
+
+    private func refreshConfiguredSections() {
+        guard let runtime = ProfileRuntime.snapshot, runtime.profileId == configuredProfileID,
+              let latest = runtime.feedSections, latest != configuredSections else { return }
+        configuredSections = latest
+        cancelSectionPreparation()
+    }
+
+    private var upcomingFeedSections: [FeedSection] {
+        (configuredSections ?? []).filter {
+            $0.enabled && $0.id != activeFeedSection?.id && !completedFeedSections.contains($0.id)
+        }
+    }
+
+    private func prepareFeedSections(store: MailStore) {
+        guard configuredSections != nil, sectionPreparation == nil else { return }
+        let pending = upcomingFeedSections.filter { $0.isMail && preparedFeedSections[$0.id] == nil }
+        guard !pending.isEmpty else { return }
+        let token = sectionPreparationID
+        sectionPreparation = Task { [weak self] in
+            guard let self else { return }
+            for section in pending {
+                guard !Task.isCancelled, await self.sectionPreparationID == token else { return }
+                let page = await self.loadFeedSection(section, store: store)
+                guard !Task.isCancelled else { return }
+                await self.installPreparedSection(page, section: section, token: token)
+            }
+            await self.finishSectionPreparation(token: token)
+        }
+    }
+
+    private func installPreparedSection(_ page: PreparedFeedSection, section: FeedSection, token: UUID) async {
+        guard sectionPreparationID == token, upcomingFeedSections.contains(where: { $0.id == section.id }) else { return }
+        preparedFeedSections[section.id] = page
+        await preparationChanged?()
+    }
+
+    private func finishSectionPreparation(token: UUID) {
+        if sectionPreparationID == token { sectionPreparation = nil }
+    }
+
+    func awaitFeedSectionPreparation() async { await sectionPreparation?.value }
+
+    private func loadFeedSection(_ section: FeedSection, store: MailStore) async -> PreparedFeedSection {
+        if let pending = sectionLoads[section.id] { return await pending.value }
+        let mailbox = section.account ?? ""
+        let scratch = LocalTriageQueue(liveFeatures: liveFeatures, mailAccounts: { [mailbox] },
+                                      feedSectionLoader: feedSectionLoader, unreadOpeningLoader: unreadOpeningLoader)
+        let task = Task { await scratch.prepareFeedSection(section, store: store) }
+        let token = sectionPreparationID
+        sectionLoads[section.id] = task
+        let result = await task.value
+        if token == sectionPreparationID { sectionLoads[section.id] = nil }
+        return result
+    }
+
+    private func prepareFeedSection(_ section: FeedSection, store: MailStore) async -> PreparedFeedSection {
+        if let feedSectionLoader {
+            let loaded = await feedSectionLoader(section)
+            let items = (loaded ?? []).filter { item in
+                item.account.caseInsensitiveCompare(section.account ?? "") == .orderedSame
+                    && (FeedSection.isImportant(band: item.importanceBand, received: item.internalDate) == (section.kind == .important))
+            }
+            return .init(stage: .init(items: items, grouping: false, topicGrouping: false, adopted: false,
+                position: items.isEmpty ? 0 : 1, ordinalOffset: 0, before: nil, more: loaded == nil,
+                total: items.count, mailboxUnreadAtStart: 0, scope: section.kind == .important ? .important : .all,
+                scopeUnsaid: false, scopePlan: [], stalled: loaded == nil), band: nil, score: nil, beforeID: nil, preparedAt: Date())
+        }
+        sectionFilter = section.kind
+        prefetchesOtherMailboxes = false
+        preparingDailySnapshot = true
+        activeAccount = section.account
+        await loadDealtWith()
+        _ = await build(scope: section.kind == .important ? .important : .all, store: store)
+        for _ in 0..<Self.gmailPageBudget {
+            guard !Task.isCancelled, running, more, !stalled, items.count < Self.refillTarget else { break }
+            let count = items.count
+            _ = await refill(store: store)
+            if count == items.count { break }
+        }
+        return .init(stage: navigationStage(), band: band, score: beforeScore,
+                     beforeID: beforeID, preparedAt: Date())
+    }
+
+    private func nextFeedSection(store: MailStore, finishCurrent: Bool = true) async -> (output: String, served: Served) {
+        if finishCurrent, let activeFeedSection { completedFeedSections.insert(activeFeedSection.id) }
+        activeFeedSection = nil
+        actionOutcome = nil
+        cancelStageWork()
+        running = false
+        items = []
+        position = 0
+        more = false
+        stalled = false
+        refreshConfiguredSections()
+        while let next = upcomingFeedSections.first {
+            activeFeedSection = next
+            sectionFilter = next.isMail ? next.kind : nil
+            if next.isMail {
+                guard await mailAccounts().contains(where: { $0.caseInsensitiveCompare(next.account ?? "") == .orderedSame }) else {
+                    completedFeedSections.insert(next.id)
+                    activeFeedSection = nil
+                    continue
+                }
+                let token = sectionPreparationID
+                let profileID = configuredProfileID
+                let ready = preparedFeedSections.removeValue(forKey: next.id)
+                let page: PreparedFeedSection
+                if let ready, Date().timeIntervalSince(ready.preparedAt) < Self.prefetchFreshness {
+                    page = ready
+                } else { page = await loadFeedSection(next, store: store) }
+                guard configuredSections != nil, configuredProfileID == profileID, !Task.isCancelled
+                else { return (Self.json(["stopped": true]), .hit) }
+                if token != sectionPreparationID {
+                    activeFeedSection = nil
+                    return await nextFeedSection(store: store, finishCurrent: false)
+                }
+                activeAccount = next.account
+                snapshotAccount = next.account
+                walkAccounts = await mailAccounts()
+                clearStageNavigation()
+                restoreNavigationStage(page.stage)
+                band = page.band
+                beforeScore = page.score
+                beforeID = page.beforeID
+                rankedPending = false
+                nothingImportantCheck = false
+                nothingImportantStanding = false
+                if let valid = await validPreparedMail(items, store: store) { items = valid }
+                else { items = []; stalled = true; more = true }
+                position = items.isEmpty ? 0 : 1
+                prepareFeedSections(store: store)
+                maintainRunway(store: store)
+                if !items.isEmpty { return (await current(store: store), ready == nil ? .live : .prefetched) }
+                if more || stalled { return (gmailPending(stalled ? .retryUnavailable : .continuePaging), .live) }
+                running = false
+            } else if next.kind == .calendar {
+                prepareFeedSections(store: store)
+                var payload: [String: Any] = ["done": false, "interstitial": "page", "configuredSection": "calendar",
+                    "calendarDue": true, "note": "Your Calendar section is next. Summarize the remaining events today, then call triage_next to continue the configured feed. Do not ask whether to continue or claim the feed is finished."]
+                if calendarAgendaPrefetch == nil, feedSectionLoader == nil {
+                    let accounts = await mailAccounts()
+                    calendarAgendaPrepared = await CalendarSearch.feedAgenda(accounts: accounts,
+                        store: CalendarStore(database: store.database))
+                    let prepared = calendarAgendaPrepared
+                    calendarAgendaPrefetch = Task { prepared }
+                }
+                if let agenda = await inlineCalendarAgenda(waitForPreparation: true) { payload["calendarEvents"] = agenda }
+                return (Self.json(payload), .hit)
+            } else if next.kind == .slack, dynamicSlackFeed {
+                let loaded: SlackQueueCache.Loaded?
+                if let prepared = slackFeedPrefetched { loaded = prepared.loaded }
+                else { loaded = await slackFeedPrefetch?.value }
+                if let loaded, let queue = loaded.queue {
+                    await Container.shared.localSlack().prepareFeed(queue, profileKey: SlackQueueRefresh.profileKey(ProfileRuntime.snapshot))
+                    let first = await Container.shared.localSlack().step(direction: nil, restart: false, stop: false)
+                    if !first.closed, let step = try? JSONSerialization.jsonObject(with: Data(first.text.utf8)) as? [String: Any] {
+                        prepareFeedSections(store: store)
+                        return (Self.json(["done": false, "interstitial": "slack", "configuredSection": "slack", "slackStep": step,
+                            "note": "Now present your Slack section. Walk slack_triage_next until it closes, then call triage_next to continue the configured feed. Do not ask whether to start Slack."]), .hit)
+                    }
+                }
+                else {
+                    stalled = true
+                    return (Self.json(["done": false, "note": "Slack could not be loaded. This feed is not finished. Say so and offer to retry this section with triage_next."]), .hit)
+                }
+            }
+            completedFeedSections.insert(next.id)
+            activeFeedSection = nil
+        }
+        sectionFilter = nil
+        feedEmitted = true
+        return (Self.json(["done": true, "interstitial": "feed", "configuredSection": "complete", "calendarDue": false,
+            "note": "The enabled sections of this feed are finished. Do not claim the entire inbox is empty; disabled sections were not walked.",
+            "feedNote": "The configured feed is finished. Ask whether they need anything else."]), .hit)
     }
 
     // MARK: - The tool
@@ -1324,9 +1716,41 @@ actor LocalTriageQueue {
         _ input: Input, store: MailStore,
         startsNewSession: Bool = false, dealtWith finishesCurrent: Bool = true
     ) async -> (output: String, served: Served) {
+        if let presented = actionOutcome, presented.explicitSelection {
+            actionOutcome = nil
+            if !input.stop, !input.restart, input.account == nil, input.scope == nil, input.rawScope == nil,
+               presented.resumeCurrent || input.direction == "back" {
+                if running, items.indices.contains(position - 1) { return (await current(store: store), .hit) }
+                return (Self.json(["done": true, "resultSelectionEnded": true,
+                    "note": "Returned to the feed. No email is selected."]), .hit)
+            }
+        }
         if onboardingFlow != nil {
             return await onboardingStep(input, store: store, dealtWith: finishesCurrent,
                 opening: startsNewSession)
+        }
+        if configuredSections != nil, input.account == nil, input.scope == nil, input.rawScope == nil {
+            refreshConfiguredSections()
+            if input.restart {
+                feedProgressLoaded = true
+                cancelSectionPreparation()
+                completedFeedSections = []
+                activeFeedSection = nil
+            }
+            if !input.stop, !input.restart, await restoreFeedProgress(store: store) {
+                return (await current(store: store), .hit)
+            }
+            if !input.stop, activeFeedSection?.isMail != true || !running || (items.isEmpty && stalled) {
+                let result = await nextFeedSection(store: store, finishCurrent: !(items.isEmpty && stalled))
+                prepareFeedSections(store: store)
+                await checkpointFeedProgress(store: store)
+                return result
+            }
+        } else if input.account != nil || input.scope != nil || input.rawScope != nil {
+            configuredSections = nil
+            activeFeedSection = nil
+            sectionFilter = nil
+            cancelSectionPreparation()
         }
         if input.offerDeclined { noteOfferDeclined() }
         // The yes to the cleanup offer serves the first message rather than stepping past it.
@@ -1404,7 +1828,8 @@ actor LocalTriageQueue {
         mailboxSwitch = nil
         if !input.stop { await checkpoint(store: store) }
         // Behind the card, never in front of it: the other mailboxes' rows for a later switch.
-        prefetchOtherMailboxes(store: store)
+        if configuredSections != nil { prepareFeedSections(store: store) }
+        else { prefetchOtherMailboxes(store: store) }
         maintainRunway(store: store)
         return result
     }
@@ -1518,7 +1943,7 @@ actor LocalTriageQueue {
             running = true
             position = 1
             total = items.count
-            if items.isEmpty { return (await close(), .hit) }
+            if items.isEmpty { return (await close(store: store), .hit) }
             return (onboardingCurrent(), .hit)
         }
         if opening || input.direction == "back" { return (onboardingCurrent(), .hit) }
@@ -1935,7 +2360,11 @@ actor LocalTriageQueue {
             await discardToday(store: store)
             return
         }
-        guard onboardingFlow == nil else { return }
+        if configuredSections != nil {
+            await checkpointFeedProgress(store: store)
+            return
+        }
+        guard onboardingFlow == nil, sectionFilter == nil else { return }
         guard let database = store.database else { return }
         let connectedAccounts = await queueAccounts()
         if snapshotAccount == nil {
@@ -2062,7 +2491,7 @@ actor LocalTriageQueue {
         defer { queueBuildsInFlight -= 1 }
         let ahead = await takeInboxAhead(crossing: asked == inboxAheadScope && crossedFromScope != nil)
         scope = asked
-        rankedPending = asked == .important && crossedFromScope == nil
+        rankedPending = sectionFilter == nil && asked == .important && crossedFromScope == nil
         nothingImportantCheck = rankedPending
         nothingImportantStanding = false
         presentedTopicKeys = []
@@ -2159,6 +2588,7 @@ actor LocalTriageQueue {
                 "empty": true,
                 "note": empty,
             ]
+            if configuredSections != nil { return await nextFeedSection(store: store) }
             return (await mailboxHandoffOrFeed(payload, trigger: "empty opening"), served)
         }
 
@@ -2184,8 +2614,8 @@ actor LocalTriageQueue {
     /// Fetch the `all` stage behind unread's last few messages, only once `more` is false so it never
     /// shares the wire with a top-up. The unread re-check at the crossing stays live to catch new mail.
     private func prefetchInboxStage(store: MailStore) {
-        guard !more, let next = nextScopeInPlan(), next != .important, !preparingDailySnapshot,
-              items.count - position < Self.topUpAt, inboxAheadTask == nil,
+        guard configuredSections == nil, !more, let next = nextScopeInPlan(), next != .important,
+              !preparingDailySnapshot, items.count - position < Self.topUpAt, inboxAheadTask == nil,
               inboxAhead.map({ !Self.isFresh($0.at) }) ?? true
         else { return }
         let gen = generation
@@ -2302,7 +2732,8 @@ actor LocalTriageQueue {
         }
         // A second queue command means the user carried on without acting on the circled-back email.
         // Retire the marker; another held outcome below replaces it with its own referent.
-        if !goingBack, actionOutcome != nil {
+        let finishesCurrent = actionOutcome?.dealtWith ?? finishesCurrent
+        if actionOutcome != nil {
             actionOutcome = nil
             RealtimeLog.log("localTriage: outcome presentation skipped — resuming cursor")
         }
@@ -2316,7 +2747,7 @@ actor LocalTriageQueue {
                 actionOutcome = ActionOutcome(
                     about: about,
                     messageId: about.id, threadId: about.threadId,
-                    dealtWith: finishesCurrent)
+                    dealtWith: finishesCurrent, jobId: waiting.jobId)
             }
             RealtimeLog.log(
                 "localTriage: outcome presented on its own message, cursor held at \(position)"
@@ -2363,6 +2794,10 @@ actor LocalTriageQueue {
             return (interstitial, .hit)
         }
 
+        if !goingBack, let activeFeedSection, let configuredSections,
+           !configuredSections.contains(where: { $0.id == activeFeedSection.id && $0.enabled }) {
+            return await nextFeedSection(store: store)
+        }
         position = goingBack ? max(1, position - 1) : position + 1
 
         if !goingBack, position > items.count, crossToLaterStage() {
@@ -2417,7 +2852,7 @@ actor LocalTriageQueue {
                 // A refill or unread re-check above was awaited in front of this build too.
                 return (crossed.0, served == .live ? .live : crossed.1)
             }
-            return (await close(), served)
+            return (await close(store: store), served)
         }
 
         // Behind the answer the user is about to hear, so deliberately not `.live`: they waited for none of it.
@@ -2470,14 +2905,14 @@ actor LocalTriageQueue {
 
     /// A page, important-Slack or coaching checkpoint due between this message and the next, or nil.
     private func checkpointBetweenMessages(store: MailStore) async -> String? {
-        if sequentialFeed, mailRemainsAfterCurrent(),
+        if configuredSections == nil, sequentialFeed, mailRemainsAfterCurrent(),
            let page = await takeSequentialPageCheckpoint() {
             RealtimeLog.log("localTriage: page checkpoint after "
                 + "\(messageOrdinal) — cursor held; calendar="
                 + "\(page["calendarDue"] as? Bool == true)")
             return Self.json(page)
         }
-        if sequentialFeed, mailRemainsAfterCurrent(),
+        if configuredSections == nil, sequentialFeed, mailRemainsAfterCurrent(),
            let slack = await takeImportantSlackStage(store: store) {
             RealtimeLog.log("localTriage: important Slack after \(messageOrdinal) — cursor held")
             return Self.json(slack)
@@ -2627,7 +3062,7 @@ actor LocalTriageQueue {
                 item.keeping(item.conversation.filter { seen.insert(Self.messageKey(account: item.account, id: $0.id)).inserted })
             }
             // `important` walks read mail, so a skip's read mark cannot retire it; the ledger must.
-            let finished = scope == .important ? gmailWalkDealtWith.union(dealtAt.keys) : gmailWalkDealtWith
+            let finished = (scope == .important || sectionFilter != nil) ? gmailWalkDealtWith.union(dealtAt.keys) : gmailWalkDealtWith
             let eligible = Self.excludingSummarizedReadThreads(Self.gmailEligible(
                 fresh,
                 dealtWithThisWalk: finished.union(dispatchSweepIDs)
@@ -2638,7 +3073,15 @@ actor LocalTriageQueue {
                     "localTriage: \(dealt) of \(fresh.count) dealt with in this walk "
                         + "(\(scope.rawValue))")
             }
-            items.append(contentsOf: eligible)
+            if let sectionFilter {
+                for (account, candidates) in Dictionary(grouping: eligible, by: \.account) {
+                    guard let important = await store.importantFeedIDs(among: candidates.flatMap(\.ids), account: account)
+                    else { return (items, previousBefore, true, live, true) }
+                    items += candidates.compactMap { item in
+                        item.keeping(item.conversation.filter { important.contains($0.id) == (sectionFilter == .important) })
+                    }
+                }
+            } else { items.append(contentsOf: eligible) }
             if page.stalled { return (items, before, true, live, true) }
             if fresh.isEmpty, page.more, before == previousBefore,
                band == previousBand, beforeScore == previousScore, beforeID == previousID {
@@ -2648,12 +3091,13 @@ actor LocalTriageQueue {
                 return (items, before, page.more, live, false)
             }
         }
-        return (items, before, true, live, true)
+        return (items, before, true, live, sectionFilter == nil)
     }
 
     // MARK: - Closing
 
-    private func close() async -> String {
+    private func close(store: MailStore) async -> String {
+        if configuredSections != nil { return await nextFeedSection(store: store).output }
         if onboardingFlow != nil {
             onboardingCompletionPresented = true
             running = false
@@ -2752,13 +3196,13 @@ actor LocalTriageQueue {
             switch scope {
             case .all:
                 forbidden = "they have been through their whole inbox"
-                close = "\"Archived — that was the last one, and that's your whole inbox "
-                    + "walked.\" Even then, do NOT say their inbox is clear, empty or at zero: "
+                close = "\"Archived — that was the last message in this inbox pass.\" "
+                    + "Even then, do NOT say their inbox is clear, empty or at zero: "
                     + "every message they did not act on is still sitting in it."
             case .important:
                 forbidden = "their important mail is done"
-                close = "\"Archived — that was the last one, and that's your important mail "
-                    + "done.\" Even then, do NOT say their inbox is clear or at zero: this "
+                close = "\"Archived — that finishes this pass through important mail from the past week.\" "
+                    + "Even then, do NOT say their inbox is clear or at zero: this "
                     + "queue only ever looked at what mattered from their past week, and the "
                     + "rest of their inbox is exactly where it was."
             case .unread:
@@ -2792,9 +3236,9 @@ actor LocalTriageQueue {
         }
         let unit: String
         switch scope {
-        case .all: unit = "their whole inbox"
-        case .important: unit = "their important mail"
-        case .unread: unit = "their unread"
+        case .all: unit = "the selected inbox pass"
+        case .important: unit = "their important mail from the past week in this pass"
+        case .unread: unit = "their unread messages in this pass"
         }
         return "They have been through \(unit). Say that in one sentence and NOTHING more — do "
             + "NOT say their inbox is clear, empty or at zero, and do not imply they are "
@@ -2802,8 +3246,13 @@ actor LocalTriageQueue {
     }
 
     private func stop() -> String {
+        let hadConfiguredFeed = configuredSections != nil
+        configuredSections = nil
+        activeFeedSection = nil
+        sectionFilter = nil
+        cancelSectionPreparation()
         let hasMailboxSession = offeredAccount != nil || !pausedOutcomes.isEmpty
-        guard running || hasMailboxSession else {
+        guard running || hasMailboxSession || hadConfiguredFeed else {
             return Self.json([
                 "stopped": true,
                 "note": "No queue was running. Do not say you have stopped one.",
@@ -2863,6 +3312,13 @@ actor LocalTriageQueue {
     }
 
     func end(preservingMailboxState: Bool = false) async {
+        configuredSections = nil
+        cancelSectionPreparation()
+        activeFeedSection = nil
+        sectionFilter = nil
+        completedFeedSections = []
+        feedProgressLoaded = false
+
         onboardingPreparation?.cancel()
         onboardingPreparation = nil
         onboardingFlow = nil
@@ -3054,6 +3510,10 @@ actor LocalTriageQueue {
         pendingArchives.append(PendingArchive(id: pending.id, account: pending.account,
             messageId: pending.messageId, threadId: pending.isMessageScoped ? nil : pending.threadId ?? matched?.thread(for: pending.messageId),
             operation: pending.operation))
+        if let presented = actionOutcome,
+           pending.matches(account: presented.about.account, ids: [presented.messageId], threadId: presented.threadId) {
+            return presented.messageId
+        }
         guard running, items.indices.contains(position - 1) else { return nil }
         let item = items[position - 1]
         let selected = item.conversation.filter {
@@ -3207,6 +3667,9 @@ actor LocalTriageQueue {
                 }
             }
             guard effect.removesFromInbox else { continue }
+            // Also retire confirmed messages outside the loaded page. A prepared page can
+            // predate the provider receipt and must not reintroduce that handled work.
+            note(ids.map { Self.messageKey(account: effect.account, id: $0) })
             let currentIndex = position - 1
             let touchesCurrent = running && items.indices.contains(currentIndex) && matches(items[currentIndex])
             let verb = effect.isDeletion || effect.added.contains("TRASH") ? "trash_message"
@@ -3242,11 +3705,14 @@ actor LocalTriageQueue {
                         forgetDealtWith(remaining)
                         items.insert(remaining, at: index + 1)
                     }
-                    finished = completed.id
+                    if actionOutcome == nil { finished = completed.id }
                 } else if ids.isSuperset(of: original.ids) {
                     items[index].acted = verb
                 }
             }
+            if let presented = actionOutcome,
+               presented.about.account.caseInsensitiveCompare(effect.account) == .orderedSame,
+               ids.contains(presented.messageId) { finished = presented.messageId }
         }
         await checkpoint(store: store)
         return finished
@@ -3318,12 +3784,12 @@ actor LocalTriageQueue {
         return true
     }
 
-    /// Finish the circled-back email and return the live cursor id whose suspended advance is now owed;
-    /// nil for an ordinary off-cursor write. The cursor id is the callers' compare-and-step token.
+    /// Resolve the displayed result, retaining its identity until the caller compares and steps.
+    /// The suspended inbox cursor is resumed only by step, never by receipt bookkeeping.
     func resolveActionOutcome(
         id: String?, threadId: String?, allowUnscoped: Bool = false, as verb: String
     ) -> ActionOutcomeResolution? {
-        guard running, let presented = actionOutcome else { return nil }
+        guard let presented = actionOutcome, running || presented.explicitSelection else { return nil }
         let matches = if let id {
             id == presented.messageId
         } else if let threadId {
@@ -3331,19 +3797,18 @@ actor LocalTriageQueue {
         } else {
             allowUnscoped
         }
-        guard matches, let cursor = currentId else { return nil }
-
-        actionOutcome = nil
-        if let index = items.firstIndex(where: { $0.id == presented.messageId }),
+        guard matches else { return nil }
+        if let index = items.firstIndex(where: { $0.id == presented.messageId
+            && $0.account.caseInsensitiveCompare(presented.about.account) == .orderedSame }),
            items[index].acted == nil {
             items[index].acted = verb
         }
         RealtimeLog.log(
             "localTriage: outcome presentation resolved by \(verb)"
                 + (id == nil && threadId == nil ? " from the user's referent" : "")
-                + " — resuming \(cursor)")
+                + " — holding the selected result until the next step")
         return ActionOutcomeResolution(
-            cursorId: cursor, dealtWith: presented.dealtWith)
+            cursorId: presented.messageId, dealtWith: presented.dealtWith)
     }
 
     /// Everything archived, labelled or walked past recently. Gmail walks use `gmailWalkDealtWith`
@@ -3463,12 +3928,19 @@ actor LocalTriageQueue {
     }
 
     /// The id of the message the user is standing on, or nil when no queue is running.
-    var currentId: String? {
+    var currentId: String? { actionOutcome?.messageId ?? queueCursorId }
+
+    private var queueCursorId: String? {
         guard running, position >= 1, position <= items.count else { return nil }
         return items[position - 1].id
     }
 
     func actionAccount(messageId: String?, threadId: String?, account: String?, store: MailStore? = nil) async -> String? {
+        if let presented = actionOutcome,
+           (messageId == presented.messageId || (messageId == nil && threadId == presented.threadId)),
+           account == nil || account?.lowercased() == presented.about.account.lowercased() {
+            return presented.about.account
+        }
         let matches = items.filter { item in
             (account == nil || item.account.lowercased() == account?.lowercased())
                 && (messageId.map { item.holds($0) } ?? threadId.map { item.threadId == $0 } ?? false)
@@ -3490,6 +3962,10 @@ actor LocalTriageQueue {
     }
 
     func standingOn(messageId: String, account: String? = nil) -> Bool {
+        if let presented = actionOutcome {
+            return presented.messageId == messageId
+                && (account == nil || account?.lowercased() == presented.about.account.lowercased())
+        }
         guard running, position >= 1, position <= items.count else { return false }
         return items[position - 1].holds(messageId)
             && (account == nil || items[position - 1].account.lowercased() == account?.lowercased())
@@ -3541,6 +4017,11 @@ actor LocalTriageQueue {
     }
 
     var standingOnJSON: String? {
+        if let presented = actionOutcome {
+            let about = presented.about
+            return Self.json(["account": about.account, "id": about.id, "threadId": about.threadId,
+                "from": about.from, "subject": about.subject])
+        }
         guard running, position >= 1, position <= items.count else { return nil }
         let item = items[position - 1]
         var dict: [String: Any] = [
@@ -3561,6 +4042,7 @@ actor LocalTriageQueue {
     /// The message the user is standing on as an outcome referent, for in-process use; `standingOnJSON`
     /// is its twin that is relayed verbatim and must stay opaque text.
     var standingOnAbout: Outcome.About? {
+        if let presented = actionOutcome { return presented.about }
         guard running, position >= 1, position <= items.count else { return nil }
         let item = items[position - 1]
         return Outcome.About(
@@ -3576,6 +4058,9 @@ actor LocalTriageQueue {
     /// Is the message the user is standing on part of this thread? A reply and a draft carry only
     /// `thread_id`, so this is the only way to match one.
     func standingOn(threadId: String, account: String? = nil) -> Bool {
+        if let presented = actionOutcome {
+            return presented.threadId == threadId && (account == nil || account?.lowercased() == presented.about.account.lowercased())
+        }
         guard running, position >= 1, position <= items.count else { return false }
         return items[position - 1].threadId == threadId
             && (account == nil || items[position - 1].account.lowercased() == account?.lowercased())
@@ -3861,6 +4346,7 @@ actor LocalTriageQueue {
     /// What the Live Activity's triage card draws, or nil when no queue is running. The denominator is
     /// the frozen `mailboxUnreadAtStart` (`.all` uses its own count); `max` stops "3 of 2".
     var standing: (position: Int, total: Int)? {
+        if actionOutcome != nil, !running { return (1, 1) }
         guard running, position >= 1, position <= items.count else { return nil }
         if topicGrouping && scope == .unread {
             return (position: position, total: items.count)
@@ -3951,7 +4437,9 @@ actor LocalTriageQueue {
         // Normally absent: an answer-shaped handoff does not badge the message it was about.
         if let acted = item?.acted { mail["alreadyDone"] = acted }
         var payload: [String: Any] = [
+            "done": false,
             "presentedForOutcome": true,
+            "returnedWorkSelection": outcome.jobId.uuidString,
             "item": mail,
             "dispatchOutcomeNote": presentNote + outcomeNaming,
         ]
@@ -4313,7 +4801,7 @@ actor LocalTriageQueue {
     private func inlineCalendarAgenda(waitForPreparation: Bool) async -> String? {
         // An invitation must not wait for the later calendar stage to finish preparing.
         let prepared = waitForPreparation ? await calendarAgendaPrefetch?.value : calendarAgendaPrepared
-        guard let agenda = prepared else { return nil }
+        guard let agenda = prepared, agenda.successful else { return nil }
         let remaining = CalendarSearch.remaining(agenda)
         inlinedCalendarEvents = remaining.events
         return CalendarSearch.formatted(remaining, query: "")
@@ -4646,7 +5134,7 @@ actor LocalTriageQueue {
 
         // No `next` lookahead: nothing moves this cursor but `triage_next`, so the model would announce
         // the next message and then read it again. `nextScopeInPlan` matters: `last` closes the walk.
-        if position >= items.count, !more, nextScopeInPlan() == nil {
+        if configuredSections == nil, position >= items.count, !more, nextScopeInPlan() == nil {
             // A field, because the absence of `next` cannot mean "last": on the last message a model
             // following the "Next is …" template reads the placeholder aloud.
             payload["last"] = true
@@ -4725,7 +5213,7 @@ actor LocalTriageQueue {
                 retainStageBeforeCrossing()
                 return await build(scope: next, store: store, walking: scopePlan, crossedFromScope: scope).0
             }
-            return await close()
+            return await close(store: store)
         }
         return nil
     }
@@ -4983,6 +5471,7 @@ actor LocalTriageQueue {
 
     /// The band this walk crosses into when the one in hand runs out, or nil at the end of the last one.
     private func nextBand() -> String? {
+        if sectionFilter == .important { return nil }
         guard let band, let at = MailImportance.walkOrder.firstIndex(of: band),
               at + 1 < MailImportance.walkOrder.count else { return nil }
         return MailImportance.walkOrder[at + 1]

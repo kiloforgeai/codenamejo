@@ -90,6 +90,7 @@ enum LocalCalendarWrites {
             return mine
         }
         let write = {
+            try Task.checkCancellation()
             let saved = try await CalendarAPI.json("PATCH", path: path, query: ["sendUpdates": "all"],
                                            body: ["attendees": patched], token: token)
             guard (saved["attendees"] as? [[String: Any]])?.first(where: { $0["self"] as? Bool == true })?["responseStatus"] as? String == response else {
