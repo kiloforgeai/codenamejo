@@ -1,3 +1,4 @@
+#if !targetEnvironment(macCatalyst)
 import Foundation
 import WatchConnectivity
 
@@ -144,3 +145,5 @@ final class WatchLink: NSObject, WCSessionDelegate, @unchecked Sendable {
     }
     #endif
 }
+
+#endif

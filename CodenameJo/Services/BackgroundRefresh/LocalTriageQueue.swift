@@ -121,6 +121,13 @@ actor LocalTriageQueue {
             + "chains. Only an explicit request for what it says or for more detail calls the "
             + "full-message read tool, and only then may the summary be extended. "
 
+    #if targetEnvironment(macCatalyst)
+    func desktopPreparedItems() -> [Item] {
+        guard running else { return [] }
+        return Array(items.dropFirst(max(0, position - 1)).prefix(30))
+    }
+    #endif
+
     var currentMailbox: String? {
         guard running, position >= 1, position <= items.count else { return nil }
         return items[position - 1].account

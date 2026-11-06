@@ -16,7 +16,9 @@ final class LocalSpeech: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
 
     @Published private(set) var paradeeState: ParadeeState = .idle
 
+    #if !targetEnvironment(macCatalyst)
     private let paradee = ParadeeTTS()
+    #endif
     private let playback = PCMPlayback()
     private let synthesizer = AVSpeechSynthesizer()
     private var utterance: AVSpeechUtterance?
@@ -35,6 +37,7 @@ final class LocalSpeech: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
     /// Downloads (first time only) and loads Paradee. Called at launch, because the local
     /// call is what answers when there is no connection, and by then it is too late to fetch.
     func warm() {
+        #if !targetEnvironment(macCatalyst)
         guard warming == nil, paradeeState != .ready else { return }
         paradeeState = .loading
         warming = Task { [weak self] in
@@ -48,6 +51,7 @@ final class LocalSpeech: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
             }
             warming = nil
         }
+        #endif
     }
 
     /// Speaks phrases as they arrive and returns once the last has been heard. `onPhrase`
@@ -56,7 +60,11 @@ final class LocalSpeech: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
                onPhrase: @escaping (String) -> Void = { _ in }) async throws {
         try Task.checkCancellation()
         stop()
+        #if targetEnvironment(macCatalyst)
+        let paradeeReady = false
+        #else
         let paradeeReady = choice == .paradee && paradeeState == .ready
+        #endif
         if choice == .paradee, !paradeeReady {
             RealtimeLog.log("local-voice: paradee not ready (\(paradeeState)) — speaking in the system voice")
         }
@@ -65,7 +73,9 @@ final class LocalSpeech: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
             await stopping?.value
             guard let self else { return }
             if paradeeReady {
+                #if !targetEnvironment(macCatalyst)
                 try await speakParadee(phrases, onPhrase: onPhrase)
+                #endif
             } else {
                 for try await phrase in phrases {
                     try Task.checkCancellation()
@@ -119,6 +129,7 @@ final class LocalSpeech: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
 
     // MARK: - Paradee
 
+    #if !targetEnvironment(macCatalyst)
     private func speakParadee(_ phrases: AsyncThrowingStream<String, Error>,
                               onPhrase: @escaping (String) -> Void) async throws {
         let session = try await playback.start()
@@ -143,6 +154,8 @@ final class LocalSpeech: NSObject, ObservableObject, AVSpeechSynthesizerDelegate
             throw error
         }
     }
+
+    #endif
 
     // MARK: - System voice
 

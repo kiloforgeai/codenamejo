@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>Jo Desktop</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleName</key>
+	<string>Jo Desktop</string>
+	<key>CFBundlePackageType</key>
+	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER).oauth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>aurex</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>INAlternativeAppNames</key>
+	<array>
+		<dict>
+			<key>INAlternativeAppName</key>
+			<string>Jo</string>
+			<key>INAlternativeAppNamePronunciationHint</key>
+			<string>Joe</string>
+		</dict>
+		<dict>
+			<key>INAlternativeAppName</key>
+			<string>Joe</string>
+		</dict>
+	</array>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>JoGitHubClientID</key>
+	<string>$(JO_GITHUB_CLIENT_ID)</string>
+	<key>JoSlackClientId</key>
+	<string>$(JO_SLACK_CLIENT_ID)</string>
+	<key>JoTokenServerHost</key>
+	<string>$(JO_TOKEN_SERVER_HOST)</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Codename Jo does not use the camera. This permission is required by its real-time audio engine and is never used to capture video.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>Codename Jo looks up a contact's phone number when you ask it to text someone by name.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Jo listens during your work session so you can talk through tasks hands-free.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Jo transcribes your speech on this Mac for the conversation and session history.</string>
+	<key>UIApplicationSupportsMultipleScenes</key>
+	<false/>
+</dict>
+</plist>

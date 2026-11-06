@@ -1,3 +1,4 @@
+#if !targetEnvironment(macCatalyst)
 import ActivityKit
 import Foundation
 
@@ -129,3 +130,19 @@ final class LiveVoiceActivity {
         inFlight = nil
     }
 }
+
+#else
+import Foundation
+
+@MainActor
+final class LiveVoiceActivity {
+    static let isAvailable = false
+    var isRunning: Bool { false }
+    func start(_ state: VoiceActivityAttributes.ContentState) {}
+    @discardableResult
+    func update(_ state: VoiceActivityAttributes.ContentState) -> Task<Void, Never>? { nil }
+    @discardableResult
+    func end() -> Task<Void, Never> { Task {} }
+    func settle() async {}
+}
+#endif

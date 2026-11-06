@@ -371,7 +371,91 @@ targets:
         TEST_TARGET_NAME: CodenameJo
         CODE_SIGN_STYLE: Automatic
         GENERATE_INFOPLIST_FILE: YES
+  JoDesktop:
+    type: application
+    platform: iOS
+    sources:
+      - CodenameJo
+      - JoDesktop
+      - Shared
+      - WatchShared
+      - path: prompts
+        type: folder
+        buildPhase: resources
+      - path: SmartTurn
+        type: folder
+        buildPhase: resources
+    configFiles:
+      Debug: Config/Version.xcconfig
+      Release: Config/Version.xcconfig
+    dependencies:
+      - package: Factory
+        product: FactoryKit
+      - package: GRDB
+      - package: WebRTC
+        product: LiveKitWebRTC
+      - package: FluidAudio
+      - package: Prefire
+      - package: mlx-swift-lm
+        product: MLXLLM
+      - package: mlx-swift-lm
+        product: MLXLMCommon
+      - package: mlx-swift-lm
+        product: MLXHuggingFace
+      - package: mlx-swift-lm
+        product: MLXFoundationModels
+      - package: swift-huggingface
+        product: HuggingFace
+      - package: swift-transformers
+        product: Tokenizers
+    settings:
+      base:
+        PRODUCT_NAME: Jo Desktop
+        PRODUCT_MODULE_NAME: CodenameJo
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID).desktop
+        SUPPORTS_MACCATALYST: YES
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
+        TARGETED_DEVICE_FAMILY: "2"
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        INFOPLIST_FILE: JoDesktop/Info.plist
+        CODE_SIGN_ENTITLEMENTS: JoDesktop/JoDesktop.entitlements
+        CODE_SIGN_STYLE: Automatic
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+        CURRENT_PROJECT_VERSION: "1"
+  JoDesktopTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - JoDesktopTests
+      - CodenameJoTests/LocalSlackQueueTests.swift
+      - CodenameJoTests/FeedOfferAnswerTests.swift
+      - CodenameJoTests/FeedFocusTests.swift
+    configFiles:
+      Debug: Config/Version.xcconfig
+      Release: Config/Version.xcconfig
+    dependencies:
+      - target: JoDesktop
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID).desktop.tests
+        SUPPORTS_MACCATALYST: YES
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
+        TARGETED_DEVICE_FAMILY: "2"
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Jo Desktop.app/Contents/MacOS/Jo Desktop
+        BUNDLE_LOADER: $(TEST_HOST)
 schemes:
+  JoDesktop:
+    build:
+      targets:
+        JoDesktop: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - JoDesktopTests
   JoWatch:
     build:
       targets:

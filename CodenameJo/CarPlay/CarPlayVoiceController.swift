@@ -1,3 +1,4 @@
+#if !targetEnvironment(macCatalyst)
 import AVFoundation
 import CarPlay
 import Combine
@@ -334,3 +335,5 @@ final class CarPlayVoiceController {
         interfaceController.presentTemplate(alert, animated: true, completion: nil)
     }
 }
+
+#endif

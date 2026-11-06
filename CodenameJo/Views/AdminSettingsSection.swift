@@ -49,7 +49,9 @@ struct AdminSection<Interactor: ViewWithModelLifecycleObserver<AdminSectionViewM
     private var handsFreeStartRow: some View {
         NavigationLink {
             AdminDetailList(title: "Siri starts") {
-                HandsFreeStartSection()
+                #if !targetEnvironment(macCatalyst)
+            HandsFreeStartSection()
+            #endif
             }
         } label: {
             SettingsRow.label(

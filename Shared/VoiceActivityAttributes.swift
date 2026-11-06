@@ -1,9 +1,11 @@
+#if !targetEnvironment(macCatalyst)
 import ActivityKit
+#endif
 import Foundation
 
 /// What the Live Activity draws; compiled into both targets, so it imports only ActivityKit and
 /// Foundation. No transcript: the Lock Screen is a public surface.
-struct VoiceActivityAttributes: ActivityAttributes {
+struct VoiceActivityAttributes {
     /// Which of the four things a live call can be doing; coarser than `SessionState` because a
     /// glance surface needs only states the user can act on.
     enum Phase: String, Codable, Hashable {
@@ -66,3 +68,7 @@ struct VoiceActivityAttributes: ActivityAttributes {
     /// from.
     var startedAt: Date
 }
+
+#if !targetEnvironment(macCatalyst)
+extension VoiceActivityAttributes: ActivityAttributes {}
+#endif

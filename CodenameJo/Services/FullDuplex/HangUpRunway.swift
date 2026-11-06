@@ -13,6 +13,12 @@ enum HangUpRunway {
     /// what the system card draws.
     static func run<T>(_ title: String, subtitle: String = "", progress: Progress? = nil,
                        _ work: @escaping @MainActor () async -> T) async -> T {
+        #if targetEnvironment(macCatalyst)
+        let activity = ProcessInfo.processInfo.beginActivity(
+            options: .userInitiatedAllowingIdleSystemSleep, reason: title)
+        defer { ProcessInfo.processInfo.endActivity(activity) }
+        return await work()
+        #else
         let inner = Task { await work() }
         let hold = Hold(cancel: { inner.cancel() })
         hold.assertion = UIApplication.shared.beginBackgroundTask(withName: title) { hold.expire() }
@@ -22,9 +28,11 @@ enum HangUpRunway {
         let result = await withTaskCancellationHandler { await inner.value } onCancel: { inner.cancel() }
         hold.finish(success: !inner.isCancelled)
         return result
+        #endif
     }
 }
 
+#if !targetEnvironment(macCatalyst)
 @MainActor
 private final class Hold {
     let cancel: () -> Void
@@ -86,3 +94,5 @@ private final class Hold {
         assertion = .invalid
     }
 }
+
+#endif

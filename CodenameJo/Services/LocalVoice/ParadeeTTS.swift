@@ -1,3 +1,4 @@
+#if !targetEnvironment(macCatalyst)
 import FluidAudio
 import Foundation
 import OnnxRuntimeBindings
@@ -115,3 +116,5 @@ actor ParadeeTTS {
         return destination
     }
 }
+
+#endif

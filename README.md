@@ -62,8 +62,8 @@ None of them goes through any server of ours.
 
 ## Requirements
 
-- An iPhone on iOS 26.4 or later.
-- A Mac with Xcode 26.4 or later and [XcodeGen](https://github.com/yonaskolb/XcodeGen)
+- An iPhone on iOS 26.4 or later, or an Apple Silicon Mac on macOS 26.4 or later.
+- A Mac with Xcode 27 or later and [XcodeGen](https://github.com/yonaskolb/XcodeGen)
   (`brew install xcodegen`).
 - An OpenAI API key whose project can use `gpt-live-1`, `gpt-5.6-luna` and `gpt-6-luna`.
 - An Apple ID. A free one works, with Apple's limits: the app has to be reinstalled from
@@ -94,6 +94,30 @@ your first call.
 
 With only the first two set, everything works. Google sign-in uses our hosted shim and our
 verified, CASA-assessed Google client, so you don't need a Google Cloud project of your own.
+
+### Mac app
+
+The `JoDesktop` scheme builds a Mac Catalyst workspace from the same `CodenameJo`, `Shared`,
+`WatchShared`, and `prompts` sources as the iPhone app. It adds a work queue, current item,
+conversation, background activity, and keyboard controls. Select **My Mac (Mac Catalyst)** in Xcode.
+The Mac requires macOS 26.4 or newer; Apple Silicon is the tested architecture.
+
+Use the configuration steps above, then run `xcodegen generate` and open `CodenameJo.xcodeproj`.
+The desktop bundle identifier is `$(APP_BUNDLE_ID).desktop`. Choose your Apple development team
+and let Xcode manage signing: a provisioned app-scoped Keychain group is required for API keys and
+connector grants. The sandbox permits WebRTC's inbound UDP audio as well as outgoing connections.
+CarPlay, Watch pairing, Live Activities, and the locked-phone Siri shortcut stay iPhone-only.
+Local fallback speech uses the installed macOS system voice; Live voice uses the shared transport.
+
+```bash
+xcodebuild test -project CodenameJo.xcodeproj -scheme JoDesktop \
+  -destination 'platform=macOS,variant=Mac Catalyst' -allowProvisioningUpdates \
+  DEVELOPMENT_TEAM=YOUR_TEAM_ID
+```
+
+The existing on-device model dependencies require Xcode 27 and its Metal Toolchain
+(`xcodebuild -downloadComponent MetalToolchain`). Enable the MLX package macro when Xcode asks.
+These are build requirements; the app deployment minimum remains 26.4.
 
 ## Your OpenAI key
 

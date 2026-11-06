@@ -3,6 +3,7 @@ import FactoryKit
 import SwiftUI
 import UIKit
 
+#if !targetEnvironment(macCatalyst)
 @main
 struct CodenameJoApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -44,6 +45,7 @@ struct CodenameJoApp: App {
     }
 }
 
+#endif
 
 struct RootView<Interactor: ViewWithModelLifecycleObserver<RootViewModel> & RootViewHandler>: View {
     @StateObject var viewModel: RootViewModel
@@ -59,7 +61,11 @@ struct RootView<Interactor: ViewWithModelLifecycleObserver<RootViewModel> & Root
             } else if !backend.isSignedIn {
                 Step1SignInViewComponent.make(onComplete: {})
             } else {
+                #if targetEnvironment(macCatalyst)
+                DesktopWorkspaceComponent.make()
+                #else
                 ContentView()
+                #endif
             }
         }
         .bind(observer: interactor, viewModel: viewModel)

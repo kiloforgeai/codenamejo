@@ -9,6 +9,10 @@ enum LocalVoice: String, CaseIterable, Identifiable {
     /// has not downloaded yet.
     case system
 
+    #if targetEnvironment(macCatalyst)
+    static let allCases: [LocalVoice] = [.system]
+    #endif
+
     static let storageKey = "localVoice"
 
     var id: String { rawValue }
@@ -21,7 +25,11 @@ enum LocalVoice: String, CaseIterable, Identifiable {
     }
 
     static var current: LocalVoice {
+        #if targetEnvironment(macCatalyst)
+        return .system
+        #else
         LocalVoice(rawValue: UserDefaults.standard.string(forKey: storageKey) ?? "") ?? .paradee
+        #endif
     }
 }
 

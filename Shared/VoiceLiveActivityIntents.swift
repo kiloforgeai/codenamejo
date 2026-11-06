@@ -1,3 +1,4 @@
+#if !targetEnvironment(macCatalyst)
 import AppIntents
 
 /// The Lock Screen / Dynamic Island mute button. A `LiveActivityIntent` runs in the app's process,
@@ -37,3 +38,5 @@ struct EndBackgroundVoiceSessionIntent: LiveActivityIntent {
         return .result()
     }
 }
+
+#endif

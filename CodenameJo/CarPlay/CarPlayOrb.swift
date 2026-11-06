@@ -1,3 +1,4 @@
+#if !targetEnvironment(macCatalyst)
 import SwiftUI
 import UIKit
 
@@ -99,3 +100,5 @@ enum CarPlayOrb {
         VoiceOrb.mood(state: state, muted: muted)
     }
 }
+
+#endif
