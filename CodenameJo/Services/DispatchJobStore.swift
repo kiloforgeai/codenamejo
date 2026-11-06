@@ -1,10 +1,13 @@
 import Foundation
+import FactoryKit
 
 /// The dispatch log, kept on the phone: `DispatchWorker` writes each job's row, and the next call
 /// reads back answers nobody heard and marks them delivered.
 /// Not `final`: `PreviewDispatchJobStore` overrides `history()` and `recover()` to serve fixtures.
 @MainActor
 class DispatchJobStore {
+    @Injected(\.backend) private var backend
+    private let persistence = DispatchQueue(label: "jo.dispatch-jobs.persistence", qos: .utility)
     private let url: URL
     private var jobs: [DispatchJob]
 
@@ -24,8 +27,9 @@ class DispatchJobStore {
 
     /// The active profile's rows; the default profile also owns rows written before profiles.
     private var visible: [DispatchJob] {
-        guard let scope = ProfileRuntime.snapshot else { return jobs.filter { $0.profileId == nil } }
-        return jobs.filter { $0.profileId == scope.profileId || (scope.isDefault && $0.profileId == nil) }
+        let owned = jobs.filter { $0.userId == backend.userId }
+        guard let scope = ProfileRuntime.snapshot else { return owned.filter { $0.profileId == nil } }
+        return owned.filter { $0.profileId == scope.profileId || (scope.isDefault && $0.profileId == nil) }
     }
 
     /// Every stored row, newest first — the History screen's Dispatch panel reads this. Read-only.
@@ -39,7 +43,7 @@ class DispatchJobStore {
     /// before this call has dispatched anything.
     func recover() async -> [DispatchJob] {
         let now = Date()
-        prune(asOf: now)
+        await prune(asOf: now)
         let undelivered = visible.filter { $0.deliveredAt == nil }
         for job in undelivered where job.hasStopped(asOf: now) && job.recoveredAnswer(asOf: now) == nil {
             await settle(job.id)
@@ -56,48 +60,93 @@ class DispatchJobStore {
     func settle(_ id: UUID) async {
         guard let index = jobs.firstIndex(where: { $0.id == id }), jobs[index].deliveredAt == nil else { return }
         jobs[index].deliveredAt = Date()
-        save()
+        await save()
+    }
+
+    func previousOperation(_ operation: DispatchMailOperation, profileID: String?) -> DispatchJob? {
+        jobs.last { $0.userId == backend.userId && $0.profileId == profileID && $0.operation == operation
+            && ($0.isDone || $0.isRunning || $0.state == "unknown") }
     }
 
     /// A job has started; a retried memo reuses its id and starts its row again.
-    func begin(id: UUID, task: String, profileId: String?) {
+    func begin(id: UUID, task: String, profileId: String?, conversationId: UUID? = nil, turnId: String? = nil, operation: DispatchMailOperation? = nil) async {
         jobs.removeAll { $0.id == id }
-        jobs.append(DispatchJob(id: id, task: task, state: "running", startedAt: Date(), profileId: profileId))
-        save()
+        let profiles = Container.shared.workspaceProfiles()
+        let defaultProfile = profileId == nil || profiles.profiles.first(where: { $0.id == profileId })?.isDefault == true
+        let owner = backend.userId.map { $0 + (defaultProfile ? "" : ":profile:" + (profileId ?? "")) }
+        jobs.append(DispatchJob(id: id, task: task, state: "running", startedAt: Date(), profileId: profileId,
+            userId: backend.userId, conversationId: conversationId, turnId: turnId, historyOwner: owner, operation: operation))
+        await save()
+        await recordHistoryOutcome(jobs.first { $0.id == id }, status: .pending)
     }
 
-    func finish(_ id: UUID, state: String, result: String, reportBack: Bool? = nil) {
+    func receipt(_ id: UUID, callId: String, tool: String, failed: Bool) async {
+        guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
+        var receipts = jobs[index].receipts ?? []
+        guard !receipts.contains(where: { $0.callId == callId }) else { return }
+        receipts.append(.init(callId: callId, tool: tool, outcome: failed ? "failed" : "success"))
+        jobs[index].receipts = receipts
+        await save()
+    }
+
+    func finish(_ id: UUID, state: String, result: String, reportBack: Bool? = nil, historyStatus: CommandRecord.CommandStatus? = nil) async {
         guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
         jobs[index].state = state
         jobs[index].result = result
         jobs[index].completedAt = Date()
         jobs[index].reportBack = reportBack
-        save()
+        let job = jobs[index]
+        await save()
+        let status: CommandRecord.CommandStatus = state == "done" ? .success : state == "partial" ? .partial : state == "unknown" ? .unknown : .failed
+        await recordHistoryOutcome(job, status: historyStatus ?? status)
     }
 
-    func discard(_ id: UUID) {
+    private func recordHistoryOutcome(_ job: DispatchJob?, status: CommandRecord.CommandStatus) async {
+        guard let job, let owner = job.historyOwner, let turn = job.turnId else { return }
+        do {
+            try await TurnStore(database: Container.shared.localContext().dbPool)
+                .recordJobOutcome(userID: owner, turnID: turn, jobID: job.id, outcome: status)
+            if owner == Container.shared.workspaceProfiles().contextOwner { await Container.shared.commandStore().refresh() }
+        } catch { RealtimeLog.log("dispatch: could not reconcile history outcome — \(error.localizedDescription)") }
+    }
+
+    func discard(_ id: UUID) async {
+        await recordHistoryOutcome(jobs.first { $0.id == id }, status: .failed)
         jobs.removeAll { $0.id == id }
-        save()
+        await save()
     }
 
     /// Sign-out: the next account inherits nothing.
     func removeAll() {
         jobs = []
-        try? FileManager.default.removeItem(at: url)
+        let url = url
+        persistence.async {
+            do {
+                if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+            } catch { RealtimeLog.log("dispatch: could not remove job log — \(error.localizedDescription)") }
+        }
     }
 
     /// Delivered rows past `DispatchJob.retention`. An undelivered answer is never pruned.
-    private func prune(asOf now: Date) {
+    private func prune(asOf now: Date) async {
         let before = jobs.count
         jobs.removeAll { job in job.deliveredAt.map { now.timeIntervalSince($0) > DispatchJob.retention } ?? false }
-        if jobs.count != before { save() }
+        if jobs.count != before { await save() }
     }
 
-    private func save() {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(jobs) else { return }
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+    private func save() async {
+        let snapshot = jobs, url = url
+        await withCheckedContinuation { continuation in
+            persistence.async {
+                do {
+                    let encoder = JSONEncoder()
+                    encoder.dateEncodingStrategy = .iso8601
+                    let data = try encoder.encode(snapshot)
+                    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+                } catch { RealtimeLog.log("dispatch: could not persist job receipts — \(error.localizedDescription)") }
+                continuation.resume()
+            }
+        }
     }
 }

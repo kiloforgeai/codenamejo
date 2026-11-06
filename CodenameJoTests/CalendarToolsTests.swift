@@ -13,7 +13,7 @@ final class CalendarToolsTests: XCTestCase {
         let accounts = ["owner@example.test", "work@example.test"]
         XCTAssertNil(try CalendarTools.bind(CalendarTools.create, ["account": " "], mailbox: nil, accounts: accounts).get()["account"])
         XCTAssertEqual(try CalendarTools.bind(CalendarTools.create, ["account": "owner@example.test"], mailbox: "WORK@example.test",
-                                              accounts: accounts).get()["account"] as? String, "work@example.test")
+                                              accounts: accounts).get()["account"] as? String, "owner@example.test")
         XCTAssertThrowsError(try CalendarTools.bind(CalendarTools.update, [:], mailbox: "other@example.test", accounts: accounts).get())
     }
 

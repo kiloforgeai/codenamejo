@@ -450,6 +450,7 @@ enum FullDuplexBroker {
         var reportBack = true
         /// The job reached the local dispatch log, so a memo queue's work is done whatever it said.
         var recorded = true
+        var status: CommandRecord.CommandStatus? = nil
     }
 
     /// The mail and calendar writes a dispatched job may call, and the connectors the job's

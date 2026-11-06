@@ -15,9 +15,25 @@ struct DispatchJob: Codable, Identifiable, Hashable {
     var profileId: String? = nil
     /// Only a confirmed action success is silent.
     var reportBack: Bool? = nil
+    var userId: String? = nil
+    var conversationId: UUID? = nil
+    var turnId: String? = nil
+    var receipts: [Receipt]? = nil
+    var historyOwner: String? = nil
+    var operation: DispatchMailOperation? = nil
+
+    struct Receipt: Codable, Hashable {
+        let callId: String
+        let tool: String
+        let outcome: String
+        var targetHash: String? = nil
+    }
 
     enum CodingKeys: String, CodingKey {
-        case id, task, state, result
+        case id, task, state, result, receipts, historyOwner, operation
+        case userId = "user_id"
+        case conversationId = "conversation_id"
+        case turnId = "turn_id"
         case startedAt = "started_at"
         case completedAt = "completed_at"
         case deliveredAt = "delivered_at"
@@ -26,7 +42,7 @@ struct DispatchJob: Codable, Identifiable, Hashable {
     }
 
     var isRunning: Bool { state == "running" }
-    var didFail: Bool { state == "failed" }
+    var didFail: Bool { state == "failed" || state == "partial" }
     var isDone: Bool { state == "done" }
 
     /// How long a `running` row is given before it is presumed dead: above `DispatchWorker.budget`,
@@ -57,7 +73,7 @@ struct DispatchJob: Codable, Identifiable, Hashable {
                 + "or what it managed to do. Do not tell the user it did nothing — say it "
                 + "is unresolved, and offer to check the part that matters."
         }
-        guard isDone || didFail, let result, !result.isEmpty else { return nil }
+        guard isDone || didFail || state == "unknown", let result, !result.isEmpty else { return nil }
         return result
     }
 }

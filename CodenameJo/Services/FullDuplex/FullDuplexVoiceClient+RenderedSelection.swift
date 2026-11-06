@@ -1,0 +1,21 @@
+import FactoryKit
+import Foundation
+
+extension FullDuplexVoiceClient {
+    func renderedSelectionRefusal() -> String? {
+        #if targetEnvironment(macCatalyst)
+        let realtime = Container.shared.realtimeService()
+        guard let step = liveQueueActionAnchor?.step ?? standingStep,
+              let key = LiveEmailPresentation.Key.step(step) else { return nil }
+        guard let rendered = realtime.renderedWorkspace else {
+            return realtime.isConversing ? "Not executed: the workspace has not displayed this selection yet. Wait for the current email to appear before acting." : nil
+        }
+        guard rendered.conversationID == realtime.activeConversationId,
+              rendered.permits(.init(account: key.account, messageID: key.messageId), profileID: ProfileRuntime.snapshot?.profileId) else {
+            return "Not executed: the displayed email and conversation selection are not synchronized. "
+                + "Confirm the sender and subject of the displayed email before acting. Do not retry this write unchanged or advance the feed."
+        }
+        #endif
+        return nil
+    }
+}

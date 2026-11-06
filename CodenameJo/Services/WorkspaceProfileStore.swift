@@ -75,6 +75,13 @@ class WorkspaceProfileStore: ObservableObject {
         }
     }
 
+    func reorderMailboxes(_ emails: [String], profileId: String) async throws {
+        guard let owner = backend.userId, selected?.id == profileId else { throw WorkspaceProfileError.notFound }
+        try await rows.reorderMailboxes(emails, userId: owner, profileId: profileId)
+        guard backend.userId == owner, selected?.id == profileId else { return }
+        await refreshConnections()
+    }
+
     /// Every mailbox the account has connected. One that no profile holds yet joins the profile
     /// the user is in when it first appears — the one they connected it from.
     func adopt(_ accounts: [String]) async {

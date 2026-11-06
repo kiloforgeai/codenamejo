@@ -376,6 +376,27 @@ class RealtimeService: ObservableObject {
     @Published private(set) var localVoiceEngine: LocalVoiceBrain.Engine?
     @Published var voiceNotice: String?
     private var diagnostics: VoiceDiagnostics.Session?
+    var renderedWorkspace: RenderedFeedState?
+    private var renderRevision = 0
+
+    func recordRenderedWorkspace(_ state: RenderedFeedState) {
+        guard state.conversationID == activeConversationId, state.profileID == ProfileRuntime.snapshot?.profileId,
+              state != renderedWorkspace else { return }
+        let queueChanged = state.queueOrder != renderedWorkspace?.queueOrder
+        renderedWorkspace = state
+        renderRevision += 1
+        guard isConversing, let diagnostics else { return }
+        var fields = ["render_revision": String(renderRevision), "queue_revision": String(state.queueRevision),
+            "queue_scope": state.queueScope, "observation_phase": "layout_applied",
+            "window_id": "workspace", "profile_hash": diagnostics.target(state.profileID ?? "default"),
+            "response_hash": diagnostics.target(state.response), "response_role": state.previousResponse ? "previous" : "current",
+            "focus_mode": String(state.focusMode), "visible_count": String(state.queueOrder.count)]
+        if let focus = state.focus { fields["target_hash"] = diagnostics.target(focus.canonical) }
+        if let current = state.queueCurrent { fields["queue_target_hash"] = diagnostics.target(current.canonical) }
+        if queueChanged { fields["queue_order"] = state.queueOrder.map { diagnostics.target($0) }.joined(separator: ",") }
+        fields["mismatch"] = String(state.focus != nil && state.focus != state.queueCurrent)
+        diagnostics.record(.workspaceRendered, fields)
+    }
     var isLocalVoice: Bool { localVoiceEngine != nil }
 
     var feedbackContext: FeedbackContext {
@@ -392,7 +413,7 @@ class RealtimeService: ObservableObject {
         return FeedbackContext(sessionID: isConversing ? diagnostics?.id : nil,
             conversationID: activeConversationId, profileID: ProfileRuntime.snapshot?.profileId,
             engine: isConversing ? (localVoiceEngine.map { "local_\($0.rawValue)" } ?? "live") : "idle",
-            state: state)
+            state: state, renderRevision: renderRevision)
     }
 
     func installProfileDossier(_ dossier: ProfileDossierContext?, profileId: String) {
@@ -562,7 +583,7 @@ class RealtimeService: ObservableObject {
             if self.commandStartTime == nil { self.commandStartTime = Date() }
             if !text.isEmpty { self.lastCommandText = text }
         }
-        client.onAssistantTranscript = { [weak self] text, isFinal in
+        client.onAssistantTranscript = { [weak self, weak client] text, isFinal in
             // `stopWithEndCue` keeps the audio session alive briefly for the falling
             // tone. Ignore any transcript frame already in flight during that window;
             // otherwise End clears the answer and a late delta draws it again.
@@ -575,7 +596,10 @@ class RealtimeService: ObservableObject {
             // A tool call ends a Realtime response without ending the turn, so
             // "final" here means the model has actually stopped — the client
             // withholds it while a continuation is in flight.
-            if isFinal { self.finalizeTurn() }
+            if isFinal {
+                self.lastCommandText = client?.historyUserText ?? self.lastCommandText
+                self.finalizeTurn(id: client?.historyTurnID)
+            }
         }
         client.onUserTurnCommitted = { [weak self] in
             // The step chips describe *one* wait and are cleared when the next one
@@ -782,8 +806,15 @@ class RealtimeService: ObservableObject {
     /// call it belongs to rather than on whichever ran first.
     private func failStep(_ tool: String) {
         guard let index = turnSteps.lastIndex(where: { $0.tool == tool && !$0.failed })
-        else { return }
+        else {
+            var step = TurnStep(tool: tool)
+            step.failed = true
+            step.endedAt = Date()
+            turnSteps.append(step)
+            return
+        }
         turnSteps[index].failed = true
+        turnSteps[index].endedAt = Date()
     }
 
     /// How long after the last queue step the user is still considered mid-queue.
@@ -1898,19 +1929,40 @@ class RealtimeService: ObservableObject {
     /// - Parameter interrupted: the user cut this reply off. Only the *stored*
     ///   copy is marked — `responseText` is what the screen is showing, and
     ///   stamping that would put the marker in front of the user.
-    private func finalizeTurn(interrupted: Bool = false) {
+    private var completedHistory: [UUID: CommandRecord] = [:]
+
+    private func finalizeTurn(interrupted: Bool = false, id: UUID? = nil) {
+        let id = id ?? fullDuplex?.historyTurnID ?? UUID()
+        let previous = completedHistory[id]
+        if fullDuplex?.isBackgroundHistory == true {
+            var record = previous ?? CommandRecord(id: id, commandText: lastCommandText, conversationId: activeConversationId)
+            record.responseText = responseText
+            record.status = fullDuplex?.historyJobOutcomes[id] ?? .unknown
+            record.toolSteps = record.toolSteps?.map { step in
+                var step = step
+                if step.tool == "dispatch" { step.outcome = record.status.rawValue }
+                return step
+            }
+            completedHistory[id] = record
+            lastCompletedTurn = record
+            return
+        }
+        let status = interrupted ? CommandRecord.CommandStatus.cancelled
+            : fullDuplex?.historyJobOutcomes[id] ?? CommandRecord.outcome(steps: turnSteps, interrupted: false)
         lastResponseText = interrupted
             ? responseText + CommandRecord.interruptedMarker
             : responseText
         // Close anything still open first: an interrupted turn leaves a running
         // step behind, and a step with no end reads as a tool that never returned.
+        let recordedSteps = turnSteps
         closeOpenSteps()
-        lastTurnSteps = turnSteps.map { step in
+        lastTurnSteps = recordedSteps.map { step in
             CommandRecord.ToolStep(
                 tool: step.tool,
                 // 0 is the "we don't know" the hosted-MCP path reports, not a
                 // measurement — see `CommandRecord.ToolStep.milliseconds`.
-                milliseconds: step.serverMilliseconds.flatMap { $0 > 0 ? $0 : nil }
+                milliseconds: step.serverMilliseconds.flatMap { $0 > 0 ? $0 : nil },
+                outcome: step.failed ? "failed" : step.isRunning ? "unknown" : "success"
             )
         }
         lastServiceName = Self.inferService(from: lastCommandText)
@@ -1926,20 +1978,23 @@ class RealtimeService: ObservableObject {
         // A turn with nothing said back isn't a turn worth filing — the old save
         // guarded on this too, and it is the one place that can still decline.
         guard !lastResponseText.isEmpty else { return }
-        let brainSteps = pendingBrainSteps
+        let brainSteps = (previous?.brainSteps ?? []) + pendingBrainSteps
         pendingBrainSteps = []
-        lastCompletedTurn = CommandRecord(
-            commandText: lastCommandText.isEmpty ? "Voice command" : lastCommandText,
+        let record = CommandRecord(
+            id: id, commandText: lastCommandText.isEmpty ? "Voice command" : lastCommandText,
             responseText: lastResponseText,
             serviceName: lastServiceName,
             serviceIcon: CommandRecord.icon(for: lastServiceName),
-            status: .success,
-            durationSeconds: duration,
+            status: status,
+            durationSeconds: (previous?.durationSeconds ?? 0) + duration,
+            issuedAt: previous?.issuedAt ?? Date(),
             conversationId: activeConversationId,
-            toolSteps: lastTurnSteps.isEmpty ? nil : lastTurnSteps,
-            latency: latency,
+            toolSteps: lastTurnSteps.isEmpty ? previous?.toolSteps : lastTurnSteps,
+            latency: latency ?? previous?.latency,
             brainSteps: brainSteps.isEmpty ? nil : brainSteps
         )
+        completedHistory[id] = record
+        lastCompletedTurn = record
     }
 
     // MARK: - Service inference

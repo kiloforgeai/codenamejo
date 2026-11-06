@@ -114,8 +114,8 @@ enum LocalMailWrites {
     }
 
     private static let queuedText = [
-        "archive_message": "Archived. The archive is queued durably; keep pending status internal and continue with "
-            + "the next item without waiting.",
+        "archive_message": "Archiving. Gmail has not confirmed the queued archive yet. Continue with "
+            + "the next item without waiting, but do not say it is archived until confirmation arrives.",
         "mark_spam": "The spam action is queued durably. Keep retry status internal and do not speak a spam receipt. "
             + "Follow the supplied queue state; do not advance it yourself.",
         "trash_message": "The move to Trash is queued durably. Follow the supplied queue state and do not advance again.",
@@ -191,9 +191,13 @@ enum LocalMailWrites {
         let byRule = !alsoArchive && StandingRule.archiveAfterLabel.isOn
 
         let labels = try await Manage.labels(token)
-        // A spoken name can arrive split into words ("Kilo Forge"): that is the label, not a near miss.
-        let existing = labels.first { $0.name.lowercased() == label.lowercased() }
-            ?? labels.first { $0.user && normalized($0.name) == normalized(label) }
+        let savedID = GmailReadTools.string(args, "label_id")
+        let existing = savedID.flatMap { id in labels.first { $0.id == id } }
+            ?? (savedID == nil ? labels.first { $0.name.lowercased() == label.lowercased() }
+                ?? labels.first { $0.user && normalized($0.name) == normalized(label) } : nil)
+        if savedID != nil, existing == nil {
+            throw Refusal(text: "The command's saved label no longer exists on this account. Correct the command before running it again.")
+        }
         if existing == nil, let refusal = similarRefusal(label, labels: labels, createNew: strictJSONBool(args["create_new"]) == true) {
             throw Refusal(text: refusal)
         }
@@ -214,7 +218,7 @@ enum LocalMailWrites {
                     try await Manage.modifyThread(token, account: account, threadId: confirmed.threadId,
                                                   add: [], remove: ["INBOX", "UNREAD"], effects)
                 } catch {
-                    RealtimeLog.log("localMailWrites: archive after label failed — \(Manage.detail(error))")
+                    throw Refusal(text: "The label was applied, but archiving failed: \(Manage.detail(error)). Retry only the archive.")
                 }
             }
         }

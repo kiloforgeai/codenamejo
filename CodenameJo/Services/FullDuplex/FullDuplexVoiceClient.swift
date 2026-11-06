@@ -568,6 +568,9 @@ final class FullDuplexVoiceClient {
         try await Container.shared.voiceAudioHandoff().wait()
         try Task.checkCancellation()
         diagnostics?.record(.livePreparing, ["model": LivePrompt.speakerModel, "brain_model": LivePrompt.brainModel])
+        LiveIntentRouter.beginSession(diagnostics: diagnostics)
+        connectCue.diagnostics = diagnostics
+        endCue.diagnostics = diagnostics
         observedRemoteAudio = false
         FullDuplexTrace.begin()
         // Before any work, so the breakdown accounts for the whole wait rather
@@ -677,6 +680,13 @@ final class FullDuplexVoiceClient {
         liveInputComplete = false
         liveTurnQueueRevisions = [:]
         liveUserTurn = 0
+        historyTurnID = UUID()
+        historyUserText = ""
+        isBackgroundHistory = false
+        historyIDsByInput.removeAll()
+        historyTranscripts.removeAll()
+        historyJobOutcomes.removeAll()
+        dispatchHistory.removeAll()
         liveQueueRevision = 0
         unheardPresentation = nil
         liveTurnsBeforeHearing.removeAll()
@@ -880,10 +890,14 @@ final class FullDuplexVoiceClient {
                     return (self.standingStep.map { self.preparedEmailStep($0) } ?? "No email selected.",
                             ProfileRuntime.snapshot?.profileId)
                 }
+                adapter.diagnostics = diagnostics
+                adapter.historyIDForTurn = { [weak self] in self?.historyIDsByInput[$0]?.uuidString }
                 adapter.enableClientDelegation { [weak self] body in
                     guard let self, self.isActive, self.dialGeneration == mintDial else { throw CancellationError() }
                     let scope = ProfileRuntime.snapshot
-                    let result = try await LiveOpenAI.respond(brain: self.liveBrain, body: body)
+                    var body = body
+                    if let index = body["turnIndex"] as? Int { body["turnID"] = self.historyIDsByInput[index]?.uuidString }
+                    let result = try await LiveOpenAI.respond(brain: self.liveBrain, body: body, diagnostics: self.diagnostics)
                     guard self.isActive, self.dialGeneration == mintDial,
                           scope?.profileId == ProfileRuntime.snapshot?.profileId else {
                         throw CancellationError()
@@ -1384,6 +1398,7 @@ final class FullDuplexVoiceClient {
             }
             if !exhausted, tryLiveFastAction(latestCompletedUserUtterance) { return }
             if exhausted {
+                onToolFailed?("resolve_request")
                 didReofferPendingStep = true
                 adapter.speakExactly("I couldn't resolve that request. This email is still selected.")
             } else {
@@ -1407,11 +1422,15 @@ final class FullDuplexVoiceClient {
             _ = resumeFeedAfterLessonIfSettled()
             emitFinalTranscript(responseCompleted: false)
         case .liveUserActivity:
+            historyTurnID = UUID()
+            historyUserText = ""
+            isBackgroundHistory = false
             didAutoContinue = false
             didReofferPendingStep = false
             assistantSpeechThisTurn = ""
             unspokenHandoffThisTurn = false
             liveUserTurn += 1
+            historyIDsByInput[liveUserTurn] = historyTurnID
             liveInputComplete = false
             liveFastProfileId = nil
             liveFastAnchor = nil
@@ -1437,6 +1456,8 @@ final class FullDuplexVoiceClient {
             toolCalledThisResponse = false
             onUserSpeechStarted?()
         case .liveFirstSpeech(let ms):
+            diagnostics?.record(.speechStarted, ["engine": "live", "turn_id": historyTurnID.uuidString,
+                "duration_ms": String(ms)])
             var turn = TurnLatency()
             turn.toFirstAudioMs = ms
             turn.turnIndex = liveUserTurn
@@ -1462,11 +1483,13 @@ final class FullDuplexVoiceClient {
                 }
             }
             latestCompletedUserUtterance = text
+            historyUserText = text
             onUserTranscript?(text, false)
             routeWithModel(text)
         case .liveInputFinished(let text):
             userSpeaking = false
             latestCompletedUserUtterance = text
+            historyUserText = text
             onUserTranscript?(text, true)
             onUserTurnCommitted?()
             liveInputComplete = true
@@ -1681,7 +1704,7 @@ final class FullDuplexVoiceClient {
                         events: [], successful: false,
                         merging: feedFocusTracker.hasCalendarResult))
                 }
-                onToolDone?(name)
+                onToolFailed?(name)
             }
             runningTool = nil
 
@@ -2097,6 +2120,14 @@ final class FullDuplexVoiceClient {
     /// History row per final, so a second one is a duplicate turn rather than a
     /// second answer. Whichever event arrives first wins; the other finds the item
     /// already spent and says nothing.
+    private var historyIDsByInput: [Int: UUID] = [:]
+    var historyTurnID = UUID()
+    var historyUserText = ""
+    var isBackgroundHistory = false
+    var historyJobOutcomes: [UUID: CommandRecord.CommandStatus] = [:]
+    var dispatchHistory: [UUID: (id: UUID, text: String)] = [:]
+    private var historyTranscripts: [UUID: TurnTranscript] = [:]
+
     func emitFinalTranscript(responseCompleted: Bool = true) {
         guard let id = currentAssistantItem, id != finalizedAssistantItem,
               let text = assistantTurns[id], !text.isEmpty else { return }
@@ -2107,7 +2138,8 @@ final class FullDuplexVoiceClient {
             onFeedFocus?(feedFocusTracker.finishTerminalResponse())
             terminalFeedReached = false
         }
-        onAssistantTranscript?(text, true)
+        let transcript = historyTranscripts[historyTurnID, default: TurnTranscript()].finish(item: id, text: text)
+        onAssistantTranscript?(transcript, true)
     }
 
     /// Error codes that describe a no-op rather than a broken session, so they are
@@ -2429,7 +2461,7 @@ final class FullDuplexVoiceClient {
     private var liveUnheardDelegations: Set<String> = []
     private var liveFastAnchor: LiveFastAction.Anchor?
     private var modelRoute: (text: String, task: Task<LiveFastAction?, Never>)?
-    private var liveQueueActionAnchor: LiveQueueActionRecovery.Anchor?
+    var liveQueueActionAnchor: LiveQueueActionRecovery.Anchor?
     /// The coaching checkpoint standing between the user and the next message, while this phone
     /// holds both the lesson and the queue. Nil wherever the model owns one of the two.
     struct PendingCoaching {
@@ -2562,7 +2594,7 @@ final class FullDuplexVoiceClient {
 
     /// Lowercase, punctuation stripped, whitespace collapsed — so "What's on your
     /// mind?" and "whats on your mind" compare equal.
-    static func normalize(_ text: String) -> String {
+    nonisolated static func normalize(_ text: String) -> String {
         let stripped = text.lowercased().map { ch -> Character in
             ch.isLetter || ch.isNumber ? ch : " "
         }
@@ -2581,10 +2613,10 @@ final class FullDuplexVoiceClient {
 
     /// Classify each partial on-device while the user is talking, before the input settles.
     private func routeWithModel(_ text: String) {
-        LiveIntentRouter.prewarm()
         modelRoute?.task.cancel()
-        guard SpokenCommand.match(text) != .resetCall,
+        guard LiveIntentRouter.isAvailable, SpokenCommand.match(text) != .resetCall,
               LiveFastAction.parse(text) == nil else { modelRoute = nil; return }
+        LiveIntentRouter.prewarm()
         modelRoute = (text, Task {
             try? await Task.sleep(for: .milliseconds(200))
             if Task.isCancelled { return nil }
@@ -2623,6 +2655,7 @@ final class FullDuplexVoiceClient {
               let adapter = transport?.liveAdapter else { return false }
         let arguments: [String: String] = action != .next
             ? ["message_id": anchor.key.messageId, "account": anchor.key.account] : [:]
+        guard action == .next || renderedSelectionRefusal() == nil else { return false }
         guard let data = try? JSONSerialization.data(withJSONObject: arguments) else { return false }
         let id = "local-" + UUID().uuidString
         guard adapter.beginFastAction(callId: id, action: action, routed: routed != nil) else { return false }
@@ -2635,12 +2668,38 @@ final class FullDuplexVoiceClient {
     }
 
     private func refuseLiveFunction(_ call: LiveSessionAdapter.Call, reason: String, output: String) {
+        diagnostics?.record(.toolFinished, ["call_id": call.id, "tool": call.name, "outcome": "refused",
+            "reason": reason, "queue_revision": String(liveQueueRevision), "delegation_id": call.delegation])
         RealtimeLog.log("liveTool: refused \(call.name) — \(reason) (anchor \(liveAnchors[call.delegation].map(String.init) ?? "none"), revision \(liveQueueRevision))")
         sendFunctionOutput(callId: call.id, output: output)
         transport?.createResponse()
     }
 
     private func runLiveFunction(_ call: LiveSessionAdapter.Call) {
+        #if targetEnvironment(macCatalyst)
+        let currentWrite = LiveWriteTarget.mailWrites.contains(ToolNarration.canonical(call.name))
+            || ["send_email", "forward_email", "create_draft", "reply_email", "dispatch", "dispatch_command"].contains(ToolNarration.canonical(call.name))
+        if currentWrite, (LiveWriteTarget.mailWrites.contains(ToolNarration.canonical(call.name))
+            || LiveRequestRecovery.refersToCurrentMessage(latestCompletedUserUtterance)),
+           let refusal = renderedSelectionRefusal() {
+            refuseLiveFunction(call, reason: "rendered_target_mismatch", output: refusal)
+            return
+        }
+        #endif
+        if LiveRequestRecovery.isFeedback(latestCompletedUserUtterance),
+           (LiveWriteTarget.mailWrites.contains(ToolNarration.canonical(call.name))
+            || ["dispatch", "dispatch_command", "respond_to_calendar_event", "create_calendar_event", "update_calendar_event", "cancel_calendar_event"].contains(call.name)) {
+            refuseLiveFunction(call, reason: "feedback_is_not_write_authorization",
+                output: "Not executed: the current request is to record feedback. Use log_feedback. Earlier mail or calendar actions are not authorized by this feedback request.")
+            return
+        }
+        if LiveRequestRecovery.refersToCurrentMessage(latestCompletedUserUtterance),
+           let step = liveQueueActionAnchor?.step, let key = LiveEmailPresentation.Key.step(step),
+           let refusal = LiveWriteTarget.refusal(tool: call.name, arguments: call.arguments,
+                                                 messageID: key.messageId, account: key.account) {
+            refuseLiveFunction(call, reason: "target_mismatch", output: refusal)
+            return
+        }
         guard liveConfiguration != nil, let anchor = liveAnchors[call.delegation] else {
             sendFunctionOutput(callId: call.id, output: "Not executed: missing delegation context.")
             transport?.createResponse()
@@ -2701,7 +2760,7 @@ final class FullDuplexVoiceClient {
             if GmailManageTools.names.contains(call.name) {
                 result = await GmailManageTools.run(name: call.name, argumentsJSON: arguments)
             } else if CalendarTools.names.contains(call.name) {
-                result = await CalendarTools.run(name: call.name, argumentsJSON: call.arguments)
+                result = await CalendarTools.run(name: call.name, argumentsJSON: call.arguments, diagnostics: self?.diagnostics, callID: call.id)
             } else {
                 result = await GmailReadTools.run(name: call.name, argumentsJSON: call.arguments)
             }
@@ -2725,6 +2784,8 @@ final class FullDuplexVoiceClient {
                 self.handle(.mcpCallResult(name: call.name, serverLabel: "aurex", argumentsJSON: arguments, itemJSON: json))
             }
             self.handle(result.failed ? .mcpCallFailed(message: output) : .mcpCallCompleted)
+            self.diagnostics?.record(.toolFinished, ["call_id": call.id, "tool": call.name,
+                "outcome": result.failed ? "failed" : "success", "delegation_id": call.delegation])
             self.sendFunctionOutput(callId: call.id, output: output)
             self.transport?.createResponse()
         }
@@ -3106,19 +3167,8 @@ final class FullDuplexVoiceClient {
 
     /// Read one enabled command; a missing keyword must not expand to the entire library.
     private func answerCommandRun(callId: String, keyword: String) {
-        let started = Date()
-        let output: String
-        let failed: Bool
-        switch CustomCommandRules.run(keyword: keyword, commands: customCommands.commands) {
-        case .success(let instructions): output = instructions; failed = false
-        case .failure(let refusal): output = refusal.sentence; failed = true
-        }
-        finishContextTool(
-            callId: callId, tool: "commands", output: output,
-            ms: Date().timeIntervalSince(started) * 1000,
-            outcome: failed ? "local_refused" : "local_hit",
-            query: keyword, detail: "run → \(failed ? "refused" : "found")",
-            subsystem: "commands", failed: failed)
+        let args = GmailReadTools.json(["command": keyword])
+        startDispatch(callId: callId, argumentsJSON: args)
     }
 
     /// `summarize` — the last step of a command, where the assistant says what it found. It
@@ -3177,6 +3227,10 @@ final class FullDuplexVoiceClient {
                 outcome = await customCommands.save(
                     keyword: keyword, label: Self.stringArgument("label", in: argumentsJSON) ?? "",
                     actions: Self.actionsArgument(in: argumentsJSON))
+            case "correct_label":
+                outcome = await customCommands.correctLabel(keyword: keyword,
+                    name: Self.stringArgument("label_name", in: argumentsJSON) ?? "",
+                    account: Self.stringArgument("account", in: argumentsJSON) ?? "")
             case "delete":
                 outcome = await customCommands.delete(keyword: keyword)
             case "enable", "disable":
@@ -3205,7 +3259,7 @@ final class FullDuplexVoiceClient {
         case .saved(let command):
             let name = command?.keyword ?? keyword
             switch action {
-            case "save":
+            case "save", "correct_label":
                 output = "Saved. \"\(name)\" is now a command. Say the keyword back "
                     + "to the user and confirm it is ready to use."
             case "delete":
@@ -3742,10 +3796,10 @@ final class FullDuplexVoiceClient {
 
     /// Preserve a deferred write's failure for the next call if its original call ended.
     private func recordOrphanedWrite(tool: String, summary: String, text: String, ok: Bool?,
-                                     profileId: String?) {
+                                     profileId: String?) async {
         let id = UUID()
-        dispatchJobs.begin(id: id, task: "\(tool) — \(summary)", profileId: profileId)
-        dispatchJobs.finish(id, state: ok == false ? "failed" : "done", result: text, reportBack: ok != true)
+        await dispatchJobs.begin(id: id, task: "\(tool) — \(summary)", profileId: profileId)
+        await dispatchJobs.finish(id, state: ok == false ? "failed" : "done", result: text, reportBack: ok != true)
         RealtimeLog.log("write: \(tool) came back after its call ended "
             + "(ok=\(ok.map(String.init(describing:)) ?? "unclassified")) — recorded for the next call")
     }
@@ -3863,7 +3917,7 @@ final class FullDuplexVoiceClient {
                 + "\(result.text.prefix(80))")
             guard !result.written else { return }
             guard self.isActive, dial == self.dialGeneration else {
-                self.recordOrphanedWrite(tool: name, summary: summary, text: result.text, ok: false,
+                await self.recordOrphanedWrite(tool: name, summary: summary, text: result.text, ok: false,
                                          profileId: profileId)
                 return
             }

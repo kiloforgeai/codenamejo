@@ -28,6 +28,15 @@ enum LiveIntentRouter {
     """
 
     private static var prewarmed = false
+    private static var availability = ModelAvailabilityCache()
+
+    private static var diagnostics: VoiceDiagnostics.Session?
+
+    static func beginSession(diagnostics: VoiceDiagnostics.Session? = nil) {
+        self.diagnostics = diagnostics
+        availability.invalidate()
+        prewarmed = false
+    }
 
     /// The model only proposes. The user's own words must name the action, so an answer to
     /// Jo's question ("yeah, go ahead", "same thing") or a stray fragment never acts on mail.
@@ -56,12 +65,18 @@ enum LiveIntentRouter {
     }
 
     static var isAvailable: Bool {
-        if case .available = SystemLanguageModel.default.availability { return true }
-        return false
+        availability.read(now: ProcessInfo.processInfo.systemUptime) {
+            let available: Bool
+            if case .available = SystemLanguageModel.default.availability { available = true }
+            else { available = false }
+            diagnostics?.record(.modelAvailability, ["available": String(available), "engine": "foundation_models"])
+            if !available { prewarmed = false }
+            return available
+        }
     }
 
     static func prewarm() {
-        guard !prewarmed, isAvailable else { return }
+        guard isAvailable, !prewarmed else { return }
         prewarmed = true
         LanguageModelSession(instructions: instructions).prewarm()
     }

@@ -106,8 +106,15 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
                     accountHeaderSection
                     #if targetEnvironment(macCatalyst)
                     Section {
-                        NavigationLink("Connections") { ProfileConnectionsSummaryComponent.make() }
+                        NavigationLink { ProfileConnectionsSummaryComponent.make() } label: {
+                            SettingsRow.label("Connections", icon: "link", detail: "Manage your email, Slack, and other connected services.")
+                        }
                             .accessibilityIdentifier("settings_connections")
+                        NavigationLink { FeedOrderComponent.make() } label: {
+                            SettingsRow.label("Feed order", icon: "line.3.horizontal.decrease", detail: "Drag your inboxes into the order you want to work through them.")
+                        }.accessibilityIdentifier("settings_feed_order")
+                    } header: {
+                        SettingsRow.header("Your workspace")
                     }
                     #endif
                     voiceSection
@@ -145,6 +152,12 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
                 .listStyle(.insetGrouped)
                 .scrollContentBackground(.hidden)
                 .frame(maxWidth: 700)
+                #if targetEnvironment(macCatalyst)
+                .environment(\.defaultMinListRowHeight, 60)
+                .listSectionSpacing(28)
+                .contentMargins(.vertical, 16)
+                .frame(maxWidth: .infinity)
+                #endif
             }
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
@@ -216,7 +229,7 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
                         }
                     }
                 }
-                .padding(.vertical, 2)
+                .padding(.vertical, 10)
                 .listRowBackground(Theme.surface)
                 .accessibilityIdentifier("accountHeader")
             } header: {

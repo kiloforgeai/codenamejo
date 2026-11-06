@@ -134,12 +134,64 @@ struct TurnStore: Sendable {
 
     // MARK: - Writing
 
-    /// Store one turn. Throwing, so History can tell a stored turn from a lost one.
-    func save(_ turn: Turn) async throws {
-        guard let dbPool else { throw BackendError.invalidResponse }
+    static func createJobOutcomes(_ db: Database) throws {
+        try db.create(table: "turn_job_outcome") { table in
+            table.column("user_id", .text).notNull()
+            table.column("turn_id", .text).notNull()
+            table.column("job_id", .text).notNull()
+            table.column("outcome", .text).notNull()
+            table.column("updated_at", .datetime).notNull().defaults(sql: "CURRENT_TIMESTAMP")
+            table.primaryKey(["user_id", "turn_id", "job_id"])
+        }
+    }
+
+    func recordJobOutcome(userID: String, turnID: String, jobID: UUID, outcome: CommandRecord.CommandStatus) async throws {
+        guard let dbPool, !userID.isEmpty else { throw BackendError.invalidResponse }
         try await dbPool.write { db in
-            try turn.save(db)
+            try db.execute(sql: "INSERT INTO turn_job_outcome(user_id, turn_id, job_id, outcome) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, turn_id, job_id) DO UPDATE SET outcome = excluded.outcome, updated_at = CURRENT_TIMESTAMP",
+                           arguments: [userID, turnID, jobID.uuidString, outcome.rawValue])
+            if let row = try Turn.filter(Column("user_id") == userID && Column("id") == turnID).fetchOne(db) {
+                try Self.applyingJobOutcomes(row, db: db).save(db)
+            }
             try Self.trim(db)
+        }
+    }
+
+    private static func applyingJobOutcomes(_ turn: Turn, db: Database) throws -> Turn {
+        guard try db.tableExists("turn_job_outcome") else { return turn }
+        let statuses = try String.fetchAll(db, sql: "SELECT outcome FROM turn_job_outcome WHERE user_id = ? AND turn_id = ?",
+                                          arguments: [turn.userId, turn.id]).compactMap(CommandRecord.CommandStatus.init(rawValue:))
+        guard !statuses.isEmpty else { return turn }
+        let status: CommandRecord.CommandStatus
+        if statuses.contains(.pending) { status = .pending }
+        else if statuses.contains(.unknown) { status = .unknown }
+        else if statuses.contains(.partial) || (statuses.contains(.success) && statuses.contains(where: { $0 == .failed || $0 == .cancelled })) { status = .partial }
+        else if statuses.contains(.failed) { status = .failed }
+        else if statuses.contains(.cancelled) { status = .cancelled }
+        else { status = statuses.contains(.success) ? .success : .conversational }
+        var updated = turn
+        updated.status = status.rawValue
+        if let data = turn.record {
+            let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+            var record = try decoder.decode(CommandRecord.self, from: data)
+            record.status = status
+            record.toolSteps = (record.toolSteps ?? []).filter { $0.tool != "dispatch" }
+                + [.init(tool: "dispatch", outcome: status.rawValue)]
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+            updated.record = try encoder.encode(record)
+        }
+        return updated
+    }
+
+    /// Store one turn. Throwing, so History can tell a stored turn from a lost one.
+    @discardableResult
+    func save(_ turn: Turn) async throws -> Turn {
+        guard let dbPool else { throw BackendError.invalidResponse }
+        return try await dbPool.write { db in
+            let updated = try Self.applyingJobOutcomes(turn, db: db)
+            try updated.save(db)
+            try Self.trim(db)
+            return updated
         }
     }
 
@@ -148,7 +200,7 @@ struct TurnStore: Sendable {
         guard let dbPool else { return }
         do {
             try await dbPool.write { db in
-                try turn.save(db)
+                try Self.applyingJobOutcomes(turn, db: db).save(db)
                 try Self.trim(db)
             }
         } catch {
@@ -161,6 +213,9 @@ struct TurnStore: Sendable {
         guard let dbPool else { throw BackendError.invalidResponse }
         try await dbPool.write { db in
             _ = try Turn.deleteOne(db, key: id.uuidString)
+            if try db.tableExists("turn_job_outcome") {
+                try db.execute(sql: "DELETE FROM turn_job_outcome WHERE turn_id = ?", arguments: [id.uuidString])
+            }
         }
     }
 
@@ -197,6 +252,12 @@ struct TurnStore: Sendable {
                 } else {
                     _ = try Turn.deleteAll(db)
                 }
+                if try db.tableExists("turn_job_outcome") {
+                    if let userId, !userId.isEmpty {
+                        try db.execute(sql: "DELETE FROM turn_job_outcome WHERE user_id = ? OR substr(user_id, 1, ?) = ?",
+                            arguments: [userId, (userId + ":profile:").count, userId + ":profile:"])
+                    } else { try db.execute(sql: "DELETE FROM turn_job_outcome") }
+                }
             }
         } catch {
             RealtimeLog.log("turns: purge failed — \(error)")
@@ -207,6 +268,9 @@ struct TurnStore: Sendable {
         try Turn
             .filter(Column("issued_at") < Date().addingTimeInterval(-retention))
             .deleteAll(db)
+        if try db.tableExists("turn_job_outcome") {
+            try db.execute(sql: "DELETE FROM turn_job_outcome WHERE updated_at < ?", arguments: [Date().addingTimeInterval(-retention)])
+        }
     }
 
     // MARK: - Reading
@@ -461,7 +525,7 @@ extension TurnStore.Turn {
         var record = CommandRecord(
             id: UUID(uuidString: id) ?? UUID(), commandText: commandText, responseText: responseText,
             serviceName: serviceName, serviceIcon: CommandRecord.icon(for: serviceName),
-            status: CommandRecord.CommandStatus(rawValue: status) ?? .success, issuedAt: issuedAt,
+            status: CommandRecord.CommandStatus(rawValue: status) ?? .unknown, issuedAt: issuedAt,
             conversationId: UUID(uuidString: conversationId))
         record.profile_id = userId.components(separatedBy: ":profile:").dropFirst().first
         return record

@@ -83,6 +83,31 @@ final class LocalProfilesTests: XCTestCase {
         XCTAssertEqual(mailboxes, [])
     }
 
+    func testFeedOrderPersistsAndIsolatesUsersAndProfiles() async throws {
+        let alice = try await rows.create(userId: "alice", name: "Work")
+        let personal = try await rows.create(userId: "alice", name: "Personal")
+        try await rows.adopt(userId: "alice", emails: ["a@test.com", "b@test.com", "c@test.com"], into: alice.id)
+        try await rows.adopt(userId: "alice", emails: ["p@test.com"], into: personal.id)
+        try await rows.adopt(userId: "bob", emails: ["a@test.com", "b@test.com"], into: alice.id)
+        try await rows.reorderMailboxes(["C@test.com", "c@test.com", "p@test.com", "missing@test.com", "a@test.com"], userId: "alice", profileId: alice.id)
+        let reopened = WorkspaceProfileRows(dbPool: context.dbPool)
+        let saved = try await reopened.mailboxes(userId: "alice", profileId: alice.id)
+        XCTAssertEqual(saved, ["c@test.com", "a@test.com", "b@test.com"])
+        let otherUser = try await rows.mailboxes(userId: "bob", profileId: alice.id)
+        XCTAssertEqual(otherUser, ["a@test.com", "b@test.com"])
+        let otherProfile = try await rows.mailboxes(userId: "alice", profileId: personal.id)
+        XCTAssertEqual(otherProfile, ["p@test.com"])
+        try await rows.forget(userId: "alice", email: "a@test.com")
+        try await rows.adopt(userId: "alice", emails: ["c@test.com", "new@test.com", "b@test.com"], into: alice.id)
+        let updated = try await rows.mailboxes(userId: "alice", profileId: alice.id)
+        XCTAssertEqual(updated, ["c@test.com", "b@test.com", "new@test.com"])
+        let before = ProfileRuntime.snapshot
+        defer { ProfileRuntime.install(before) }
+        ProfileRuntime.install(.init(profileId: alice.id, isDefault: false, emails: updated))
+        XCTAssertEqual(ProfileRuntime.allowedMailAccounts(["new@test.com", "B@test.com", "outside@test.com", "C@test.com"]),
+                       ["C@test.com", "B@test.com", "new@test.com"])
+    }
+
     func testDeletingTakesSettingsDossierAndMappingButNeverTheDefault() async throws {
         let listed = try await rows.list(userId: "alice")
         let personal = try XCTUnwrap(listed.first)

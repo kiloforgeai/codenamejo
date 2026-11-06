@@ -40,11 +40,17 @@ class CommandStore: ObservableObject {
     /// Store and publish only the changed turn; false lets the caller queue a retry.
     @discardableResult
     func save(_ record: CommandRecord, expectedUserId: String? = nil) async -> Bool {
+        var record = record
         if let expectedUserId, backend.userId != expectedUserId { return false }
         guard let accountOwner = backend.userId else { return false }
         let owner = accountOwner + (record.profile_id.map { ":profile:" + $0 } ?? "")
         do {
-            try await turns.save(TurnStore.Turn(record, userId: owner))
+            let stored = try await turns.save(TurnStore.Turn(record, userId: owner))
+            if let data = stored.record {
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                record = try decoder.decode(CommandRecord.self, from: data)
+            }
         } catch {
             RealtimeLog.log("history: turn \(record.id) not stored — \(error)")
             return false

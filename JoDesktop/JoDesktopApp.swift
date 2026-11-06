@@ -6,34 +6,37 @@ import UIKit
 @main
 struct JoDesktopApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    #if !JO_QA
     @ObservedObject private var backend = Container.shared.backend()
     @ObservedObject private var realtime = Container.shared.realtimeService()
+    #endif
     @AppStorage(OnboardingState.storageKey) private var onboarded = false
     @AppStorage(AppearanceSetting.storageKey) private var appearance = AppearanceSetting.system
 
     init() {
-        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
-            OpenAIKeyService.dropIfLeftByDeletedInstall()
-        }
+        #if !JO_QA
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil { OpenAIKeyService.dropIfLeftByDeletedInstall() }
+        #endif
     }
 
     var body: some Scene {
         WindowGroup {
-            Group {
-                if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
-                    Color.clear
-                } else {
-                    RootViewComponent.make()
-                }
-            }
+            #if JO_QA
+            DesktopFixtureComponent.make()
+            #else
+            if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil { Color.clear } else {
+            RootViewComponent.make()
                 .frame(minWidth: 1040, minHeight: 700)
                 .preferredColorScheme(appearance.colorScheme)
                 .onOpenURL { url in
                     if Container.shared.shortcutActions().handle(url) { return }
                     if MemoDeepLink.matches(url) { Container.shared.voiceLauncher().requestMemo() }
                 }
+            }
+            #endif
         }
         .commands {
+            #if !JO_QA
             CommandGroup(after: .appInfo) {
                 Button("Start work session") {
                     Container.shared.voiceLauncher().requestLaunch(source: "desktop shortcut")
@@ -49,6 +52,7 @@ struct JoDesktopApp: App {
                 }.keyboardShortcut(".", modifiers: [.command])
                     .disabled(!realtime.isConversing)
             }
+            #endif
         }
     }
 }

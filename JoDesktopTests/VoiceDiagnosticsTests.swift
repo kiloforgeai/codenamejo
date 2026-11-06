@@ -15,6 +15,14 @@ final class VoiceDiagnosticsTests: XCTestCase {
         XCTAssertTrue(events.allSatisfy { $0["session_id"] as? String == first.id.uuidString })
     }
 
+    func testRenderedSelectionAndWriteReceiptUseTheSameRedactedIdentity() {
+        let selection = MailSelection(account: "OWNER@example.test", messageID: "same-id")
+        let write = VoiceDiagnostics.targetIdentity(arguments: #"{"account":"owner@example.test","message_id":"same-id","label_id":"Label_42","thread_id":"thread"}"#)
+        XCTAssertEqual(write, selection.canonical)
+        XCTAssertEqual(selection, MailSelection(account: "owner@example.test", messageID: "same-id"))
+        XCTAssertNotEqual(write, MailSelection(account: "other@example.test", messageID: "same-id").canonical)
+    }
+
     private func directory() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)

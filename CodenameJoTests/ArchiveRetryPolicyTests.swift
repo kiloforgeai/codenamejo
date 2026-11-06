@@ -15,7 +15,8 @@ final class ArchiveRetryPolicyTests: XCTestCase {
     func testHealthyAndPendingReceiptsAreDistinct() {
         XCTAssertEqual(ArchiveReceiptPolicy.receipt(succeeded: true, pending: nil), "Archived.")
         XCTAssertEqual(ArchiveReceiptPolicy.receipt(succeeded: false, pending: job), "Archiving.")
-        XCTAssertEqual(ArchiveReceiptPolicy.receipt(succeeded: false, pending: job, live: true), "Archived.")
+        XCTAssertEqual(ArchiveReceiptPolicy.receipt(succeeded: false, pending: job, live: true), "Archiving.")
+        XCTAssertEqual(ArchiveReceiptPolicy.receipt(succeeded: true, pending: job, live: true), "Archiving.")
         XCTAssertNil(ArchiveReceiptPolicy.receipt(succeeded: false, pending: nil))
     }
 

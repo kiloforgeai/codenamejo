@@ -829,7 +829,7 @@ extension FullDuplexVoiceClient {
                     speakerBrief: LiveCoachingSpeakerContract.backendOnly)
             }
         }
-        if sequentialFeed, served.isEmpty {
+        if sequentialFeed {
             // The buffer count, not `standing.total`: on the whole-inbox pile that is Gmail's
             // INBOX message total, and the card read "2 of <INBOX total>" (2026-09-09).
             onFeedFocus?(feedFocusTracker.applyTriage(
@@ -878,6 +878,17 @@ extension FullDuplexVoiceClient {
             break
         case .clear:
             publishQueueCard(nil, step: nil, dial: dial)
+        }
+        for jobId in served {
+            diagnostics?.record(.jobInjected, ["job_id": jobId.uuidString, "outcome": "queue_context",
+                "queue_revision": String(liveQueueRevision)])
+        }
+        if let object = try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any],
+           let item = object["item"] as? [String: Any], let id = item["id"] as? String,
+           let account = item["account"] as? String {
+            diagnostics?.record(.queueRecovery, ["transition": "step_applied", "queue_revision": String(liveQueueRevision),
+                "target_hash": diagnostics?.target(MailSelection(account: account, messageID: id).canonical) ?? "unknown",
+                "turn_id": historyTurnID.uuidString])
         }
     }
 
@@ -2044,7 +2055,7 @@ extension FullDuplexVoiceClient {
                 callId: callId, tool: tool,
                 output: (tool == "mark_spam" ? "Do not speak a spam receipt. " : tool == "archive_message" ? (ArchiveReceiptPolicy.receipt(succeeded: succeeded, pending: pending, live: self.transport != nil) ?? result.text) : receipt) + Self.renderLocalDispatchAdvance(
                     stepOutput: self.preparedEmailStep(step.output), done: progress?.done ?? true,
-                    deed: deed, say: tool != "archive_message" ? say : pending != nil && self.transport != nil ? "Use a varied conversational receipt with Archived, never Archiving; keep pending retry status internal." : (pending != nil ? "Say exactly \"Archiving.\" The archive is pending; do not say archived." : say)),
+                    deed: deed, say: tool != "archive_message" ? say : (pending != nil ? "Say exactly \"Archiving.\" The archive is pending; do not say archived." : say)),
                 ms: Date().timeIntervalSince(started) * 1000,
                 outcome: pending != nil ? "pending" : step.served.rawValue,
                 query: messageId ?? "",
@@ -2062,7 +2073,19 @@ extension FullDuplexVoiceClient {
         let started = Date()
         let dial = dialGeneration
         let profileId = ProfileRuntime.snapshot?.profileId
-        let deferCalendar = transport != nil
+        var args = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8))) as? [String: Any] ?? [:]
+        if name == LocalCalendarWrites.respond, let anchor = liveQueueActionAnchor,
+           let key = LiveEmailPresentation.Key.step(anchor.step), key.selectedIDs.count == 1,
+           LiveRequestRecovery.refersToCurrentMessage(latestCompletedUserUtterance) {
+            args["source_message_id"] = key.messageId
+            args["source_account"] = key.account
+        }
+        let words = Self.normalize(latestCompletedUserUtterance)
+        if words.contains("keep"), words.contains("inbox") { args["keep_in_inbox"] = true }
+        let argumentsJSON = GmailReadTools.json(args)
+        let sourceID = args["source_message_id"] as? String
+        let sourceAccount = args["source_account"] as? String
+        let deferCalendar = false
         functionCallTask = Task { [weak self] in
             let result = await FullDuplexBroker.runTool(
                 name: name, argumentsJSON: argumentsJSON,
@@ -2088,6 +2111,14 @@ extension FullDuplexVoiceClient {
                     response, eventId: eventId, account: account)
             } else {
                 cacheChanges = 0
+            }
+            self.diagnostics?.record(.calendarReceipt, ["call_id": callId, "tool": name,
+                "outcome": succeeded ? "success" : "failed_or_partial", "target_hash": self.diagnostics?.target(eventId) ?? "unknown"])
+            if let effects = result.effects, !effects.isEmpty, let sourceID {
+                if let finished = await self.applyQueueFinish(canonical: "archive_message", named: sourceID,
+                    thread: nil, account: sourceAccount, effects: effects, succeeded: succeeded) {
+                    self.queueFinisherAwaitingAdvance = finished
+                }
             }
             self.finishContextTool(
                 callId: callId, tool: name, output: result.text,

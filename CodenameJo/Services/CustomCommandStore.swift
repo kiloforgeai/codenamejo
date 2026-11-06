@@ -59,6 +59,32 @@ class CustomCommandStore: ObservableObject {
         }
     }
 
+    func correctLabel(keyword: String, name: String, account: String) async -> Outcome {
+        await refresh()
+        guard let command = commands.first(where: { $0.keyword == CustomCommandRules.normalise(keyword) }) else {
+            return .refused("That command does not exist. Read the command list first.")
+        }
+        let indices = command.actions.indices.filter {
+            ["label_message", "gmail_label_message"].contains(command.actions[$0].tool)
+        }
+        guard indices.count == 1 else {
+            return .refused("The command must have exactly one label step to correct it; save the full command otherwise.")
+        }
+        do {
+            let accounts = try GmailReadTools.targets(account.isEmpty ? [:] : ["account": account])
+            let target = try GmailManageTools.single(accounts)
+            let token = try await GmailReadTools.token(target)
+            guard let label = try await GmailManageTools.findLabel(token, name), label.user else {
+                return .refused("That user label was not found. List the labels and choose an existing label.")
+            }
+            var actions = command.actions
+            actions[indices[0]].resolvedLabel = .init(id: label.id, name: label.name, account: target)
+            actions[indices[0]].detail = "Apply the saved label \(label.name)."
+            return await save(keyword: command.spoken.isEmpty ? command.keyword : command.spoken,
+                              label: command.instruction, actions: actions)
+        } catch { return .failed("The command correction did not save: \(error.localizedDescription)") }
+    }
+
     /// Delete one command, by exact keyword. A keyword that matches nothing is refused by name
     /// rather than reported done: losing a dictated command is the one unrecoverable thing here.
     func delete(keyword raw: String) async -> Outcome {

@@ -1,6 +1,28 @@
 import Foundation
 
 enum LiveRequestRecovery {
+    static func isFeedback(_ text: String) -> Bool {
+        let words = Set(FullDuplexVoiceClient.normalize(text).split(separator: " "))
+        return words.contains("feedback") || (words.contains("report") && words.contains("bug"))
+    }
+
+    static func requiresQueueAction(_ text: String) -> Bool {
+        let normalized = FullDuplexVoiceClient.normalize(text)
+        let tokens = normalized.split(separator: " ").map(String.init)
+        let words = Set(tokens)
+        guard !isFeedback(text), words.isDisjoint(with: ["command", "commands"]),
+              !["don t", "do not", "never", "already", "did you"].contains(where: normalized.contains) else { return false }
+        let first = tokens.first { !questionFillers.contains($0) && $0 != "please" }
+        let verbs: Set<String> = ["archive", "delete", "trash", "spam", "skip", "next", "unsubscribe", "label", "snooze"]
+        guard !words.isDisjoint(with: verbs) else { return false }
+        if let first, verbs.contains(first) { return true }
+        return ["can you", "could you", "would you", "i want you to", "go to", "move on"].contains(where: normalized.contains)
+    }
+
+    static func refersToCurrentMessage(_ text: String) -> Bool {
+        let words = Set(FullDuplexVoiceClient.normalize(text).split(separator: " "))
+        return !words.isDisjoint(with: ["this", "it", "that", "yes", "yeah", "yep"])
+    }
     enum Decision: String { case noAction = "no_action", clarification }
 
     struct Output {
@@ -63,12 +85,13 @@ enum LiveRequestRecovery {
 
     private static let questionFillers: Set<String> = [
         "uh", "um", "er", "ah", "oh", "okay", "ok", "mkay", "so", "and", "but", "yeah", "yes", "yep",
-        "well", "hmm", "mm", "alright", "hey", "wait", "actually",
+        "well", "hmm", "mm", "alright", "hey", "wait", "actually", "no",
     ]
     private static let questionOpeners: Set<String> = [
         "where", "when", "who", "whom", "whose", "which",
         "is", "are", "was", "were", "does", "any", "anything",
     ]
+
     private static let actionWords: Set<String> = [
         "archive", "skip", "next", "reply", "respond", "forward", "send", "delete", "trash", "spam",
         "unsubscribe", "label", "snooze", "accept", "decline", "draft", "mark", "move", "file",

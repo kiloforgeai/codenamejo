@@ -21,7 +21,18 @@ enum DispatchWorker {
         var profileId: String? = ProfileRuntime.snapshot?.profileId
         /// Advanced once per round, out of `maxRounds`, for `HangUpRunway`'s system card.
         var progress: Progress? = nil
+        var diagnostics: VoiceDiagnostics.Session? = nil
+        var turnID: String? = nil
+        var operation: DispatchMailOperation? = nil
     }
+
+    typealias Request = ([String: Any]) async throws -> [[String: Any]]
+    struct StepFailure: LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
+    }
+    private struct PendingStep: Error { let message: String }
+    typealias Execution = (output: String, failed: Bool, write: Bool, pending: Bool)
 
     static let maxRounds = 16
     /// Rounds stop starting here, leaving room for the terminal write.
@@ -29,68 +40,152 @@ enum DispatchWorker {
     /// The message that ends every failure the live assistant relays.
     private static let relay = " Tell the user plainly; do not invent a result."
 
-    private struct Performed { let tool: String; let summary: String; let failed: Bool }
-    private struct Forced { let stored: String; let actual: String; let detail: String; let web: Bool }
+    private struct Performed { let tool: String; let summary: String; let failed: Bool; let target: String? }
+    private struct Forced { let stored: String; let actual: String; let detail: String; let web: Bool; var label: CommandAction.ResolvedLabel? = nil }
 
     // MARK: - Running
 
     @MainActor
-    static func run(_ job: Job) async -> FullDuplexBroker.DispatchOutcome {
+    static func run(_ job: Job, request: Request? = nil) async -> FullDuplexBroker.DispatchOutcome {
         let store = Container.shared.dispatchJobs()
-        store.begin(id: job.id, task: job.task, profileId: job.profileId)
+        if let operation = job.operation,
+           let previous = store.previousOperation(operation, profileID: job.profileId) {
+            if previous.isRunning, !previous.hasStopped() {
+                return .init(text: "That exact archive is already queued. Do not start it or advance the feed again.",
+                    ok: nil, status: .pending)
+            }
+            do {
+                _ = try GmailReadTools.targets(["account": operation.account])
+                let token = try await GmailReadTools.token(operation.account)
+                await GmailQuota.shared.spend(GmailQuota.Cost.get)
+                let current = try await GmailAPI.call("GET", path: "messages/\(operation.messageID)",
+                    query: ["format": "minimal", "fields": "id,labelIds"], token: token)
+                if let labels = current["labelIds"] as? [String], !labels.contains("INBOX") {
+                    if !previous.isDone {
+                        await store.receipt(previous.id, callId: "reconciled-" + previous.id.uuidString, tool: operation.tool, failed: false)
+                        await store.finish(previous.id, state: "done", result: "Gmail confirms that email is archived.", reportBack: false)
+                    }
+                    job.diagnostics?.record(.jobInjected, ["job_id": previous.id.uuidString, "outcome": "reused_receipt"])
+                    return .init(text: previous.isDone ? (previous.result ?? "That email is already archived.") : "Gmail confirms that email is archived.", ok: true, reportBack: false, status: .success)
+                }
+                if !previous.isDone {
+                    return .init(text: "The earlier archive is still unconfirmed. Its queued retry may still run; no second write was started.", ok: nil, status: .unknown)
+                }
+            } catch {
+                return .init(text: "The earlier archive has a stored receipt, but its current mailbox state could not be checked. No additional write was attempted.",
+                    ok: nil, status: .unknown)
+            }
+        }
+        await store.begin(id: job.id, task: job.task, profileId: job.profileId, conversationId: job.diagnostics?.conversationID, turnId: job.turnID, operation: job.operation)
         let started = Date()
+        job.diagnostics?.record(.jobStarted, ["job_id": job.id.uuidString, "turn_id": job.turnID ?? "unknown"])
+        var outcome = "unknown"
+        defer { job.diagnostics?.record(.jobFinished, ["job_id": job.id.uuidString, "outcome": outcome,
+            "duration_ms": String(Int(Date().timeIntervalSince(started) * 1000))]) }
         var performed: [Performed] = []
         do {
-            let text = try await loop(job, started: started) { ref in
+            if let operation = job.operation, job.expects == .receipt, job.commandSteps == nil {
+                let callID = "operation-" + job.id.uuidString
+                let target = target(standingOnJSON: job.standingOnJSON, facts: job.facts)
+                let cursor = target.flatMap { about -> GmailManageTools.Cursor? in
+                    GmailManageTools.cursor(step: GmailReadTools.json(["done": false, "item": about]))
+                }
+                guard cursor?.messageId == operation.messageID,
+                      cursor?.account.caseInsensitiveCompare(operation.account) == .orderedSame else {
+                    throw StepFailure(message: "The selected email changed before the action was authorized. Nothing was changed.")
+                }
+                let fields = ["job_id": job.id.uuidString, "call_id": callID, "tool": operation.tool,
+                    "target_hash": job.diagnostics?.target(VoiceDiagnostics.targetIdentity(arguments: operation.arguments) ?? "unknown") ?? "unknown"]
+                job.diagnostics?.record(.toolStarted, fields)
+                let result = await FullDuplexBroker.runTool(name: operation.tool, argumentsJSON: operation.arguments,
+                    profileId: job.profileId)
+                let pending = result.pendingArchive != nil || result.pendingDraft != nil || result.deferred
+                if pending {
+                    let text = "This action is queued for retry; Gmail has not confirmed completion yet. Check its outcome before retrying."
+                    await store.finish(job.id, state: "unknown", result: text, reportBack: true, historyStatus: .pending)
+                    job.diagnostics?.record(.toolFinished, fields.merging(["outcome": "pending"]) { _, new in new })
+                    outcome = "pending"
+                    return .init(text: text, ok: nil, status: .pending)
+                }
+                let failed = result.ok != true
+                await store.receipt(job.id, callId: callID, tool: operation.tool, failed: failed)
+                if failed, result.effects?.isEmpty == false {
+                    performed.append(.init(tool: operation.tool, summary: "Gmail confirmed part of the archive",
+                        failed: false, target: VoiceDiagnostics.targetIdentity(arguments: operation.arguments)))
+                }
+                performed.append(.init(tool: operation.tool, summary: result.text, failed: failed,
+                                       target: VoiceDiagnostics.targetIdentity(arguments: operation.arguments)))
+                job.diagnostics?.record(.toolFinished, fields.merging(["outcome": failed ? "failed" : "success"]) { _, new in new })
+                let report = GmailReadTools.json(["completed": !failed, "remaining_work": failed ? "action" : "none",
+                    "report": failed ? result.text : "Archived the selected email."])
+                let finished = await finish(job, text: report, performed: performed, store: store, started: started)
+                outcome = finished.status?.rawValue ?? "unknown"
+                return finished
+            }
+            let text = try await loop(job, started: started, request: request) { ref in
                 // A refusal the job corrected and retried is not a failed write.
-                if !ref.failed { performed.removeAll { $0.failed && $0.tool == ref.tool } }
+                if !ref.failed { performed.removeAll { $0.failed && $0.tool == ref.tool && $0.target == ref.target } }
                 performed.append(ref)
             }
-            return finish(job, text: text, performed: performed, store: store, started: started)
+            let result = await finish(job, text: text, performed: performed, store: store, started: started)
+            outcome = result.status?.rawValue ?? "unknown"
+            return result
+        } catch let pending as PendingStep {
+            outcome = "pending"
+            await store.finish(job.id, state: "unknown", result: pending.message, reportBack: true, historyStatus: .pending)
+            return .init(text: pending.message, ok: nil, status: .pending)
         } catch {
             let cancelled = Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled
             let wrote = performed.contains { !$0.failed }
+            let status: CommandRecord.CommandStatus = wrote ? .partial : cancelled ? .cancelled : .failed
+            outcome = status.rawValue
             let reason = cancelled ? "That job was stopped before it could finish" : "That job failed before it could finish"
-            let row = wrote ? "\(reason), part-way. Before it stopped: \(describe(performed))"
-                : (error as? LiveOpenAI.MissingKey)?.errorDescription ?? "\(reason), and nothing was changed."
+            let detail = (error as? StepFailure).map { " " + $0.message } ?? ""
+            let row = wrote ? "\(reason), part-way. Before it stopped: \(describe(performed))\(detail)"
+                : (error as? LiveOpenAI.MissingKey)?.errorDescription ?? (performed.isEmpty ? "\(reason), before any tool recorded a write.\(detail)" : "\(reason); check the recorded actions before retrying.\(detail)")
             RealtimeLog.log("dispatch: \(job.id) \(cancelled ? "cancelled" : "failed") after "
                 + "\(Int(Date().timeIntervalSince(started) * 1000))ms — \(error.localizedDescription)")
             // An unreachable OpenAI or a missing key, with nothing done, leaves no row: a note retries later.
             let unreached = !cancelled && !wrote && (error is URLError || error is LiveOpenAI.MissingKey)
-            if unreached { store.discard(job.id) } else { store.finish(job.id, state: "failed", result: row) }
-            return FullDuplexBroker.DispatchOutcome(text: row + relay, ok: false, recorded: !unreached)
+            if unreached { await store.discard(job.id) } else { await store.finish(job.id, state: wrote ? "partial" : "failed", result: row) }
+            return FullDuplexBroker.DispatchOutcome(text: row + relay, ok: false, recorded: !unreached, status: status)
         }
     }
 
     @MainActor
     private static func finish(_ job: Job, text raw: String, performed: [Performed],
-                               store: DispatchJobStore, started: Date) -> FullDuplexBroker.DispatchOutcome {
+                               store: DispatchJobStore, started: Date) async -> FullDuplexBroker.DispatchOutcome {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let ms = Int(Date().timeIntervalSince(started) * 1000)
         if job.expects == .receipt {
-            var result = actionResult(text, writeFailed: performed.contains(where: \.failed))
+            var result = actionResult(text, writeFailed: performed.contains(where: \.failed), writeSucceeded: performed.contains { !$0.failed })
             if !result.ok, !performed.isEmpty {
                 result.text += " Action record: " + performed.map { $0.failed ? "\($0.summary) failed" : $0.summary }
                     .joined(separator: "; ") + "."
             }
-            store.finish(job.id, state: result.ok ? "done" : "failed", result: result.text, reportBack: !result.ok)
+            await store.finish(job.id, state: result.ok ? "done" : performed.contains(where: { !$0.failed }) ? "partial" : "failed", result: result.text, reportBack: !result.ok)
             RealtimeLog.log("dispatch: \(job.id) \(result.ok ? "done silently" : "failed") in \(ms)ms")
-            return FullDuplexBroker.DispatchOutcome(text: result.text, ok: result.ok, reportBack: !result.ok)
+            return FullDuplexBroker.DispatchOutcome(text: result.text, ok: result.ok, reportBack: !result.ok, status: result.ok ? .success : performed.contains(where: { !$0.failed }) ? .partial : .failed)
+        }
+        if performed.contains(where: \.failed) {
+            let report = describe(performed) + " " + text
+            await store.finish(job.id, state: performed.contains(where: { !$0.failed }) ? "partial" : "failed", result: report)
+            return FullDuplexBroker.DispatchOutcome(text: report, ok: false, status: performed.contains(where: { !$0.failed }) ? .partial : .failed)
         }
         RealtimeLog.log("dispatch: \(job.id) answered in \(ms)ms — \(text.count) chars")
         if !text.isEmpty {
-            store.finish(job.id, state: "done", result: text)
-            return FullDuplexBroker.DispatchOutcome(text: text, ok: nil)
+            await store.finish(job.id, state: "done", result: text, historyStatus: performed.isEmpty ? .conversational : .success)
+            return FullDuplexBroker.DispatchOutcome(text: text, ok: nil, status: performed.isEmpty ? .conversational : .success)
         }
         if !performed.isEmpty {
             let done = "That job ran out of steps before it could say how it went, but it did this much — "
                 + describe(performed)
-            store.finish(job.id, state: "done", result: done)
-            return FullDuplexBroker.DispatchOutcome(text: done, ok: nil)
+            await store.finish(job.id, state: "done", result: done)
+            return FullDuplexBroker.DispatchOutcome(text: done, ok: nil, status: .partial)
         }
         let empty = "That job stopped before it had anything to report, and nothing was changed."
-        store.finish(job.id, state: "failed", result: empty)
-        return FullDuplexBroker.DispatchOutcome(text: empty + relay, ok: false)
+        await store.finish(job.id, state: "failed", result: empty)
+        return FullDuplexBroker.DispatchOutcome(text: empty + relay, ok: false, status: .failed)
     }
 
     /// The writes a job made, for when it produced no prose of its own.
@@ -103,11 +198,15 @@ enum DispatchWorker {
     }
 
     /// A receipt job's structured report; anything unparseable must surface as unfinished.
-    static func actionResult(_ raw: String, writeFailed: Bool) -> (text: String, ok: Bool) {
+    static func actionResult(_ raw: String, writeFailed: Bool, writeSucceeded: Bool = false) -> (text: String, ok: Bool) {
         if let data = raw.data(using: .utf8),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let completed = json["completed"] as? Bool,
            let report = (json["report"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !report.isEmpty {
+            let queueOnly = json["remaining_work"] as? String == "foreground_queue"
+            if queueOnly, writeSucceeded, !writeFailed {
+                return ("The external action completed. Foreground queue continuation remains with the live session.", true)
+            }
             return (report, completed && !writeFailed)
         }
         return ("That job did not confirm that all the requested work finished. Its outcome needs checking.", false)
@@ -116,7 +215,7 @@ enum DispatchWorker {
     // MARK: - The loop
 
     @MainActor
-    private static func loop(_ job: Job, started: Date, performed: (Performed) -> Void) async throws -> String {
+    private static func loop(_ job: Job, started: Date, request: Request?, performed: (Performed) -> Void) async throws -> String {
         let mail = GoogleAccountStore.mailAccounts()
         let calendar = CalendarTools.accounts()
         let target = job.scope == .independent ? nil : target(standingOnJSON: job.standingOnJSON, facts: job.facts)
@@ -152,7 +251,7 @@ enum DispatchWorker {
         if let steps = job.commandSteps {
             let summaries = steps.indices.filter { ["summarize", "summarise"].contains(steps[$0].tool.lowercased()) }
             if summaries.count > 1 || (summaries.count == 1 && summaries[0] != steps.count - 1) {
-                return "The saved command has a Final answer step that is not its single last step."
+                throw StepFailure(message: "The saved command has a Final answer step that is not its single last step.")
             }
             if let last = summaries.first, !steps[last].detail.isEmpty { finalInstruction = steps[last].detail }
             for (index, step) in steps.enumerated() where !summaries.contains(index) {
@@ -162,16 +261,16 @@ enum DispatchWorker {
                 }
                 let bare = stored.hasPrefix("gmail_") ? String(stored.dropFirst(6)) : stored
                 guard let actual = [stored, bare, "gmail_" + bare].first(where: names.contains) else {
-                    return "Saved command step \(index + 1) needs \(stored), which is not available to a background job."
+                    throw StepFailure(message: "Saved command step \(index + 1) needs \(stored), which is not available to a background job.")
                 }
-                forced.append(Forced(stored: stored, actual: actual, detail: step.detail, web: false))
+                forced.append(Forced(stored: stored, actual: actual, detail: step.detail, web: false, label: step.resolvedLabel))
             }
             if forced.count >= maxRounds {
-                return "The saved command has \(forced.count) tool steps, and a dispatched job can run at most "
-                    + "\(maxRounds - 1) before its report. Shorten the command."
+                throw StepFailure(message: "The command has too many steps. Shorten it before running.")
             }
         }
         var next = 0
+        var stepReceipts: [String] = []
         let cacheKey = SHA256.hash(data: Data((instructions + names.sorted().joined()).utf8)).prefix(16)
             .map { String(format: "%02x", $0) }.joined()
 
@@ -185,6 +284,9 @@ enum DispatchWorker {
             let step = job.commandSteps == nil ? nil : forced.indices.contains(next) ? forced[next] : nil
             let finalCommandRound = job.commandSteps != nil && step == nil
             var choice: Any?
+            if receipt, finalCommandRound {
+                return GmailReadTools.json(["completed": true, "remaining_work": "none", "report": stepReceipts.joined(separator: " ")])
+            }
             if let step {
                 input.append(["role": "user", "content": "Execute saved command step \(next + 1) now. You must call "
                     + "\(step.stored) exactly once. " + (step.detail.isEmpty
@@ -200,8 +302,8 @@ enum DispatchWorker {
             var text: [String: Any] = ["verbosity": "medium"]
             if receipt {
                 text["format"] = ["type": "json_schema", "name": "dispatch_result", "strict": true, "schema": [
-                    "type": "object", "additionalProperties": false, "required": ["completed", "report"],
-                    "properties": ["completed": ["type": "boolean"], "report": ["type": "string"]],
+                    "type": "object", "additionalProperties": false, "required": ["completed", "report", "remaining_work"],
+                    "properties": ["completed": ["type": "boolean"], "report": ["type": "string"], "remaining_work": ["type": "string", "enum": ["none", "foreground_queue", "action"]]],
                 ] as [String: Any]]
             }
             var body: [String: Any] = [
@@ -210,19 +312,19 @@ enum DispatchWorker {
                 "include": ["reasoning.encrypted_content"], "prompt_cache_key": cacheKey,
             ]
             if let choice { body["tool_choice"] = choice }
-            let output = try await respond(body, deadline: started.addingTimeInterval(budget))
+            let output = try await (request.map { call in { try await call(body) } } ?? { try await respond(body, deadline: started.addingTimeInterval(budget), job: job) })()
             input += output
             let calls = output.filter { $0["type"] as? String == "function_call" }
             if let step, step.web {
                 let searches = output.filter { $0["type"] as? String == "web_search_call" }
                 guard searches.count == 1, searches[0]["status"] as? String == "completed" else {
-                    return "Saved command step \(next + 1) could not complete web search."
+                    throw StepFailure(message: "Saved command step \(next + 1) could not complete web search.")
                 }
                 next += 1
                 continue
             }
             if let step, calls.count != 1 || calls[0]["name"] as? String != step.actual {
-                return "Saved command step \(next + 1) did not call \(step.stored) exactly once."
+                throw StepFailure(message: "Saved command step \(next + 1) did not call \(step.stored) exactly once.")
             }
             guard !calls.isEmpty else {
                 return output.filter { $0["type"] as? String == "message" }
@@ -235,7 +337,10 @@ enum DispatchWorker {
                 let name = call["name"] as? String ?? ""
                 let callId = call["call_id"] as? String ?? ""
                 let raw = call["arguments"] as? String ?? "{}"
-                let result: (output: String, failed: Bool, write: Bool)
+                let result: Execution
+                let toolStarted = ProcessInfo.processInfo.systemUptime
+                job.diagnostics?.record(.toolStarted, ["job_id": job.id.uuidString, "call_id": callId, "tool": name,
+                    "target_hash": job.diagnostics?.target(VoiceDiagnostics.targetIdentity(arguments: raw) ?? "unspecified") ?? "unknown"])
                 if var args = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [String: Any] {
                     // The account the live call pinned, unless the model named one or is replying on a thread.
                     // A connector tool takes none: GitHub's `account` is a login, and the rest have no such field.
@@ -243,15 +348,43 @@ enum DispatchWorker {
                        takesMailAccount(name) {
                         args["account"] = account
                     }
+                    if let label = step?.label {
+                        guard let cursor, cursor.account.caseInsensitiveCompare(label.account) == .orderedSame else {
+                            throw StepFailure(message: "The saved label belongs to another mailbox. Correct the command for this account first.")
+                        }
+                        args["label"] = label.name
+                        args["label_id"] = label.id
+                        args["account"] = label.account
+                    }
                     let json = String(decoding: (try? JSONSerialization.data(withJSONObject: args)) ?? Data("{}".utf8), as: UTF8.self)
-                    result = await execute(name, json, relayNames: relayNames, cursor: cursor, standingOn: target,
-                                           profileId: job.profileId)
+                    if let cursor, let refusal = LiveWriteTarget.refusal(tool: name, arguments: json,
+                        messageID: cursor.messageId, account: cursor.account) {
+                        result = (refusal, true, true, false)
+                    } else {
+                        result = await execute(name, json, relayNames: relayNames, cursor: cursor, standingOn: target,
+                                               profileId: job.profileId, diagnostics: job.diagnostics, callID: callId)
+                    }
                 } else {
-                    result = ("Could not read those arguments as JSON. Call the tool again.", true, false)
+                    result = ("Could not read those arguments as JSON. Call the tool again.", true, false, false)
+                }
+                if result.pending {
+                    job.diagnostics?.record(.toolFinished, ["job_id": job.id.uuidString, "call_id": callId,
+                        "tool": name, "outcome": "pending"])
+                    throw PendingStep(message: "This action is queued for retry and has not been confirmed. Later command steps were not run. " + result.output)
                 }
                 if result.write {
+                    await Container.shared.dispatchJobs().receipt(job.id, callId: callId, tool: name, failed: result.failed)
                     let line = result.output.split(separator: "\n").first.map(String.init) ?? name
-                    performed(Performed(tool: name, summary: String(line.prefix(200)), failed: result.failed))
+                    performed(Performed(tool: name, summary: String(line.prefix(200)), failed: result.failed, target: VoiceDiagnostics.targetIdentity(arguments: raw)))
+                }
+                job.diagnostics?.record(.toolFinished, ["job_id": job.id.uuidString, "call_id": callId, "tool": name,
+                    "outcome": result.failed ? "failed" : "success",
+                    "duration_ms": String(Int((ProcessInfo.processInfo.systemUptime - toolStarted) * 1000))])
+                if step != nil {
+                    stepReceipts.append(result.output)
+                    if result.failed {
+                        throw StepFailure(message: "Command stopped at step \(next + 1). Later steps were not run. " + result.output)
+                    }
                 }
                 RealtimeLog.log("dispatch: \(job.id) tool \(name)\(result.failed ? " failed" : "")")
                 input.append(["type": "function_call_output", "call_id": callId, "output": result.output])
@@ -263,12 +396,12 @@ enum DispatchWorker {
     }
 
     /// One round, retried twice on a transient failure while the deadline allows.
-    private static func respond(_ body: [String: Any], deadline: Date) async throws -> [[String: Any]] {
+    private static func respond(_ body: [String: Any], deadline: Date, job: Job) async throws -> [[String: Any]] {
         var attempt = 0
         while true {
             attempt += 1
             do {
-                let result = try await LiveOpenAI.responses(body, timeout: 120)
+                let result = try await LiveOpenAI.responses(body, timeout: 120, diagnostics: job.diagnostics, jobID: job.id)
                 guard let output = result["output"] as? [[String: Any]] else {
                     throw LiveBrainRequestError(status: 502, serverCode: "dispatch_request_failed")
                 }
@@ -314,63 +447,73 @@ enum DispatchWorker {
     }
 
     static func execute(_ name: String, _ arguments: String, relayNames: Set<String>,
-                                cursor: GmailManageTools.Cursor?, standingOn: [String: Any]?, profileId: String?)
-        async -> (output: String, failed: Bool, write: Bool) {
+                                cursor: GmailManageTools.Cursor?, standingOn: [String: Any]?, profileId: String?,
+                                diagnostics: VoiceDiagnostics.Session? = nil, callID: String? = nil)
+        async -> Execution {
+        var arguments = arguments
+        let bare = name.hasPrefix("gmail_") ? String(name.dropFirst(6)) : name
+        if LiveWriteTarget.mailWrites.contains(bare), let cursor,
+           var args = try? JSONSerialization.jsonObject(with: Data(arguments.utf8)) as? [String: Any] {
+            if args["message_id"] == nil { args["message_id"] = cursor.messageId }
+            if args["account"] == nil { args["account"] = cursor.account }
+            arguments = GmailReadTools.json(args)
+        }
         if NotionTools.names.contains(name), relayNames.contains(name) {
             let result = await FullDuplexBroker.runTool(name: name, argumentsJSON: arguments, profileId: profileId)
-            return (result.text, result.ok == false, NotionTools.writes.contains(name))
+            return (result.text, result.ok == false, NotionTools.writes.contains(name), result.deferred)
         }
         // The live call's connectors, each on the job profile's own grant.
         if GranolaTools.names.contains(name), relayNames.contains(name) {
             let grants = GranolaConnector.grants(profileId: profileId).filter { !$0.needsReauth }
             let result = await GranolaTools.run(name: name, argumentsJSON: arguments, grants: grants)
-            return (result.text, result.ok == false, false)
+            return (result.text, result.ok == false, false, false)
         }
         if SlackTools.readNames.contains(name) || SlackTools.writeNames.contains(name), relayNames.contains(name) {
             let result = await SlackTools.run(name: name, argumentsJSON: arguments,
                                               workspaces: SlackWorkspace.served(profileId: profileId))
-            return (result.text, !result.ok, SlackTools.writeNames.contains(name))
+            return (result.text, !result.ok, SlackTools.writeNames.contains(name), false)
         }
         if GitHubTools.isGitHubTool(name), relayNames.contains(name) {
             let result = await GitHubTools.run(name: name, argumentsJSON: arguments)
-            return (result.text, result.ok == false, GitHubTools.writeTools.contains(name))
+            return (result.text, result.ok == false, GitHubTools.writeTools.contains(name), false)
         }
         // A listed tool says nothing about whether it writes, so every call is recorded as one: a
         // needless line in a failure report beats a write the report never mentions.
         if CustomMCPTools.isCustomTool(name), relayNames.contains(name) {
             let result = await CustomMCPTools.run(name: name, argumentsJSON: arguments,
                                                   servers: CustomMCPConnector.servers(profileId: profileId))
-            return (result.text, result.ok == false, true)
+            return (result.text, result.ok == false, true, false)
         }
         if GmailReadTools.names.contains(name) {
             let result = await GmailReadTools.run(name: name, argumentsJSON: arguments)
-            return (result.output, result.failed, false)
+            return (result.output, result.failed, false, false)
         }
         if GmailManageTools.names.contains(name) {
             let resolved = GmailManageTools.resolvedArguments(name: name, argumentsJSON: arguments, cursor: cursor)
             let result = await GmailManageTools.run(name: name, argumentsJSON: resolved)
-            return (result.output, result.failed, !readOnlyManage.contains(name))
+            return (result.output, result.failed, !readOnlyManage.contains(name), false)
         }
         if CalendarTools.names.contains(name) {
-            let result = await CalendarTools.run(name: name, argumentsJSON: arguments)
-            return (result.output, result.failed, name != CalendarTools.list)
+            let result = await CalendarTools.run(name: name, argumentsJSON: arguments, diagnostics: diagnostics, callID: callID)
+            return (result.output, result.failed, name != CalendarTools.list, false)
         }
         if name == EmailLinkTool.name {
-            return (await EmailLinkTool.run(argumentsJSON: arguments, standingOn: standingOn), false, false)
+            return (await EmailLinkTool.run(argumentsJSON: arguments, standingOn: standingOn), false, false, false)
         }
         // Answered from this phone's correspondent directory, as a call's `find_person` is.
         if name == "find_person", relayNames.contains(name) {
             let args = (try? JSONSerialization.jsonObject(with: Data(arguments.utf8))) as? [String: Any] ?? [:]
             let spoken = (args["name"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let answer = await FullDuplexVoiceClient.resolvePerson(spoken, store: Container.shared.contactStore())
-            return (answer.output, false, false)
+            return (answer.output, false, false, false)
         }
         // Drafts and sends run on this phone (`LocalCompose`); `runTool` routes them there.
         if relayNames.contains(name) {
-            let result = await FullDuplexBroker.runTool(name: name, argumentsJSON: arguments)
-            return (result.text, result.ok == false, !readOnlyRelays.contains(name))
+            let result = await FullDuplexBroker.runTool(name: name, argumentsJSON: arguments, profileId: profileId)
+            return (result.text, result.ok == false, !readOnlyRelays.contains(name),
+                result.deferred || result.pendingArchive != nil || result.pendingDraft != nil)
         }
-        return ("There is no tool called \(name). Use only the tools you were given.", true, false)
+        return ("There is no tool called \(name). Use only the tools you were given.", true, false, false)
     }
 
     // MARK: - Prompt

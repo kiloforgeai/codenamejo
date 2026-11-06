@@ -113,6 +113,9 @@ final class LiveSessionAdapter {
     private var farewell: LiveFarewellPlayback?
     private var assistantID = UUID().uuidString
     private var assistantText = ""
+    var historyIDForTurn: ((Int) -> String?)?
+    var diagnostics: VoiceDiagnostics.Session?
+    private var toolStartedAt: [String: TimeInterval] = [:]
     private var inputID = UUID().uuidString
     private var inputText = ""
     private var inputEnd: Double = 0
@@ -245,16 +248,6 @@ final class LiveSessionAdapter {
         "okay", "ok", "sure", "yes", "yeah", "yep", "of", "course", "got", "it", "good", "great",
         "question", "thing", "alright", "right", "absolutely", "that", "s", "a", "hmm", "let", "me", "see",
     ]
-
-    private func authorizationWasAnswered() -> Bool {
-        if LiveRequestRecovery.isBackchannel(authorizationText) { return true }
-        guard !recoverySpeech.isEmpty else { return false }
-        if LiveFastAction.parse(authorizationText) != nil { return true }
-        let words = authorizationText.lowercased().split(whereSeparator: { !$0.isLetter })
-            .joined(separator: " ")
-        // Only standalone acknowledgements can expire without a tool resolving the request.
-        return ["yes", "yeah", "yep", "thanks", "thank you"].contains(words)
-    }
 
     /// `action` nil is a local action that is not one of the four quick ones (a dispatch the
     /// phone starts for an accepted suggestion); it must be `routed`.
@@ -604,6 +597,14 @@ final class LiveSessionAdapter {
                     return
                 }
                 trace("tool_result", call: id, delegation: activeCall?.delegation)
+                if let call = activeCall {
+                    var fields = ["call_id": id, "tool": call.name, "delegation_id": call.delegation,
+                                  "turn_id": (historyIDForTurn?(delegationTurns[call.delegation] ?? inputTurn) ?? String(delegationTurns[call.delegation] ?? inputTurn)), "outcome": "reported"]
+                    if let start = toolStartedAt.removeValue(forKey: id) {
+                        fields["duration_ms"] = String(Int((ProcessInfo.processInfo.systemUptime - start) * 1000))
+                    }
+                    diagnostics?.record(.toolFinished, fields)
+                }
                 if ["dispatch", "dispatch_command"].contains(activeCall?.name ?? ""),
                    output.hasPrefix("Started."),
                    let delegation = activeCall?.delegation,
@@ -809,7 +810,6 @@ final class LiveSessionAdapter {
                 emit(.liveFirstSpeech(afterInputMs: Int(start - inputEnd)))
             }
             let speech = speechOutsideWaitBeat(fragment)
-            if start - outputEnd > 1200, !assistantText.isEmpty { finishTranscript() }
             lastOutputAt = Date()
             // Presence speech is heard, not recorded: it never joins a reply, settles a turn or feeds recovery.
             guard let delta = speech, !delta.isEmpty else {
@@ -841,10 +841,13 @@ final class LiveSessionAdapter {
                 && lastSettledInput.lowercased().trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("go")
                 && suffix == "ahead"
             if finishesAssent { inputText = lastSettledInput + " " }
-            if inputText.isEmpty || start - inputEnd > 1000 {
+            let newIntent = LiveRequestRecovery.isFeedback(delta) || LiveRequestRecovery.requiresQueueAction(delta) || LiveRequestRecovery.isQuestion(delta)
+            let answered = !speechAfterInput.isEmpty || turnsWithTools.contains(inputTurn) || resolvedInputTurns.contains(inputTurn)
+            if inputText.isEmpty || (finalizedInput && !finishesAssent && (newIntent || (answered && start - inputEnd > 1000))) {
                 finishTranscript()
                 // Caption pauses and backchannels do not finish the user's authorization.
-                if authorizationWasAnswered() { authorizationText = "" }
+                // A new request cannot inherit permission to repeat an earlier failed write.
+                authorizationText = ""
                 completedDelegation = nil
                 recoverySpeech = ""
                 speechAfterInput = ""
@@ -858,15 +861,15 @@ final class LiveSessionAdapter {
                 if clockAppendedAt != nil { appendClock() }
                 // A presence line already requested may still be spoken; it keeps being recognised.
                 waitBeatsSpoken = 0
-                trace("input_started")
                 inputTurns.append((inputTurn, start))
                 if !authorizationText.isEmpty { authorizationText += " " }
                 emit(.liveUserActivity)
+                trace("input_started")
             }
             finalizedInput = false
             inputEnd = event["end_ms"] as? Double ?? start
             inputText += delta
-            authorizationText += delta
+            authorizationText = inputText
             refreshBrainState()
             clientBrain?.user(authorizationText, turn: inputTurn)
             emit(.liveInputText(inputText))
@@ -889,7 +892,8 @@ final class LiveSessionAdapter {
                    LiveRequestRecovery.isBackchannel(self.authorizationText) {
                     self.resolvedInputTurns.insert(self.inputTurn)
                 }
-                if !self.turnsWithQueueActions.contains(self.inputTurn),
+                if LiveRequestRecovery.requiresQueueAction(self.authorizationText),
+                   !self.turnsWithQueueActions.contains(self.inputTurn),
                    !self.resolvedInputTurns.contains(self.inputTurn) {
                     self.queueActionRecovery = LiveQueueActionRecovery(now: ProcessInfo.processInfo.systemUptime)
                 }
@@ -897,7 +901,6 @@ final class LiveSessionAdapter {
                 self.trace("input_settled")
                 self.lastSettledInput = self.inputText
                 self.emit(.liveInputFinished(self.inputText))
-                self.inputText = ""
                 if self.clientBrain != nil {
                     for (id, turn) in self.delegationTurns where turn == 0 {
                         self.delegationTurns[id] = self.inputTurn
@@ -981,6 +984,13 @@ final class LiveSessionAdapter {
         }
         if delegationTurns[call.delegation] == inputTurn { authorizationText = "" }
         trace("tool_started", call: call.id, delegation: call.delegation)
+        toolStartedAt[call.id] = ProcessInfo.processInfo.systemUptime
+        var fields = ["call_id": call.id, "tool": call.name, "delegation_id": call.delegation,
+                      "turn_id": (historyIDForTurn?(delegationTurns[call.delegation] ?? inputTurn) ?? String(delegationTurns[call.delegation] ?? inputTurn))]
+        if let target = VoiceDiagnostics.targetIdentity(arguments: call.arguments) {
+            fields["target_hash"] = diagnostics?.target(target)
+        }
+        diagnostics?.record(.toolStarted, fields)
         armCallWatchdog(for: call)
         emit(.liveFunction(call))
     }
@@ -1139,6 +1149,11 @@ final class LiveSessionAdapter {
     }
 
     private func trace(_ transition: String, call: String? = nil, delegation: String? = nil) {
+        var fields = ["transition": transition, "turn_id": historyIDForTurn?(inputTurn) ?? String(inputTurn),
+                      "pending_calls": String(calls.count), "pending_responses": String(runningResponses.count)]
+        fields["call_id"] = call
+        fields["delegation_id"] = delegation
+        diagnostics?.record(transition.hasPrefix("queue_action") ? .queueRecovery : .turnTransition, fields)
         RealtimeLog.log("liveTurn: \(transition) uptime=\(ProcessInfo.processInfo.systemUptime) turn=\(inputTurn) delegation=\(delegation ?? "none") call=\(call ?? "none") active=\(activeCall?.id ?? "none") fast=\(activeFastCall?.id ?? "none") backend=\(runningResponses.count) starting=\(backendStarting) queued=\(calls.count) context=\(pendingContext.count)")
     }
 
@@ -1165,7 +1180,7 @@ final class LiveSessionAdapter {
             && lastTranscriptAt.map({ ProcessInfo.processInfo.systemUptime - $0 >= 0.8 }) ?? true
         guard settled else { return }
         guard let decision = queueActionRecovery?.poll(now: ProcessInfo.processInfo.systemUptime) else { return }
-        if settled, questionTurn == inputTurn, Self.answersQuestion(speechAfterInput) {
+        if settled, questionTurn == inputTurn, !speechAfterInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             retireAnsweredQuestion()
             trace("queue_action_answered")
             return
@@ -1210,6 +1225,7 @@ final class LiveSessionAdapter {
 
     func close() {
         guard !closed else { return }
+        finishTranscript()
         trace("closed")
         closed = true
         recoveryOutput.removeAll()
