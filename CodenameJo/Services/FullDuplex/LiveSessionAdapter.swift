@@ -161,6 +161,12 @@ final class LiveSessionAdapter {
     private var backgroundStartedTurns: Set<Int> = []
     private var finalizedInput = false
     private var authorizationText = ""
+    var onDispatchRefused: ((Call, String) -> Void)?
+
+    private func recordDispatchRefusal(_ call: Call, reason: String) {
+        if call.name == "dispatch" || call.name == "dispatch_command" { onDispatchRefused?(call, reason) }
+    }
+
     var allowsNewDispatch: Bool {
         finalizedInput && !closed && !desktopQuiet && inputTurn > desktopDismissedThroughTurn
             && LiveRequestRecovery.dispatchRefusal(authorizationText) == nil
@@ -1439,6 +1445,7 @@ final class LiveSessionAdapter {
         if LiveWriteTarget.requiresCurrentRequest(call.name),
            delegationTurns[call.delegation] != inputTurn || LiveRequestRecovery.isFeedback(inputText)
             || LiveRequestRecovery.isBackchannel(inputText) || LiveRequestRecovery.incompleteAction(inputText) || !finalizedInput {
+            recordDispatchRefusal(call, reason: "stale_or_unsettled_request")
             trace("write_request_superseded", call: call.id, delegation: call.delegation)
             outbound(["type": "conversation.item.create", "item": ["type": "function_call_output",
                 "call_id": call.id, "output": "Not executed: this action belongs to an earlier request or the current request is feedback. Do not revive it, retry it, or advance the feed. Handle only the user's latest request."]])
@@ -1446,6 +1453,7 @@ final class LiveSessionAdapter {
         }
         if presentationDelegations.contains(call.delegation),
            !["gmail_get_message", "gmail_get_thread", "get_message", "get_thread"].contains(call.name) {
+            recordDispatchRefusal(call, reason: "presentation_only")
             outbound(["type": "conversation.item.create", "item": ["type": "function_call_output",
                 "call_id": call.id, "output": "Not executed: this is presentation-only work. Do not write or advance; present the supplied result."]])
             return
@@ -1456,6 +1464,7 @@ final class LiveSessionAdapter {
         }
         if let turn = delegationTurns[call.delegation], recoveryRequests[turn] != nil {
             if turn != inputTurn || recoveryOwners[turn].map({ $0 != call.delegation }) == true {
+                recordDispatchRefusal(call, reason: "request_superseded")
                 trace("request_assessment_stale_or_duplicate", call: call.id, delegation: call.delegation)
                 outbound(["type": "conversation.item.create", "item": ["type": "function_call_output",
                     "call_id": call.id, "output": "Not executed: this request was superseded or another delegation owns its execution. Do not retry or advance the feed."]])
@@ -1479,6 +1488,7 @@ final class LiveSessionAdapter {
                 if turn == inputTurn { stopQueueActionRecovery() }
             }
             if let result = fastResults[turn], !allowsFastFollowup(call) {
+                recordDispatchRefusal(call, reason: "request_already_handled")
                 RealtimeLog.log("liveFastAction: suppressed late \(call.name) from handled user turn")
                 outbound(["type": "conversation.item.create", "item": ["type": "function_call_output",
                     "call_id": call.id, "output": result]])
