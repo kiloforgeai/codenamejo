@@ -189,17 +189,22 @@ enum TriageQueueBuilder {
     /// The `all` stage's first Gmail pages for `prefetchInboxStage`, keyed by the `before:` each
     /// was asked with. Stops at the first incomplete answer, or once a page holds mail not yet walked.
     static func inboxAheadPages(
-        walked: Set<String>, budget: Int,
+        walked: Set<String>, budget: Int, minimumItems: Int = 1,
         livePage: (Int64?) async -> TriageMailSource.LivePageResult
     ) async -> [Int64?: TriageMailSource.LivePageResult] {
         var pages: [Int64?: TriageMailSource.LivePageResult] = [:]
+        var eligible = 0
+        var seen = walked
         var before: Int64?
         for _ in 0..<budget {
             // Only complete answers are kept; anything else is left for the crossing to ask live.
             let page = await livePage(before)
             guard case .success(let live, let hasMore, true) = page else { break }
             pages[before] = page
-            guard hasMore, Self.gmailEligible(live, dealtWithThisWalk: walked).isEmpty,
+            let fresh = Self.gmailEligible(live, dealtWithThisWalk: seen)
+            eligible += fresh.count
+            seen.formUnion(LocalTriageQueue.messageKeys(fresh))
+            guard hasMore, eligible < minimumItems,
                   let next = TriageMailSource.watermark(live), next != before
             else { break }
             before = next

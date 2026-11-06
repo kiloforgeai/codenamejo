@@ -163,6 +163,9 @@ enum LiveToolSchemas {
             "parameters": [
                 "type": "object",
                 "properties": [
+                    "source_message_id": ["type": "string", "description": "The original invitation email ID, only when accepting from an email. It is archived after confirmed acceptance and an exact invitation UID match."],
+                    "source_account": ["type": "string", "description": "Mailbox owning that source invitation email."],
+                    "keep_in_inbox": ["type": "boolean", "description": "True when the user explicitly asks to keep the invitation email in the inbox."],
                     "event_id": [
                         "type": "string",
                         "description": "From a search_calendar or list_calendar_events result.",
@@ -608,13 +611,13 @@ enum LiveToolSchemas {
     static let commands: [String: Any] = [
         "type": "function",
         "name": "commands",
-        "description": "The user's own commands: a keyword they say, and the tool calls it runs. Answered on the device, instantly. `run` with that exact `keyword` when they say a saved command — it returns that command's steps, which you then carry out in order. `list` when they ask what commands they have — it returns names to read back, and no steps, because they asked what they have rather than how it works. `save` to create one or change what a keyword does, `delete` to remove one, `enable` and `disable` to switch one without losing it.",
+        "description": "The user's own commands: a keyword they say, and the tool calls it runs. Answered on the device, instantly. `run` with that exact `keyword` when they say a saved command — it executes the stored steps in order as one job. Do not repeat its steps yourself. `list` when they ask what commands they have — it returns names to read back, and no steps, because they asked what they have rather than how it works. `correct_label` to persist an explicitly agreed correction to a command's label (keyword, label_name, account); never claim a correction saved before this succeeds. `save` to create one or change what a keyword does, `delete` to remove one, `enable` and `disable` to switch one without losing it.",
         "parameters": [
             "type": "object",
             "properties": [
                 "action": [
                     "type": "string",
-                    "enum": ["run", "list", "save", "delete", "enable", "disable"],
+                    "enum": ["run", "list", "save", "correct_label", "delete", "enable", "disable"],
                     "description": "What to do. `list` takes nothing else.",
                 ],
                 "keyword": [
@@ -625,6 +628,8 @@ enum LiveToolSchemas {
                     "type": "string",
                     "description": "A short name for the app screen — three or four words, like \"Research a company\" or \"Morning standup\". **A name, not an instruction**: it is what you read back on `list`, and writing it as \"send an email to…\" makes a sentence you will later mistake for work. For `save`.",
                 ],
+                "label_name": ["type": "string", "description": "Exact existing Gmail label for correct_label."],
+                "account": ["type": "string", "description": "Mailbox owning the corrected Gmail label."],
                 "actions": [
                     "type": "array",
                     "description": "The steps, in the order they should run. **This is the whole command.** Turn what the user described into calls to the tools you already have: \"look them up and check what they've sent me\" is a web_search then a gmail_search_messages, then a summarize step saying what to tell them. **One step per tool call, and each step describes only its own call.** Never restate the command inside a step, and never have one step mention what another does — a step reading \"send the email and then say it was sent\" is two orders and does the work twice. **Only the steps they asked for**, never one added because it might help and never a conditional one: every step runs every time, on mail you have not read yet. For `save`.",

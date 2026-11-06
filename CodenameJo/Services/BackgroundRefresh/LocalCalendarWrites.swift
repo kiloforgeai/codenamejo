@@ -77,8 +77,8 @@ enum LocalCalendarWrites {
         let when = start(event).map { " (\($0))" } ?? ""
         let scope = CalendarTools.isInstanceId(eventId) ? " This was that one occurrence, not the whole recurring series." : ""
         if me["responseStatus"] as? String == response {
-            return .init(text: "\"\(title)\"\(when) was already \(response) on \(target). "
-                + "Nothing changed and nobody was notified again.\(scope)", ok: true)
+            let receipt = FullDuplexBroker.ToolResult(text: "\"\(title)\"\(when) was already \(response) on \(target). Nothing changed and nobody was notified again.\(scope)", ok: true)
+            return await InvitationArchive.finish(receipt, args: args, event: event, account: target)
         }
         let said = response == "accepted" ? "Accepted" : response == "declined" ? "Declined" : "Tentatively accepted"
         let receipt = "\(said) \"\(title)\"\(when) as \(target). The organizer was notified.\(scope)"
@@ -90,14 +90,19 @@ enum LocalCalendarWrites {
             return mine
         }
         let write = {
-            _ = try await CalendarAPI.json("PATCH", path: path, query: ["sendUpdates": "all"],
+            let saved = try await CalendarAPI.json("PATCH", path: path, query: ["sendUpdates": "all"],
                                            body: ["attendees": patched], token: token)
+            guard (saved["attendees"] as? [[String: Any]])?.first(where: { $0["self"] as? Bool == true })?["responseStatus"] as? String == response else {
+                throw Refusal(text: "The calendar did not confirm the requested RSVP. Check its current state before retrying; the email was kept.")
+            }
         }
         let landed = { await store().setOwnResponse(response, eventId: eventId, account: target) }
-        return try await finish(write, landed: landed, receipt: receipt, target: target, capability: capability,
+        let result = try await finish(write, landed: landed, receipt: receipt, target: target, capability: capability,
             prefix: "NOT ANSWERED", claim: "answered it",
             unchanged: "your answer wasn't sent and the organizer wasn't told",
-            deferred: deferred, conversationId: conversationId)
+            deferred: false, conversationId: conversationId)
+        _ = await landed()
+        return await InvitationArchive.finish(result, args: args, event: event, account: target)
     }
 
     // MARK: - cancel_calendar_event

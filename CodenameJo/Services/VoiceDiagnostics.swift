@@ -9,18 +9,25 @@ final class VoiceDiagnostics: @unchecked Sendable {
         case liveConnected, liveEvent, microphoneStarted, remoteAudioObserved
         case fallbackSelected, fallbackReady, fallbackFailed, audioReleased, turnStarted, turnFailed
         case speechRequested, speechStarted, speechFinished, speechCancelled, speechFailed
+        case turnTransition, toolStarted, toolFinished, brainRequest, brainResponse
+        case jobStarted, jobFinished, jobDeferred, jobInjected, queueRecovery, calendarReceipt, modelAvailability, audioRouteChanged
+        case workspaceRendered
     }
 
     struct Session: Sendable {
         let id: UUID
         let conversationID: UUID?
         let userID: String?
-        private let origin = Date()
+        private let origin = ProcessInfo.processInfo.systemUptime
         fileprivate let owner: VoiceDiagnostics
 
         func record(_ event: Event, _ fields: [String: String] = [:]) {
             owner.record(session: self, event: event, fields: fields,
-                         elapsed: Int(Date().timeIntervalSince(origin) * 1000))
+                         elapsed: Int((ProcessInfo.processInfo.systemUptime - origin) * 1000))
+        }
+
+        func target(_ value: String) -> String {
+            SHA256.hash(data: Data((id.uuidString + value).utf8)).map { String(format: "%02x", $0) }.joined()
         }
     }
 
@@ -57,14 +64,21 @@ final class VoiceDiagnostics: @unchecked Sendable {
     private static let allowedFields: Set<String> = [
         "engine", "model", "brain_model", "reason", "resource", "error_domain", "error_code",
         "http_status", "request_id", "provider_code", "event_type", "sample_rate", "output_ports",
-        "utterance_id", "characters", "voice_id", "phase", "response_status", "ice_candidates"
+        "utterance_id", "characters", "voice_id", "phase", "response_status", "ice_candidates",
+        "turn_id", "delegation_id", "call_id", "job_id", "tool", "target_hash", "outcome", "duration_ms",
+        "queue_revision", "transition", "input_tokens", "cached_tokens", "output_tokens", "instructions_bytes",
+        "tools_bytes", "context_bytes", "input_bytes", "pending_calls", "pending_responses", "time_zone",
+        "requested_start", "requested_end", "stored_start", "stored_end", "available", "provider_request_id", "provider_response_id",
+        "render_revision", "queue_scope", "observation_phase", "window_id", "profile_hash", "response_hash",
+        "response_role", "focus_mode", "visible_count", "queue_target_hash", "queue_order", "mismatch"
     ]
 
     static func safeFields(_ fields: [String: String]) -> [String: String] {
         fields.filter { key, value in
-            allowedFields.contains(key) && !value.isEmpty && value.count <= 160
+            allowedFields.contains(key) && !value.isEmpty && value.count <= (key == "queue_order" ? 4096 : 160)
+                && (key != "queue_order" || value.range(of: "^[a-f0-9,]+$", options: .regularExpression) != nil)
                 && !value.lowercased().contains("sk-") && !value.lowercased().contains("bearer")
-                && value.range(of: "^[A-Za-z0-9_.:/(), -]+$", options: .regularExpression) != nil
+                && value.range(of: "^[A-Za-z0-9_.:/(), +-]+$", options: .regularExpression) != nil
         }
     }
 
@@ -75,9 +89,10 @@ final class VoiceDiagnostics: @unchecked Sendable {
             sequence += 1
             var row: [String: Any] = ["timestamp": timestamp, "elapsed_ms": elapsed,
                 "sequence": sequence, "session_id": session.id.uuidString,
-                "event": event.rawValue, "app_version": version, "fields": safe]
-            if let conversationID = session.conversationID { row["conversation_id"] = conversationID.uuidString }
+                "event": event.rawValue, "app_version": version, "schema_version": 2,
+                "source_revision": Bundle.main.infoDictionary?["JoSourceRevision"] as? String ?? "unknown", "fields": safe]
             if let userID = session.userID { row["user_id"] = userID }
+            if let conversationID = session.conversationID { row["conversation_id"] = conversationID.uuidString }
             do {
                 var data = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
                 let line = String(decoding: data, as: UTF8.self)
@@ -92,6 +107,37 @@ final class VoiceDiagnostics: @unchecked Sendable {
 
     private func path(_ index: Int, prefix: String = "voice-session") -> URL {
         directory.appendingPathComponent("\(prefix)-\(index).jsonl")
+    }
+
+    static func protocolFields(_ event: [String: Any]) -> [String: String]? {
+        guard let outer = event["type"] as? String else { return nil }
+        let nested = event["event"] as? [String: Any] ?? event
+        let type = nested["type"] as? String ?? outer
+        guard !type.hasSuffix(".delta"), !type.contains("audio.delta") else { return nil }
+        let accepted = type.hasPrefix("session.") || type.hasPrefix("response.")
+            || type.hasPrefix("input_audio_buffer.") || type == "error"
+        guard accepted else { return nil }
+        var fields = ["event_type": type]
+        fields["delegation_id"] = event["delegation_id"] as? String
+        let response = nested["response"] as? [String: Any] ?? [:]
+        fields["request_id"] = response["id"] as? String
+        fields["response_status"] = response["status"] as? String
+        let details = response["status_details"] as? [String: Any] ?? [:]
+        let error = nested["error"] as? [String: Any] ?? details["error"] as? [String: Any] ?? [:]
+        fields["provider_code"] = error["code"] as? String
+        fields["provider_request_id"] = nested["request_id"] as? String ?? error["request_id"] as? String
+        fields["provider_response_id"] = response["id"] as? String
+        return safeFields(fields)
+    }
+
+    static func targetIdentity(arguments: String) -> String? {
+        guard let args = try? JSONSerialization.jsonObject(with: Data(arguments.utf8)) as? [String: Any] else { return nil }
+        if let account = args["account"] as? String, let id = args["message_id"] as? String {
+            return MailSelection(account: account, messageID: id).canonical
+        }
+        let target = args.filter { ["message_id", "message_ids", "thread_id", "event_id", "account", "label_id", "source_message_id", "source_account"].contains($0.key) }
+        guard !target.isEmpty, let data = try? JSONSerialization.data(withJSONObject: target, options: .sortedKeys) else { return nil }
+        return String(decoding: data, as: UTF8.self)
     }
 
     private static func feedbackPrefix(userID: String) -> String {
@@ -130,6 +176,7 @@ final class VoiceDiagnostics: @unchecked Sendable {
                     if let value = context.sessionID { row["session_id"] = value.uuidString }
                     if let value = context.conversationID { row["conversation_id"] = value.uuidString }
                     if let value = context.profileID { row["profile_id"] = value }
+                    if let value = context.renderRevision { row["render_revision"] = value }
                     var data = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
                     data.append(0x0a)
                     try append(data, prefix: Self.feedbackPrefix(userID: userID), durable: true)

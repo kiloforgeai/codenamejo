@@ -25,6 +25,8 @@ enum ProfileRuntime {
     /// (connections not fetched yet) filters nothing; an empty profile filters everything.
     static func allowedMailAccounts(_ accounts: [String]) -> [String] {
         guard let emails = snapshot?.emails else { return accounts }
-        return accounts.filter { emails.contains($0.lowercased()) }
+        return emails.compactMap { email in
+            accounts.first { $0.caseInsensitiveCompare(email) == .orderedSame }
+        }
     }
 }

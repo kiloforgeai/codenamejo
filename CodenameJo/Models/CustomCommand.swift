@@ -13,6 +13,13 @@ import Foundation
 struct CommandAction: Codable, Hashable, Sendable {
     var tool: String
     var detail: String
+    var resolvedLabel: ResolvedLabel? = nil
+
+    struct ResolvedLabel: Codable, Hashable, Sendable {
+        var id: String
+        var name: String
+        var account: String
+    }
 
     /// The step as a line of text, for the tool's answer.
     var line: String {

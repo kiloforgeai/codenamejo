@@ -26,6 +26,19 @@ struct CommandRecord: Codable, Identifiable, Hashable {
         case failed
         case pending
         case cancelled
+        case partial
+        case conversational
+        case unknown
+    }
+
+    static func outcome(steps: [TurnStep], interrupted: Bool) -> CommandStatus {
+        if interrupted { return .cancelled }
+        if steps.isEmpty { return .conversational }
+        if steps.contains(where: \.isRunning) { return .unknown }
+        let failed = steps.filter(\.failed).count
+        if failed == steps.count { return .failed }
+        if failed > 0 { return .partial }
+        return .success
     }
 
     /// One tool the assistant ran during the turn: the persisted twin of `TurnStep`, which can't
@@ -35,6 +48,7 @@ struct CommandRecord: Codable, Identifiable, Hashable {
         /// The broker's own measurement, where there was one. A reported 0 means unknown, so it is
         /// stored as nil.
         var milliseconds: Int?
+        var outcome: String? = nil
     }
 
     /// One delegated backend response on Live: when it finished, counted from the hand-off, and what it called.

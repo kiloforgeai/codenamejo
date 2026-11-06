@@ -9,6 +9,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        #if JO_QA
+        return true
+        #else
         // Unit tests inject their own providers and must not warm models or refresh accounts.
         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil { return true }
         // MARK: - Notification routing
@@ -70,6 +73,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         }
 
         return true
+        #endif
     }
 
     @objc private func didBecomeActive() {

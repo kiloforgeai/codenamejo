@@ -246,8 +246,6 @@ final class VoiceCallCoordinator {
 
     /// File a finished turn. The record arrives already built; nothing here reads live session state.
     private func save(_ record: CommandRecord, owner: String) async -> Bool {
-        guard lastSavedTurnId != record.id else { return true }
-        lastSavedTurnId = record.id
 
         return await commandStore.save(record, expectedUserId: owner)
     }
@@ -262,8 +260,11 @@ final class VoiceCallCoordinator {
             RealtimeLog.log("history: completed turn has no captured conversation owner")
             return
         }
-        guard turnSaves[record.id] == nil else { return }
-        let task = Task { await self.save(record, owner: owner) ? nil : record }
+        let previous = turnSaves[record.id]?.task
+        let task = Task {
+            _ = await previous?.value
+            return await self.save(record, owner: owner) ? nil : record
+        }
         turnSaves[record.id] = (conversation, record, task)
         if endedCalls.contains(conversation) { conversationEnded(conversation, owner: owner) }
     }

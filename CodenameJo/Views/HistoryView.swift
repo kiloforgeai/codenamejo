@@ -245,7 +245,7 @@ struct HistoryView<Interactor: ViewWithModelLifecycleObserver<HistoryViewModel> 
 
             if !command.responseText.isEmpty && command.responseText != "Processing..." {
                 let isOpen = viewModel.expanded.contains(command.id)
-                let failed = command.status == .failed
+                let failed = [.failed, .partial, .unknown].contains(command.status)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(alignment: .top, spacing: 5) {
                         // Without this a failure reads as an answer — the

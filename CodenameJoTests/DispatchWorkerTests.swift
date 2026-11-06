@@ -151,10 +151,10 @@ final class DispatchJobStoreTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")
         defer { try? FileManager.default.removeItem(at: url) }
         let store = DispatchJobStore(url: url)
-        let personal = UUID(), work = UUID()
-        store.begin(id: personal, task: "Personal note", profileId: "personal")
-        store.begin(id: work, task: "Work note", profileId: "work")
-        store.finish(work, state: "done", result: "Archived.", reportBack: false)
+        let personal = UUID(), work = UUID(), conversation = UUID()
+        await store.begin(id: personal, task: "Personal note", profileId: "personal")
+        await store.begin(id: work, task: "Work note", profileId: "work", conversationId: conversation, turnId: "turn-1")
+        await store.finish(work, state: "done", result: "Archived.", reportBack: false)
 
         ProfileRuntime.install(.init(profileId: "personal", isDefault: false))
         let reloaded = DispatchJobStore(url: url)
@@ -165,6 +165,8 @@ final class DispatchJobStoreTests: XCTestCase {
         let row = try XCTUnwrap(workRows.first)
         XCTAssertEqual(row.result, "Archived.")
         XCTAssertEqual(row.reportBack, false)
+        XCTAssertEqual(row.conversationId, conversation)
+        XCTAssertEqual(row.turnId, "turn-1")
         let recovered = await reloaded.recover()
         XCTAssertTrue(recovered.isEmpty, "a silent success is not recovered")
     }
@@ -175,8 +177,8 @@ final class DispatchJobStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
         let store = DispatchJobStore(url: url)
         let id = UUID()
-        store.begin(id: id, task: "Look up", profileId: nil)
-        store.finish(id, state: "done", result: "Thursday at two.")
+        await store.begin(id: id, task: "Look up", profileId: nil)
+        await store.finish(id, state: "done", result: "Thursday at two.")
         let first = await store.recover()
         XCTAssertEqual(first.map(\.id), [id])
         await store.settle(id)

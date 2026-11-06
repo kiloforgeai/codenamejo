@@ -25,8 +25,8 @@ struct ArchiveRetryStatus: Decodable, Sendable {
 }
 
 enum ArchiveReceiptPolicy {
-    static func receipt(succeeded: Bool, pending: PendingArchive?, live: Bool = false) -> String? {
-        if pending != nil { return live ? SpokenPhrases.archived : SpokenPhrases.archiving }
+    static func receipt(succeeded: Bool, pending: PendingArchive?, live _: Bool = false) -> String? {
+        if pending != nil { return SpokenPhrases.archiving }
         return succeeded ? SpokenPhrases.archived : nil
     }
 }

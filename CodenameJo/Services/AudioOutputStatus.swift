@@ -20,6 +20,12 @@ enum AudioOutputStatus {
         guard device != kAudioObjectUnknown else {
             return "No speaker or headphones are available. Choose an output in System Settings → Sound."
         }
+        address.mSelector = kAudioDevicePropertyDeviceIsAlive
+        var alive: UInt32 = 0
+        size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &alive) == noErr, alive != 0 else {
+            return "The sound output disconnected. Choose an available output in System Settings → Sound."
+        }
         address.mScope = kAudioDevicePropertyScopeOutput
         address.mSelector = kAudioDevicePropertyMute
         var muted: UInt32 = 0

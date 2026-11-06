@@ -293,7 +293,7 @@ final class LiveClientBrain {
             fail("The current task context is too large to process safely."); return
         }
         let prior = history.enumerated().filter { $0.offset != turnHistoryIndex }.map(\.element)
-        let body: [String: Any] = ["requestId": UUID().uuidString,
+        let body: [String: Any] = ["requestId": UUID().uuidString, "delegationId": delegation, "turnIndex": currentTurn,
             "context": String(decoding: stateData, as: UTF8.self), "history": Array(prior.suffix(12)), "input": input,
             "presentationOnly": presentationOnly]
         deliver(["type": "response.event", "delegation_id": delegation,

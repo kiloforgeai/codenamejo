@@ -48,6 +48,8 @@
 	<string>$(JO_GITHUB_CLIENT_ID)</string>
 	<key>JoSlackClientId</key>
 	<string>$(JO_SLACK_CLIENT_ID)</string>
+	<key>JoSourceRevision</key>
+	<string>$(JO_SOURCE_REVISION)</string>
 	<key>JoTokenServerHost</key>
 	<string>$(JO_TOKEN_SERVER_HOST)</string>
 	<key>LSApplicationCategoryType</key>

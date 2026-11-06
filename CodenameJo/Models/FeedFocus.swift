@@ -20,6 +20,9 @@ enum FeedFocus: Hashable, Sendable {
         let account: String
         var position: Int
         var total: Int?
+        var messageId: String? = nil
+        var threadId: String? = nil
+        var isBackgroundResult = false
 
         var pageTotal: Int? {
             guard let total, total > 0 else { return nil }
@@ -163,6 +166,8 @@ struct FeedFocusTracker: Sendable {
 
     mutating func refreshEmailProgress(_ progress: LocalTriageQueue.Progress) -> FeedFocus? {
         guard case .email(var email) = focus,
+              email.messageId == progress.messageId,
+              email.threadId == progress.threadId,
               email.account.caseInsensitiveCompare(progress.account ?? "") == .orderedSame else { return focus }
         email.position = progress.displayPosition ?? progress.position
         email.total = progress.displayQueued ?? progress.queued
@@ -202,6 +207,9 @@ struct FeedFocusTracker: Sendable {
                 account: Self.string(item["account"], fallback: ""),
                 position: position,
                 total: displayTotal ?? queueTotal,
+                messageId: item["id"] as? String,
+                threadId: item["threadId"] as? String,
+                isBackgroundResult: Self.bool(object["presentedForOutcome"]) == true,
                 received: Self.date(item["date"]),
                 threadIndex: (object["thread"] as? [String: Any]).flatMap { Self.int($0["index"]) },
                 threadCount: (object["thread"] as? [String: Any]).flatMap { Self.int($0["queued"]) },
@@ -215,6 +223,12 @@ struct FeedFocusTracker: Sendable {
         }
 
         let interstitial = object["interstitial"] as? String
+        if interstitial == "mailbox_handoff" {
+            focus = nil
+            terminalResponsePending = false
+            summary.email = .reviewing
+            return focus
+        }
         // Important Slack between the important mail and the rest: its first conversation.
         if interstitial == "slack", let slackStep = object["slackStep"] as? [String: Any] {
             applySlack(step: slackStep)

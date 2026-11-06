@@ -174,8 +174,7 @@ class LocalSpeech: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         previewMessage = "Playing Jo's voice…"
         previewTask = Task { [weak self] in
             guard let self else { return }
-            let trace = Container.shared.voiceDiagnostics().begin(engine: "speaker_test",
-                userID: Container.shared.backend().userId)
+            let trace = Container.shared.voiceDiagnostics().begin(engine: "speaker_test", userID: Container.shared.backend().userId)
             defer { trace.record(.sessionEnded) }
             do {
                 let issue = try await audioQueue.run("speaker availability", AudioOutputStatus.issue)

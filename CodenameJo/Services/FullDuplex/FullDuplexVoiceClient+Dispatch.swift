@@ -595,6 +595,12 @@ extension FullDuplexVoiceClient {
             return
         }
         let relatesToEmail = isSavedCommand || scope != .independent
+        #if targetEnvironment(macCatalyst)
+        if relatesToEmail, let refusal = renderedSelectionRefusal() {
+            postDispatchOutput(callId: callId, startedWork: false, output: refusal)
+            return
+        }
+        #endif
         // The two pinning fields, passed through untouched. **Nothing here validates
         // them, deliberately** — the phone cannot tell a good address from a plausible
         // one, and a guess about which of the user's accounts was meant is the exact
@@ -760,6 +766,13 @@ extension FullDuplexVoiceClient {
         // treats it as an idempotency key and answers a repeat from the stored row
         // rather than running a second minute-long agent turn.
         let jobId = UUID()
+        let operation: DispatchMailOperation? = {
+            guard expects == .receipt, !isSavedCommand, relatesToEmail,
+                  let anchor = liveQueueActionAnchor?.step ?? standingStep,
+                  let key = LiveEmailPresentation.Key.step(anchor) else { return nil }
+            return DispatchMailOperation.archiveRequest(latestCompletedUserUtterance, account: key.account, messageID: key.messageId)
+        }()
+        dispatchHistory[jobId] = (historyTurnID, historyUserText)
         onDispatchStarted?(jobId, displayTask)
         // Captured before the task, like `answerTriageNext` does — a dispatch outlives its
         // turn by design, so its queue advance is exactly the straggler `dialGeneration`
@@ -916,7 +929,8 @@ extension FullDuplexVoiceClient {
                 id: jobId, task: task,
                 account: account, facts: handoverFacts, standingOnJSON: standingOnJSON,
                 expects: expects, scope: isSavedCommand ? nil : scope,
-                commandSteps: savedCommand?.actions, progress: progress)
+                commandSteps: savedCommand?.actions, progress: progress, diagnostics: self?.diagnostics,
+                turnID: self?.dispatchHistory[jobId]?.id.uuidString, operation: operation)
             let outcome = await HangUpRunway.run(
                 "Finishing a job", subtitle: "It keeps going if you hang up.", progress: progress
             ) { await DispatchWorker.run(job) }
@@ -925,7 +939,13 @@ extension FullDuplexVoiceClient {
             // Cannot race the assignment above: the body always suspends at the
             // `await` before reaching this line.
             self.dispatchTasks[callId] = nil
-            self.onToolDone?("dispatch")
+            if let history = self.dispatchHistory[jobId] {
+                self.historyJobOutcomes[history.id] = outcome.status ?? (outcome.ok == false ? .failed : outcome.ok == true ? .success : .conversational)
+                if self.historyTurnID == history.id {
+                    if outcome.ok == false { self.onToolFailed?("dispatch") } else { self.onToolDone?("dispatch") }
+                }
+            }
+            self.transport?.sendContextItem("Background job \(jobId) has finished. It is no longer running. Result: \(outcome.text)", role: "system")
 
             if let reconciliation,
                dial == self.dialGeneration, self.endCueTask == nil {
@@ -983,6 +1003,8 @@ extension FullDuplexVoiceClient {
                 jobId: jobId, task: displayTask, text: outcome.text, ok: outcome.ok,
                 expects: expects, about: presentAbout, independent: !relatesToEmail)) {
                 guard self.isActive, !Task.isCancelled else { return }
+                self.diagnostics?.record(.jobDeferred, ["job_id": jobId.uuidString, "reason": "queue_holds_result",
+                    "queue_revision": String(self.liveQueueRevision)])
                 self.watchHeldOutcome(report, deadline: relatesToEmail
                     ? Self.queuedOutcomeDeadline : Self.independentOutcomeDeadline)
                 return
@@ -1259,6 +1281,9 @@ extension FullDuplexVoiceClient {
         // next tick. Re-entering rather than looping in here keeps the "is there a
         // gap" test in exactly one place. Standard reports remain bounded by the speak
         // window; a queue-origin report keeps polling until a gap or call teardown.
+        diagnostics?.record(.jobDeferred, ["job_id": pendingReports[0].jobId?.uuidString ?? "shortcut",
+            "reason": userSpeaking ? "user_speaking" : assistantAudible ? "assistant_speaking" : responseInFlight ? "response_in_flight" : "pending_turn",
+            "queue_revision": String(liveQueueRevision)])
         guard reportDrain == nil else { return }
         reportDrain = Task { [weak self] in
             try? await Task.sleep(for: Self.reportDrainPoll)
@@ -1271,6 +1296,14 @@ extension FullDuplexVoiceClient {
     /// Put one answer or outcome into the conversation, and ask for it to be spoken if
     /// it is still wanted.
     func injectDispatchReport(_ report: DispatchReport, speak: Bool) {
+        if speak {
+            isBackgroundHistory = true
+            let origin = report.jobId.flatMap { dispatchHistory[$0] }
+            historyTurnID = origin?.id ?? UUID()
+            historyUserText = origin?.text ?? report.task
+        }
+        diagnostics?.record(.jobInjected, ["job_id": report.jobId?.uuidString ?? "shortcut", "outcome": speak ? "speech_requested" : "context_only",
+            "duration_ms": String(Int(Self.seconds(since: report.landedAt) * 1000))])
         if case .shortcut(_, let userID) = report.kind,
            Container.shared.backend().userId != userID { return }
         // The framing lives in the prompt's addenda (`prompts/addenda/`), not here. The item

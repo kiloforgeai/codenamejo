@@ -59,7 +59,7 @@ enum LiveOpenAI {
     }
 
     /// One brain step: `LivePrompt`'s Responses config plus the bounded task the client brain sends.
-    static func respond(brain: Data, body: [String: Any]) async throws -> [String: Any] {
+    static func respond(brain: Data, body: [String: Any], diagnostics: VoiceDiagnostics.Session? = nil) async throws -> [String: Any] {
         guard var request = try JSONSerialization.jsonObject(with: brain) as? [String: Any] else {
             throw LiveBrainRequestError(status: 400, serverCode: "invalid_request")
         }
@@ -77,9 +77,21 @@ enum LiveOpenAI {
             .map { String(format: "%02x", $0) }.joined()
 
         let started = Date()
+        let requestID = body["requestId"] as? String ?? UUID().uuidString
+        diagnostics?.record(.brainRequest, ["request_id": requestID, "turn_id": body["turnID"] as? String ?? "unknown", "delegation_id": body["delegationId"] as? String ?? "unknown", "model": LivePrompt.brainModel,
+            "instructions_bytes": String(bytes(request["instructions"] ?? "")),
+            "tools_bytes": String(bytes(request["tools"] ?? [])), "input_bytes": String(bytes(input))])
+        var completed = false
+        defer {
+            if !completed { diagnostics?.record(.brainResponse, ["request_id": requestID, "outcome": "failed",
+                "duration_ms": String(Int(Date().timeIntervalSince(started) * 1000))]) }
+        }
         let (data, response) = try await URLSession.shared.data(
             for: try post("responses", body: JSONSerialization.data(withJSONObject: request), timeout: 45))
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        let errorEnvelope = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        diagnostics?.record(.brainResponse, ["request_id": requestID, "http_status": String(status),
+            "provider_code": (errorEnvelope?["error"] as? [String: Any])?["code"] as? String ?? "none"])
         guard (200..<300).contains(status), let result = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             throw LiveBrainRequestError(status: status, serverCode: "brain_request_failed")
         }
@@ -88,6 +100,13 @@ enum LiveOpenAI {
         }
         let usage = result["usage"] as? [String: Any]
         let cached = (usage?["input_tokens_details"] as? [String: Any])?["cached_tokens"] as? Int
+        completed = true
+        var fields = ["request_id": requestID, "outcome": "success", "model": LivePrompt.brainModel,
+            "duration_ms": String(Int(Date().timeIntervalSince(started) * 1000)),
+            "input_tokens": String(usage?["input_tokens"] as? Int ?? -1), "cached_tokens": String(cached ?? -1),
+            "output_tokens": String(usage?["output_tokens"] as? Int ?? -1)]
+        fields["provider_request_id"] = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "x-request-id")
+        diagnostics?.record(.brainResponse, fields)
         RealtimeLog.log("liveBrain: ms=\(Int(Date().timeIntervalSince(started) * 1000)) "
             + "inputTokens=\(usage?["input_tokens"] as? Int ?? -1) cachedTokens=\(cached ?? -1)")
         var answer: [String: Any] = ["output": output]
@@ -97,15 +116,39 @@ enum LiveOpenAI {
     }
 
     /// One round of a dispatched job: a complete Responses request, answered as the raw result.
-    static func responses(_ body: [String: Any], timeout: TimeInterval) async throws -> [String: Any] {
-        let (data, response) = try await URLSession.shared.data(
-            for: try post("responses", body: JSONSerialization.data(withJSONObject: body), timeout: timeout))
-        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-        guard (200..<300).contains(status), let result = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            RealtimeLog.log("dispatch: responses \(status) — \(String(decoding: data.prefix(200), as: UTF8.self))")
-            throw LiveBrainRequestError(status: status, serverCode: "dispatch_request_failed")
+    static func responses(_ body: [String: Any], timeout: TimeInterval, diagnostics: VoiceDiagnostics.Session? = nil, jobID: UUID? = nil) async throws -> [String: Any] {
+        let start = ProcessInfo.processInfo.systemUptime
+        let id = UUID().uuidString
+        var fields = ["request_id": id, "job_id": jobID?.uuidString ?? "unknown",
+            "model": body["model"] as? String ?? "unknown", "input_bytes": String(bytes(body["input"] ?? [])),
+            "tools_bytes": String(bytes(body["tools"] ?? [])), "instructions_bytes": String(bytes(body["instructions"] ?? ""))]
+        diagnostics?.record(.brainRequest, fields)
+        do {
+            let (data, response) = try await URLSession.shared.data(
+                for: try post("responses", body: JSONSerialization.data(withJSONObject: body), timeout: timeout))
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            fields["http_status"] = String(status)
+            fields["provider_request_id"] = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "x-request-id")
+            let result = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            fields["provider_code"] = (result?["error"] as? [String: Any])?["code"] as? String
+            guard (200..<300).contains(status), let result, result["status"] as? String == "completed" else {
+                throw LiveBrainRequestError(status: status, serverCode: "dispatch_request_failed")
+            }
+            let usage = result["usage"] as? [String: Any] ?? [:]
+            fields["input_tokens"] = String(usage["input_tokens"] as? Int ?? -1)
+            fields["output_tokens"] = String(usage["output_tokens"] as? Int ?? -1)
+            fields["cached_tokens"] = String((usage["input_tokens_details"] as? [String: Any])?["cached_tokens"] as? Int ?? -1)
+            fields["outcome"] = "success"
+            fields["duration_ms"] = String(Int((ProcessInfo.processInfo.systemUptime - start) * 1000))
+            diagnostics?.record(.brainResponse, fields)
+            return result
+        } catch {
+            fields.merge(VoiceDiagnostics.failure(error)) { _, new in new }
+            fields["outcome"] = "failed"
+            fields["duration_ms"] = String(Int((ProcessInfo.processInfo.systemUptime - start) * 1000))
+            diagnostics?.record(.brainResponse, fields)
+            throw error
         }
-        return result
     }
 
     /// Any other JSON endpoint on the user's key (`responses`, `decisions`), answered as the raw result.

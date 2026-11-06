@@ -20,6 +20,12 @@ final class LocalContextStore: Sendable {
     /// unrelated English sentences around 0.2–0.4, so this is deliberately above that.
     static let similarityFloor: Float = 0.55
 
+    static func vectorDiagnostic(count: Int, best: Float?) -> String {
+        let score = Double(best ?? Float.zero).formatted(.number.precision(.fractionLength(3)).locale(Locale(identifier: "en_US_POSIX")))
+        let floor = Double(similarityFloor).formatted(.number.precision(.fractionLength(2)).locale(Locale(identifier: "en_US_POSIX")))
+        return "localContext: vector scanned \(count), best \(score), floor \(floor)"
+    }
+
     /// The most rows the vector scan will load and score. A cap on the phone's work, not
     /// on what comes back — `textLimit` still decides that.
     static let vectorScanLimit = 500
@@ -341,9 +347,7 @@ final class LocalContextStore: Sendable {
                             return (row, ContextEmbedding.similarity(queryVector, vector))
                         }
                         .sorted { $0.1 > $1.1 }
-                    RealtimeLog.log(String(
-                        format: "localContext: vector scanned %d, best %.3f, floor %.2f",
-                        scored.count, scored.first?.1 ?? 0, Self.similarityFloor))
+                    RealtimeLog.log(Self.vectorDiagnostic(count: scored.count, best: scored.first?.1))
                     let ranked = scored.filter { $0.1 >= Self.similarityFloor }
                         .prefix(limit)
                         .map(\.0)
@@ -656,6 +660,8 @@ final class LocalContextStore: Sendable {
         migrator.registerMigration("v49-drop-email-categories") { db in
             try db.execute(sql: "DROP TABLE IF EXISTS email_category")
         }
+        migrator.registerMigration("v50-mailbox-feed-order", migrate: WorkspaceProfileRows.addFeedOrder)
+        migrator.registerMigration("v51-turn-job-outcomes", migrate: TurnStore.createJobOutcomes)
         return migrator
     }
 }

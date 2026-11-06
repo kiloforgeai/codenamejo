@@ -412,6 +412,8 @@ targets:
       base:
         PRODUCT_NAME: Jo Desktop
         PRODUCT_MODULE_NAME: CodenameJo
+        OTHER_SWIFT_FLAGS: "$(inherited) $(JO_TEST_SWIFT_FLAGS)"
+        JO_SOURCE_REVISION: unversioned
         PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID).desktop
         SUPPORTS_MACCATALYST: YES
         DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
@@ -435,6 +437,16 @@ targets:
       - CodenameJoTests/GoogleSignInFlowTests.swift
       - CodenameJoTests/GoogleCredentialFailureTests.swift
       - CodenameJoTests/OpenAIKeyReinstallTests.swift
+      - CodenameJoTests/LiveRequestRecoveryTests.swift
+      - CodenameJoTests/LiveFastActionTests.swift
+      - CodenameJoTests/LiveClientBrainTests.swift
+      - CodenameJoTests/LiveOpenAITests.swift
+      - CodenameJoTests/DispatchWorkerTests.swift
+      - CodenameJoTests/CalendarToolsTests.swift
+      - CodenameJoTests/LiveIntentRouterTests.swift
+      - CodenameJoTests/LocalProfilesTests.swift
+      - CodenameJoTests/ConversationQueueIntegrationTests.swift
+      - CodenameJoTests/EmailPreviewTests.swift
     configFiles:
       Debug: Config/Version.xcconfig
       Release: Config/Version.xcconfig
@@ -443,6 +455,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID).desktop.tests
+        OTHER_SWIFT_FLAGS: "$(inherited) $(JO_TEST_SWIFT_FLAGS)"
         SUPPORTS_MACCATALYST: YES
         DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
         TARGETED_DEVICE_FAMILY: "2"

@@ -10,6 +10,7 @@ struct FeedbackContext: Sendable {
     var profileID: String?
     var engine = "idle"
     var state = "ready"
+    var renderRevision: Int? = nil
 }
 
 enum FeedbackError: LocalizedError {

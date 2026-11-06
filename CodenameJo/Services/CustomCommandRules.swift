@@ -156,7 +156,7 @@ enum CustomCommandRules {
                 return .failure(Refusal("A command can't \(describe(tool)) as one of its steps. Leave that step "
                     + "out and save the rest, or tell the user to ask for it in the moment instead."))
             }
-            steps.append(CommandAction(tool: tool, detail: action.detail.trimmingCharacters(in: .whitespacesAndNewlines)))
+            steps.append(CommandAction(tool: tool, detail: action.detail.trimmingCharacters(in: .whitespacesAndNewlines), resolvedLabel: action.resolvedLabel))
         }
         return .success(steps)
     }

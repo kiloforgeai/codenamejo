@@ -34,6 +34,8 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             voiceBar
         }
         .background(Desk.canvas)
+        .background(DesktopRenderProbe(state: viewModel.renderedState, applied: interactor.rendered)
+            .allowsHitTesting(false).accessibilityHidden(true))
         .tint(Desk.accent)
         .bind(observer: interactor, viewModel: viewModel)
         .fileExporter(isPresented: $viewModel.exportingDiagnostics,
@@ -49,7 +51,7 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
         .sheet(isPresented: $viewModel.showingFeedback) { feedbackSheet }
         .sheet(isPresented: $viewModel.showingSettings) {
             NavigationStack { ProfileViewComponent.make(onClose: { viewModel.showingSettings = false }) }
-                .frame(minWidth: 580, minHeight: 600)
+                .frame(minWidth: 760, idealWidth: 840, minHeight: 700, idealHeight: 820)
         }
         .sheet(isPresented: $viewModel.showingHistory) {
             NavigationStack { HistoryViewComponent.make(onClose: { viewModel.showingHistory = false }) }
@@ -113,6 +115,10 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                 .help("Leave feedback about Jo")
             Button(action: interactor.exportDiagnostics) { Image(systemName: "doc.text.magnifyingglass").padding(8) }
                 .buttonStyle(.plain).accessibilityLabel("Export session logs")
+                .contextMenu {
+                    Button("Export logs only", action: interactor.exportDiagnostics)
+                    Button("Export with conversation text — review before sharing", action: interactor.exportHistory)
+                }
         }.padding(.horizontal, 24).frame(height: 64)
     }
 
@@ -163,20 +169,16 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
                     if viewModel.filteredQueue.isEmpty {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Image(systemName: "tray").font(.title2).foregroundStyle(.tertiary)
-                            Text(viewModel.inSession ? "Preparing your feed" : "A little room to think.")
-                                .font(.system(size: 15, weight: .medium))
-                            Text(viewModel.inSession
-                                ? "Prepared email and Slack conversations appear here as Jo walks your feed."
-                                : "Start a session to bring your email, Slack, and unfinished work into focus.")
-                                .font(.system(size: 13)).foregroundStyle(.secondary).lineSpacing(4)
-                        }.padding(18)
+                        feedEmptyState
                     }
                     ForEach(viewModel.filteredQueue) { row in
                         VStack(alignment: .leading, spacing: 8) {
                             Label(row.source, systemImage: row.symbol)
                                 .font(.system(size: 10, weight: .semibold)).foregroundStyle(Desk.accent)
+                            if case .email(let email) = viewModel.focus,
+                               row.selection?.matches(account: email.account, messageID: email.messageId ?? "") == true {
+                                Text("CURRENT").font(.caption2.weight(.semibold)).foregroundStyle(Desk.accent)
+                            }
                             Text(row.title).font(.system(size: 14, weight: .medium)).lineLimit(2)
                             Text(row.detail).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
                             if let reason = row.reason {
@@ -185,6 +187,7 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                         }.padding(15).frame(maxWidth: .infinity, alignment: .leading)
                             .background(Desk.canvas, in: RoundedRectangle(cornerRadius: 10))
                             .overlay(RoundedRectangle(cornerRadius: 10).stroke(Desk.line, lineWidth: 1))
+                            .accessibilityIdentifier("feedRow_\(row.id)")
                     }
                 }.padding(.horizontal, 14)
             }
@@ -196,6 +199,24 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
         }.background(Desk.inset.opacity(0.6))
     }
 
+    private var feedEmptyState: some View {
+        let done = viewModel.feedComplete
+        let unavailable = viewModel.queueStatus == .unavailable
+        let filtered = !viewModel.queue.isEmpty
+        return VStack(alignment: .leading, spacing: 14) {
+            Image(systemName: done ? "checkmark.seal.fill" : unavailable ? "exclamationmark.triangle" : "tray")
+                .font(.system(size: done ? 42 : 26)).foregroundStyle(done ? Desk.accent : Color.secondary)
+            Text(done ? "You’re done." : unavailable ? "Couldn’t load the feed" : filtered ? "No \(viewModel.filter.lowercased()) here" : viewModel.inSession ? "Preparing your feed" : "A little room to think.")
+                .font(.system(size: done ? 26 : 16, weight: .medium, design: done ? .serif : .default))
+            Text(done ? "Nice work. You’ve worked through the selected feed. Take a breath."
+                 : unavailable ? "Your place is saved. Ask Jo to try loading the next items again."
+                 : filtered ? "Choose All to see the rest of your prepared work."
+                 : viewModel.inSession ? "Next items are loading in the background."
+                 : "Start a session to bring your email, Slack, and unfinished work into focus.")
+                .font(.system(size: 13)).foregroundStyle(.secondary).lineSpacing(4)
+        }.padding(18).accessibilityIdentifier(done ? "feedComplete" : "feedEmptyState")
+    }
+
     private var workspace: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 26) {
@@ -203,12 +224,19 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                     Label(viewModel.inSession ? "IN FOCUS" : "LET’S GET TO IT", systemImage: "viewfinder")
                         .font(.system(size: 10, weight: .semibold)).tracking(1.7).foregroundStyle(Desk.accent)
                     Spacer()
-                    if case .email(let email) = viewModel.focus {
+                    if !viewModel.selectionIsTransitioning, case .email(let email) = viewModel.focus {
                         Text("\(email.position)\(email.total.map { " / \($0)" } ?? "")")
                             .font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary)
                     }
                 }
-                if let focus = viewModel.focus {
+                if viewModel.selectionIsTransitioning {
+                    ProgressView("Updating the selected email…")
+                        .padding(.vertical, 32).accessibilityIdentifier("feedSelectionTransition")
+                } else if let focus = viewModel.focus {
+                    if case .email(let email) = focus, email.isBackgroundResult {
+                        Label("Background result · your place in the feed is saved", systemImage: "arrow.uturn.backward")
+                            .font(.caption).foregroundStyle(.secondary).accessibilityIdentifier("feedBackgroundResult")
+                    }
                     focusContent(focus)
                 } else {
                     VStack(alignment: .leading, spacing: 18) {
@@ -264,6 +292,7 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
     private func focusContent(_ focus: FeedFocus) -> some View {
         switch focus {
         case .email(let email):
+            let preview = EmailPreview(snippet: email.snippet)
             VStack(alignment: .leading, spacing: 18) {
                 Label("EMAIL · \(email.account)", systemImage: "envelope")
                     .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
@@ -275,8 +304,27 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                     if let received = email.received { Text(received, style: .date).font(.caption).foregroundStyle(.secondary) }
                 }
                 Divider()
-                Text(email.snippet).font(.system(size: 15)).foregroundStyle(.secondary).lineSpacing(6).textSelection(.enabled)
+                HStack {
+                    Text("EMAIL PREVIEW").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Spacer()
+                    if let url = EmailPreview.gmailURL(account: email.account, messageID: email.messageId) {
+                        Link(destination: url) { Label("Open in Gmail", systemImage: "arrow.up.right") }
+                            .font(.callout).accessibilityIdentifier("openFocusedEmail")
+                    }
+                }
+                Text(preview.text.isEmpty ? "No preview available." : preview.text)
+                    .font(.system(size: 15)).foregroundStyle(.secondary).lineSpacing(6).textSelection(.enabled)
+                    .accessibilityIdentifier("focusedEmailPreview")
+                if !preview.quoted.isEmpty {
+                    DisclosureGroup("Quoted conversation") {
+                        Text(preview.quoted).font(.body).foregroundStyle(.secondary)
+                            .lineSpacing(5).textSelection(.enabled).padding(.top, 8)
+                    }
+                }
+                Text("This preview may be shortened or include earlier replies. Open the email for the complete message.")
+                    .font(.footnote).foregroundStyle(.tertiary)
             }
+            .accessibilityIdentifier("focusedEmail")
         case .slack(let slack):
             VStack(alignment: .leading, spacing: 18) {
                 Label(slack.workspace, systemImage: "number").font(.caption).foregroundStyle(.secondary)

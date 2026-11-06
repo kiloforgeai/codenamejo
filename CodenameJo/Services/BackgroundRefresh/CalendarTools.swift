@@ -1,5 +1,6 @@
 import Foundation
 import FactoryKit
+import CryptoKit
 
 /// Calendar list, create and update, declared by the phone and run on its own Google grant.
 /// Results and refusals keep their wording: the queue and Feed parse them.
@@ -39,6 +40,7 @@ enum CalendarTools {
                  "time_max": ["type": "string", "description":
                     "End of the window, RFC3339. Keep windows tight — a week at most for a summary."],
                  "query": ["type": "string", "description": "Optional free-text filter on title, description, attendees."],
+                 "ical_uid": ["type": "string", "description": "Exact UID from an invitation attachment. Prefer this stable identity over title search."],
                  "max_results": ["type": "number", "description": "Default 25, max 50."],
                  "availability_check": ["type": "boolean", "description":
                     "Read complete free/busy intervals instead of a limited event list. Required before booking a suggested slot; use the exact proposed start/end."],
@@ -50,11 +52,12 @@ enum CalendarTools {
                 + "current. Use that email only as event context; never draft to its sender. Google "
                 + "Calendar sends invitations, so Gmail draft-only mode does not apply. No attendees: "
                 + "call now. Attendees: say each address, wait for a yes, then call."
-                + " It cannot read, list, search or check anything already scheduled — use "
-                + "list_calendar_events for that — and never call it with placeholder titles or times.",
+                + " Reuses a matching existing event instead of duplicating it. For an invitation, supply its ical_uid and accept the original event. Never call it with placeholder titles or times.",
                 ["summary": ["type": "string", "description": "The event title."],
                  "start": ["type": "string", "description": "RFC3339 start, e.g. 2026-07-31T14:00:00-04:00."],
                  "end": ["type": "string", "description": "RFC3339 end. If the user gave no duration, use one hour."],
+                 "time_zone": ["type": "string", "description": "IANA zone for the intended wall time. Defaults to the Mac's zone. The offset must match this zone on the EVENT date, not today."],
+                 "ical_uid": ["type": "string", "description": "UID from the source invitation, when present. Resolves the original instead of creating a replacement."],
                  "description": ["type": "string", "description": "Optional notes on the event."],
                  "location": ["type": "string", "description": "Optional location."],
                  "attendees": ["type": "array", "items": ["type": "string"], "description":
@@ -81,6 +84,7 @@ enum CalendarTools {
                     "New RFC3339 start, e.g. 2026-07-31T16:00:00-04:00. Give this alone "
                     + "to move the event and keep its current length. Never end a time with \"Z\"."],
                  "end": ["type": "string", "description": "New RFC3339 end. Only needed when the event's length changes too."],
+                 "time_zone": ["type": "string", "description": "IANA zone of the new time. Use the event date's daylight-saving offset."],
                  "summary": ["type": "string", "description": "New title."],
                  "location": ["type": "string", "description": "New location. Pass \"\" to clear it."],
                  "description": ["type": "string", "description": "New notes. Pass \"\" to clear them."],
@@ -110,7 +114,7 @@ enum CalendarTools {
 
     struct Refusal: Error { let text: String }
 
-    static func run(name: String, argumentsJSON: String) async -> (output: String, failed: Bool, effects: [GmailWriteEffect]?) {
+    static func run(name: String, argumentsJSON: String, diagnostics: VoiceDiagnostics.Session? = nil, callID: String? = nil) async -> (output: String, failed: Bool, effects: [GmailWriteEffect]?) {
         var args = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8))) as? [String: Any] ?? [:]
         var connected = await accounts()
         guard !connected.isEmpty else {
@@ -122,29 +126,38 @@ enum CalendarTools {
         }
         // The feed's current mailbox owns calendar writes; reads span every connected calendar.
         switch bind(name, args, mailbox: await Container.shared.localTriage().currentMailbox, accounts: connected) {
-        case .failure(let refusal): return (refusal.text, false, nil)
+        case .failure(let refusal): return (refusal.text, true, nil)
         case .success(let bound):
             args = bound
             if let named = args["account"] as? String {
                 connected = connected.filter { $0.caseInsensitiveCompare(named) == .orderedSame }
             }
         }
+        let receipt: ([String: Any]) -> Void = { event in
+            var fields = CalendarWriteTiming.metadata(request: args, event: event)
+            fields["tool"] = name
+            fields["call_id"] = callID
+            fields["outcome"] = "confirmed"
+            fields["target_hash"] = diagnostics?.target(GmailReadTools.json([
+                "account": args["account"] as? String ?? "", "event_id": event["id"] as? String ?? ""]))
+            diagnostics?.record(.calendarReceipt, fields)
+        }
         let started = Date()
         do {
             let output: String
             switch name {
             case list: output = try await runList(args, accounts: connected)
-            case create: output = try await runCreate(args, accounts: connected)
-            default: output = try await runUpdate(args, accounts: connected)
+            case create: output = try await runCreate(args, accounts: connected, receipt: receipt)
+            default: output = try await runUpdate(args, accounts: connected, receipt: receipt)
             }
             RealtimeLog.log("calendarTool: \(name) in \(Int(Date().timeIntervalSince(started) * 1000))ms")
             return (output, false, nil)
         } catch let refusal as Refusal {
-            return (refusal.text, false, nil)
+            return (refusal.text, true, nil)
         } catch {
             RealtimeLog.log("calendarTool: \(name) failed — \(error)")
             return ("Google Calendar couldn't be reached (\(String(describing: error).prefix(120))). "
-                + "Nothing was changed. Do not guess; say so plainly.", true, nil)
+                + "The outcome is unconfirmed. Check the event before retrying; do not claim a write succeeded or failed.", true, nil)
         }
     }
 
@@ -152,7 +165,7 @@ enum CalendarTools {
     /// connected calendar: one person's clash on any of them is a clash, whichever inbox the feed is in.
     static func bind(_ name: String, _ args: [String: Any], mailbox: String?, accounts: [String]) -> Result<[String: Any], Refusal> {
         let requested = (args["account"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let selected = (name == list ? nil : mailbox) ?? requested
+        let selected = requested.isEmpty ? (name == list ? "" : mailbox ?? "") : requested
         var out = args
         guard !selected.isEmpty else {
             out.removeValue(forKey: "account")
@@ -207,11 +220,11 @@ enum CalendarTools {
 
     // MARK: - list_calendar_events
 
-    private static let listFields = "items(id,summary,start,end,location,transparency,"
+    private static let listFields = "nextPageToken,items(id,iCalUID,status,recurringEventId,summary,description,start,end,location,transparency,"
         + "attendees(email,displayName,self,responseStatus),organizer(email,displayName,self),hangoutLink)"
     static let attendeeCap = 12
 
-    /// A cached answer older than this still answers; it also starts the pass that freshens the next one.
+    /// Older or incomplete cache windows fall through to Google.
     static let cacheFreshness = BackgroundCalendarRefresh.pushThrottle
 
     private static func runList(_ args: [String: Any], accounts: [String]) async throws -> String {
@@ -223,6 +236,7 @@ enum CalendarTools {
         let max = Swift.min(Swift.max(1, asked), 50)
         let availability = args["availability_check"] as? Bool == true
         let query = string(args["query"]) ?? ""
+        let uid = string(args["ical_uid"])
         // The phone's own copy answers first: `BackgroundCalendarRefresh` keeps every account's
         // rolling window, so a covered lookup costs no Google round trip. The rest go live.
         let store = CalendarStore(database: Container.shared.localContext().dbPool)
@@ -231,19 +245,23 @@ enum CalendarTools {
         let rows = await withTaskGroup(of: (Int, [String: Any], Date?).self) { group in
             for (index, account) in accounts.enumerated() {
                 group.addTask {
-                    if let window, let state = await store.syncState(account: account), covers(state, window) {
+                    if uid == nil, let window, let state = await store.syncState(account: account), covers(state, window),
+                       Date().timeIntervalSince(state.lastSyncedAt) <= cacheFreshness {
                         let cached = await store.search(account: account, timeMinMs: window.0, timeMaxMs: window.1, limit: 500)
                         let term = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                         let events = cached.events.filter {
                             $0.status != "cancelled" && (availability || mentions($0, cached.attendees, term))
                         }
-                        if availability {
+                        if availability && cached.events.count < 500 {
                             let intervals = busy(events, attendees: cached.attendees, account: account, window: window, offset: zone)
                             return (index, ["account": account, "availability":
                                 ["timeMin": timeMin, "timeMax": timeMax, "busy": intervals]], state.lastSyncedAt)
                         }
-                        let listed = events.prefix(max).map { row(account: account, $0, cached.attendees) }
-                        return (index, ["account": account, "events": listed, "count": listed.count], state.lastSyncedAt)
+                        if !events.isEmpty {
+                            let listed = events.prefix(max).map { row(account: account, $0, cached.attendees) }
+                            return (index, ["account": account, "events": listed, "count": listed.count,
+                                            "source": "cache", "complete": events.count <= max && cached.events.count < 500], state.lastSyncedAt)
+                        }
                     }
                     do {
                         let token = try await accessToken(account, write: false, capability: "read the calendar")
@@ -253,11 +271,14 @@ enum CalendarTools {
                                 ["timeMin": timeMin, "timeMax": timeMax, "busy": busy]], nil)
                         }
                         var params = ["timeMin": timeMin, "timeMax": timeMax, "singleEvents": "true",
-                                      "orderBy": "startTime", "maxResults": String(max), "fields": listFields]
-                        if !query.isEmpty { params["q"] = query }
+                                      "orderBy": "startTime", "maxResults": String(max), "fields": listFields,
+                                      "showHiddenInvitations": "true"]
+                        if let uid { params["iCalUID"] = uid }
+                        else if !query.isEmpty { params["q"] = query }
                         let data = try await CalendarAPI.json("GET", path: "calendars/primary/events", query: params, token: token)
                         let events = (data["items"] as? [[String: Any]] ?? []).map { summary(account: account, $0) }
-                        return (index, ["account": account, "events": events, "count": events.count], nil)
+                        return (index, ["account": account, "events": events, "count": events.count,
+                                        "source": "live", "complete": data["nextPageToken"] == nil], nil)
                     } catch let refusal as Refusal {
                         return (index, ["account": account, "error": refusal.text], nil)
                     } catch {
@@ -289,7 +310,9 @@ enum CalendarTools {
         guard !term.isEmpty else { return true }
         let roster = attendees.filter { $0.eventId == event.id && $0.calendarId == event.calendarId }
         let fields = [event.summary, event.location, event.description] + roster.flatMap { [$0.email, $0.displayName] }
-        return fields.contains { $0?.lowercased().contains(term) == true }
+        let haystack = fields.compactMap { $0?.lowercased() }.joined(separator: " ")
+        let terms = term.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        return terms.allSatisfy { haystack.contains($0) }
     }
 
     /// A cached event in the shape `summary` gives a live one.
@@ -396,6 +419,7 @@ enum CalendarTools {
             "organizer": organizer?["email"] as? String ?? organizer?["displayName"] as? String ?? "",
             "hangoutLink": event["hangoutLink"] as? String ?? "",
         ]
+        if let uid = event["iCalUID"] as? String { out["ical_uid"] = uid }
         if let transparency = event["transparency"] as? String { out["transparency"] = transparency }
         if everyone.count > attendeeCap { out["moreAttendees"] = everyone.count - attendeeCap }
         return out
@@ -409,7 +433,7 @@ enum CalendarTools {
         "ignore", "tbd", "n/a", "none",
     ]
 
-    private static func runCreate(_ args: [String: Any], accounts: [String]) async throws -> String {
+    private static func runCreate(_ args: [String: Any], accounts: [String], receipt: ([String: Any]) -> Void) async throws -> String {
         let target = try singleTarget(args, accounts, creating: true)
         let trim = { (key: String) in (args[key] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
         let title = trim("summary"), start = trim("start"), end = trim("end")
@@ -424,14 +448,15 @@ enum CalendarTools {
                 + "back to what they actually asked for.")
         }
         if let utc = utcRefusal("NOT CREATED", [start, end]) { throw Refusal(text: utc) }
+        let zone = try CalendarWriteTiming.zone(args["time_zone"] as? String)
+        try CalendarWriteTiming.validate(start: start, end: end, zone: zone)
         let attendees = (args["attendees"] as? [Any])?.compactMap { $0 as? String }
         let isPrivate = args["private"] as? Bool == true
         let venue = trim("location")
         let conference = args["online"] as? Bool == true || (args["online"] as? Bool != false && venue.isEmpty)
 
-        let zone = TimeZone.current.identifier
         var body: [String: Any] = ["summary": title,
-            "start": ["dateTime": start, "timeZone": zone], "end": ["dateTime": end, "timeZone": zone]]
+            "start": ["dateTime": start, "timeZone": zone.identifier], "end": ["dateTime": end, "timeZone": zone.identifier]]
         if let description = args["description"] as? String, !description.isEmpty { body["description"] = description }
         if let location = args["location"] as? String, !location.isEmpty { body["location"] = location }
         if isPrivate { body["visibility"] = "private" }
@@ -443,25 +468,97 @@ enum CalendarTools {
             query["conferenceDataVersion"] = "1"
         }
         let token = try await accessToken(target, write: true, capability: "create events")
+        if let existing = try await existingEvent(args, account: target, token: token) {
+            receipt(existing)
+            await cacheWrite(existing, account: target)
+            return "Already on the calendar; no event created and no invitations sent. "
+                + GmailReadTools.json(summary(account: target, existing)) + " " + CalendarWriteTiming.receipt(existing)
+        }
+        let stableID = createIdentity(account: target, title: title, start: start, end: end, attendees: attendees ?? [])
+        body["id"] = stableID
         let created: [String: Any]
         do {
             created = try await CalendarAPI.json("POST", path: "calendars/primary/events", query: query, body: body, token: token)
+        } catch CalendarAPI.Failure.http(409) {
+            let existing = try await CalendarAPI.json("GET", path: "calendars/primary/events/\(stableID)", token: token)
+            guard existing["status"] as? String != "cancelled" else {
+                throw Refusal(text: "That previously created event was cancelled. Clarify whether to restore it; no new event was created.")
+            }
+            receipt(existing)
+            await cacheWrite(existing, account: target)
+            return "This event was already created; no invitations were sent again. " + CalendarWriteTiming.receipt(existing)
         } catch CalendarAPI.Failure.unauthorized {
             throw Refusal(text: reconnect(target, "create events"))
         }
+        receipt(created)
         await cacheWrite(created, account: target)
         let id = created["id"] as? String ?? ""
         let link = created["htmlLink"] as? String ?? ""
         let invited = (attendees ?? []).isEmpty ? "" : " Invited \((attendees ?? []).joined(separator: ", "))."
         let marked = isPrivate ? " Marked private." : ""
         let online = conference ? " Added a Google Meet link." : ""
-        return "Created \"\(title)\" (\(id)) on \(target).\(invited)\(marked)\(online) \(link)"
+        return "Created \"\(title)\" (\(id)) on \(target). \(CalendarWriteTiming.receipt(created))\(invited)\(marked)\(online) \(link)"
             .trimmingCharacters(in: .whitespaces)
     }
 
     // MARK: - update_calendar_event
 
-    private static func runUpdate(_ args: [String: Any], accounts: [String]) async throws -> String {
+    static func createIdentity(account: String, title: String, start: String, end: String, attendees: [String]) -> String {
+        let values = [account.lowercased(), FullDuplexVoiceClient.normalize(title),
+                      String(instant(start) ?? 0), String(instant(end) ?? 0)] + attendees.map { $0.lowercased() }.sorted()
+        let data = (try? JSONEncoder().encode(values)) ?? Data()
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func matchesCreation(_ event: [String: Any], _ args: [String: Any]) -> Bool {
+        guard event["status"] as? String != "cancelled" else { return false }
+        if let uid = args["ical_uid"] as? String {
+            guard event["iCalUID"] as? String == uid else { return false }
+            if event["recurringEventId"] != nil {
+                return instant((event["start"] as? [String: Any])?["dateTime"] as? String ?? "") == instant(args["start"] as? String ?? "")
+            }
+            return true
+        }
+        guard let start = (event["start"] as? [String: Any])?["dateTime"] as? String,
+              let end = (event["end"] as? [String: Any])?["dateTime"] as? String,
+              let requestedStart = args["start"] as? String, let requestedEnd = args["end"] as? String,
+              let from = instant(start), let to = instant(end),
+              from == instant(requestedStart), to == instant(requestedEnd) else { return false }
+        let title = FullDuplexVoiceClient.normalize(args["summary"] as? String ?? "")
+        let existing = FullDuplexVoiceClient.normalize(event["summary"] as? String ?? "")
+        if !title.isEmpty && title == existing { return true }
+        let lhs = Set(title.split(separator: " ")), rhs = Set(existing.split(separator: " "))
+        return min(lhs.count, rhs.count) >= 2 && (lhs.isSubset(of: rhs) || rhs.isSubset(of: lhs))
+    }
+
+    private static func existingEvent(_ args: [String: Any], account: String, token: String) async throws -> [String: Any]? {
+        var query = ["singleEvents": "true", "showHiddenInvitations": "true", "maxResults": "250", "fields": listFields]
+        if let uid = args["ical_uid"] as? String { query["iCalUID"] = uid }
+        else {
+            query["timeMin"] = args["start"] as? String
+            query["timeMax"] = args["end"] as? String
+        }
+        var matches: [[String: Any]] = []
+        for _ in 0..<8 {
+            let page = try await CalendarAPI.json("GET", path: "calendars/primary/events", query: query, token: token)
+            matches += (page["items"] as? [[String: Any]] ?? []).filter { matchesCreation($0, args) }
+            if matches.count > 1 {
+                throw Refusal(text: "Several existing events match. No new event was created. Review these before choosing: "
+                    + GmailReadTools.json(matches.map { summary(account: account, $0) }))
+            }
+            guard let next = page["nextPageToken"] as? String else {
+                if matches.count == 1 { return matches[0] }
+                if args["ical_uid"] != nil {
+                    throw Refusal(text: "The original invitation was not found on this calendar. Search the other connected calendars by its ical_uid; do not create a replacement invitation.")
+                }
+                return nil
+            }
+            query["pageToken"] = next
+        }
+        throw Refusal(text: "Could not finish checking for an existing event. Nothing was created; retry the calendar lookup.")
+    }
+
+    private static func runUpdate(_ args: [String: Any], accounts: [String], receipt: ([String: Any]) -> Void) async throws -> String {
         let target = try singleTarget(args, accounts)
         let eventId = (args["event_id"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !eventId.isEmpty else {
@@ -469,6 +566,10 @@ enum CalendarTools {
         }
         let newStart = string(args["start"]), newEnd = string(args["end"])
         if let utc = utcRefusal("NOT CHANGED", [newStart, newEnd]) { throw Refusal(text: utc) }
+        let requestedZone = try CalendarWriteTiming.zone(args["time_zone"] as? String)
+        for stamp in [newStart, newEnd].compactMap({ $0 }) where !isDateOnly(stamp) {
+            try CalendarWriteTiming.validate(stamp, zone: requestedZone)
+        }
         let newSummary = string(args["summary"]), newDescription = string(args["description"])
         let newLocation = string(args["location"])
         let add = strings(args["add_attendees"]), remove = strings(args["remove_attendees"])
@@ -505,11 +606,14 @@ enum CalendarTools {
                            allDay: start?["date"] != nil)
             let timing: Retimed
             switch retime(current, newStart: newStart, newEnd: newEnd) {
-            case .failure(let problem): return problem.text
+            case .failure(let problem): throw problem
             case .success(let value): timing = value
             }
             if let phrase = timing.phrase {
-                let zone = TimeZone.current.identifier
+                let zone = requestedZone.identifier
+                if !isDateOnly(timing.start) {
+                    try CalendarWriteTiming.validate(start: timing.start, end: timing.end, zone: requestedZone)
+                }
                 body["start"] = isDateOnly(timing.start) ? ["date": timing.start] : ["dateTime": timing.start, "timeZone": zone]
                 body["end"] = isDateOnly(timing.end) ? ["date": timing.end] : ["dateTime": timing.end, "timeZone": zone]
                 changed.append(phrase)
@@ -528,10 +632,11 @@ enum CalendarTools {
                 return "\"\(reported)\" is already like that on \(target). Nothing changed and no one was notified.\(selfNote)\(scope)"
             }
             let patched = try await CalendarAPI.json("PATCH", path: path, query: ["sendUpdates": "all"], body: body, token: token)
+            receipt(patched)
             await cacheWrite(patched, account: target)
             let guests = merge.attendees.filter { $0["self"] as? Bool != true }.count
             let told = guests > 0 ? " The \(guests == 1 ? "guest was" : "\(guests) guests were") notified." : ""
-            return "Updated \"\(reported)\" on \(target) — \(changed.joined(separator: "; ")).\(told)\(selfNote)\(scope)"
+            return "Updated \"\(reported)\" on \(target) — \(changed.joined(separator: "; ")). \(CalendarWriteTiming.receipt(patched))\(told)\(selfNote)\(scope)"
         } catch CalendarAPI.Failure.unauthorized {
             throw Refusal(text: reconnect(target, "change events"))
         } catch CalendarAPI.Failure.http(404) {

@@ -2,6 +2,17 @@ import XCTest
 @testable import CodenameJo
 
 final class FeedFocusTests: XCTestCase {
+    func testProgressFromAnotherMessageCannotRelabelTheCurrentCard() throws {
+        var tracker = FeedFocusTracker()
+        _ = tracker.applyTriage(output: #"{"position":3,"item":{"id":"C","threadId":"thread-C","account":"work@example.com","subject":"Thanks"}}"#, queueTotal: 12)
+        let progress = LocalTriageQueue.Progress(account: "work@example.com", position: 4, queued: 20,
+            remaining: 17, done: false, messageId: "D", threadId: "thread-D")
+        let card = try email(from: tracker.refreshEmailProgress(progress))
+        XCTAssertEqual(card.messageId, "C")
+        XCTAssertEqual(card.position, 3)
+        XCTAssertEqual(card.total, 12)
+    }
+
     func testOnboardingAboutStepShowsTheWholeDraft() {
         var tracker = FeedFocusTracker()
         let output = #"{"done":false,"position":2,"about":{"items":["Plays golf","Reads fiction"]},"onboarding":{"step":2}}"#

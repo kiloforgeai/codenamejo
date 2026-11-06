@@ -68,6 +68,12 @@ struct WorkspaceProfileRows: Sendable {
 
     let dbPool: DatabasePool?
 
+    static func addFeedOrder(_ db: Database) throws {
+        try db.alter(table: Mailbox.databaseTableName) { table in
+            table.add(column: "feed_order", .integer).notNull().defaults(to: 0)
+        }
+    }
+
     private func pool() throws -> DatabasePool {
         guard let dbPool else { throw WorkspaceProfileError.unavailable }
         return dbPool
@@ -148,17 +154,35 @@ struct WorkspaceProfileRows: Sendable {
 
     func mailboxes(userId: String, profileId: String) async throws -> [String] {
         try await pool().read { db in
-            try String.fetchAll(db, sql: "SELECT email FROM workspace_profile_mailbox WHERE user_id = ? AND profile_id = ? ORDER BY email",
+            try String.fetchAll(db, sql: "SELECT email FROM workspace_profile_mailbox WHERE user_id = ? AND profile_id = ? ORDER BY feed_order, email",
                                 arguments: [userId, profileId])
+        }
+    }
+
+    func reorderMailboxes(_ emails: [String], userId: String, profileId: String) async throws {
+        try await pool().write { db in
+            let existing = try String.fetchAll(db, sql: "SELECT email FROM workspace_profile_mailbox WHERE user_id = ? AND profile_id = ? ORDER BY feed_order, email",
+                                               arguments: [userId, profileId])
+            var seen = Set<String>()
+            let order = (emails.map { $0.lowercased() } + existing).filter {
+                existing.contains($0) && seen.insert($0).inserted
+            }
+            for (index, email) in order.enumerated() {
+                try db.execute(sql: "UPDATE workspace_profile_mailbox SET feed_order = ? WHERE user_id = ? AND profile_id = ? AND email = ?",
+                               arguments: [index, userId, profileId, email])
+            }
         }
     }
 
     /// Places each mailbox no profile holds yet into `profileId`. Mapped mailboxes never move.
     func adopt(userId: String, emails: [String], into profileId: String) async throws {
         try await pool().write { db in
-            for email in Set(emails.map { $0.lowercased() }) {
-                try db.execute(sql: "INSERT OR IGNORE INTO workspace_profile_mailbox(user_id, email, profile_id) VALUES (?, ?, ?)",
-                               arguments: [userId, email, profileId])
+            var next = try Int.fetchOne(db, sql: "SELECT MAX(feed_order) FROM workspace_profile_mailbox WHERE user_id = ? AND profile_id = ?",
+                                       arguments: [userId, profileId]).map { $0 + 1 } ?? 0
+            for email in emails.map({ $0.lowercased() }) {
+                try db.execute(sql: "INSERT OR IGNORE INTO workspace_profile_mailbox(user_id, email, profile_id, feed_order) VALUES (?, ?, ?, ?)",
+                               arguments: [userId, email, profileId, next])
+                if db.changesCount > 0 { next += 1 }
             }
         }
     }

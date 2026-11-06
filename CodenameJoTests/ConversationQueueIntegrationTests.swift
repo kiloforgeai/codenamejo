@@ -39,6 +39,28 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         }
     }
 
+    func testRunwayRefillsBelowTwelveWithoutMovingCurrentOrDuplicatingRows() async throws {
+        let fixture = try StoreFixture()
+        defer { fixture.close() }
+        UserDefaults.standard.set(false, forKey: ThreadQueue.storageKey)
+        let messages = (0..<40).map { row("runway-\($0)", thread: "thread-\($0)", date: Int64(40 - $0) * 1000, sender: "Sender") }
+        try await fixture.seed(messages, unread: Set(messages.map(\.id)))
+        let queue = makeQueue()
+        _ = await queue.step(.init(restart: true, scope: .unread), store: fixture.store)
+        let next = await queue.step(.init(), store: fixture.store, dealtWith: false)
+        let pinned = try current(next.output)["id"] as? String
+        await queue.awaitRunway()
+        let progress = await queue.progress
+        XCTAssertGreaterThanOrEqual(progress?.remaining ?? 0, 12)
+        XCTAssertEqual(progress?.messageId, pinned)
+        #if targetEnvironment(macCatalyst)
+        let prepared = await queue.desktopPreparedItems()
+        XCTAssertEqual(prepared.first?.id, pinned)
+        XCTAssertEqual(Set(prepared.map(\.id)).count, prepared.count)
+        #endif
+        await queue.end()
+    }
+
     func testBackgroundPreparationAddsClassifiedArrivalsBehindNonemptyCurrent() async throws {
         let fixture = try StoreFixture()
         defer { fixture.close() }
@@ -400,7 +422,7 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         }
         await fulfillment(of: [refilled], timeout: 5)
         let prefetched = await queue.progress
-        XCTAssertEqual(prefetched?.queued, 24)
+        XCTAssertGreaterThanOrEqual(prefetched?.queued ?? 0, 24)
         for index in 9...36 {
             let next = await queue.step(.init(), store: fixture.store, dealtWith: true)
             XCTAssertEqual(try current(next.output)["id"] as? String, "mail-\(index)")
@@ -2366,8 +2388,10 @@ final class ConversationQueueIntegrationTests: XCTestCase {
 
         let closing = await queue.step(.init(), store: fixture.store, dealtWith: true)
         XCTAssertEqual(try object(closing.output)["done"] as? Bool, true)
-        XCTAssertTrue(try XCTUnwrap(object(closing.output)["note"] as? String).contains("inbox clear"),
-                      "the close still arrives, on the turn after")
+        let closingNote = try XCTUnwrap(object(closing.output)["note"] as? String)
+        XCTAssertTrue(closingNote.contains("their unread"))
+        XCTAssertTrue(closingNote.contains("NOT say their inbox is clear"),
+                      "finishing an unread pass cannot prove Inbox is empty")
         await queue.end()
     }
 

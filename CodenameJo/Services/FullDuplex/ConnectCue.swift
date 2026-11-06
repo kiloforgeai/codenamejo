@@ -83,6 +83,11 @@ final class ConnectCue {
     /// Bumped by every `play()` and `stop()` so an overtaken cue can recognise itself and do nothing.
     private var generation = 0
     private var audible = false
+    var diagnostics: VoiceDiagnostics.Session?
+
+    nonisolated static func validOutput(sampleRate: Double, channels: UInt32) -> Bool {
+        sampleRate.isFinite && sampleRate > 0 && channels > 0
+    }
 
     // MARK: - Lifecycle
 
@@ -100,6 +105,8 @@ final class ConnectCue {
         let format = buffer.format
         let started = (try? await queue.run("\(label) start") { [engine, player] in
             // No `setCategory` or `setActive`: libwebrtc owns the session.
+            let hardware = engine.outputNode.outputFormat(forBus: 0)
+            guard Self.validOutput(sampleRate: hardware.sampleRate, channels: hardware.channelCount) else { return false }
             if player.engine == nil { engine.attach(player) }
             engine.connect(player, to: engine.mainMixerNode, format: format)
             engine.prepare()
@@ -108,6 +115,8 @@ final class ConnectCue {
         }) ?? false
 
         guard started else {
+            diagnostics?.record(.speechFailed, ["engine": "cue", "phase": label, "reason": "invalid_or_unavailable_output"])
+            await releaseGraph()
             RealtimeLog.log("\(label): not playing — engine unavailable")
             return
         }
@@ -119,11 +128,19 @@ final class ConnectCue {
             return
         }
 
-        player.volume = 1
-        // One-shot, so it is never cut mid-note.
-        player.scheduleBuffer(buffer, at: nil, options: [], completionHandler: nil)
-        player.play()
+        let playing = (try? await queue.run("\(label) play") { [player] in
+            player.volume = 1
+            player.scheduleBuffer(buffer, at: nil, options: [], completionHandler: nil)
+            player.play()
+            return true
+        }) ?? false
+        guard playing else {
+            diagnostics?.record(.speechFailed, ["engine": "cue", "phase": label, "reason": "play_failed"])
+            await releaseGraph()
+            return
+        }
         audible = true
+        diagnostics?.record(.speechStarted, ["engine": "cue", "phase": label])
         // "Earpiece" here means something reconfigured the session.
         RealtimeLog.log("\(label): playing on \(AudioRoute.describeCurrentRoute())")
 
@@ -132,6 +149,7 @@ final class ConnectCue {
         guard generation == mine else { return }
         audible = false
         await releaseGraph()
+        diagnostics?.record(.speechFinished, ["engine": "cue", "phase": label])
     }
 
     /// Silence and release early — the call ended while the cue was still playing.
@@ -143,7 +161,7 @@ final class ConnectCue {
         // Ramp instead of cutting, to avoid a click.
         let steps = 6
         for step in (0..<steps).reversed() {
-            player.volume = Float(step) / Float(steps)
+            _ = try? await queue.run("\(label) fade") { [player] in player.volume = Float(step) / Float(steps) }
             try? await Task.sleep(for: .milliseconds(8))
         }
 
@@ -155,8 +173,10 @@ final class ConnectCue {
         _ = try? await queue.run("\(label) release") { [engine, player] in
             player.stop()
             engine.stop()
-            engine.disconnectNodeOutput(player)
-            engine.detach(player)
+            if player.engine != nil {
+                engine.disconnectNodeOutput(player)
+                engine.detach(player)
+            }
             // No `setActive(false)`: this runs under a live call, and the ADM needs an active session.
         }
     }

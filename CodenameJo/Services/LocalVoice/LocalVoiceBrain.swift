@@ -160,18 +160,19 @@ enum LocalVoiceBrain {
                 let name = call["name"] as? String ?? ""
                 let callId = call["call_id"] as? String ?? ""
                 let arguments = call["arguments"] as? String ?? "{}"
-                let result: (output: String, failed: Bool, write: Bool)
+                let result: DispatchWorker.Execution
                 if name == UserFeedbackTool.name {
                     let feedback = Container.shared.userFeedback()
                     let submission = feedback.capture()
                     let receipt = await UserFeedbackTool.run(argumentsJSON: arguments) {
                         try await feedback.save($0, source: .voice, submission: submission)
                     }
-                    result = (receipt.output, receipt.failed, false)
+                    result = (receipt.output, receipt.failed, false, false)
                 } else {
                     result = await DispatchWorker.execute(name, arguments, relayNames: relayNames, cursor: focus?.cursor,
                                                           standingOn: focus?.standingOn, profileId: profileId)
                 }
+                if result.pending { return "That action is queued, but its completion has not been confirmed yet." }
                 RealtimeLog.log("local-voice: tool \(name)\(result.failed ? " failed" : "")")
                 input.append(["type": "function_call_output", "call_id": callId, "output": result.output])
             }

@@ -122,9 +122,44 @@ actor LocalTriageQueue {
             + "full-message read tool, and only then may the summary be extended. "
 
     #if targetEnvironment(macCatalyst)
+    enum DesktopStatus: String, Sendable { case idle, ready, loading, unavailable, nextInbox, complete }
+    struct DesktopSnapshot: Sendable, Equatable {
+        var items: [Item]
+        var currentID: String?
+        var account: String?
+        var scope: String
+        var status: DesktopStatus
+        var revision: Int = 0
+    }
+    private var lastDesktopSnapshot: DesktopSnapshot?
+
+    func desktopSnapshot() -> DesktopSnapshot {
+        let accounts = ProfileRuntime.allowedMailAccounts(walkAccounts ?? [])
+        let current = desktopPreparedItems()
+        let future = inboxAheadFirst(Self.refillTarget) + accounts.filter {
+            $0.caseInsensitiveCompare(activeAccount ?? "") != .orderedSame
+                && !completedAccounts.contains($0.lowercased())
+        }.flatMap { mailboxAheadItems[$0.lowercased()] ?? [] }
+        var seen = Self.messageKeys(current)
+        let upcoming = future.compactMap { item in
+            item.keeping(item.conversation.filter {
+                !gmailWalkDealtWith.contains(Self.messageKey(account: item.account, id: $0.id))
+                    && seen.insert(Self.messageKey(account: item.account, id: $0.id)).inserted
+            })
+        }
+        let status: DesktopStatus = stalled ? .unavailable : offeredAccount != nil ? .nextInbox
+            : running ? (current.isEmpty ? .loading : .ready)
+            : feedEmitted && !more && !stalled ? .complete : .idle
+        var snapshot = DesktopSnapshot(items: Array((current + upcoming).prefix(36)), currentID: actionOutcome?.messageId ?? currentId,
+            account: actionOutcome?.about.account ?? activeAccount, scope: scope.rawValue, status: status,
+            revision: lastDesktopSnapshot?.revision ?? 0)
+        if snapshot != lastDesktopSnapshot { snapshot.revision += 1; lastDesktopSnapshot = snapshot }
+        return snapshot
+    }
+
     func desktopPreparedItems() -> [Item] {
         guard running else { return [] }
-        return Array(items.dropFirst(max(0, position - 1)).prefix(30))
+        return Array(items.dropFirst(max(0, position - 1)).filter { $0.acted == nil }.prefix(36))
     }
     #endif
 
@@ -177,7 +212,8 @@ actor LocalTriageQueue {
     ]
 
     /// How close to the end of the buffer a top-up starts.
-    static let topUpAt = 5
+    static let topUpAt = 12
+    static let refillTarget = 24
 
 
     /// What the queue is walking. `important` is the past week of the inbox in our importance order.
@@ -212,10 +248,6 @@ actor LocalTriageQueue {
             case .unread: "your unread mail"
             }
         }
-
-        /// Whether reaching the end of this queue means the inbox is actually clear. Only `unread`:
-        /// `all` and `important` leave mail behind.
-        var meansInboxZero: Bool { self == .unread }
 
         /// Every stage, in order. `all` is last because only its end leaves nothing in the inbox unseen.
         static let scopeChain: [Scope] = [.important, .unread, .all]
@@ -432,6 +464,8 @@ actor LocalTriageQueue {
         var displayPosition: Int? = nil
         var displayQueued: Int? = nil
         var displayRemaining: Int? = nil
+        var messageId: String? = nil
+        var threadId: String? = nil
     }
 
     /// What the model asked for.
@@ -544,6 +578,7 @@ actor LocalTriageQueue {
     /// The fetch in flight, so a second caller waits for it rather than skipping it; skipping lets a
     /// fast "next" find nothing fetched and report the queue finished.
     private var refillTask: Task<Bool, Never>?
+    private var runwayTask: Task<Void, Never>?
     /// Ids the user has finished with (acted on or skipped), against when. Survives rebuilds and calls
     /// so finished mail is not offered again; pruned by `dealtWithMaxAge` and `dealtWithCap`.
     private var dealtAt: [String: Double] = [:]
@@ -557,7 +592,14 @@ actor LocalTriageQueue {
     private var dispatchSweepIDs: Set<String> = []
     /// Which walk the state belongs to, bumped by everything that replaces or clears a queue, so a
     /// page in flight cannot append into or stall a newer queue.
-    private var generation = 0
+    private var generation = 0 {
+        didSet {
+            refillTask?.cancel()
+            refillTask = nil
+            runwayTask?.cancel()
+            runwayTask = nil
+        }
+    }
     /// Saved buffer and its cursor offsets; unchanged tails need only a cursor write.
     private var savedBuffer: (key: String, items: [Item], trimmedItems: Int, trimmedOrdinals: Int,
                               itemCount: Int, ordinalOffset: Int)?
@@ -636,12 +678,15 @@ actor LocalTriageQueue {
     private typealias InboxAhead = TriageQueueBuilder.InboxAhead
     private var inboxAheadTask: Task<Void, Never>?
     private var inboxAhead: InboxAhead?
+    private var inboxAheadScope: Scope?
     /// The other mailboxes of this profile being prepared on scratch queues — see `prefetchOtherMailboxes`.
     private var mailboxAheadTask: Task<Void, Never>?
     /// Lowercased mailboxes prepared ahead in this conversation; once per call is enough.
     private var mailboxesPreparedAhead: Set<String> = []
     /// Every other mailbox is prepared (or there is none), so a step need not look again this call.
     private var mailboxAheadSettled = false
+    private var mailboxAheadItems: [String: [Item]] = [:]
+    private var preparedMailboxPreview: [Item] = []
     /// Off on a scratch queue, which prepares one mailbox and must not prepare the others in turn.
     private var prefetchesOtherMailboxes = true
     /// Thread context carried by today's row, keyed by `threadKey`, so a page rebuilt from the cache
@@ -751,6 +796,8 @@ actor LocalTriageQueue {
         generation &+= 1
         refillTask?.cancel()
         refillTask = nil
+        runwayTask?.cancel()
+        runwayTask = nil
     }
 
     private func clearStageNavigation() {
@@ -1142,6 +1189,8 @@ actor LocalTriageQueue {
                   await mailAccounts().contains(where: { $0.lowercased() == mailbox.lowercased() })
             else { return }
             mailboxesPreparedAhead.insert(mailbox.lowercased())
+            mailboxAheadItems[mailbox.lowercased()] = await scratch.preparedMailboxPreview
+            await preparationChanged?()
             RealtimeLog.log(
                 "mailboxAhead: prepared \(mailbox) \(served?.rawValue ?? "nothing") in "
                     + String(format: "%.0f", Date().timeIntervalSince(started) * 1000) + "ms")
@@ -1160,6 +1209,7 @@ actor LocalTriageQueue {
         await loadDealtWith()
         guard let mailbox = await mailAccounts().first else { return nil }
         let result = await prepareSnapshot(for: mailbox, store: store)
+        preparedMailboxPreview = Array(items.dropFirst(max(0, position - 1)).prefix(Self.refillTarget))
         await end()
         return result.served
     }
@@ -1228,7 +1278,9 @@ actor LocalTriageQueue {
             displayPosition: topicGrouping && scope == .unread ? position : nil,
             displayQueued: topicGrouping && scope == .unread ? items.count : nil,
             displayRemaining: topicGrouping && scope == .unread
-                ? items.dropFirst(max(0, position - 1)).count : nil
+                ? items.dropFirst(max(0, position - 1)).count : nil,
+            messageId: items.indices.contains(position - 1) ? items[position - 1].id : nil,
+            threadId: items.indices.contains(position - 1) ? items[position - 1].threadId : nil
         )
     }
 
@@ -1353,6 +1405,7 @@ actor LocalTriageQueue {
         if !input.stop { await checkpoint(store: store) }
         // Behind the card, never in front of it: the other mailboxes' rows for a later switch.
         prefetchOtherMailboxes(store: store)
+        maintainRunway(store: store)
         return result
     }
 
@@ -2007,7 +2060,7 @@ actor LocalTriageQueue {
     ) async -> (String, Served) {
         queueBuildsInFlight += 1
         defer { queueBuildsInFlight -= 1 }
-        let ahead = await takeInboxAhead(crossing: asked == .all && crossedFromScope != nil)
+        let ahead = await takeInboxAhead(crossing: asked == inboxAheadScope && crossedFromScope != nil)
         scope = asked
         rankedPending = asked == .important && crossedFromScope == nil
         nothingImportantCheck = rankedPending
@@ -2131,28 +2184,27 @@ actor LocalTriageQueue {
     /// Fetch the `all` stage behind unread's last few messages, only once `more` is false so it never
     /// shares the wire with a top-up. The unread re-check at the crossing stays live to catch new mail.
     private func prefetchInboxStage(store: MailStore) {
-        // A stale fetch is fetched again rather than left for the crossing to drop.
-        guard scope == .unread, !more, nextScopeInPlan() == .all, !preparingDailySnapshot,
+        guard !more, let next = nextScopeInPlan(), next != .important, !preparingDailySnapshot,
               items.count - position < Self.topUpAt, inboxAheadTask == nil,
               inboxAhead.map({ !Self.isFresh($0.at) }) ?? true
         else { return }
         let gen = generation
-        RealtimeLog.log("localTriage: prefetching all behind unread")
-        inboxAheadTask = Task { [weak self] in await self?.fetchInboxAhead(generation: gen, store: store) }
+        inboxAheadScope = next
+        inboxAheadTask = Task { [weak self] in await self?.fetchInboxAhead(generation: gen, scope: next, store: store) }
     }
 
-    private func fetchInboxAhead(generation gen: Int, store: MailStore) async {
+    private func fetchInboxAhead(generation gen: Int, scope next: Scope, store: MailStore) async {
         let started = Date()
         let accounts = await queueAccounts()
-        let counted = await count(store: store, scope: .all)
+        let counted = await count(store: store, scope: next)
         // Everything unread still holds will be dealt with by the crossing, so a page of only
         // that is a page `pageRun` would skip — keep going, as it would.
         let walked = Self.messageKeys(items).union(gmailWalkDealtWith)
             .union(dispatchSweepIDs).union(navigationExcludedIDs)
-        let pages = await TriageQueueBuilder.inboxAheadPages(walked: walked, budget: Self.gmailPageBudget) { before in
-            await self.livePage(before: before, store: store, scope: .all)
+        let pages = await TriageQueueBuilder.inboxAheadPages(walked: walked, budget: Self.gmailPageBudget, minimumItems: Self.refillTarget) { before in
+            await self.livePage(before: before, store: store, scope: next)
         }
-        guard gen == generation, scope == .unread else { return }
+        guard gen == generation, nextScopeInPlan() == next else { return }
         inboxAhead = InboxAhead(total: counted.total, accounts: accounts, pages: pages, at: Date())
         inboxAheadTask = nil
         RealtimeLog.log(
@@ -2167,7 +2219,15 @@ actor LocalTriageQueue {
 
     /// The prefetched stage's first messages that the crossing would actually serve.
     private func inboxAheadFirst(_ n: Int) -> [Item] {
-        guard case .success(let live, _, _)? = inboxAhead?.pages[nil] else { return [] }
+        guard let pages = inboxAhead?.pages else { return [] }
+        var before: Int64?
+        var live: [Item] = []
+        for _ in 0..<Self.gmailPageBudget {
+            guard case .success(let page, let more, _)? = pages[before] else { break }
+            live.append(contentsOf: page)
+            guard more, let next = TriageMailSource.watermark(page), next != before else { break }
+            before = next
+        }
         let walked = Self.messageKeys(items).union(gmailWalkDealtWith)
             .union(dispatchSweepIDs).union(navigationExcludedIDs)
         return Array(grouped(Self.gmailEligible(live, dealtWithThisWalk: walked)).prefix(n))
@@ -2177,7 +2237,7 @@ actor LocalTriageQueue {
     /// Any other build drops it: it was fetched for this walk's crossing and no other.
     private func takeInboxAhead(crossing: Bool) async -> InboxAhead? {
         if crossing, let task = inboxAheadTask { await task.value }
-        defer { inboxAhead = nil; inboxAheadTask = nil }
+        defer { inboxAhead = nil; inboxAheadTask = nil; inboxAheadScope = nil }
         guard crossing, let ahead = inboxAhead, Self.isFresh(ahead.at),
               await queueAccounts() == ahead.accounts
         else { return nil }
@@ -2216,6 +2276,7 @@ actor LocalTriageQueue {
     /// Retire the walk's handles; in-flight reads may still update the account-scoped cache.
     private func releasePrefetch() {
         inboxAhead = nil
+        inboxAheadScope = nil
         inboxAheadTask = nil
         unreadArrivalsAhead = nil
     }
@@ -2360,15 +2421,7 @@ actor LocalTriageQueue {
         }
 
         // Behind the answer the user is about to hear, so deliberately not `.live`: they waited for none of it.
-        // The last page landing can bring the stage's end close, so the look ahead is checked again then.
-        if more, items.count - position < Self.topUpAt, refillTask == nil {
-            Task { [weak self] in
-                guard let self else { return }
-                await self.refill(store: store)
-                await self.prefetchInboxStage(store: store)
-                await self.prefetchUnreadArrivals(store: store)
-            }
-        }
+        maintainRunway(store: store)
         prefetchInboxStage(store: store)
         prefetchUnreadArrivals(store: store)
 
@@ -2449,12 +2502,40 @@ actor LocalTriageQueue {
         // A caller that waits on an in-flight page reports what that page cost, not `false`.
         if let inFlight = refillTask { return await inFlight.value }
         guard more else { return false }
+        let gen = generation
         let task = Task { [weak self] in await self?.fetchNextPage(store: store) ?? false }
         refillTask = task
         let live = await task.value
-        refillTask = nil
+        if generation == gen { refillTask = nil }
         return live
     }
+
+    private func maintainRunway(store: MailStore) {
+        guard running, !preparingDailySnapshot, onboardingFlow == nil,
+              items.count - max(0, position - 1) < Self.topUpAt, more,
+              !stalled, runwayTask == nil else { return }
+        let gen = generation
+        runwayTask = Task { [weak self] in
+            await self?.fillRunway(generation: gen, store: store)
+        }
+    }
+
+    private func fillRunway(generation gen: Int, store: MailStore) async {
+        defer { if generation == gen { runwayTask = nil } }
+        for _ in 0..<Self.gmailPageBudget {
+            guard !Task.isCancelled, gen == generation, running, more, !stalled,
+                  items.count - max(0, position - 1) < Self.refillTarget else { break }
+            let priorCount = items.count
+            _ = await refill(store: store)
+            guard gen == generation else { return }
+            if items.count == priorCount { break }
+        }
+        guard gen == generation else { return }
+        prefetchInboxStage(store: store)
+        prefetchUnreadArrivals(store: store)
+    }
+
+    func awaitRunway() async { await runwayTask?.value }
 
     private func appendPage(_ page: [Item]) {
         let frozen = topicGrouping ? max(position, (items.lastIndex {
@@ -2682,7 +2763,8 @@ actor LocalTriageQueue {
                     + "rest of their inbox is exactly where it was."
             case .unread:
                 forbidden = "their inbox is clear"
-                close = "\"Archived — that was the last one, and that's your inbox clear.\""
+                close = "\"Archived — that was the last unread message in this pass.\" "
+                    + "Do NOT say their inbox is clear, empty or at zero: read mail may remain."
             }
         }
         return "This is the LAST message in the queue, and IT IS NOT DEALT WITH YET — so the "
@@ -2699,8 +2781,7 @@ actor LocalTriageQueue {
             + "triage_next on THIS turn; `note` already says when the queue moves."
     }
 
-    /// What may honestly be said about the mailbox at the end of this walk. Only `unread` may claim
-    /// the inbox is clear; every other scope leaves mail behind.
+    /// Traversal proves a selected pass completed, not that Gmail contains no inbox messages.
     private static func closeClaim(scope: Scope, adopted: Bool = false) -> String {
         // An adopted queue is the handful they named, so the only claim worth stating is the one that
         // would be false.
@@ -2708,9 +2789,6 @@ actor LocalTriageQueue {
             return "This queue was only the messages they asked for, and it is finished. "
                 + "Their inbox is NOT clear, empty, at zero or gone through — never say any "
                 + "of that, and do not state a mailbox count."
-        }
-        guard !scope.meansInboxZero else {
-            return "That is their inbox clear — here it is true. Say it in one sentence."
         }
         let unit: String
         switch scope {
@@ -2834,6 +2912,7 @@ actor LocalTriageQueue {
             mailboxAheadTask?.cancel()
             mailboxAheadTask = nil
             mailboxesPreparedAhead = []
+            mailboxAheadItems = [:]
             mailboxAheadSettled = false
             // A profile switch or disconnect changes which inboxes this queue may walk, so the
             // selection must not outlive it.
@@ -3921,7 +4000,6 @@ actor LocalTriageQueue {
         guard feedEligible else { return Self.json(base) }
         let profileComplete = profileHandoff.canCompleteCurrent
         guard !feedEmitted || profileComplete else { return Self.json(base) }
-        guard !pageFeedPresented || profileComplete else { return Self.json(base) }
         let scope = ProfileRuntime.snapshot
         var slackLoaded: SlackQueueCache.Loaded?
         if dynamicSlackFeed {
@@ -4072,6 +4150,10 @@ actor LocalTriageQueue {
         offeredAccount = next
         var payload = base
         payload["account"] = current
+        payload["done"] = false
+        payload["mailboxDone"] = true
+        payload["interstitial"] = "mailbox_handoff"
+        payload["nextAccount"] = next
         let prior = (payload["note"] as? String).map { $0 + " " } ?? ""
         payload["note"] = prior
             + "Say they are done with the selected queue in \(current). Then ask exactly "
@@ -4475,6 +4557,7 @@ actor LocalTriageQueue {
     }
 
     private func current(includeOutcome: Bool = false, store: MailStore) async -> String {
+        maintainRunway(store: store)
         if onboardingFlow != nil {
             let output = onboardingCurrent()
             guard includeOutcome, let outcome = takeOneOutcome(),
@@ -5025,7 +5108,7 @@ actor LocalTriageQueue {
         before: Int64?, store: MailStore, scope asked: Scope? = nil
     ) async -> LivePageResult {
         let scope = asked ?? self.scope
-        if asked == nil, scope == .all, inboxAheadPages != nil {
+        if asked == nil, inboxAheadPages != nil {
             if let prefetched = inboxAheadPages?.removeValue(forKey: before) { return prefetched }
             inboxAheadPages = nil
         }

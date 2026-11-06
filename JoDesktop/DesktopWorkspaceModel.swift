@@ -9,6 +9,7 @@ struct DesktopFeedRow: Identifiable, Equatable {
     let title: String
     let detail: String
     let reason: String?
+    var selection: MailSelection? = nil
     var symbol: String { source == "Slack" ? "number" : "envelope" }
 }
 
@@ -25,6 +26,27 @@ class DesktopWorkspaceModel: ViewModel {
     @Published var steps: [TurnStep] = []
     @Published var jobs: [DispatchJob] = []
     @Published var queue: [DesktopFeedRow] = []
+    @Published var queueStatus: LocalTriageQueue.DesktopStatus = .idle
+    @Published var queueScope = ""
+    @Published var queueRevision = 0
+    @Published var queueCurrent: MailSelection?
+    @Published var conversationID: UUID?
+    @Published var profileID: String?
+
+    var selectionIsTransitioning: Bool {
+        guard case .email(let email) = focus, let id = email.messageId else { return false }
+        return queueCurrent?.matches(account: email.account, messageID: id) != true
+    }
+
+    var renderedState: RenderedFeedState {
+        let selected: MailSelection?
+        if !selectionIsTransitioning, case .email(let email) = focus, let id = email.messageId {
+            selected = MailSelection(account: email.account, messageID: id)
+        } else { selected = nil }
+        return RenderedFeedState(profileID: profileID, conversationID: conversationID, focus: selected,
+            queueCurrent: queueCurrent, queueOrder: queue.map { $0.selection?.canonical ?? $0.id }, queueRevision: queueRevision,
+            queueScope: queueScope, response: response, previousResponse: previousResponse, focusMode: focusMode)
+    }
     @Published var showMicDenied = false
     @Published var showMicUnavailable = false
     @Published var showingSettings = false
@@ -50,6 +72,9 @@ class DesktopWorkspaceModel: ViewModel {
     }
     var runningJobs: [DispatchJob] { jobs.filter { $0.isRunning && !$0.hasStopped() } }
     var finishedJobs: [DispatchJob] { jobs.filter { $0.hasStopped() } }
+    var feedComplete: Bool {
+        inSession && queueStatus == .complete && queue.isEmpty && runningJobs.isEmpty && focus?.isComplete == true
+    }
     var status: String {
         if case .error = state { return "Connection needs attention" }
         if !inSession { return "Ready when you are" }
@@ -69,8 +94,10 @@ protocol DesktopWorkspaceHandler {
     func stopSpeaking()
     func refresh(viewModel: DesktopWorkspaceModel)
     func exportDiagnostics()
+    func exportHistory()
     func showFeedback()
     func saveFeedback()
+    func rendered(_ state: RenderedFeedState)
 }
 
 @MainActor
@@ -93,6 +120,7 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
     private weak var model: DesktopWorkspaceModel?
     private var checkingMicrophone = false
     private var loading = false
+    private var refreshPending = false
 
     init(hasMicrophone: @escaping @Sendable () -> Bool = { OnboardingAudioSession.hasInputDevice }) {
         self.hasMicrophone = hasMicrophone
@@ -159,14 +187,27 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
         model.userWords = realtime.lastCommandText
         model.steps = realtime.turnSteps
         model.voiceNotice = realtime.voiceNotice
+        model.conversationID = realtime.activeConversationId
+        model.profileID = ProfileRuntime.snapshot?.profileId
+        refresh(viewModel: model)
     }
 
-    func exportDiagnostics() {
+    func rendered(_ state: RenderedFeedState) { realtime.recordRenderedWorkspace(state) }
+
+    func exportDiagnostics() { exportSession(includeContent: false) }
+    func exportHistory() { exportSession(includeContent: true) }
+
+    private func exportSession(includeContent: Bool) {
         let owner = backend.userId
+        let profileOwner = Container.shared.workspaceProfiles().contextOwner
         Task { [weak self] in
             do {
-                let data = try await Container.shared.voiceDiagnostics().snapshot(userID: owner)
-                guard self?.backend.userId == owner else { return }
+                let records = try await TurnStore(database: Container.shared.localContext().dbPool).history(owner: profileOwner)
+                let jobs = await Container.shared.dispatchJobs().history()
+                let logs = try await Container.shared.voiceDiagnostics().snapshot(userID: owner)
+                let data = try SessionExport.append(records: records, jobs: jobs, to: logs, includeContent: includeContent)
+                guard self?.backend.userId == owner,
+                      Container.shared.workspaceProfiles().contextOwner == profileOwner else { return }
                 self?.model?.diagnosticsDocument = VoiceDiagnosticsDocument(data: data)
                 self?.model?.exportingDiagnostics = true
             } catch { self?.model?.diagnosticsError = error.localizedDescription }
@@ -199,20 +240,30 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
     }
 
     func refresh(viewModel: DesktopWorkspaceModel) {
-        guard !loading else { return }
+        guard !loading else { refreshPending = true; return }
         loading = true
         let profile = ProfileRuntime.snapshot?.profileId
         Task { [weak self, weak viewModel] in
             guard let self else { return }
-            defer { self.loading = false }
-            let mail = await mailQueue.desktopPreparedItems()
+            defer {
+                self.loading = false
+                if self.refreshPending, let viewModel {
+                    self.refreshPending = false
+                    self.refresh(viewModel: viewModel)
+                }
+            }
+            let mail = await mailQueue.desktopSnapshot()
             let slack = await slackQueue.desktopPreparedItems()
             let jobs = await dispatchJobs.history()
             guard let viewModel, ProfileRuntime.snapshot?.profileId == profile else { return }
-            viewModel.queue = mail.map {
+            viewModel.queueStatus = mail.status
+            viewModel.queueScope = mail.scope
+            viewModel.queueRevision = mail.revision
+            viewModel.queueCurrent = mail.currentID.flatMap { id in mail.account.map { MailSelection(account: $0, messageID: id) } }
+            viewModel.queue = mail.items.map {
                 DesktopFeedRow(id: "mail:\($0.account):\($0.id)", source: "Email",
                     title: $0.subject.isEmpty ? "No subject" : $0.subject,
-                    detail: $0.from, reason: $0.importanceWhy)
+                    detail: $0.from, reason: $0.importanceWhy, selection: .init(account: $0.account, messageID: $0.id))
             } + slack.map {
                 DesktopFeedRow(id: "slack:\($0.teamId):\($0.channelId)", source: "Slack",
                     title: $0.label, detail: $0.teamName, reason: $0.why.isEmpty ? nil : $0.why)

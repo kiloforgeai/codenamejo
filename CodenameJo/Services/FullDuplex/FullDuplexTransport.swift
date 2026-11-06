@@ -423,18 +423,7 @@ final class FullDuplexTransport: NSObject {
 
     fileprivate func handle(frame: Data) {
         if let event = try? JSONSerialization.jsonObject(with: frame) as? [String: Any],
-           let type = event["type"] as? String,
-           ["session.created", "session.updated", "error", "response.created", "response.done",
-            "input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped"].contains(type) {
-            var fields = ["event_type": type]
-            if let error = event["error"] as? [String: Any] { fields["provider_code"] = error["code"] as? String }
-            if let response = event["response"] as? [String: Any] {
-                fields["response_status"] = response["status"] as? String
-                if let details = response["status_details"] as? [String: Any],
-                   let error = details["error"] as? [String: Any] {
-                    fields["provider_code"] = error["code"] as? String
-                }
-            }
+           let fields = VoiceDiagnostics.protocolFields(event) {
             diagnostics?.record(.liveEvent, fields)
         }
         validationEvidence.receive(frame)

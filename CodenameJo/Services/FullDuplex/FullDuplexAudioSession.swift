@@ -31,6 +31,7 @@ final class FullDuplexAudioSession {
         self.mode = mode
         // Our own override emits a route change; reacting to it would loop and reset AEC convergence.
         routeObserver = AudioRoute.Observer(ignoringSelfInflicted: true) { [weak self] in
+            diagnostics?.record(.audioRouteChanged, ["engine": "webrtc", "output_ports": AudioRoute.describeCurrentRoute()])
             MainActor.assumeIsolated { self?.applyOutputRoute() }
         }
         // The route is asserted after libwebrtc configures the session. See `WebRTCSessionObserver`.

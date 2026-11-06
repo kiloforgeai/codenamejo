@@ -14,21 +14,25 @@ enum SettingsRow {
         @ScaledMetric private var iconWidth: CGFloat = 24
 
         var body: some View {
-            HStack(spacing: 12) {
+            HStack(alignment: .top, spacing: 16) {
                 Image(systemName: icon)
                     .font(.body)
                     .foregroundStyle(Theme.accent)
                     .frame(width: iconWidth)
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 6) {
                     Text(title)
                         .font(.body)
                         .foregroundStyle(Theme.textPrimary)
                     Text(detail)
                         .font(.footnote)
                         .foregroundStyle(Theme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer()
             }
+            #if targetEnvironment(macCatalyst)
+            .padding(.vertical, 10)
+            #endif
         }
     }
 
