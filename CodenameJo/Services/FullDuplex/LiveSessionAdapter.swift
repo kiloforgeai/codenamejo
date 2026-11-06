@@ -199,8 +199,10 @@ final class LiveSessionAdapter {
             && activeFastCall == nil && calls.isEmpty
     }
     func canRestoreReturnedWork(_ callID: String) -> Bool {
-        started && !closed && activeFastCall?.id == callID && activeFastCall?.turn == inputTurn
-            && activeCall == nil && calls.isEmpty
+        guard started, !closed, finalizedInput, inputTurn > desktopDismissedThroughTurn, !desktopQuiet else { return false }
+        if activeFastCall?.id == callID, activeFastCall?.turn == inputTurn { return activeCall == nil && calls.isEmpty }
+        return activeCall?.id == callID && activeCall.flatMap { delegationTurns[$0.delegation] } == inputTurn
+            && activeFastCall == nil && calls.isEmpty
     }
     private var backendRunning: Bool { backendStarting || !runningResponses.isEmpty }
     var isWorkSettled: Bool {
