@@ -17,7 +17,7 @@ final class LiveSessionAdapter {
     func calendarSource(for call: Call) -> String? { clientBrain?.calendarSource(for: call) }
     private var presentationDelegations = Set<String>()
     private var abandonedPresentations = Set<String>()
-    private var resultPresentationState: (turn: Int, scope: String?, selection: LiveSelectionGrounding.Selection)?
+    private var resultPresentationState: (turn: Int, scope: String?, selection: LiveSelectionGrounding.Selection?)?
     private var buttonPresentationWatchdog: Task<Void, Never>?
     private var buttonPresentationText = ""
     var buttonPresentationBound: TimeInterval = 10
@@ -161,6 +161,31 @@ final class LiveSessionAdapter {
     private var backgroundStartedTurns: Set<Int> = []
     private var finalizedInput = false
     private var authorizationText = ""
+    var mailRequestSelection: (() -> MailSelection?)?
+    private var mailRequestSource: (turn: Int, profile: String?, scope: String?, selection: MailSelection?)?
+    private var currentMailRequestSelection: MailSelection? {
+        if let mailRequestSelection { return mailRequestSelection() }
+        guard let state = clientBrainState?(), let key = LiveEmailPresentation.Key.selection(state.text) else { return nil }
+        return MailSelection(account: key.account, messageID: key.messageId)
+    }
+    private var mailOperations: [LiveMailAuthorization.Operation: String] = [:]
+
+    func mailRequestRefusal(for call: Call) -> String? {
+        guard let operation = LiveMailAuthorization.Operation(tool: call.name) else { return nil }
+        if operation == .next, inputTurn == 0 { return nil }
+        guard let source = mailRequestSource, source.turn == inputTurn,
+              delegationTurns[call.delegation] == inputTurn, finalizedInput, !closed,
+              inputTurn > desktopDismissedThroughTurn, !desktopQuiet else { return "stale_mail_request" }
+        guard source.profile == ProfileRuntime.snapshot?.profileId,
+              source.scope == clientBrainState?().scope else { return "mail_request_profile_changed" }
+        if source.selection != currentMailRequestSelection {
+            return "mail_request_selection_changed"
+        }
+        guard LiveMailAuthorization(inputText).operations.contains(operation)
+                || clientBrain?.authorizesPreservedReply(call.id, name: call.name) == true else { return "mail_operation_not_requested" }
+        if let executed = mailOperations[operation], executed != call.id { return "mail_operation_already_attempted" }
+        return nil
+    }
     var allowsNewDispatch: Bool {
         finalizedInput && !closed && !desktopQuiet && inputTurn > desktopDismissedThroughTurn
             && LiveRequestRecovery.dispatchRefusal(authorizationText) == nil
@@ -1297,6 +1322,10 @@ final class LiveSessionAdapter {
                 inputID = UUID().uuidString
                 inputText = ""
                 inputTurn += 1
+                let mailState = clientBrainState?()
+                mailRequestSource = (inputTurn, ProfileRuntime.snapshot?.profileId, mailState?.scope,
+                    currentMailRequestSelection)
+                mailOperations = [:]
                 if resumesDesktopVoice {
                     desktopQuiet = false
                     append("A new spoken request begins now. Answer only this request using the current selected item; do not resume earlier presentations or desktop action receipts.", type: "session.instructions.append")
@@ -1438,10 +1467,18 @@ final class LiveSessionAdapter {
         activeCall = call
         if LiveWriteTarget.requiresCurrentRequest(call.name),
            delegationTurns[call.delegation] != inputTurn || LiveRequestRecovery.isFeedback(inputText)
-            || LiveRequestRecovery.isBackchannel(inputText) || LiveRequestRecovery.incompleteAction(inputText) || !finalizedInput {
+            || (LiveRequestRecovery.isBackchannel(inputText) && clientBrain?.authorizesPreservedReply(call.id, name: call.name) != true)
+            || LiveRequestRecovery.incompleteAction(inputText) || !finalizedInput {
             trace("write_request_superseded", call: call.id, delegation: call.delegation)
             outbound(["type": "conversation.item.create", "item": ["type": "function_call_output",
                 "call_id": call.id, "output": "Not executed: this action belongs to an earlier request or the current request is feedback. Do not revive it, retry it, or advance the feed. Handle only the user's latest request."]])
+            return
+        }
+        if let reason = mailRequestRefusal(for: call) {
+            diagnostics?.record(.turnTransition, ["transition": "mail_request_refused", "reason": reason,
+                "call_id": call.id, "tool": call.name, "turn_id": historyIDForTurn?(inputTurn) ?? String(inputTurn)])
+            outbound(["type": "conversation.item.create", "item": ["type": "function_call_output",
+                "call_id": call.id, "output": "Not executed: the current request does not authorize this mail operation on the original selection (\(reason)). No mailbox change or feed advance occurred. Answer the requested question or ask which action the user wants; do not retry this operation."]])
             return
         }
         if presentationDelegations.contains(call.delegation),
@@ -1491,6 +1528,7 @@ final class LiveSessionAdapter {
             if turn == inputTurn { stopQueueActionRecovery() }
         }
         if delegationTurns[call.delegation] == inputTurn { authorizationText = "" }
+        if let operation = LiveMailAuthorization.Operation(tool: call.name) { mailOperations[operation] = call.id }
         trace("tool_started", call: call.id, delegation: call.delegation)
         toolStartedAt[call.id] = ProcessInfo.processInfo.systemUptime
         var fields = ["call_id": call.id, "tool": call.name, "delegation_id": call.delegation,
