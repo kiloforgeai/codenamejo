@@ -19,6 +19,7 @@ enum LocalCompose {
         let ownerID: String?
         let profileID: String?
         var isCurrent: @MainActor @Sendable () -> Bool
+        var isOriginalRequestSource = false
 
         func validate() async throws {
             let allowed = await MainActor.run {
@@ -501,21 +502,31 @@ enum LocalCompose {
         return participant
     }
 
-    private static func retainReply(_ name: String, args: [String: Any], reason: String, source: ReplySource?,
+    static func retainReply(_ name: String, args: [String: Any], reason: String, source: ReplySource?,
                                      conversationId: String?, callID: String?) async -> Bool {
         guard let source, !text(args["body"]).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let owner = source.ownerID else { return false }
         let selection = source.selection
+        let requested = DispatchJob.MailOrigin(account: GmailReadTools.string(args, "account") ?? selection.account,
+            messageID: GmailReadTools.string(args, "reply_message_id") ?? selection.messageId,
+            threadID: GmailReadTools.string(args, "thread_id") ?? selection.threadId, sender: "", subject: "Unsent reply")
+        let bound = (try? source.binding(args)) != nil
+        let verified = source.isOriginalRequestSource || bound
+        let original = DispatchJob.MailOrigin(account: selection.account, messageID: selection.messageId,
+            threadID: selection.threadId, sender: "", subject: "Unsent reply")
+        let intended = verified ? original : requested
         let message = MailMIME.Outgoing(to: "Recipient not verified", cc: [], bcc: [], subject: "Unsent reply",
-            body: text(args["body"]), threadId: selection.threadId, inReplyTo: nil, footer: false)
-        var action = MailActionReceipt(kind: name == "create_draft" ? .draft : .send, account: selection.account,
-            message: message, replyMessageID: selection.messageId, requestKey: callID.map { "reply-preflight:" + (conversationId ?? "foreground") + ":" + $0 })
+            body: text(args["body"]), threadId: intended.threadID, inReplyTo: nil, footer: false)
+        var action = MailActionReceipt(kind: name == "create_draft" ? .draft : .send, account: intended.account,
+            message: message, replyMessageID: intended.messageID, requestKey: callID.map { "reply-preflight:" + (conversationId ?? "foreground") + ":" + $0 })
         action.state = .failed
+        action.replyPreflight = true
+        action.requestedReplySource = requested
         do {
             let store = await MainActor.run { Container.shared.dispatchJobs() }
-            let (job, _) = try await store.beginMailAction(action, ownerID: owner, profileID: source.profileID,
-                conversationID: conversationId, origin: .init(account: selection.account, messageID: selection.messageId,
-                    threadID: selection.threadId, sender: "", subject: "Unsent reply"))
+            let (job, created) = try await store.beginMailAction(action, ownerID: owner, profileID: source.profileID,
+                conversationID: conversationId, origin: verified ? original : nil)
+            guard created || job.mailAction?.replyPreflight == true else { return false }
             return await store.recordMailAction(job.id, state: .failed, result: reason + " No send was attempted. The composed reply is retained here.")
         } catch { return false }
     }

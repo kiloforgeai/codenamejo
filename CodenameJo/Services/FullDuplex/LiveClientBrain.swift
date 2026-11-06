@@ -31,6 +31,18 @@ final class LiveClientBrain {
         return calendar.source(for: call)
     }
 
+    func replySource(for callID: String) -> String? {
+        guard functionItems[callID] != nil, replyComposition?.writeCall == callID else { return nil }
+        return replyComposition?.selection
+    }
+
+    private func recoverReplyPreflight() {
+        guard let composition = replyComposition, let call = composition.writeCall,
+              let job = Container.shared.dispatchJobs().preflightReply(call, source: composition.source) else { return }
+        replyComposition?.recover(job)
+        recordReplyComposition("reply_preflight_recovery")
+    }
+
     private func persistCalendarIntent() {
         guard let intent = calendar.intent else { return }
         let store = Container.shared.dispatchJobs(), owner = Container.shared.backend().userId, profile = ProfileRuntime.snapshot?.profileId
@@ -211,6 +223,7 @@ final class LiveClientBrain {
     func user(_ text: String, turn: Int, finalized: Bool = true) {
         userInputFinalized = finalized
         if finalized {
+            recoverReplyPreflight()
             if let replyComposition, let call = replyComposition.writeCall,
                LiveReplyComposition.requestsReply(text),
                Container.shared.dispatchJobs().resolvedMailCall(call, source: replyComposition.source) {
@@ -548,6 +561,7 @@ final class LiveClientBrain {
                 calendar.reconcile(jobs: Container.shared.dispatchJobs())
                 persistCalendarIntent()
             }
+            recoverReplyPreflight()
             functionItems.removeValue(forKey: id)
             while actionRecords.count > 12 { actionRecords.removeFirst() }
         }
@@ -932,13 +946,37 @@ final class LiveClientBrain {
                 }
                 if !calls.isEmpty { armCallWatchdog(for: calls) }
                 var localResultCalls = false
-                for item in output {
+                for originalItem in output {
+                    var item = originalItem
+                    if let name = item["name"] as? String, ["send_email", "reply_email", "create_draft"].contains(ToolNarration.canonical(name)),
+                       let id = item["call_id"] as? String, let composition = replyComposition,
+                       composition.writeCall == nil, composition.recoveryJobID == nil, !LiveReplyComposition.sameSource(DispatchJob.MailOrigin.captured(in: state), composition.source),
+                       let key = LiveEmailPresentation.Key.selection(composition.selection) {
+                        let args = (item["arguments"] as? String).flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] } ?? [:]
+                        let source = LocalCompose.ReplySource(selection: key, ownerID: Container.shared.backend().userId,
+                            profileID: ProfileRuntime.snapshot?.profileId, isCurrent: { false }, isOriginalRequestSource: true)
+                        let reason = "NOT SENT — the feed moved away from the original reply. The complete body is retained in Activity. Use Work on this email there, then retry. Nothing was sent or saved to Gmail."
+                        _ = await LocalCompose.retainReply(name, args: args, reason: reason, source: source,
+                            conversationId: nil, callID: id)
+                        guard requestScope == scopeRevision, requestTurn == currentTurn else { return }
+                        replyComposition?.writeCall = id
+                        self.item(["type": "function_call_output", "call_id": id, "output": reason])
+                        localResultCalls = true
+                        continue
+                    }
                     if let name = item["name"] as? String, let id = item["call_id"] as? String,
                        let refusal = replyComposition?.refusal(name: name, arguments: item["arguments"] as? String ?? "{}", selection: state) {
                         recordReplyComposition("reply_write_refused")
                         self.item(["type": "function_call_output", "call_id": id, "output": refusal])
                         localResultCalls = true
                         continue
+                    }
+                    if let name = item["name"] as? String, ["send_email", "reply_email", "create_draft"].contains(ToolNarration.canonical(name)),
+                       let body = replyComposition?.recoveredBody, replyComposition?.targetConfirmed == true,
+                       LiveReplyComposition.requestsRetry(latestUser), let raw = item["arguments"] as? String,
+                       var args = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any] {
+                        args["body"] = body
+                        item["arguments"] = GmailReadTools.json(args)
                     }
                     if item["type"] as? String == "message", needsExactCalendarSpeech,
                        CalendarAvailabilityEvidence.claimsAvailability(GmailReadTools.json(item)) { continue }

@@ -47,6 +47,58 @@ final class LiveClientBrainTests: XCTestCase {
         "name": "archive_message", "arguments": "{\"message_id\":\"a\"}"]
     @MainActor private func drain() async { for _ in 0..<20 { await Task.yield() } }
 
+    @MainActor func testReplyPreflightPreservesOriginalSourceAndFullBodyUntilExplicitRetry() async throws {
+        Container.shared.manager.push()
+        let old = ProfileRuntime.snapshot
+        ProfileRuntime.install(.init(profileId: "work", isDefault: false, emails: ["owner@example.test"]))
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { Scope.singleton.reset(); Container.shared.manager.pop(); ProfileRuntime.install(old); try? FileManager.default.removeItem(at: folder) }
+        let backend = BackendService(restoringSession: false); backend.userId = "reply-test"
+        Container.shared.backend.register { backend }
+        let jobs = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        Container.shared.dispatchJobs.register { jobs }
+        let h = Harness()
+        defer { h.brain.close(); for reply in h.replies { reply.resume(throwing: CancellationError()) }; h.replies = [] }
+        let a = #"{"done":false,"item":{"id":"A","threadId":"thread-A","account":"owner@example.test","subject":"Same subject"}}"#
+        let b = #"{"done":false,"item":{"id":"B","threadId":"thread-B","account":"other@example.test","subject":"Same subject"}}"#
+        let body = String(repeating: "All dictated details must survive. ", count: 80)
+        h.brain.updateState(a, scope: "work")
+        h.brain.user("Reply saying " + body, turn: 1)
+        h.brain.begin("reply", live: true, turn: 1); h.brain.settle(turn: 1)
+        await waitForRequest(1, in: h)
+        h.brain.updateState(b, scope: "work")
+        h.reply([["type": "function_call", "call_id": "preflight", "name": "send_email",
+            "arguments": GmailReadTools.json(["account": "owner@example.test", "thread_id": "thread-A", "reply_message_id": "A", "body": body])]])
+        await waitForRequest(2, in: h)
+        XCTAssertTrue(h.calls.isEmpty)
+        let rows = await jobs.history()
+        XCTAssertEqual(rows.first?.origin?.messageID, "A")
+        XCTAssertEqual(rows.first?.mailAction?.body, body)
+        let context = try XCTUnwrap(h.requests.last?["context"] as? String)
+        let pending = try XCTUnwrap((JSONSerialization.jsonObject(with: Data(context.utf8)) as? [String: Any])?["pendingReply"] as? [String: Any])
+        XCTAssertEqual(pending["preserved_body"] as? String, body)
+        h.reply([["type": "message", "content": [["text": "The reply is saved. Open its original email in Activity, then retry."]]]])
+        await drain()
+        h.brain.updateState(a, scope: "work")
+        h.brain.user("Retry the reply", turn: 2)
+        h.brain.begin("retry", live: true, turn: 2); h.brain.settle(turn: 2)
+        await waitForRequest(3, in: h)
+        h.reply([["type": "function_call", "call_id": "retry", "name": "send_email",
+            "arguments": GmailReadTools.json(["account": "owner@example.test", "thread_id": "thread-A", "reply_message_id": "A", "body": "Shortened by model"]) ]])
+        await waitForCalls(1, in: h)
+        XCTAssertEqual(h.calls.count, 1)
+        let args = try XCTUnwrap(h.calls.first?["arguments"] as? String)
+        XCTAssertEqual(ToolArguments(args).string("body"), body)
+        XCTAssertEqual(ToolArguments(args).string("reply_message_id"), "A")
+        h.brain.item(["type": "function_call_output", "call_id": "retry", "output": "Outcome unknown. Inspect the receipt before retrying."])
+        h.brain.continueResponse(delegation: "retry")
+        await waitForRequest(4, in: h)
+        h.reply([["type": "function_call", "call_id": "duplicate", "name": "send_email",
+            "arguments": args]])
+        await waitForRequest(5, in: h)
+        XCTAssertEqual(h.calls.count, 1)
+    }
+
     @MainActor func testConfirmedReplyTargetContinuesPreservedBodyInsteadOfAnotherDispositionQuestion() async throws {
         let h = Harness()
         let source = #"{"done":false,"item":{"id":"A","threadId":"thread-A","account":"owner@example.test","subject":"Coffee"}}"#
