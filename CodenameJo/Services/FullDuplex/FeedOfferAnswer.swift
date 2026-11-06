@@ -27,6 +27,16 @@ enum FeedOfferAnswer {
         // A qualified yes must never bypass a refusal. "Sure, why not" is a bare assent.
         if words.suffix(2) == ["why", "not"] { words.removeLast(2) }
         if words.contains(where: negatives.contains) { return .declined }
+        var requested = words
+        while let first = requested.first, affirmatives.contains(first) || fillers.contains(first) { requested.removeFirst() }
+        while let last = requested.last, ["please", "thanks"].contains(last) { requested.removeLast() }
+        let feedRequests: Set<String> = [
+            "let s do some cleanup", "lets do some cleanup", "let s do cleanup", "lets do cleanup",
+            "do some cleanup", "do cleanup", "go through my inbox", "go through the inbox",
+            "let s go through my inbox", "let s go through the inbox", "go through the feed",
+            "let s go through the feed", "start the feed", "start my inbox",
+        ]
+        if feedRequests.contains(requested.joined(separator: " ")) { return .accepted }
         if words == ["do"] || words == ["do", "it"] || words == ["go", "ahead"] { return .accepted }
         guard affirmatives.contains(first), words.count <= 6 else { return nil }
         let assentWords = affirmatives.union(["go", "ahead", "do", "it", "please", "thanks", "thank", "you"])

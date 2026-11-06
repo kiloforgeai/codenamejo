@@ -59,7 +59,8 @@ enum LiveOpenAI {
     }
 
     /// One brain step: `LivePrompt`'s Responses config plus the bounded task the client brain sends.
-    static func respond(brain: Data, body: [String: Any], diagnostics: VoiceDiagnostics.Session? = nil) async throws -> [String: Any] {
+    static func respond(brain: Data, body: [String: Any], diagnostics: VoiceDiagnostics.Session? = nil,
+                        onRequestSent: (() async -> Void)? = nil) async throws -> [String: Any] {
         guard var request = try JSONSerialization.jsonObject(with: brain) as? [String: Any] else {
             throw LiveBrainRequestError(status: 400, serverCode: "invalid_request")
         }
@@ -68,6 +69,12 @@ enum LiveOpenAI {
             request["tools"] = presentationTools(request["tools"] as? [[String: Any]] ?? [])
             request["instructions"] = (request["instructions"] as? String ?? "") + "\nThis request is presentation-only. The application already performed the action. Present its recorded outcome and current queue item; retrieve selected email bodies if needed. Never repeat a write, dispatch or queue advance. If the result says the application is presenting it, return no user-facing text."
         }
+        var tools = request["tools"] as? [[String: Any]] ?? []
+        tools.append(["type": "function", "name": "read_tool_result",
+            "description": "Read the next bounded page of a retained tool result. This reads local data and never reexecutes the original tool. Use the source_call_id and next_offset supplied by a partial result.",
+            "parameters": ["type": "object", "properties": ["source_call_id": ["type": "string"], "offset": ["type": "integer", "minimum": 0]],
+                "required": ["source_call_id", "offset"], "additionalProperties": false]])
+        request["tools"] = tools
         request["input"] = input
         request["store"] = false
         request["include"] = ["reasoning.encrypted_content"]
@@ -78,6 +85,8 @@ enum LiveOpenAI {
 
         let started = ProcessInfo.processInfo.systemUptime
         let requestID = body["requestId"] as? String ?? UUID().uuidString
+        let urlRequest = try post("responses", body: JSONSerialization.data(withJSONObject: request), timeout: 45)
+        await onRequestSent?()
         diagnostics?.record(.brainRequest, ["request_id": requestID, "turn_id": body["turnID"] as? String ?? "unknown", "delegation_id": body["delegationId"] as? String ?? "unknown", "model": LivePrompt.brainModel,
             "instructions_bytes": String(bytes(request["instructions"] ?? "")),
             "tools_bytes": String(bytes(request["tools"] ?? [])), "input_bytes": String(bytes(input))])
@@ -86,8 +95,7 @@ enum LiveOpenAI {
             if !completed { diagnostics?.record(.brainResponse, ["request_id": requestID, "outcome": Task.isCancelled ? "cancelled" : "failed",
                 "duration_ms": String(Int((ProcessInfo.processInfo.systemUptime - started) * 1000))]) }
         }
-        let (data, response) = try await URLSession.shared.data(
-            for: try post("responses", body: JSONSerialization.data(withJSONObject: request), timeout: 45))
+        let (data, response) = try await URLSession.shared.data(for: urlRequest)
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         let errorEnvelope = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         diagnostics?.record(.brainResponse, ["request_id": requestID, "http_status": String(status),

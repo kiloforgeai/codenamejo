@@ -97,6 +97,12 @@ struct HistoryView<Interactor: ViewWithModelLifecycleObserver<HistoryViewModel> 
             .navigationBarTitleDisplayMode(.inline)
             // History sits left of the voice screen; the chevron points toward home.
             .toolbar {
+                #if targetEnvironment(macCatalyst)
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { onClose?() }
+                        .accessibilityIdentifier("historyBackButton")
+                }
+                #else
                 ToolbarItem(placement: .cancellationAction) {
                     Button {
                         onClose?()
@@ -109,6 +115,7 @@ struct HistoryView<Interactor: ViewWithModelLifecycleObserver<HistoryViewModel> 
                     .accessibilityLabel("Back")
                     .accessibilityIdentifier("historyBackButton")
                 }
+                #endif
             }
             .alert("Delete Command", isPresented: $viewModel.showDeleteAlert) {
                 Button("Delete", role: .destructive) {
@@ -810,13 +817,21 @@ struct HistoryView<Interactor: ViewWithModelLifecycleObserver<HistoryViewModel> 
             Text("No command history yet")
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(Theme.textSecondary)
-            Text("Your voice commands will appear here after you issue them from the Command tab.")
+            Text(historyEmptyMessage)
                 .font(.system(size: 13))
                 .foregroundStyle(Theme.textTertiary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 40)
             Spacer()
         }
+    }
+
+    private var historyEmptyMessage: String {
+        #if targetEnvironment(macCatalyst)
+        "Your conversations with Jo will appear here after a session."
+        #else
+        "Your voice commands will appear here after you issue them from the Command tab."
+        #endif
     }
 }
 
@@ -1064,7 +1079,7 @@ final class HistoryViewInteractor: ViewModelInteractor<HistoryViewModel> {
         switch viewModel.grouping {
         case .actions:
             names = Set(allActionRecords.map { $0.serviceName })
-                .union(allDispatchJobs.map { RealtimeService.inferService(from: $0.task) })
+                .union(allDispatchJobs.map { CommandRecord.inferService(from: $0.task) })
         case .conversations:
             names = Set(commands.map { $0.serviceName })
         }
@@ -1093,7 +1108,7 @@ final class HistoryViewInteractor: ViewModelInteractor<HistoryViewModel> {
         if let service, service != "All" {
             actions = allActionRecords.filter { $0.serviceName == service }
             jobs = allDispatchJobs.filter {
-                RealtimeService.inferService(from: $0.task) == service
+                CommandRecord.inferService(from: $0.task) == service
             }
         } else {
             actions = allActionRecords

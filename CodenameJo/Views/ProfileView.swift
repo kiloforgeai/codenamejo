@@ -153,9 +153,9 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
                 .scrollContentBackground(.hidden)
                 .frame(maxWidth: 700)
                 #if targetEnvironment(macCatalyst)
-                .environment(\.defaultMinListRowHeight, 60)
-                .listSectionSpacing(28)
-                .contentMargins(.vertical, 16)
+                .environment(\.defaultMinListRowHeight, 54)
+                .listSectionSpacing(20)
+                .contentMargins(.vertical, 8)
                 .frame(maxWidth: .infinity)
                 #endif
             }
@@ -252,7 +252,7 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
             .accessibilityIdentifier("joTipsToggle")
             .listRowBackground(Theme.surface)
 
-            // `VoiceSettings.voiceNotes` says what off stops and why turning it back on takes a relaunch.
+            #if !targetEnvironment(macCatalyst)
             Toggle(isOn: voiceNotes) {
                 SettingsRow.label(
                     "Voice notes",
@@ -267,8 +267,13 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
             .tint(Theme.toggleOn)
             .accessibilityIdentifier("voiceNotesToggle")
             .listRowBackground(Theme.surface)
+            #endif
 
             Toggle(isOn: $allLocal) {
+                #if targetEnvironment(macCatalyst)
+                SettingsRow.label("Fully local mode", icon: "desktopcomputer",
+                    detail: "Use on-device speech recognition and the Mac’s system voice. Gmail actions use your direct Google connection. When this is off, Jo uses Live voice and the system voice can step in if the call drops.")
+                #else
                 SettingsRow.label(
                     "Fully local mode",
                     icon: "iphone.and.arrow.forward",
@@ -280,6 +285,7 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
                         + "voice still steps in on its own whenever the live call can't connect "
                         + "or drops, keeping your mail and calendar while there's a connection."
                 )
+                #endif
             }
             .tint(Theme.toggleOn)
             .accessibilityIdentifier("allLocalToggle")

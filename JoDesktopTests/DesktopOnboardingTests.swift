@@ -1,10 +1,26 @@
 import Combine
 import AVFoundation
+import FactoryKit
 import XCTest
 @testable import CodenameJo
 
 @MainActor
 final class DesktopOnboardingTests: XCTestCase {
+    override func setUp() async throws {
+        try await super.setUp()
+        Container.shared.manager.push()
+        let realtime = RealtimeService()
+        let audioQueue = AudioQueue()
+        Container.shared.realtimeService.register { realtime }
+        Container.shared.onboardingAudioQueue.register { audioQueue }
+    }
+
+    override func tearDown() async throws {
+        Scope.singleton.reset()
+        Container.shared.manager.pop()
+        try await super.tearDown()
+    }
+
     func testMacWithoutMicrophoneSpeaksAndCanContinueWithoutStartingCapture() async {
         let model = OnboardingSayItViewModel()
         var advances = 0

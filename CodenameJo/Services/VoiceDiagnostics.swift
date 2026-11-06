@@ -9,7 +9,7 @@ final class VoiceDiagnostics: @unchecked Sendable {
         case liveConnected, liveEvent, microphoneStarted, remoteAudioObserved
         case fallbackSelected, fallbackReady, fallbackFailed, audioReleased, turnStarted, turnFailed
         case speechRequested, speechStarted, speechFinished, speechCancelled, speechFailed
-        case turnTransition, toolStarted, toolFinished, brainRequest, brainResponse
+        case turnTransition, toolStarted, toolFinished, brainRequest, brainResponse, brainAttemptEnded
         case jobStarted, jobFinished, jobDeferred, jobInjected, jobSpeechStarted, jobSpeechCancelled, queueRecovery, calendarReceipt, modelAvailability, audioRouteChanged
         case workspaceRendered, presentationBound, playbackBoundary, offerTransition, resultSelected
     }
@@ -35,14 +35,29 @@ final class VoiceDiagnostics: @unchecked Sendable {
     private let logger = Logger(subsystem: "com.kiloforge.jo.desktop", category: "voice-session")
     private let directory: URL
     private let maximumBytes: Int
+    private let lifecycleMaximumBytes: Int
+    private struct Coverage: Codable {
+        var sessionID: String
+        var userID: String?
+        var conversationID: String?
+        var started: Double
+        var ended: Double?
+        var expected = 0
+        var coreExpected = 0
+        var firstSequence: Int
+        var lastSequence: Int
+    }
+    private var coverage: [String: Coverage] = [:]
     private let retainedFiles = 4
     private var sequence = 0
     private let version: String
 
     init(directory: URL = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("Logs/Jo", isDirectory: true), maximumBytes: Int = 512_000) {
+        .appendingPathComponent("Logs/Jo", isDirectory: true), maximumBytes: Int = 512_000,
+         lifecycleMaximumBytes: Int = 2_000_000) {
         self.directory = directory
         self.maximumBytes = maximumBytes
+        self.lifecycleMaximumBytes = lifecycleMaximumBytes
         version = "\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")"
             + " (\(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown"))"
     }
@@ -71,12 +86,20 @@ final class VoiceDiagnostics: @unchecked Sendable {
         "requested_start", "requested_end", "stored_start", "stored_end", "available", "provider_request_id", "provider_response_id",
         "render_revision", "queue_scope", "observation_phase", "window_id", "profile_hash", "response_hash",
         "response_role", "focus_mode", "visible_count", "queue_target_hash", "queue_order", "mismatch",
-        "response_item_id", "playback_id", "selection_state", "displayed_position", "displayed_total", "job_states", "attribution"
+        "response_item_id", "playback_id", "selection_state", "displayed_position", "displayed_total", "job_states", "attribution",
+        "raw_target_hash", "raw_focus_state", "display_branch",
+        "stage", "recovery", "request_sent", "byte_limit", "total_bytes", "tool_result_bytes",
+        "currentSelection_bytes", "requestSelection_bytes", "latestAssistant_bytes", "pendingQuestion_bytes",
+        "questionSelection_bytes", "recordedActions_bytes", "completedJobs_bytes", "applicationUpdates_bytes",
+        "current_turn_bytes", "selectionStatus_bytes", "selectionRule_bytes",
+        "expected_events", "available_events", "expected_range", "available_ranges", "missing_ranges",
+        "missing_range_count", "dropped_events", "core_expected", "core_available", "core_complete",
+        "complete", "ended", "started_at", "ended_at", "first_sequence", "last_sequence", "coverage_known"
     ]
 
     static func safeFields(_ fields: [String: String]) -> [String: String] {
         fields.filter { key, value in
-            allowedFields.contains(key) && !value.isEmpty && value.count <= (["queue_order", "job_states"].contains(key) ? 4096 : 160)
+            allowedFields.contains(key) && !value.isEmpty && value.count <= (["queue_order", "job_states", "available_ranges", "missing_ranges"].contains(key) ? 4096 : 160)
                 && (key != "queue_order" || value.range(of: "^[a-f0-9,]+$", options: .regularExpression) != nil)
                 && !value.lowercased().contains("sk-") && !value.lowercased().contains("bearer")
                 && value.range(of: "^[A-Za-z0-9_.:/(), +-]+$", options: .regularExpression) != nil
@@ -88,18 +111,39 @@ final class VoiceDiagnostics: @unchecked Sendable {
         let safe = Self.safeFields(fields)
         queue.async { [self] in
             sequence += 1
+            let id = session.id.uuidString
+            var span = coverage[id] ?? Coverage(sessionID: id, userID: session.userID,
+                conversationID: session.conversationID?.uuidString, started: timestamp,
+                firstSequence: sequence, lastSequence: sequence)
+            span.expected += 1
+            if event != .workspaceRendered { span.coreExpected += 1 }
+            span.lastSequence = sequence
+            if event == .sessionEnded { span.ended = timestamp }
+            coverage[id] = span
             var row: [String: Any] = ["timestamp": timestamp, "elapsed_ms": elapsed,
                 "sequence": sequence, "session_id": session.id.uuidString,
+                "session_sequence": span.expected,
                 "event": event.rawValue, "app_version": version, "schema_version": 2,
                 "source_revision": Bundle.main.infoDictionary?["JoSourceRevision"] as? String ?? "unknown", "fields": safe]
             if let userID = session.userID { row["user_id"] = userID }
             if let conversationID = session.conversationID { row["conversation_id"] = conversationID.uuidString }
+            if event != .workspaceRendered { row["core_sequence"] = span.coreExpected }
             do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let manifest = sessionPath(span, suffix: "json")
+                try JSONEncoder().encode(span).write(to: manifest, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: manifest.path)
                 var data = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
                 let line = String(decoding: data, as: UTF8.self)
                 logger.notice("\(line, privacy: .public)")
                 data.append(0x0a)
+                if event != .workspaceRendered {
+                    let file = sessionPath(span, suffix: "jsonl")
+                    let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                    if size + data.count <= lifecycleMaximumBytes { try appendFile(data, file: file, durable: true) }
+                }
                 try append(data, prefix: "voice-session")
+                try pruneSessions(userID: session.userID)
             } catch {
                 logger.error("Voice diagnostic write failed: \(error.localizedDescription, privacy: .public)")
             }
@@ -108,6 +152,69 @@ final class VoiceDiagnostics: @unchecked Sendable {
 
     private func path(_ index: Int, prefix: String = "voice-session") -> URL {
         directory.appendingPathComponent("\(prefix)-\(index).jsonl")
+    }
+
+    private func sessionPrefix(_ userID: String?) -> String {
+        "lifecycle-" + Self.feedbackPrefix(userID: userID ?? "anonymous") + "-"
+    }
+
+    private func sessionPath(_ span: Coverage, suffix: String) -> URL {
+        directory.appendingPathComponent(sessionPrefix(span.userID) + span.sessionID + "." + suffix)
+    }
+
+    private func retainedSessions(userID: String?) throws -> [Coverage] {
+        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
+        return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix(sessionPrefix(userID)) && $0.pathExtension == "json" }
+            .map { try JSONDecoder().decode(Coverage.self, from: Data(contentsOf: $0)) }
+            .filter { $0.userID == userID }.sorted { $0.started > $1.started }
+    }
+
+    private func pruneSessions(userID: String?) throws {
+        for span in try retainedSessions(userID: userID).dropFirst(3) {
+            for suffix in ["json", "jsonl"] {
+                let file = sessionPath(span, suffix: suffix)
+                if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+            }
+        }
+    }
+
+    private static func ranges(_ numbers: [Int]) -> [String] {
+        var result: [String] = []
+        var start: Int?, end = 0
+        for number in numbers {
+            if let first = start, number != end + 1 {
+                result.append(first == end ? String(first) : "\(first):\(end)")
+                start = nil
+            }
+            if start == nil { start = number }
+            end = number
+        }
+        if let start { result.append(start == end ? String(start) : "\(start):\(end)") }
+        return result
+    }
+
+    private func manifest(_ span: Coverage, rows: [[String: Any]]) -> [String: Any] {
+        let rows = rows.filter { $0["session_id"] as? String == span.sessionID }
+        let present = Set(rows.compactMap { $0["session_sequence"] as? Int })
+        let core = Set(rows.compactMap { $0["core_sequence"] as? Int })
+        let missing = Self.ranges((1...max(1, span.expected)).filter { !present.contains($0) })
+        let availableRanges = Self.ranges(present.sorted()).prefix(200).joined(separator: ",")
+        let ended = span.ended.map { String($0) } ?? "unknown"
+        let fields: [String: String] = ["expected_events": String(span.expected), "available_events": String(present.count),
+            "expected_range": "1:\(span.expected)", "available_ranges": availableRanges,
+            "missing_ranges": missing.prefix(200).joined(separator: ","), "missing_range_count": String(missing.count),
+            "dropped_events": String(max(0, span.expected - present.count)),
+            "core_expected": String(span.coreExpected), "core_available": String(core.count),
+            "core_complete": String(core.count == span.coreExpected && span.ended != nil),
+            "complete": String(present.count == span.expected && span.ended != nil), "coverage_known": "true",
+            "ended": String(span.ended != nil), "started_at": String(span.started), "ended_at": ended,
+            "first_sequence": String(span.firstSequence), "last_sequence": String(span.lastSequence)]
+        var value: [String: Any] = ["event": "sessionManifest", "session_id": span.sessionID,
+            "timestamp": span.started, "fields": fields]
+        value["user_id"] = span.userID
+        value["conversation_id"] = span.conversationID
+        return value
     }
 
     static func protocolFields(_ event: [String: Any]) -> [String: String]? {
@@ -150,6 +257,10 @@ final class VoiceDiagnostics: @unchecked Sendable {
         let file = path(0, prefix: prefix)
         let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         if size + data.count > maximumBytes { try rotate(prefix: prefix) }
+        try appendFile(data, file: file, durable: durable)
+    }
+
+    private func appendFile(_ data: Data, file: URL, durable: Bool) throws {
         if !FileManager.default.fileExists(atPath: file.path) {
             try Data().write(to: file, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
@@ -178,6 +289,7 @@ final class VoiceDiagnostics: @unchecked Sendable {
                     if let value = context.conversationID { row["conversation_id"] = value.uuidString }
                     if let value = context.profileID { row["profile_id"] = value }
                     if let value = context.renderRevision { row["render_revision"] = value }
+                    if let value = context.turnID { row["turn_id"] = value }
                     var data = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
                     data.append(0x0a)
                     try append(data, prefix: Self.feedbackPrefix(userID: userID), durable: true)
@@ -205,14 +317,41 @@ final class VoiceDiagnostics: @unchecked Sendable {
             queue.async { [self] in
                 do {
                     var data = Data()
-                    for index in (0..<retainedFiles).reversed() where FileManager.default.fileExists(atPath: path(index).path) {
-                        let file = try Data(contentsOf: path(index))
+                    var rows: [[String: Any]] = []
+                    var seen = Set<String>()
+                    func collect(_ file: Data) throws {
                         for line in file.split(separator: 0x0a) {
                             guard let row = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
                                   row["user_id"] as? String == userID else { continue }
-                            data.append(contentsOf: line)
-                            data.append(0x0a)
+                            let key = "\(row["session_id"] ?? "unknown"):\(row["sequence"] ?? 0)"
+                            if seen.insert(key).inserted { rows.append(row) }
                         }
+                    }
+                    for index in (0..<retainedFiles).reversed() where FileManager.default.fileExists(atPath: path(index).path) {
+                        try collect(Data(contentsOf: path(index)))
+                    }
+                    let spans = try retainedSessions(userID: userID)
+                    for span in spans {
+                        let file = sessionPath(span, suffix: "jsonl")
+                        if FileManager.default.fileExists(atPath: file.path) { try collect(Data(contentsOf: file)) }
+                    }
+                    rows.sort {
+                        let a = $0["timestamp"] as? Double ?? 0, b = $1["timestamp"] as? Double ?? 0
+                        return a == b ? ($0["sequence"] as? Int ?? 0) < ($1["sequence"] as? Int ?? 0) : a < b
+                    }
+                    let known = Set(spans.map(\.sessionID))
+                    let older = Dictionary(grouping: rows.filter { !known.contains($0["session_id"] as? String ?? "") },
+                        by: { $0["session_id"] as? String ?? "unknown" }).map { id, entries -> [String: Any] in
+                            var row: [String: Any] = ["event": "sessionManifest", "session_id": id,
+                                "fields": ["coverage_known": "false", "complete": "false", "core_complete": "false",
+                                    "available_events": String(entries.count), "reason": "outside_retained_coverage"]]
+                            row["user_id"] = userID
+                            row["conversation_id"] = entries.first?["conversation_id"]
+                            return row
+                        }
+                    for row in rows + spans.reversed().map({ manifest($0, rows: rows) }) + older {
+                        data.append(try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys]))
+                        data.append(0x0a)
                     }
                     if let userID, !userID.isEmpty {
                         let prefix = Self.feedbackPrefix(userID: userID)

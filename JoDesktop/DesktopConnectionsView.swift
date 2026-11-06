@@ -7,10 +7,10 @@ struct DesktopConnectionsView<Interactor: ViewWithModelLifecycleObserver<Profile
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
+            VStack(alignment: .leading, spacing: 22) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Connections")
-                        .font(.largeTitle.bold())
+                        .font(.system(size: 26, weight: .semibold))
                         .foregroundStyle(Theme.textPrimary)
                     Text("Bring your work into Jo. Manage accounts and add the services you use.")
                         .font(.body)
@@ -59,7 +59,7 @@ struct DesktopConnectionsView<Interactor: ViewWithModelLifecycleObserver<Profile
                 .font(.footnote)
                 .foregroundStyle(Theme.textSecondary)
             }
-            .padding(32)
+            .padding(24)
             .frame(maxWidth: 760, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .top)
         }
@@ -142,7 +142,7 @@ private struct DesktopConnectionRow: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(Theme.textTertiary)
         }
-        .padding(20)
+        .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(hovering ? Theme.surfaceSecondary : Color.clear)
         .contentShape(Rectangle())

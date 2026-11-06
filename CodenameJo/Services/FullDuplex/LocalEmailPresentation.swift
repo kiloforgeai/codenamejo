@@ -209,7 +209,8 @@ enum LocalEmailPresentation {
                             textComplete: !extracted.text.isEmpty && !isMarkupDominatedText(extracted.text)
                                 && extracted.text.utf8.count <= FeedEmailContent.perMessageBytes,
                             attachments: files.map { .init(name: $0.filename, mimeType: $0.mimeType, size: $0.size) },
-                            fromMe: (m.labelIds ?? []).contains("SENT")))
+                            fromMe: (m.labelIds ?? []).contains("SENT"),
+                            fullReadComplete: FullEmailSource.completeInlinePlain(m.payload)))
     }
 
     static func describeSize(_ bytes: Int) -> String {
@@ -258,13 +259,14 @@ enum LocalEmailPresentation {
     }
 
     /// An email's HTML as the text its recipient can read: hidden elements, scripts and styles dropped.
-    static func htmlToText(_ html: String) -> String {
+    static func htmlToText(_ html: String, includeLinkTargets: Bool = false) -> String {
         let removed: Set<String> = ["script", "style", "noscript", "head", "svg", "title"]
         let blocks: Set<String> = ["p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6"]
         let voids: Set<String> = ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
                                   "source", "track", "wbr"]
         var out = ""
         var skip: (name: String, depth: Int)?
+        var link: (url: String, start: String.Index)?
         var i = html.startIndex
         while i < html.endIndex {
             let next = html.index(after: i)
@@ -292,10 +294,30 @@ enum LocalEmailPresentation {
                     continue
                 }
                 if closing {
+                    if name == "a", let target = link {
+                        if String(out[target.start...]).trimmingCharacters(in: .whitespacesAndNewlines) != target.url {
+                            out += " (" + target.url + ")"
+                        }
+                        link = nil
+                    }
                     if blocks.contains(name) { out += "\n" }
                     continue
                 }
                 if name == "br" { out += "\n"; continue }
+                if includeLinkTargets, !hidden(tag) {
+                    if name == "li" {
+                        if !out.hasSuffix("\n") { out += "\n" }
+                        out += "• "
+                    }
+                    if name == "a", let expression = try? NSRegularExpression(pattern: #"\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#, options: .caseInsensitive),
+                       let match = expression.firstMatch(in: tag, range: NSRange(tag.startIndex..., in: tag)),
+                       let raw = (1...3).compactMap({ Range(match.range(at: $0), in: tag).map { String(tag[$0]) } }).first {
+                        let url = decodeEntities(raw)
+                        if ["https://", "http://", "mailto:"].contains(where: { url.lowercased().hasPrefix($0) }) {
+                            link = (url, out.endIndex)
+                        }
+                    }
+                }
                 guard !selfClosing, removed.contains(name) || hidden(tag) else { continue }
                 // Script and style bodies are raw text: their end tag is the only way out.
                 if ["script", "style", "title"].contains(name) {

@@ -18,7 +18,7 @@ extension FullDuplexVoiceClient {
         guard rendered.conversationID == realtime.activeConversationId,
               rendered.permits(.init(account: key.account, messageID: key.messageId), profileID: ProfileRuntime.snapshot?.profileId) else {
             return "Not executed: the displayed email and conversation selection are not synchronized. "
-                + "Confirm the sender and subject of the displayed email before acting. Do not retry this write unchanged or advance the feed."
+                + "Select the original email from its returned work card before retrying. Confirming a sender or subject alone cannot restore a selection. Do not retry this write unchanged or advance the feed."
         }
         #endif
         return nil

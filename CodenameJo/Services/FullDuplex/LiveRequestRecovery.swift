@@ -23,6 +23,8 @@ enum LiveRequestRecovery {
         let verbs: Set<String> = ["archive", "delete", "trash", "spam", "skip", "next", "unsubscribe", "label", "snooze"]
         return tokens.first.map(verbs.contains) == true || tokens.starts(with: ["go", "to", "next"])
             || tokens.starts(with: ["move", "on"])
+            || tokens.starts(with: ["get", "this", "out", "of", "my", "inbox"])
+            || tokens.starts(with: ["get", "it", "out", "of", "my", "inbox"])
     }
 
     static func refersToCurrentMessage(_ text: String) -> Bool {
@@ -34,7 +36,7 @@ enum LiveRequestRecovery {
         var words = FullDuplexVoiceClient.normalize(text).split(separator: " ").map(String.init)
         while let first = words.first, first != "no", questionFillers.contains(first) { words.removeFirst() }
         return words.first == "no" || words.first == "not" || words.starts(with: ["don", "t"])
-            || words.starts(with: ["do", "not"])
+            || words.starts(with: ["do", "not"]) || words.first == "keep"
     }
     /// A caption pause cannot turn the verb completing a negation/reminder into authorization.
     static func hasUnfinishedAuthorizationPrefix(_ text: String) -> Bool {

@@ -23,6 +23,7 @@ struct FeedEmailContent: Codable, Sendable, Equatable {
         var textComplete: Bool
         var attachments: [Attachment]
         var fromMe: Bool = false
+        var fullReadComplete: Bool? = nil
     }
 
     var messages: [Message]

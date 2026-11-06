@@ -528,8 +528,63 @@ extension FullDuplexVoiceClient {
     /// one. The cost of that is `unspokenHandoffThisTurn`, because the two things in
     /// `response.done` that stand down for a pending tool both key off exactly those
     /// fields.
+    func trySavedCommandRetry(_ text: String) -> Bool {
+        let callID = "command-retry-" + UUID().uuidString
+        guard let retry = failedCommandRetry, CommandRetryText.matches(text, keyword: retry.keyword),
+              let adapter = transport?.liveAdapter,
+              adapter.beginFastAction(callId: callID, action: nil, routed: true) else { return false }
+        adapter.resolveLocalInput(applicationResult: "The application owns this explicit saved-command retry. Wait for its actual result; do not reintroduce a stale email, dispatch, write or advance.", allowPresentation: false)
+        let dial = dialGeneration, turn = liveUserTurn
+        let historyID = historyTurnID
+        let profile = ProfileRuntime.snapshot?.profileId
+        toolCalledThisResponse = true
+        Task { [weak self] in
+            guard let self else { return }
+            @MainActor func refused(_ message: String) {
+                historyJobOutcomes[historyID] = .failed
+                guard isActive, dial == dialGeneration else { return }
+                if historyTurnID == historyID { onToolFailed?("commands") }
+                diagnostics?.record(.turnTransition, ["transition": "command_retry_refused", "job_id": retry.id.uuidString,
+                    "turn_id": historyID.uuidString])
+                postDispatchOutput(callId: callID, startedWork: false, output: "Not started. " + message)
+            }
+            guard let job = dispatchJobs.latestCommandAttempt(from: retry.id),
+                  let saved = customCommands.commands.first(where: { $0.keyword == retry.keyword }) else {
+                refused("The failed command is unavailable in this profile. Select its original result in the correct profile before retrying."); return
+            }
+            let accounts = await localTriage.resultSelectionAccounts()
+            let plan: DispatchJob.CommandRun
+            do { plan = try job.commandRetry(using: saved, profileID: profile, accounts: accounts) }
+            catch { refused(error.localizedDescription); return }
+            guard isActive, dial == dialGeneration, turn == liveUserTurn, profile == ProfileRuntime.snapshot?.profileId else {
+                refused("The conversation changed before retrying. No new work started."); return
+            }
+            if let error = await selectReturnedResult(job.id, localActionID: callID) { refused(error); return }
+            guard let origin = job.origin else { refused("The original email is unavailable."); return }
+            let selected = MailSelection(account: origin.account, messageID: origin.messageID)
+            let realtime = Container.shared.realtimeService()
+            for _ in 0..<40 {
+                guard isActive, dial == dialGeneration, turn == liveUserTurn,
+                      profile == ProfileRuntime.snapshot?.profileId, !Task.isCancelled else {
+                    refused("The conversation changed before retrying. No new work started."); return
+                }
+                if let rendered = realtime.renderedWorkspace,
+                   rendered.conversationID == realtime.activeConversationId,
+                   rendered.permits(selected, profileID: profile) {
+                    diagnostics?.record(.turnTransition, ["transition": "command_retry_restored", "job_id": job.id.uuidString,
+                        "turn_id": historyTurnID.uuidString, "target_hash": diagnostics?.target(selected.canonical) ?? "unknown"])
+                    startDispatch(callId: callID, argumentsJSON: GmailReadTools.json(["command": saved.keyword]), commandRetry: plan)
+                    return
+                }
+                do { try await Task.sleep(for: .milliseconds(50)) } catch { refused("Retry cancelled before any action."); return }
+            }
+            refused("The original email is selected, but the window has not displayed it yet. Let it appear, then say run it again.")
+        }
+        return true
+    }
+
     func startDispatch(callId: String, argumentsJSON: String,
-                       requestedBackground: Bool = false) {
+                       requestedBackground: Bool = false, commandRetry: DispatchJob.CommandRun? = nil) {
         let arguments = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8)))
             as? [String: Any]
         let requestedCommand = (arguments?["command"] as? String)?
@@ -577,12 +632,42 @@ extension FullDuplexVoiceClient {
                     + "Tell the user that plainly and do not invent any.")
                 return
             }
+            if let commandRetry, commandRetry.actions != savedCommand.actions || commandRetry.keyword != savedCommand.keyword {
+                postDispatchOutput(callId: callId, startedWork: false, output: "Not started. The saved command changed during recovery. Retry with its current definition.")
+                return
+            }
         }
         // A saved command wins if a loose model supplied both fields. The exact stored
         // steps are authoritative; combining them with a paraphrased `task` is how a
         // command gets duplicated or subtly changed.
         let task = savedCommand.map { Self.dispatchTask(for: $0) } ?? freeTextTask
         let isSavedCommand = savedCommand != nil
+        if commandRetry == nil, let savedCommand, let pending = failedCommandRetry,
+           pending.keyword == savedCommand.keyword, let previous = dispatchJobs.latestCommandAttempt(from: pending.id),
+           let original = previous.origin, let selected = standingStep.flatMap(LiveEmailPresentation.Key.step),
+           selected.account.caseInsensitiveCompare(original.account) == .orderedSame,
+           selected.selectedIDs == [original.messageID] {
+            do {
+                let accounts = try GmailReadTools.targets(["account": original.account])
+                let plan = try previous.commandRetry(using: savedCommand, profileID: ProfileRuntime.snapshot?.profileId, accounts: accounts)
+                startDispatch(callId: callId, argumentsJSON: argumentsJSON, requestedBackground: requestedBackground, commandRetry: plan)
+            } catch {
+                historyJobOutcomes[historyTurnID] = .failed
+                onToolFailed?("commands")
+                postDispatchOutput(callId: callId, startedWork: false, output: "Not started. " + error.localizedDescription)
+            }
+            return
+        }
+        let commandRun = commandRetry ?? savedCommand.map { DispatchJob.CommandRun(keyword: $0.keyword, actions: $0.actions) }
+        let retrySource = commandRetry?.retryOf.flatMap { dispatchJobs.commandResult($0)?.origin }
+        if commandRetry != nil {
+            guard let retrySource, let selected = standingStep.flatMap(LiveEmailPresentation.Key.step),
+                  selected.account.caseInsensitiveCompare(retrySource.account) == .orderedSame,
+                  selected.selectedIDs == [retrySource.messageID] else {
+                postDispatchOutput(callId: callId, startedWork: false, output: "Not started. The restored command source changed before dispatch. Select its original result and retry.")
+                return
+            }
+        }
         // What the screen, History and the spoken report call this job. The worker prompt
         // above is not for reading back.
         let displayTask = savedCommand.map { "Run saved command “\($0.title)”" } ?? freeTextTask
@@ -736,7 +821,7 @@ extension FullDuplexVoiceClient {
         // as dealing with the message the user is standing on, and its answer comes back on
         // a step of the queue rather than in a separate ack.
         let mailQueueLive = queueStanding() != nil
-        let dispatchUsesQueue = mailQueueLive && relatesToEmail
+        let dispatchUsesQueue = mailQueueLive && relatesToEmail && commandRetry == nil
         // Mid-queue the answer comes back as a step of the queue rather than out of the blue,
         // so the ack says which — a model told to expect a note is a model that treats the
         // step carrying it as something else.
@@ -770,6 +855,7 @@ extension FullDuplexVoiceClient {
         // treats it as an idempotency key and answers a repeat from the stored row
         // rather than running a second minute-long agent turn.
         let jobId = UUID()
+        if commandRetry != nil { failedCommandRetry = nil }
         let operation: DispatchMailOperation? = {
             guard expects == .receipt, !isSavedCommand, relatesToEmail,
                   let anchor = liveQueueActionAnchor?.step ?? standingStep,
@@ -806,13 +892,14 @@ extension FullDuplexVoiceClient {
             // and the broker is the only side that can know it in time. It classifies; the
             // phone only carries the words. See `queueAdvanceAfterDispatch`.
 
-            var standingOnJSON: String?
+            var standingOnJSON: String? = retrySource.map { GmailReadTools.json([
+                "id": $0.messageID, "threadId": $0.threadID, "account": $0.account, "from": $0.sender, "subject": $0.subject]) }
             var unresolvedDispatchContext: String?
             // The same message as `standingOnJSON`, kept in a form this process can read.
             // Only ever set on the local branch, the only queue that can serve the answer.
-            var presentAbout: LocalTriageQueue.Outcome.About?
+            var presentAbout: LocalTriageQueue.Outcome.About? = retrySource?.about
             var pinnedCleanupQuery: String?
-            let reconciliation = relatesToEmail && expects != .answer
+            let reconciliation = commandRetry == nil && relatesToEmail && expects != .answer
                 ? await localTriage.dispatchReconciliation(account: account) : nil
             if dispatchUsesQueue {
                 // **`localTriage.currentId` is non-nil exactly when this phone owns the walk,
@@ -933,7 +1020,8 @@ extension FullDuplexVoiceClient {
                 id: jobId, task: task,
                 account: account, facts: handoverFacts, standingOnJSON: standingOnJSON,
                 expects: expects, scope: isSavedCommand ? nil : scope,
-                commandSteps: savedCommand?.actions, progress: progress, diagnostics: self?.diagnostics,
+                commandSteps: savedCommand.map { Array($0.actions.dropFirst(commandRun?.completedSteps ?? 0)) },
+                command: commandRun, progress: progress, diagnostics: self?.diagnostics,
                 turnID: self?.dispatchHistory[jobId]?.id.uuidString, operation: operation)
             let outcome = await HangUpRunway.run(
                 "Finishing a job", subtitle: "It keeps going if you hang up.", progress: progress
@@ -943,6 +1031,7 @@ extension FullDuplexVoiceClient {
             // Cannot race the assignment above: the body always suspends at the
             // `await` before reaching this line.
             self.dispatchTasks[callId] = nil
+            if outcome.ok == false, let savedCommand { self.failedCommandRetry = (jobId, savedCommand.keyword) }
             if let history = self.dispatchHistory[jobId] {
                 self.historyJobOutcomes[history.id] = outcome.status ?? (outcome.ok == false ? .failed : outcome.ok == true ? .success : .conversational)
                 if self.historyTurnID == history.id {

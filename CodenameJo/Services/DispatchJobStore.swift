@@ -71,6 +71,22 @@ class DispatchJobStore {
         }
     }
 
+    func commandResult(_ id: UUID) -> DispatchJob? {
+        visible.first { $0.id == id && $0.command != nil }
+    }
+
+    func latestCommandAttempt(from id: UUID) -> DispatchJob? {
+        guard var current = commandResult(id) else { return nil }
+        var seen: Set<UUID> = [id]
+        while true {
+            let children = visible.filter { $0.command?.retryOf == current.id }
+            guard children.count <= 1 else { return nil }
+            guard let next = children.first else { return current }
+            guard seen.insert(next.id).inserted, next.origin == current.origin else { return nil }
+            current = next
+        }
+    }
+
     func jobWithCommittedWrite(_ id: UUID, profileID: String?) -> DispatchJob? {
         jobs.first { $0.id == id && $0.userId == backend.userId && $0.profileId == profileID
             && $0.receipts?.contains(where: { $0.outcome == "success" }) == true }
@@ -82,23 +98,32 @@ class DispatchJobStore {
     }
 
     /// A job has started; a retried memo reuses its id and starts its row again.
-    func begin(id: UUID, task: String, profileId: String?, conversationId: UUID? = nil, turnId: String? = nil, operation: DispatchMailOperation? = nil, origin: DispatchJob.MailOrigin? = nil) async {
+    func begin(id: UUID, task: String, profileId: String?, conversationId: UUID? = nil, turnId: String? = nil, operation: DispatchMailOperation? = nil, origin: DispatchJob.MailOrigin? = nil, command: DispatchJob.CommandRun? = nil) async {
         jobs.removeAll { $0.id == id }
         let profiles = Container.shared.workspaceProfiles()
         let defaultProfile = profileId == nil || profiles.profiles.first(where: { $0.id == profileId })?.isDefault == true
         let owner = backend.userId.map { $0 + (defaultProfile ? "" : ":profile:" + (profileId ?? "")) }
         jobs.append(DispatchJob(id: id, task: task, state: "running", startedAt: Date(), profileId: profileId,
-            userId: backend.userId, conversationId: conversationId, turnId: turnId, historyOwner: owner, operation: operation, origin: origin))
+            userId: backend.userId, conversationId: conversationId, turnId: turnId, historyOwner: owner, operation: operation, origin: origin, command: command))
         await save()
         await recordHistoryOutcome(jobs.first { $0.id == id }, status: .pending)
     }
 
-    func receipt(_ id: UUID, callId: String, tool: String, failed: Bool, targetHash: String? = nil) async {
+    func receipt(_ id: UUID, callId: String, tool: String, failed: Bool, targetHash: String? = nil, commandStep: Int? = nil) async {
         guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
         var receipts = jobs[index].receipts ?? []
         guard !receipts.contains(where: { $0.callId == callId }) else { return }
-        receipts.append(.init(callId: callId, tool: tool, outcome: failed ? "failed" : "success", targetHash: targetHash))
+        receipts.append(.init(callId: callId, tool: tool, outcome: failed ? "failed" : "success", targetHash: targetHash, commandStep: commandStep))
         jobs[index].receipts = receipts
+        await save()
+    }
+
+    func completeCommandStep(_ id: UUID, index: Int, result: String) async {
+        guard let row = jobs.firstIndex(where: { $0.id == id }), var command = jobs[row].command,
+              index == command.completedSteps, index < command.actions.count else { return }
+        command.completedSteps += 1
+        command.completedResults.append(LiveCompactContext.bounded(result, bytes: 4_000, includeEmailContent: false))
+        jobs[row].command = command
         await save()
     }
 

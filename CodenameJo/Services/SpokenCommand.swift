@@ -19,6 +19,20 @@ enum SpokenCommand: Equatable {
         return endCallPhrases.contains(phrase) ? .endCall : nil
     }
 
+    /// Live exit control accepts only an explicit call/session request, never an email decision.
+    static func explicitlyEndsSession(_ text: String) -> Bool {
+        guard !CalendarRSVPQueuePolicy.refusesEndSession(for: text) else { return false }
+        let spoken = text.replacingOccurrences(of: #"\[\s*(?:inhale|exhale|breath|breathing|sigh)\s*\]"#,
+            with: " ", options: [.regularExpression, .caseInsensitive])
+        var phrase = normalized(spoken)
+        let prefixes = ["yeah ", "yes ", "yep ", "okay ", "ok ", "well ", "uh ", "um ",
+            "i guess ", "i think ", "lets ", "please ", "just ", "go ahead and ",
+            "can you ", "could you ", "would you ", "i want to ", "id like to "]
+        while let prefix = prefixes.first(where: { phrase.hasPrefix($0) }) { phrase.removeFirst(prefix.count) }
+        phrase = normalized(phrase)
+        return endCallPhrases.subtracting(["im done", "i am done"]).contains(phrase)
+    }
+
     // MARK: - Internals
 
     private static let resetCallPhrases: Set<String> = [

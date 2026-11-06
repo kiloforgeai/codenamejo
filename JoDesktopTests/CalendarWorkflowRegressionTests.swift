@@ -175,7 +175,12 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
             "time_min": "2026-11-02T00:00:00-08:00", "time_max": "2026-11-03T00:00:00-08:00", "ical_uid": "original-invite"]))
         let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(result.output.utf8)) as? [[String: Any]])
         XCTAssertTrue(rows.allSatisfy { $0["complete"] as? Bool == false })
-        XCTAssertEqual(provider.calls.count, 4, "A repeated continuation token must stop both mailbox reads")
+        let invitationReads = provider.calls.filter {
+            $0.httpMethod == "GET" && $0.url?.path.hasSuffix("/events") == true
+                && URLComponents(url: $0.url!, resolvingAgainstBaseURL: false)?.queryItems?
+                    .contains { $0.name == "iCalUID" && $0.value == "original-invite" } == true
+        }
+        XCTAssertEqual(invitationReads.count, 4, "A repeated continuation token must stop both invitation searches")
         let write = await CalendarTools.run(name: CalendarTools.create, argumentsJSON: GmailReadTools.json(create))
         XCTAssertTrue(write.failed)
         XCTAssertEqual(provider.creates, 0)
@@ -250,6 +255,80 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
         .init(id: UUID(), task: "Follow up this email", account: "owner@example.test",
               standingOnJSON: #"{"id":"invite-a","threadId":"thread-a","account":"owner@example.test","from":"sender@example.test"}"#,
               expects: .receipt, commandSteps: steps)
+    }
+
+    func testFailedCommandRestoresItsPinnedSourceAndRetriesOnlyUnfinishedSteps() async throws {
+        let label = CommandAction(tool: "label_message", detail: "follow up",
+            resolvedLabel: .init(id: "Label_42", name: "#Followup", account: "owner@example.test"))
+        let archive = CommandAction(tool: "archive_message", detail: "this")
+        for partial in [false, true] {
+            let initial = [partial ? label : .init(tool: "label_message", detail: "wrong name"), archive]
+            var job = commandJob(steps: initial)
+            job.command = .init(keyword: "follow up", actions: initial)
+            let failed = await DispatchWorker.run(job) { body in
+                let name = (body["tool_choice"] as? [String: Any])?["name"] as? String ?? "unknown"
+                let id = name == "archive_message" ? "booking-b" : "invite-a"
+                return [["type": "function_call", "name": name, "call_id": UUID().uuidString,
+                    "arguments": GmailReadTools.json(["message_id": id, "account": "owner@example.test", "label": "wrong name"])]]
+            }
+            XCTAssertEqual(failed.ok, false)
+            let store = Container.shared.dispatchJobs()
+            let stopped = try XCTUnwrap(store.commandResult(job.id))
+            XCTAssertEqual(stopped.origin?.messageID, "invite-a")
+            XCTAssertEqual(stopped.command?.completedSteps, partial ? 1 : 0)
+            let saved = CustomCommand(id: "follow", keyword: "follow up", spoken: "Follow up", instruction: "", actions: [label, archive], enabled: true)
+            let plan = try stopped.commandRetry(using: saved, profileID: nil, accounts: ["owner@example.test"])
+            var resumed = commandJob(steps: Array(saved.actions.dropFirst(plan.completedSteps)))
+            resumed.command = plan
+            var names: [String] = []
+            let result = await DispatchWorker.run(resumed) { body in
+                let name = (body["tool_choice"] as? [String: Any])?["name"] as? String ?? "unknown"
+                names.append(name)
+                return [["type": "function_call", "name": name, "call_id": UUID().uuidString,
+                    "arguments": GmailReadTools.json(["message_id": "invite-a", "account": "owner@example.test"])]]
+            }
+            XCTAssertEqual(result.ok, true, result.text)
+            XCTAssertEqual(names, partial ? ["archive_message"] : ["label_message", "archive_message"])
+            let completed = try XCTUnwrap(store.commandResult(resumed.id))
+            XCTAssertEqual(completed.command?.completedSteps, 2)
+            XCTAssertEqual(completed.command?.retryOf, job.id)
+            XCTAssertEqual(store.latestCommandAttempt(from: job.id)?.id, resumed.id)
+            XCTAssertThrowsError(try completed.commandRetry(using: saved, profileID: nil, accounts: ["owner@example.test"]))
+            resumed.id = UUID()
+            let duplicate = await DispatchWorker.run(resumed) { _ in
+                XCTFail("Selecting the original failed result must not repeat an already completed retry")
+                return []
+            }
+            XCTAssertEqual(duplicate.ok, false)
+        }
+        let labels = provider.calls.filter { String(decoding: $0.httpBody ?? Data(), as: UTF8.self).contains("Label_42") }
+        XCTAssertEqual(labels.count, 2, "Each scenario labels once, including a partial-success retry")
+        XCTAssertFalse(provider.calls.contains { $0.httpMethod == "POST" && $0.url?.path.contains("/messages/booking-b/") == true },
+            "Retry cannot write to a newer foreground email; the fixture also records thread requests separately")
+    }
+
+    func testCommandRetryRefusesUncertainWritesChangedPrefixesAndForeignScopes() async throws {
+        let steps: [CommandAction] = [.init(tool: "label_message", detail: "original"), .init(tool: "archive_message", detail: "this")]
+        let saved = CustomCommand(id: "follow", keyword: "follow up", spoken: "Follow up", instruction: "", actions: steps, enabled: true)
+        let origin = DispatchJob.MailOrigin(account: "owner@example.test", messageID: "original", threadID: "t", sender: "same", subject: "same")
+        var job = DispatchJob(id: UUID(), task: "follow up", state: "partial", profileId: "work", origin: origin,
+            command: .init(keyword: "follow up", actions: steps, completedSteps: 1, completedResults: ["Label applied"]))
+        job.receipts = [.init(callId: "label", tool: "label_message", outcome: "success", commandStep: 0)]
+        XCTAssertEqual(try job.commandRetry(using: saved, profileID: "work", accounts: [origin.account]).completedSteps, 1)
+        XCTAssertThrowsError(try job.commandRetry(using: saved, profileID: "personal", accounts: [origin.account]))
+        XCTAssertThrowsError(try job.commandRetry(using: saved, profileID: "work", accounts: []))
+        var changed = saved; changed.actions[0].detail = "different label"
+        XCTAssertThrowsError(try job.commandRetry(using: changed, profileID: "work", accounts: [origin.account]))
+        job.receipts?[0].commandStep = nil
+        XCTAssertThrowsError(try job.commandRetry(using: saved, profileID: "work", accounts: [origin.account]))
+        job.receipts = []; job.state = "unknown"
+        XCTAssertThrowsError(try job.commandRetry(using: saved, profileID: "work", accounts: [origin.account]))
+        for phrase in ["Run it again", "Run command follow up again", "Please retry command follow up"] {
+            XCTAssertTrue(CommandRetryText.matches(phrase, keyword: "follow up"))
+        }
+        for phrase in ["Yes", "Don't run it again", "Run command research again", "Did you run it again?"] {
+            XCTAssertFalse(CommandRetryText.matches(phrase, keyword: "follow up"))
+        }
     }
 
     func testBackgroundInvitationCannotReplaceConfirmedBookingInWorker() async {

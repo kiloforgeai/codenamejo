@@ -3,6 +3,80 @@ import XCTest
 
 @MainActor
 final class UserFeedbackTests: XCTestCase {
+    private final class CaptureHarness: UserFeedback {
+        var owner = Submission(userID: "user", context: .init(sessionID: UUID(), profileID: "work"))
+        var saved: [(String, Submission)] = []
+        var failSave = false
+        override func capture() -> Submission { owner }
+        override func save(_ message: String, source: FeedbackSource, submission: Submission) async throws -> UUID {
+            if failSave { throw URLError(.cannotWriteToFile) }
+            saved.append((message, submission))
+            return UUID()
+        }
+    }
+
+    func testSolicitedVoiceFeedbackCollectsFragmentsAndSavesOnceBeforeResumingFeed() async throws {
+        let feedback = CaptureHarness()
+        feedback.voiceSaveDelay = .milliseconds(80)
+        var replies: [String] = [], phases: [String] = []
+        func input(_ text: String, _ turn: String) -> Bool {
+            feedback.voiceInput(text, turnID: turn, reply: { replies.append($0) }, transition: { phases.append($0) })
+        }
+        XCTAssertTrue(input("Yeah, just file some feedback.", "request"))
+        XCTAssertEqual(replies, ["What would you like the feedback to say?"])
+        XCTAssertTrue(input("Yeah, basically this weird error", "note"))
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertTrue(input("Yeah, basically this weird error of the inbox being too full", "note"))
+        XCTAssertTrue(input("Uh, yeah, let's go through the feed", "resume"))
+        try await Task.sleep(for: .milliseconds(120))
+        XCTAssertEqual(feedback.saved.map { $0.0 }, ["Yeah, basically this weird error of the inbox being too full"])
+        XCTAssertEqual(feedback.saved.first?.1.context.profileID, "work")
+        XCTAssertEqual(feedback.saved.first?.1.context.turnID, "request")
+        XCTAssertEqual(phases.filter { $0 == "saved" }.count, 1)
+        XCTAssertTrue(replies.last?.hasPrefix("Feedback saved") == true)
+        XCTAssertTrue(input("Yeah, just file some feedback.", "request"))
+        XCTAssertTrue(input("Yeah, basically this weird error of the inbox being too full", "note"))
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(feedback.saved.count, 1)
+    }
+
+    func testVoiceFeedbackSurvivesSaveFailureAndTransfersToButtonWithoutAnotherSave() async throws {
+        let feedback = CaptureHarness()
+        feedback.voiceSaveDelay = .milliseconds(20)
+        feedback.failSave = true
+        var replies: [String] = []
+        XCTAssertTrue(feedback.voiceInput("Log this feedback: audio failed", turnID: "note", reply: { replies.append($0) }, transition: { _ in }))
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(feedback.pendingVoiceText, "audio failed")
+        XCTAssertTrue(replies.last?.contains("not saved") == true)
+        feedback.failSave = false
+        XCTAssertEqual(feedback.takeVoiceDraft(), "audio failed")
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertTrue(feedback.saved.isEmpty)
+        XCTAssertNil(feedback.pendingVoiceText)
+    }
+
+    func testVoiceFeedbackCancelsAndDoesNotCrossProfileOrUserBoundaries() async throws {
+        let feedback = CaptureHarness()
+        feedback.voiceSaveDelay = .milliseconds(30)
+        func input(_ text: String, _ turn: String) {
+            _ = feedback.voiceInput(text, turnID: turn, reply: { _ in }, transition: { _ in })
+        }
+        input("record feedback: original note", "a")
+        feedback.owner = .init(userID: "other", context: .init(profileID: "other-profile"))
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertTrue(feedback.saved.isEmpty)
+        XCTAssertNil(feedback.pendingVoiceText)
+        feedback.owner = .init(userID: "user", context: .init(sessionID: UUID(), profileID: "work"))
+        XCTAssertEqual(feedback.pendingVoiceText, "original note", "Reconnect retains the original scoped draft")
+        input("cancel feedback", "b")
+        XCTAssertNil(feedback.pendingVoiceText)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertTrue(feedback.saved.isEmpty)
+        XCTAssertNil(VoiceFeedbackText.request("don't log feedback"))
+        XCTAssertNil(VoiceFeedbackText.request("read the feedback email"))
+    }
+
     private func directory() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -22,7 +96,7 @@ final class UserFeedbackTests: XCTestCase {
         let conversation = UUID()
         let session = log.begin(conversationID: conversation, engine: "live", userID: "user-a")
         let context = FeedbackContext(sessionID: session.id, conversationID: conversation,
-                                      profileID: "profile-a", engine: "live", state: "responding")
+                                      profileID: "profile-a", engine: "live", state: "responding", turnID: "turn-a")
         let message = "The voice cut off.\nPlease let me finish — thanks! 🎙️"
         let id = try await log.saveFeedback(message, source: .button, userID: "user-a", context: context)
         let receipt = await UserFeedbackTool.run(argumentsJSON: #"{"message":"The next button is hard to find."}"#) {
@@ -31,7 +105,7 @@ final class UserFeedbackTests: XCTestCase {
         XCTAssertFalse(receipt.failed)
         let data = try await VoiceDiagnostics(directory: folder).snapshot(userID: "user-a")
         let entries = try rows(data)
-        XCTAssertEqual(entries.count, 3)
+        XCTAssertEqual(entries.filter { $0["event"] as? String != "sessionManifest" }.count, 3)
         let notes = entries.filter { $0["event"] as? String == "userFeedback" }
         XCTAssertEqual(notes.count, 2)
         XCTAssertEqual(notes[0]["feedback_id"] as? String, id.uuidString)
@@ -41,6 +115,7 @@ final class UserFeedbackTests: XCTestCase {
         XCTAssertEqual(notes[0]["session_id"] as? String, session.id.uuidString)
         XCTAssertEqual(notes[0]["conversation_id"] as? String, conversation.uuidString)
         XCTAssertEqual(notes[0]["profile_id"] as? String, "profile-a")
+        XCTAssertEqual(notes[0]["turn_id"] as? String, "turn-a")
         XCTAssertEqual(notes[0]["user_id"] as? String, "user-a")
         XCTAssertEqual(notes[0]["engine"] as? String, "live")
         XCTAssertNotNil(notes[0]["timestamp"])
