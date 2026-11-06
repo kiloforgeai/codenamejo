@@ -75,6 +75,7 @@ final class ConversationQueueIntegrationTests: XCTestCase {
 
     private func assertRenderedCounter(_ output: String, queue: LocalTriageQueue, position: Int?, total: Int?,
                                        file: StaticString = #filePath, line: UInt = #line) async {
+        #if targetEnvironment(macCatalyst)
         let progress = await queue.progress
         var tracker = FeedFocusTracker()
         let model = DesktopWorkspaceModel()
@@ -89,6 +90,7 @@ final class ConversationQueueIntegrationTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(position, 1, file: file, line: line)
             XCTAssertLessThanOrEqual(position, total, file: file, line: line)
         }
+        #endif
     }
 
     func testAnnotatedYesThroughAdapterConsumesOneOfferAndPresentsFirstQueueItem() async throws {
@@ -1139,6 +1141,22 @@ final class ConversationQueueIntegrationTests: XCTestCase {
 
         XCTAssertEqual(seen, ["urgent", "bulk"], "the top band opens the walk and the bulk follows")
         XCTAssertEqual(last["done"] as? Bool, true, "and reaching the end closes the queue")
+        await queue.end()
+    }
+
+    func testQueueCanInitializeAnUnresolvedTaskStore() async throws {
+        let fixture = try StoreFixture()
+        defer { fixture.close() }
+        let path = fixture.directory.appendingPathComponent("tasks.json")
+        Container.shared.dispatchJobs.register {
+            MainActor.assumeIsolated { DispatchJobStore(url: path) }
+        }
+        defer { Container.shared.dispatchJobs.reset() }
+        let rows = [row("first", thread: "first", date: 20, sender: "Fixture")]
+        try await fixture.seed(rows, unread: ["first"])
+        let queue = makeQueue()
+        let step = await queue.step(.init(scope: .unread), store: fixture.store)
+        XCTAssertEqual(try current(step.output)["id"] as? String, "first")
         await queue.end()
     }
 

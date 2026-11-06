@@ -443,7 +443,8 @@ actor LocalTriageQueue {
 
     private func refreshTaskOwnership() async {
         let snapshot = await MainActor.run { (Container.shared.backend().userId, ProfileRuntime.snapshot?.profileId) }
-        let jobs = await Container.shared.dispatchJobs().history()
+        let taskStore = await MainActor.run { Container.shared.dispatchJobs() }
+        let jobs = await taskStore.history()
         let current = await MainActor.run { (Container.shared.backend().userId, ProfileRuntime.snapshot?.profileId) }
         guard snapshot == current else { return }
         let scope = (snapshot.0 ?? "") + ":" + (snapshot.1 ?? "default")
