@@ -55,6 +55,13 @@ actor LocalSlackQueue {
         guard let queue else { return [] }
         return Array(queue.items.dropFirst(max(0, position - 1)).prefix(30))
     }
+
+    func mergeDesktopRefresh(_ fresh: SlackQueueSnapshot) {
+        guard var queue else { return }
+        let held = Set(queue.items.map(Self.walkKey)).union(walked[SlackQueueRefresh.profileKey()] ?? [])
+        queue.items += fresh.items.filter { !held.contains(Self.walkKey($0)) }
+        self.queue = queue
+    }
     #endif
 
     var isRunning: Bool { queue != nil }

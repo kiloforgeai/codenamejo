@@ -45,6 +45,31 @@ final class UnsupportedPresentationReplayTests: XCTestCase {
     }
 
     private let invented = "Up next is an Atlassian Jira email about a comment waiting for review. What would you like to do with it?"
+
+    func testFactualCorrectionRejectsInflightInterpretationAndClearsOldPresentationContext() async throws {
+        let h = Harness()
+        let source = selected("same-source")
+        h.brain.updateState(source, scope: "fixture")
+        h.brain.observe("Stale interpretation: ordered the newsletter")
+        h.start("Summarize this email", turn: 1)
+        try await h.waitForRequest()
+        var cache = LiveEmailPreparationCache(profileId: "fixture")
+        let key = try XCTUnwrap(LiveEmailPresentation.Key.step(source))
+        cache.correct(key, text: "It was a book, not the newsletter")
+        h.brain.updateState(cache.annotatingCorrection(source), scope: "fixture")
+        h.brain.correctEmailInterpretation()
+        await h.answer("Sender ordered the newsletter.")
+        XCTAssertTrue(h.spoken.isEmpty, "The in-flight obsolete answer must never reach the speaker")
+        try await h.waitForRequest()
+        let context = try h.context()
+        let encoded = String(decoding: try JSONSerialization.data(withJSONObject: context), as: UTF8.self)
+        XCTAssertTrue(encoded.contains("a book, not the newsletter"))
+        XCTAssertFalse(encoded.contains("Stale interpretation"))
+        await h.answer("You clarified that Sender ordered a book.")
+        XCTAssertEqual(h.spoken, ["You clarified that Sender ordered a book."])
+        h.brain.close()
+    }
+
     private func selected(_ id: String) -> String {
         GmailReadTools.json(["done": false, "item": ["account": "fixture@example.test",
             "id": id, "threadId": "thread-" + id, "from": "Same Sender", "subject": "Same Subject"]])

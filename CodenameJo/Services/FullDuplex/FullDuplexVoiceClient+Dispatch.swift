@@ -3,6 +3,18 @@ import Foundation
 
 extension FullDuplexVoiceClient {
 
+    func parkAcceptedTask(_ id: UUID) async -> String? {
+        guard isActive, let job = Container.shared.dispatchJobs().existing(id), job.ownsFeedSource else { return nil }
+        let dial = dialGeneration
+        guard let step = await localTriage.parkTaskSource(job, store: Container.shared.mailStore()),
+              isActive, dial == dialGeneration, ProfileRuntime.snapshot?.profileId == job.profileId else { return nil }
+        let progress = await localTriage.progress
+        let standing = await localTriage.standing
+        let served = await localTriage.takeServedOutcomes()
+        applyStep(step, progress: progress, standing: standing, served: served, dial: dial)
+        return step
+    }
+
     // MARK: - Dispatch
 
     /// The two substrings that name the mailbox.
@@ -595,8 +607,7 @@ extension FullDuplexVoiceClient {
         let commandWasRequested: Bool
         if !requestedCommand.isEmpty {
             commandWasRequested = true
-            let keyword = CustomCommandRules.normalise(requestedCommand)
-            savedCommand = customCommands.commands.first { $0.keyword == keyword }
+            savedCommand = CustomCommandRules.matching(requestedCommand, commands: customCommands.commands)
         } else if Self.looksLikeSavedCommandTask(freeTextTask),
                   let referenced = Self.exactSavedCommandReference(
                     in: freeTextTask, commands: customCommands.commands) {
@@ -610,6 +621,11 @@ extension FullDuplexVoiceClient {
             savedCommand = nil
         }
         if commandWasRequested {
+            diagnostics?.record(.turnTransition, ["transition": "command_lookup", "call_id": callId,
+                "turn_id": historyTurnID.uuidString,
+                "target_hash": diagnostics?.target(requestedCommand) ?? "unknown",
+                "profile_hash": diagnostics?.target(ProfileRuntime.snapshot?.profileId ?? "default") ?? "unknown",
+                "outcome": savedCommand.map { $0.enabled ? "enabled" : "disabled" } ?? "missing_or_ambiguous"])
             guard let savedCommand else {
                 RealtimeLog.log("dispatch: refused — no exact saved command")
                 postDispatchOutput(callId: callId, startedWork: false, output:
@@ -632,7 +648,7 @@ extension FullDuplexVoiceClient {
                     + "Tell the user that plainly and do not invent any.")
                 return
             }
-            if let commandRetry, commandRetry.actions != savedCommand.actions || commandRetry.keyword != savedCommand.keyword {
+            if let commandRetry, commandRetry.actions.map(\.definition) != savedCommand.actions.map(\.definition) || commandRetry.keyword != savedCommand.keyword {
                 postDispatchOutput(callId: callId, startedWork: false, output: "Not started. The saved command changed during recovery. Retry with its current definition.")
                 return
             }
@@ -644,7 +660,7 @@ extension FullDuplexVoiceClient {
         let isSavedCommand = savedCommand != nil
         if commandRetry == nil, let savedCommand, let pending = failedCommandRetry,
            pending.keyword == savedCommand.keyword, let previous = dispatchJobs.latestCommandAttempt(from: pending.id),
-           let original = previous.origin, let selected = standingStep.flatMap(LiveEmailPresentation.Key.step),
+           let original = previous.origin, let selected = standingStep.flatMap(LiveEmailPresentation.Key.selection),
            selected.account.caseInsensitiveCompare(original.account) == .orderedSame,
            selected.selectedIDs == [original.messageID] {
             do {
@@ -661,7 +677,7 @@ extension FullDuplexVoiceClient {
         let commandRun = commandRetry ?? savedCommand.map { DispatchJob.CommandRun(keyword: $0.keyword, actions: $0.actions) }
         let retrySource = commandRetry?.retryOf.flatMap { dispatchJobs.commandResult($0)?.origin }
         if commandRetry != nil {
-            guard let retrySource, let selected = standingStep.flatMap(LiveEmailPresentation.Key.step),
+            guard let retrySource, let selected = standingStep.flatMap(LiveEmailPresentation.Key.selection),
                   selected.account.caseInsensitiveCompare(retrySource.account) == .orderedSame,
                   selected.selectedIDs == [retrySource.messageID] else {
                 postDispatchOutput(callId: callId, startedWork: false, output: "Not started. The restored command source changed before dispatch. Select its original result and retry.")
@@ -673,10 +689,6 @@ extension FullDuplexVoiceClient {
         let displayTask = savedCommand.map { "Run saved command “\($0.title)”" } ?? freeTextTask
         let requestedBackground = requestedBackground || (arguments?["requested_background"] as? Bool == true)
         let scope = (arguments?["scope"] as? String).flatMap(DispatchScope.init(rawValue:))
-        // The model's own one-sentence receipt, spoken by the phone so no backend step has to word it.
-        let announce = (arguments?["announce"] as? String)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .flatMap { $0.isEmpty || $0.utf8.count > 200 ? nil : ($0.last?.isPunctuation == true ? $0 : $0 + ".") }
         if !isSavedCommand, scope == nil, dispatchScopeRequired || arguments?["scope"] != nil {
             postDispatchOutput(callId: callId, startedWork: false, output:
                 "Not started. Set scope to current_email only when the task concerns the email "
@@ -684,6 +696,11 @@ extension FullDuplexVoiceClient {
             return
         }
         let relatesToEmail = isSavedCommand || scope != .independent
+        if let savedCommand, let reason = CustomCommandRules.accountRefusal(savedCommand.actions,
+            account: (liveQueueActionAnchor?.step ?? standingStep).flatMap(LiveEmailPresentation.Key.selection)?.account) {
+            postDispatchOutput(callId: callId, startedWork: false, output: reason)
+            return
+        }
         #if targetEnvironment(macCatalyst)
         if relatesToEmail, let refusal = renderedSelectionRefusal() {
             postDispatchOutput(callId: callId, startedWork: false, output: refusal)
@@ -821,7 +838,11 @@ extension FullDuplexVoiceClient {
         // as dealing with the message the user is standing on, and its answer comes back on
         // a step of the queue rather than in a separate ack.
         let mailQueueLive = queueStanding() != nil
-        let dispatchUsesQueue = mailQueueLive && relatesToEmail && commandRetry == nil
+        let completionPreference = DispatchJob.CompletionPreference.requested(in: latestCompletedUserUtterance)
+            ?? DispatchJob.CompletionPreference(rawValue: Self.stringArgument("completion_preference", in: argumentsJSON) ?? "")
+        let parksSource = relatesToEmail && commandRetry == nil
+            && (expects != .receipt || requestedBackground || completionPreference == .bringBack)
+        let dispatchUsesQueue = mailQueueLive && relatesToEmail && commandRetry == nil && (!requestedBackground || parksSource)
         // Mid-queue the answer comes back as a step of the queue rather than out of the blue,
         // so the ack says which — a model told to expect a note is a model that treats the
         // step carrying it as something else.
@@ -830,8 +851,8 @@ extension FullDuplexVoiceClient {
         // outcome rides the step the advance produced; a turn of its own was the shape that
         // stalled the device walk and was removed. Promising one primed the model to expect a
         // slot it would never get, and the note it actually reads then read as a demotion.
-        let announcement = Self.dispatchAnnouncementNote(expects: expects)
-        let delivery = expects == .answer
+        let announcement = "Say only ‘Request accepted.’ This acknowledges acceptance, not current execution or completion. Do not claim the task is still running."
+        let delivery = (completionPreference ?? (expects == .receipt ? .quiet : .bringBack)) == .bringBack
             ? (dispatchUsesQueue
                 ? "The answer comes back on a step of their queue; follow that step's note. "
                 : "The answer arrives later as a note in this conversation. ")
@@ -840,14 +861,14 @@ extension FullDuplexVoiceClient {
         // With no queue to return to, the phone says the receipt instead of waiting on the backend to word one.
         let phoneSaysReceipt = !dispatchUsesQueue && transport != nil && (!relatesToEmail || queueStanding() == nil)
         if phoneSaysReceipt {
-            if !userSpeaking { transport?.liveAdapter?.speakExactly(announce ?? Self.dispatchHandoffLine) }
+            if !userSpeaking { transport?.liveAdapter?.speakExactly("Request accepted.") }
             postDispatchOutput(callId: callId,
                 output: "Started. " + delivery + "Do not wait for it or dispatch this again. "
                     + "The application has already told the user it is handing this off; return no user-facing text for this action.",
-                queueAdvance: relatesToEmail ? nil : "\n" + DispatchScope.independentNote)
+                queueAdvance: relatesToEmail ? "The foreground email is unchanged. Do not advance it or archive it merely because this task started." : "\n" + DispatchScope.independentNote)
         } else if !dispatchUsesQueue {
             postDispatchOutput(callId: callId, output: ack,
-                queueAdvance: relatesToEmail ? nil : "\n" + DispatchScope.independentNote)
+                queueAdvance: relatesToEmail ? "The foreground email is unchanged. Do not advance it or archive it merely because this task started." : "\n" + DispatchScope.independentNote)
         }
 
         // The row this job will be recorded as. Generated here, before the request, so
@@ -859,7 +880,7 @@ extension FullDuplexVoiceClient {
         let operation: DispatchMailOperation? = {
             guard expects == .receipt, !isSavedCommand, relatesToEmail,
                   let anchor = liveQueueActionAnchor?.step ?? standingStep,
-                  let key = LiveEmailPresentation.Key.step(anchor) else { return nil }
+                  let key = LiveEmailPresentation.Key.selection(anchor) else { return nil }
             return DispatchMailOperation.archiveRequest(latestCompletedUserUtterance, account: key.account, messageID: key.messageId)
         }()
         dispatchHistory[jobId] = (historyTurnID, historyUserText)
@@ -871,9 +892,17 @@ extension FullDuplexVoiceClient {
         // The turn that asked for this. A later one owns the speaker, so its advance is the
         // backend's to word again.
         let userTurn = liveUserTurn
+        let calendarWindow = transport?.liveAdapter?.calendarWindow
         // The profile this job belongs to. A switch while it runs makes the answer an aside
         // about somewhere else, and the report has to be able to say where.
         let origin = Container.shared.workspaceProfiles().selected
+        let acceptedProfile = ProfileRuntime.snapshot?.profileId
+        let acceptedOwner = Container.shared.backend().userId
+        let backgroundSource: String? = {
+            guard (requestedBackground || parksSource), relatesToEmail, let step = liveQueueActionAnchor?.step ?? standingStep,
+                  let data = step.data(using: .utf8), let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            return GmailReadTools.json(root["item"] as? [String: Any] ?? root)
+        }()
 
         // An inherited-isolation task, deliberately not `Task.detached`. The body
         // touches `self` throughout; detaching would make that a concurrency error, and the usual
@@ -893,15 +922,16 @@ extension FullDuplexVoiceClient {
             // phone only carries the words. See `queueAdvanceAfterDispatch`.
 
             var standingOnJSON: String? = retrySource.map { GmailReadTools.json([
-                "id": $0.messageID, "threadId": $0.threadID, "account": $0.account, "from": $0.sender, "subject": $0.subject]) }
+                "id": $0.messageID, "threadId": $0.threadID, "account": $0.account, "from": $0.sender, "subject": $0.subject]) } ?? backgroundSource
             var unresolvedDispatchContext: String?
             // The same message as `standingOnJSON`, kept in a form this process can read.
             // Only ever set on the local branch, the only queue that can serve the answer.
             var presentAbout: LocalTriageQueue.Outcome.About? = retrySource?.about
+                ?? DispatchJob.MailOrigin.from(DispatchWorker.target(standingOnJSON: backgroundSource, facts: []))?.about
             var pinnedCleanupQuery: String?
             let reconciliation = commandRetry == nil && relatesToEmail && expects != .answer
                 ? await localTriage.dispatchReconciliation(account: account) : nil
-            if dispatchUsesQueue {
+            if dispatchUsesQueue && !parksSource {
                 // **`localTriage.currentId` is non-nil exactly when this phone owns the walk,
                 // and there is no third case.** A queue walked here leaves no `triage_queue`
                 // row, so asking the broker to advance one finds nothing and falls back to
@@ -958,11 +988,8 @@ extension FullDuplexVoiceClient {
                             self.applyStep(step.output, progress: progress, standing: standing,
                                            served: served, dial: dial)
                             let presented = canAdvance
-                                // A long announce can push the line past the speaker cap; the rotating receipt still fits.
-                                ? announce.flatMap { self.preparedDispatchAdvance(
-                                    step: step.output, dial: dial, userTurn: userTurn, receipt: $0, expects: expects) }
-                                    ?? self.preparedDispatchAdvance(
-                                        step: step.output, dial: dial, userTurn: userTurn, expects: expects)
+                                ? self.preparedDispatchAdvance(
+                                    step: step.output, dial: dial, userTurn: userTurn, receipt: "Request accepted.", expects: expects)
                                 : nil
                             self.postDispatchOutput(callId: callId, output: ack,
                                 queueAdvance: presented.map {
@@ -1019,13 +1046,27 @@ extension FullDuplexVoiceClient {
             let job = DispatchWorker.Job(
                 id: jobId, task: task,
                 account: account, facts: handoverFacts, standingOnJSON: standingOnJSON,
+                calendarWindow: calendarWindow,
                 expects: expects, scope: isSavedCommand ? nil : scope,
                 commandSteps: savedCommand.map { Array($0.actions.dropFirst(commandRun?.completedSteps ?? 0)) },
-                command: commandRun, progress: progress, diagnostics: self?.diagnostics,
-                turnID: self?.dispatchHistory[jobId]?.id.uuidString, operation: operation)
-            let outcome = await HangUpRunway.run(
-                "Finishing a job", subtitle: "It keeps going if you hang up.", progress: progress
-            ) { await DispatchWorker.run(job) }
+                command: commandRun, profileId: acceptedProfile, progress: progress, diagnostics: self?.diagnostics,
+                turnID: self?.dispatchHistory[jobId]?.id.uuidString, operation: operation,
+                completionPreference: completionPreference, ownerID: acceptedOwner, parksSource: parksSource)
+            let tasks = Container.shared.applicationTasks()
+            let accepted = await tasks.submit(job)
+            if parksSource, dispatchUsesQueue, let self, self.isActive, dial == self.dialGeneration {
+                guard Container.shared.dispatchJobs().existing(accepted)?.context != nil else {
+                    let refusal = await tasks.result(accepted)
+                    self.postDispatchOutput(callId: callId, startedWork: false, output: refusal.text)
+                    return
+                }
+                let step = await self.parkAcceptedTask(accepted)
+                self.postDispatchOutput(callId: callId, output: ack,
+                    queueAdvance: step.map { Self.renderLocalDispatchAdvance(stepOutput: $0, done: false,
+                        say: announcement, unresolvedTarget: false) }
+                        ?? "The source is retained with its task in Activities. Do not ask what to do with it again or repeat the operation. Continue with the current feed selection.")
+            }
+            guard case .task(let outcome) = await tasks.result(accepted) else { return }
             // A job that outlived its call has already written its row; the next call reads it.
             guard let self, self.isActive, dial == self.dialGeneration, !Task.isCancelled else { return }
             // Cannot race the assignment above: the body always suspends at the
@@ -1038,8 +1079,11 @@ extension FullDuplexVoiceClient {
                     if outcome.ok == false { self.onToolFailed?("dispatch") } else { self.onToolDone?("dispatch") }
                 }
             }
-            self.transport?.liveAdapter?.jobCompleted(id: jobId, result: outcome.text)
-            self.transport?.sendContextItem("Background job \(jobId) has finished. It is no longer running. Result: \(outcome.text)", role: "system")
+            if outcome.reportBack, Container.shared.dispatchJobs().existing(jobId)?.ownsFeedSource != true {
+                if let receipt = Container.shared.dispatchJobs().existing(jobId)?.spokenReceipt {
+                    self.transport?.liveAdapter?.jobCompleted(id: jobId, result: receipt)
+                }
+            }
 
             if let reconciliation,
                dial == self.dialGeneration, self.endCueTask == nil {
@@ -1076,6 +1120,10 @@ extension FullDuplexVoiceClient {
                 RealtimeLog.log("dispatch: action completed silently — \(jobId)")
                 return
             }
+            if Container.shared.dispatchJobs().existing(jobId)?.ownsFeedSource == true {
+                self.diagnostics?.record(.jobDeferred, ["job_id": jobId.uuidString, "reason": "next_feed_boundary"])
+                return
+            }
 
             // A queue walked here serves this answer at its next step; a watchdog takes it back
             // if no step has served it in time.
@@ -1089,11 +1137,11 @@ extension FullDuplexVoiceClient {
                 text: outcome.text,
                 ok: outcome.ok, landedAt: .now,
                 delivery: mailQueueLive ? .nextQuietBeat : .standard,
-                origin: origin, scope: isSavedCommand ? nil : scope)
+                origin: origin, scope: isSavedCommand ? nil : scope, revision: 1)
             // A queue holds an answer so its own next step can serve it. After a switch that
             // step belongs to another profile, so the answer goes back to being an aside.
             let crossed = Self.crossedProfile(origin: origin, current: ProfileRuntime.snapshot?.profileId) != nil
-            if !crossed, await localTriage.hold(LocalTriageQueue.Outcome(
+            if !Container.shared.dispatchJobs().contains(jobId), !crossed, await localTriage.hold(LocalTriageQueue.Outcome(
                 jobId: jobId, task: displayTask, text: outcome.text, ok: outcome.ok,
                 expects: expects, about: presentAbout, independent: !relatesToEmail)) {
                 guard self.isActive, !Task.isCancelled else { return }
@@ -1106,6 +1154,7 @@ extension FullDuplexVoiceClient {
 
             // Reports no queue step can take reach this path; confirmed action successes do not.
             self.pendingReports.append(report)
+            self.recordTaskReport(report, phase: "created")
             self.drainDispatchReports()
         }
     }
@@ -1144,7 +1193,7 @@ extension FullDuplexVoiceClient {
             self.pendingReports.append(DispatchReport(
                 kind: report.kind, jobId: report.jobId, task: report.task, text: report.text,
                 ok: report.ok, landedAt: .now, finishedAt: report.finishedAt, delivery: report.delivery, origin: report.origin,
-                scope: report.scope))
+                scope: report.scope, revision: report.revision))
             self.drainDispatchReports()
         }
         heldOutcomes[jobId] = HeldOutcome(report: report, watchdog: watchdog)
@@ -1164,7 +1213,7 @@ extension FullDuplexVoiceClient {
                 kind: outcome.report.kind, jobId: jobId, task: outcome.report.task,
                 text: outcome.report.text, ok: outcome.report.ok, landedAt: .now, finishedAt: outcome.report.finishedAt,
                 delivery: outcome.report.delivery, origin: outcome.report.origin,
-                scope: outcome.report.scope))
+                scope: outcome.report.scope, revision: outcome.report.revision))
         }
     }
 
@@ -1322,6 +1371,7 @@ extension FullDuplexVoiceClient {
         let answerOwed = assistantAwaitsAnswer && standingStep == nil
         var stillWaiting: [DispatchReport] = []
         for var report in pendingReports {
+            if let id = report.jobId, !Container.shared.dispatchJobs().shouldPresent(id, revision: report.revision) { continue }
             if case .shortcut(_, let userID) = report.kind,
                Container.shared.backend().userId != userID { continue }
             // Held because Jo is waiting on the user, so the wait must not age it out unspoken.
@@ -1391,8 +1441,19 @@ extension FullDuplexVoiceClient {
     /// it is still wanted.
     func recordJobSpeechStarted() {
         guard let pending = pendingJobSpeech else { return }
+        if let revision = pending.revision {
+            guard let job = Container.shared.dispatchJobs().existing(pending.id),
+                  job.taskRevision == revision, job.state == pending.state else {
+                cancelJobSpeech(reason: "obsolete_at_playback")
+                return
+            }
+            onJobDelivered?(pending.id)
+        }
         pendingJobSpeech = nil
         diagnostics?.record(.jobSpeechStarted, ["job_id": pending.id.uuidString,
+            "task_revision": pending.revision.map(String.init) ?? "legacy",
+            "outcome": pending.state ?? "legacy", "target_hash": pending.sourceHash ?? "unknown",
+            "queue_target_hash": reportForegroundHash,
             "turn_id": dispatchHistory[pending.id]?.id.uuidString ?? "unknown",
             "phase": "output_started_after_result",
             "duration_ms": String(Int(Self.seconds(since: pending.finishedAt) * 1000))])
@@ -1404,7 +1465,64 @@ extension FullDuplexVoiceClient {
         diagnostics?.record(.jobSpeechCancelled, ["job_id": pending.id.uuidString, "reason": reason])
     }
 
+    private var reportForegroundHash: String {
+        guard let target = DispatchWorker.target(standingOnJSON: standingStep, facts: []),
+              let origin = DispatchJob.MailOrigin.from(target) else { return "none" }
+        return diagnostics?.target(MailSelection(account: origin.account, messageID: origin.messageID).canonical) ?? "unknown"
+    }
+
+    func recordTaskReport(_ report: DispatchReport, phase: String) {
+        guard let id = report.jobId else { return }
+        let job = Container.shared.dispatchJobs().existing(id)
+        let source = job?.origin.map { MailSelection(account: $0.account, messageID: $0.messageID).canonical }
+        diagnostics?.record(.jobInjected, ["job_id": id.uuidString, "phase": phase,
+            "task_revision": String(job?.taskRevision ?? report.revision ?? 0),
+            "outcome": job?.state ?? "unavailable", "queue_target_hash": reportForegroundHash,
+            "target_hash": source.flatMap { diagnostics?.target($0) } ?? "none"])
+    }
+
+    func currentTaskReceipt(_ report: DispatchReport) -> DispatchJob? {
+        guard let id = report.jobId, Container.shared.dispatchJobs().shouldPresent(id, revision: report.revision),
+              let job = Container.shared.dispatchJobs().existing(id), job.spokenReceipt != nil else { return nil }
+        return job
+    }
+
+    private func injectTaskReceipt(_ report: DispatchReport, speak: Bool) {
+        guard let job = currentTaskReceipt(report), let line = job.spokenReceipt else {
+            recordTaskReport(report, phase: "obsolete_suppressed")
+            responseInFlight = false
+            return
+        }
+        recordTaskReport(report, phase: speak ? "speech_enqueued" : "context_only")
+        transport?.sendContextItem("Authoritative task receipt, revision \(job.taskRevision). This belongs only to its named source, not the foreground email. Do not retry an action or describe this task as running.\n" + line, role: "system")
+        guard speak else { onJobDelivered?(job.id); return }
+        checkpointHistory()
+        emitFinalTranscript(responseCompleted: false)
+        isBackgroundHistory = true
+        historyTurnID = dispatchHistory[job.id]?.id ?? UUID()
+        historyUserText = dispatchHistory[job.id]?.text ?? job.task
+        let hash = job.origin.flatMap { diagnostics?.target(MailSelection(account: $0.account, messageID: $0.messageID).canonical) }
+        pendingJobSpeech = .init(id: job.id, finishedAt: report.finishedAt,
+            revision: job.taskRevision, state: job.state, sourceHash: hash)
+        let turn = liveUserTurn
+        unspokenHandoffThisTurn = true
+        responseInFlight = false
+        transport?.liveAdapter?.speakExactly(line, ifCurrent: { [weak self] in
+            guard let self else { return false }
+            let current = self.currentTaskReceipt(report)
+            let valid = self.liveUserTurn == turn && current?.taskRevision == job.taskRevision
+                && current?.state == job.state && current?.result == job.result
+            if !valid, self.pendingJobSpeech?.id == job.id { self.cancelJobSpeech(reason: "obsolete_before_speech") }
+            return valid
+        })
+    }
+
     func injectDispatchReport(_ report: DispatchReport, speak: Bool) {
+        if let id = report.jobId, !Container.shared.dispatchJobs().shouldPresent(id, revision: report.revision) { return }
+        if let id = report.jobId, Container.shared.dispatchJobs().contains(id) {
+            injectTaskReceipt(report, speak: speak)
+            return
+        }
         if case .shortcut(_, let userID) = report.kind,
            Container.shared.backend().userId != userID { return }
         if speak {

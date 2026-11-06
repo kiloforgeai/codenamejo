@@ -14,6 +14,7 @@ enum DispatchWorker {
         var standingOnJSON: String? = nil
         var authoredAt: Date? = nil
         var authoredTimeZone: TimeZone? = nil
+        var calendarWindow: CalendarRequestWindow? = nil
         var expects: LocalTriageQueue.Outcome.Shape? = nil
         var scope: DispatchScope? = nil
         /// A saved command's stored steps, forced one per round; nil for a free-text job.
@@ -25,6 +26,13 @@ enum DispatchWorker {
         var diagnostics: VoiceDiagnostics.Session? = nil
         var turnID: String? = nil
         var operation: DispatchMailOperation? = nil
+        var validate: (() -> String?)? = nil
+        var revision: Int? = nil
+        var inputSource = "voice"
+        var completionPreference: DispatchJob.CompletionPreference? = nil
+        var ownerID: String? = nil
+        var parksSource: Bool? = nil
+        var linkChoice: String? = nil
     }
 
     typealias Request = ([String: Any]) async throws -> [[String: Any]]
@@ -33,6 +41,7 @@ enum DispatchWorker {
         var errorDescription: String? { message }
     }
     private struct PendingStep: Error { let message: String }
+    private struct LinkChoiceRequired: Error { let choices: [DispatchJob.InputChoice] }
     typealias Execution = (output: String, failed: Bool, write: Bool, pending: Bool)
 
     static let maxRounds = 16
@@ -48,6 +57,10 @@ enum DispatchWorker {
 
     @MainActor
     static func run(_ job: Job, request: Request? = nil) async -> FullDuplexBroker.DispatchOutcome {
+        var job = job
+        if job.calendarWindow == nil {
+            job.calendarWindow = CalendarRequestWindow(request: job.task, reference: job.authoredAt ?? Date(), zone: job.authoredTimeZone ?? .current)
+        }
         let store = Container.shared.dispatchJobs()
         if let retry = job.command, let previousID = retry.retryOf {
             let source = DispatchJob.MailOrigin.from(target(standingOnJSON: job.standingOnJSON, facts: job.facts))
@@ -64,7 +77,7 @@ enum DispatchWorker {
                 ok: previous.isDone ? true : nil, reportBack: previous.reportBack ?? !previous.isDone, status: status)
         }
         if let operation = job.operation,
-           let previous = store.previousOperation(operation, profileID: job.profileId) {
+           let previous = store.previousOperation(operation, profileID: job.profileId, excluding: job.id) {
             if previous.isRunning, !previous.hasStopped() {
                 return .init(text: "That exact archive is already queued. Do not start it or advance the feed again.",
                     ok: nil, status: .pending)
@@ -94,12 +107,23 @@ enum DispatchWorker {
         await store.begin(id: job.id, task: job.task, profileId: job.profileId, conversationId: job.diagnostics?.conversationID, turnId: job.turnID, operation: job.operation,
             origin: job.scope == .independent ? nil : DispatchJob.MailOrigin.from(target(standingOnJSON: job.standingOnJSON, facts: job.facts)), command: job.command)
         let started = Date()
-        job.diagnostics?.record(.jobStarted, ["job_id": job.id.uuidString, "turn_id": job.turnID ?? "unknown"])
+        job.diagnostics?.record(.jobStarted, ["job_id": job.id.uuidString, "task_revision": String(job.revision ?? 1), "input_source": job.inputSource, "turn_id": job.turnID ?? "unknown"])
         var outcome = "unknown"
         defer { job.diagnostics?.record(.jobFinished, ["job_id": job.id.uuidString, "outcome": outcome,
             "duration_ms": String(Int(Date().timeIntervalSince(started) * 1000))]) }
         var performed: [Performed] = []
         do {
+            if let refusal = job.validate?() { throw StepFailure(message: refusal) }
+            if let steps = job.commandSteps {
+                let source = target(standingOnJSON: job.standingOnJSON, facts: job.facts)
+                do {
+                    job.commandSteps = try await Container.shared.customCommands().resolveLabels(steps,
+                        keyword: job.command?.keyword, account: source?["account"] as? String ?? job.account,
+                        ownerID: job.ownerID ?? Container.shared.backend().userId, profileID: job.profileId)
+                } catch is CancellationError { throw CancellationError() }
+                catch { throw StepFailure(message: "Label verification did not finish: " + error.localizedDescription) }
+                if let refusal = job.validate?() { throw StepFailure(message: refusal) }
+            }
             if let operation = job.operation, job.expects == .receipt, job.commandSteps == nil {
                 let callID = "operation-" + job.id.uuidString
                 let target = target(standingOnJSON: job.standingOnJSON, facts: job.facts)
@@ -113,18 +137,23 @@ enum DispatchWorker {
                 let fields = ["job_id": job.id.uuidString, "call_id": callID, "tool": operation.tool,
                     "target_hash": job.diagnostics?.target(VoiceDiagnostics.targetIdentity(arguments: operation.arguments) ?? "unknown") ?? "unknown"]
                 job.diagnostics?.record(.toolStarted, fields)
+                guard await store.markOperation(job.id, revision: job.revision, callID: callID) else {
+                    throw StepFailure(message: "The action could not be saved safely. Nothing was started.")
+                }
+                try Task.checkCancellation()
                 let result = await FullDuplexBroker.runTool(name: operation.tool, argumentsJSON: operation.arguments,
                     profileId: job.profileId)
                 let pending = result.pendingArchive != nil || result.pendingDraft != nil || result.deferred
                 if pending {
                     let text = "This action is queued for retry; Gmail has not confirmed completion yet. Check its outcome before retrying."
-                    await store.finish(job.id, state: "unknown", result: text, reportBack: true, historyStatus: .pending)
+                    await store.finish(job.id, state: "unknown", result: text, reportBack: true, historyStatus: .pending, revision: job.revision)
                     job.diagnostics?.record(.toolFinished, fields.merging(["outcome": "pending"]) { _, new in new })
                     outcome = "pending"
                     return .init(text: text, ok: nil, status: .pending)
                 }
                 let failed = result.ok != true
-                await store.receipt(job.id, callId: callID, tool: operation.tool, failed: failed, targetHash: receiptTarget(job, operation.arguments))
+                await store.receipt(job.id, callId: callID, tool: operation.tool, failed: failed, targetHash: receiptTarget(job, operation.arguments), revision: job.revision)
+                if !failed || !Task.isCancelled { _ = await store.markOperation(job.id, revision: job.revision, callID: nil) }
                 if failed, result.effects?.isEmpty == false {
                     performed.append(.init(tool: operation.tool, summary: "Gmail confirmed part of the archive",
                         failed: false, target: VoiceDiagnostics.targetIdentity(arguments: operation.arguments)))
@@ -134,6 +163,7 @@ enum DispatchWorker {
                 job.diagnostics?.record(.toolFinished, fields.merging(["outcome": failed ? "failed" : "success"]) { _, new in new })
                 let report = GmailReadTools.json(["completed": !failed, "remaining_work": failed ? "action" : "none",
                     "report": failed ? result.text : "Archived the selected email."])
+                try Task.checkCancellation()
                 let finished = await finish(job, text: report, performed: performed, store: store, started: started)
                 outcome = finished.status?.rawValue ?? "unknown"
                 return finished
@@ -143,27 +173,39 @@ enum DispatchWorker {
                 if !ref.failed { performed.removeAll { $0.failed && $0.tool == ref.tool && $0.target == ref.target } }
                 performed.append(ref)
             }
+            try Task.checkCancellation()
             let result = await finish(job, text: text, performed: performed, store: store, started: started)
             outcome = result.status?.rawValue ?? "unknown"
             return result
+        } catch let pending as LinkChoiceRequired {
+            outcome = "pending"
+            let saved = await store.requireChoice(job.id, revision: job.revision, choices: pending.choices)
+            let question = saved ? "Which page should I read? " + pending.choices.enumerated().map {
+                "\($0.offset + 1): \($0.element.label)"
+            }.joined(separator: "; ") + ". Reading only; no RSVP will be submitted."
+                : "The link choices could not be saved. No page was opened; check task storage before continuing."
+            await store.finish(job.id, state: saved ? "awaiting_input" : "failed", result: question,
+                reportBack: true, historyStatus: saved ? .pending : .failed, revision: job.revision)
+            return .init(text: question, ok: saved ? nil : false, reportBack: true, status: saved ? .pending : .failed)
         } catch let pending as PendingStep {
             outcome = "pending"
-            await store.finish(job.id, state: "unknown", result: pending.message, reportBack: true, historyStatus: .pending)
+            await store.finish(job.id, state: "unknown", result: pending.message, reportBack: true, historyStatus: .pending, revision: job.revision)
             return .init(text: pending.message, ok: nil, status: .pending)
         } catch {
             let cancelled = Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled
             let wrote = performed.contains { !$0.failed }
-            let status: CommandRecord.CommandStatus = wrote ? .partial : cancelled ? .cancelled : .failed
+            let uncertain = store.existing(job.id)?.inFlightOperation != nil
+            let status: CommandRecord.CommandStatus = uncertain ? .unknown : wrote ? .partial : cancelled ? .cancelled : .failed
             outcome = status.rawValue
             let reason = cancelled ? "That job was stopped before it could finish" : "That job failed before it could finish"
             let detail = (error as? StepFailure).map { " " + $0.message } ?? ""
-            let row = wrote ? "\(reason), part-way. Before it stopped: \(describe(performed))\(detail)"
+            let row = uncertain ? "An external operation did not confirm its outcome. Check provider state before retrying; recorded writes remain committed." : wrote ? "\(reason), part-way. Before it stopped: \(describe(performed))\(detail)"
                 : (error as? LiveOpenAI.MissingKey)?.errorDescription ?? (performed.isEmpty ? "\(reason), before any tool recorded a write.\(detail)" : "\(reason); check the recorded actions before retrying.\(detail)")
             RealtimeLog.log("dispatch: \(job.id) \(cancelled ? "cancelled" : "failed") after "
                 + "\(Int(Date().timeIntervalSince(started) * 1000))ms — \(error.localizedDescription)")
             // An unreachable OpenAI or a missing key, with nothing done, leaves no row: a note retries later.
-            let unreached = !cancelled && !wrote && (error is URLError || error is LiveOpenAI.MissingKey)
-            if unreached { await store.discard(job.id) } else { await store.finish(job.id, state: wrote ? "partial" : "failed", result: row, historyStatus: status) }
+            let unreached = job.revision == nil && !cancelled && !wrote && !uncertain && (error is URLError || error is LiveOpenAI.MissingKey)
+            if unreached { await store.discard(job.id) } else { await store.finish(job.id, state: uncertain ? "unknown" : wrote ? "partial" : cancelled ? "cancelled" : "failed", result: row, historyStatus: status, revision: job.revision) }
             return FullDuplexBroker.DispatchOutcome(text: row + relay, ok: false, recorded: !unreached, status: status)
         }
     }
@@ -171,7 +213,13 @@ enum DispatchWorker {
     @MainActor
     private static func finish(_ job: Job, text raw: String, performed: [Performed],
                                store: DispatchJobStore, started: Date) async -> FullDuplexBroker.DispatchOutcome {
-        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsed = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [String: Any]
+        let needsInput = parsed?["status"] as? String == "needs_input" || parsed?["remaining_work"] as? String == "input"
+        if needsInput, let question = parsed?["report"] as? String, !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            await store.finish(job.id, state: "awaiting_input", result: question, reportBack: true, historyStatus: .pending, revision: job.revision)
+            return .init(text: question, ok: nil, reportBack: true, status: .pending)
+        }
+        let text = (job.expects != .receipt ? parsed?["report"] as? String ?? raw : raw).trimmingCharacters(in: .whitespacesAndNewlines)
         let ms = Int(Date().timeIntervalSince(started) * 1000)
         if job.expects == .receipt {
             var result = actionResult(text, writeFailed: performed.contains(where: \.failed), writeSucceeded: performed.contains { !$0.failed })
@@ -179,28 +227,28 @@ enum DispatchWorker {
                 result.text += " Action record: " + performed.map { $0.failed ? "\($0.summary) failed" : $0.summary }
                     .joined(separator: "; ") + "."
             }
-            await store.finish(job.id, state: result.ok ? "done" : performed.contains(where: { !$0.failed }) ? "partial" : "failed", result: result.text, reportBack: !result.ok, foregroundContinuation: result.foregroundQueue)
+            await store.finish(job.id, state: result.ok ? "done" : performed.contains(where: { !$0.failed }) ? "partial" : "failed", result: result.text, reportBack: !result.ok, foregroundContinuation: result.foregroundQueue, revision: job.revision)
             RealtimeLog.log("dispatch: \(job.id) \(result.ok ? "done silently" : "failed") in \(ms)ms")
             return FullDuplexBroker.DispatchOutcome(text: result.text, ok: result.ok, reportBack: !result.ok, status: result.ok ? .success : performed.contains(where: { !$0.failed }) ? .partial : .failed)
         }
         if performed.contains(where: \.failed) {
             let report = describe(performed) + " " + text
-            await store.finish(job.id, state: performed.contains(where: { !$0.failed }) ? "partial" : "failed", result: report)
+            await store.finish(job.id, state: performed.contains(where: { !$0.failed }) ? "partial" : "failed", result: report, revision: job.revision)
             return FullDuplexBroker.DispatchOutcome(text: report, ok: false, status: performed.contains(where: { !$0.failed }) ? .partial : .failed)
         }
         RealtimeLog.log("dispatch: \(job.id) answered in \(ms)ms — \(text.count) chars")
         if !text.isEmpty {
-            await store.finish(job.id, state: "done", result: text, historyStatus: performed.isEmpty ? .conversational : .success)
+            await store.finish(job.id, state: "done", result: text, historyStatus: performed.isEmpty ? .conversational : .success, revision: job.revision)
             return FullDuplexBroker.DispatchOutcome(text: text, ok: nil, status: performed.isEmpty ? .conversational : .success)
         }
         if !performed.isEmpty {
             let done = "That job ran out of steps before it could say how it went, but it did this much — "
                 + describe(performed)
-            await store.finish(job.id, state: "done", result: done)
+            await store.finish(job.id, state: "partial", result: done, revision: job.revision)
             return FullDuplexBroker.DispatchOutcome(text: done, ok: nil, status: .partial)
         }
         let empty = "That job stopped before it had anything to report, and nothing was changed."
-        await store.finish(job.id, state: "failed", result: empty)
+        await store.finish(job.id, state: "failed", result: empty, revision: job.revision)
         return FullDuplexBroker.DispatchOutcome(text: empty + relay, ok: false, status: .failed)
     }
 
@@ -241,6 +289,7 @@ enum DispatchWorker {
 
     @MainActor
     private static func loop(_ job: Job, started: Date, request: Request?, performed: (Performed) -> Void) async throws -> String {
+        var calendarReadAt: Date?
         let mail = GoogleAccountStore.mailAccounts()
         let calendar = CalendarTools.accounts()
         let target = job.scope == .independent ? nil : target(standingOnJSON: job.standingOnJSON, facts: job.facts)
@@ -331,7 +380,12 @@ enum DispatchWorker {
             if receipt {
                 text["format"] = ["type": "json_schema", "name": "dispatch_result", "strict": true, "schema": [
                     "type": "object", "additionalProperties": false, "required": ["completed", "report", "remaining_work"],
-                    "properties": ["completed": ["type": "boolean"], "report": ["type": "string"], "remaining_work": ["type": "string", "enum": ["none", "foreground_queue", "action"]]],
+                    "properties": ["completed": ["type": "boolean"], "report": ["type": "string"], "remaining_work": ["type": "string", "enum": ["none", "foreground_queue", "action", "input"]]],
+                ] as [String: Any]]
+            } else {
+                text["format"] = ["type": "json_schema", "name": "task_result", "strict": true, "schema": [
+                    "type": "object", "additionalProperties": false, "required": ["status", "report"],
+                    "properties": ["status": ["type": "string", "enum": ["completed", "needs_input"]], "report": ["type": "string"]]
                 ] as [String: Any]]
             }
             var body: [String: Any] = [
@@ -341,6 +395,8 @@ enum DispatchWorker {
             ]
             if let choice { body["tool_choice"] = choice }
             let output = try await (request.map { call in { try await call(body) } } ?? { try await respond(body, deadline: started.addingTimeInterval(budget), job: job) })()
+            try Task.checkCancellation()
+            if let refusal = job.validate?() { throw StepFailure(message: refusal) }
             input += output
             let calls = output.filter { $0["type"] as? String == "function_call" }
             if let step, step.web {
@@ -349,7 +405,7 @@ enum DispatchWorker {
                     throw StepFailure(message: "Saved command step \(next + 1) could not complete web search.")
                 }
                 await Container.shared.dispatchJobs().completeCommandStep(job.id,
-                    index: (job.command?.completedSteps ?? 0) + next, result: GmailReadTools.json(output))
+                    index: (job.command?.completedSteps ?? 0) + next, result: GmailReadTools.json(output), revision: job.revision)
                 next += 1
                 continue
             }
@@ -357,12 +413,21 @@ enum DispatchWorker {
                 throw StepFailure(message: "Saved command step \(next + 1) did not call \(step.stored) exactly once.")
             }
             guard !calls.isEmpty else {
-                return output.filter { $0["type"] as? String == "message" }
+                let answer = output.filter { $0["type"] as? String == "message" }
                     .flatMap { $0["content"] as? [[String: Any]] ?? [] }
                     .compactMap { $0["type"] as? String == "output_text" ? $0["text"] as? String : nil }
                     .joined()
+                if let window = job.calendarWindow, window.containsOutsideDate(answer) {
+                    throw StepFailure(message: "The proposed dates do not match the requested week. " + window.rangeExplanation)
+                }
+                if job.calendarWindow != nil, calendarReadAt.map({ Date().timeIntervalSince($0) > CalendarTools.cacheFreshness }) != false,
+                   answer.range(of: #"\b(?:available|free|slots?)\b"#, options: [.regularExpression, .caseInsensitive]) != nil {
+                    throw StepFailure(message: "Availability could not be confirmed across all requested calendars. No free times are confirmed.")
+                }
+                return answer
             }
             for call in calls {
+                if let refusal = job.validate?() { throw StepFailure(message: refusal) }
                 try Task.checkCancellation()
                 let name = call["name"] as? String ?? ""
                 let callId = call["call_id"] as? String ?? ""
@@ -370,9 +435,19 @@ enum DispatchWorker {
                 let result: Execution
                 var executedArguments = raw
                 let toolStarted = ProcessInfo.processInfo.systemUptime
-                job.diagnostics?.record(.toolStarted, ["job_id": job.id.uuidString, "call_id": callId, "tool": name,
+                job.diagnostics?.record(.toolStarted, ["job_id": job.id.uuidString, "task_revision": String(job.revision ?? 1), "call_id": callId, "tool": name,
                     "target_hash": job.diagnostics?.target(VoiceDiagnostics.targetIdentity(arguments: raw) ?? "unspecified") ?? "unknown"])
+                if job.linkChoice != nil, mayWrite(name, relayNames: relayNames) {
+                    job.diagnostics?.record(.toolFinished, ["job_id": job.id.uuidString, "call_id": callId,
+                        "tool": name, "outcome": "refused", "reason": "read_only_link_choice"])
+                    throw StepFailure(message: "Choosing an event page authorizes reading only. No RSVP or other write was performed.")
+                }
                 if var args = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [String: Any] {
+                    if name == EmailLinkTool.name, let choice = job.linkChoice {
+                        args["link_choice"] = choice
+                        args["account"] = target?["account"]
+                        args["message_id"] = target?["id"]
+                    }
                     // The account the live call pinned, unless the model named one or is replying on a thread.
                     // A connector tool takes none: GitHub's `account` is a login, and the rest have no such field.
                     if let account = job.account, !account.isEmpty, args["account"] == nil, args["thread_id"] == nil,
@@ -389,7 +464,12 @@ enum DispatchWorker {
                     }
                     let json = String(decoding: (try? JSONSerialization.data(withJSONObject: args)) ?? Data("{}".utf8), as: UTF8.self)
                     executedArguments = json
-                    if LiveWriteTarget.mailWrites.contains(ToolNarration.canonical(name)),
+                    if job.calendarWindow != nil, CalendarRequestWindow.schedulingReply(name: name, arguments: json),
+                       calendarReadAt.map({ Date().timeIntervalSince($0) > CalendarTools.cacheFreshness }) != false {
+                        result = ("Not executed: read complete fresh availability across the requested calendars before sending scheduling times.", true, false, false)
+                    } else if let refusal = job.calendarWindow?.toolRefusal(name: name, arguments: json) {
+                        result = (refusal, true, false, false)
+                    } else if LiveWriteTarget.mailWrites.contains(ToolNarration.canonical(name)),
                        job.scope != .independent, target == nil,
                        job.standingOnJSON != nil || job.facts.contains(where: { $0.hasPrefix("Current queue context, not a resolved action target.") }) {
                         result = ("Not executed: the job's confirmed email context is invalid. Do not replace it with another message.", true, true, false)
@@ -397,11 +477,29 @@ enum DispatchWorker {
                         messageID: cursor.messageId, account: cursor.account) {
                         result = (refusal, true, true, false)
                     } else {
+                        let writes = mayWrite(name, relayNames: relayNames)
+                        if writes {
+                            guard await Container.shared.dispatchJobs().markOperation(job.id, revision: job.revision, callID: callId) else {
+                                throw StepFailure(message: "The operation could not be recorded safely. Nothing was started.")
+                            }
+                        }
+                        try Task.checkCancellation()
                         result = await execute(name, json, relayNames: relayNames, cursor: cursor, standingOn: target,
                                                profileId: job.profileId, diagnostics: job.diagnostics, callID: callId)
                     }
                 } else {
                     result = ("Could not read those arguments as JSON. Call the tool again.", true, false, false)
+                }
+                if name == EmailLinkTool.name {
+                    let choices = EmailLinkTool.choices(in: result.output)
+                    if !choices.isEmpty {
+                        job.diagnostics?.record(.toolFinished, ["job_id": job.id.uuidString, "call_id": callId,
+                            "tool": name, "outcome": "awaiting_input", "reason": "ambiguous_link"])
+                        throw LinkChoiceRequired(choices: choices)
+                    }
+                }
+                if name == CalendarTools.list {
+                    calendarReadAt = !result.failed && CalendarRequestWindow.completeRead(result.output, window: job.calendarWindow) ? Date() : nil
                 }
                 if result.pending {
                     job.diagnostics?.record(.toolFinished, ["job_id": job.id.uuidString, "call_id": callId,
@@ -410,11 +508,14 @@ enum DispatchWorker {
                 }
                 if result.write {
                     await Container.shared.dispatchJobs().receipt(job.id, callId: callId, tool: name, failed: result.failed,
-                        targetHash: receiptTarget(job, executedArguments), commandStep: step == nil ? nil : (job.command?.completedSteps ?? 0) + next)
+                        targetHash: receiptTarget(job, executedArguments), commandStep: step == nil ? nil : (job.command?.completedSteps ?? 0) + next, revision: job.revision)
                     let line = result.output.split(separator: "\n").first.map(String.init) ?? name
                     performed(Performed(tool: name, summary: String(line.prefix(200)), failed: result.failed, target: VoiceDiagnostics.targetIdentity(arguments: executedArguments)))
                 }
-                job.diagnostics?.record(.toolFinished, ["job_id": job.id.uuidString, "call_id": callId, "tool": name,
+                if !result.pending, !result.failed || !Task.isCancelled {
+                    _ = await Container.shared.dispatchJobs().markOperation(job.id, revision: job.revision, callID: nil)
+                }
+                job.diagnostics?.record(.toolFinished, ["job_id": job.id.uuidString, "task_revision": String(job.revision ?? 1), "call_id": callId, "tool": name,
                     "outcome": result.failed ? "failed" : "success",
                     "duration_ms": String(Int((ProcessInfo.processInfo.systemUptime - toolStarted) * 1000))])
                 if step != nil {
@@ -423,7 +524,7 @@ enum DispatchWorker {
                         throw StepFailure(message: "Command stopped at step \(next + 1). Later steps were not run. " + result.output)
                     }
                     await Container.shared.dispatchJobs().completeCommandStep(job.id,
-                        index: (job.command?.completedSteps ?? 0) + next, result: result.output)
+                        index: (job.command?.completedSteps ?? 0) + next, result: result.output, revision: job.revision)
                 }
                 RealtimeLog.log("dispatch: \(job.id) tool \(name)\(result.failed ? " failed" : "")")
                 input.append(["type": "function_call_output", "call_id": callId, "output": result.output])
@@ -485,6 +586,16 @@ enum DispatchWorker {
           || SlackTools.writeNames.contains(name) || GitHubTools.isGitHubTool(name) || CustomMCPTools.isCustomTool(name))
     }
 
+    static func mayWrite(_ name: String, relayNames: Set<String>) -> Bool {
+        if NotionTools.names.contains(name) { return NotionTools.writes.contains(name) }
+        if GranolaTools.names.contains(name) || GmailReadTools.names.contains(name) || name == EmailLinkTool.name { return false }
+        if SlackTools.readNames.contains(name) || SlackTools.writeNames.contains(name) { return SlackTools.writeNames.contains(name) }
+        if GitHubTools.isGitHubTool(name) { return GitHubTools.writeTools.contains(name) }
+        if GmailManageTools.names.contains(name) { return !readOnlyManage.contains(name) }
+        if CalendarTools.names.contains(name) { return name != CalendarTools.list }
+        return relayNames.contains(name) && !readOnlyRelays.contains(name)
+    }
+
     static func execute(_ name: String, _ arguments: String, relayNames: Set<String>,
                                 cursor: GmailManageTools.Cursor?, standingOn: [String: Any]?, profileId: String?,
                                 diagnostics: VoiceDiagnostics.Session? = nil, callID: String? = nil)
@@ -537,7 +648,9 @@ enum DispatchWorker {
             return (result.output, result.failed, name != CalendarTools.list, false)
         }
         if name == EmailLinkTool.name {
-            return (await EmailLinkTool.run(argumentsJSON: arguments, standingOn: standingOn), false, false, false)
+            let output = await EmailLinkTool.run(argumentsJSON: arguments, standingOn: standingOn)
+            let status = ((try? JSONSerialization.jsonObject(with: Data(output.utf8))) as? [String: Any])?["status"] as? String
+            return (output, status != "ok" && status != "partial_auth_required", false, false)
         }
         // Answered from this phone's correspondent directory, as a call's `find_person` is.
         if name == "find_person", relayNames.contains(name) {
@@ -570,6 +683,7 @@ enum DispatchWorker {
             out += "\n\n" + (try text("notes/custom-mcp", ["servers": customMCP.joined(separator: ", ")]))
         }
         out += "\n\n" + (try text("dispatch/worker"))
+        out += "\nCompletion preference never grants action approval. If clarification or approval is required, stop before that action and return needs_input (or remaining_work input for receipt jobs) with the concrete question in report. A draft awaiting review needs input; do not send it without existing authorization. Report completed only when the authorized request is finished."
         if receipt { out += "\n\n" + (try text("dispatch/action-result")) }
         return out
     }
@@ -579,6 +693,9 @@ enum DispatchWorker {
         let zone = TimeZone.current
         var parts = [try text("dispatch/clock", ["now": spoken(now, in: zone), "zone": zone.identifier,
                                                   "unix": String(Int(now.timeIntervalSince1970))])]
+        if let window = job.calendarWindow {
+            parts.append("Resolved calendar request: " + GmailReadTools.json(window.context))
+        }
         if let authored = job.authoredAt, now.timeIntervalSince(authored) >= 5 * 60 {
             let minutes = max(0, Int((now.timeIntervalSince(authored) / 60).rounded()))
             func unit(_ n: Int, _ word: String) -> String { "\(n) \(word)\(n == 1 ? "" : "s")" }

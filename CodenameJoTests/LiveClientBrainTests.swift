@@ -101,7 +101,8 @@ final class LiveClientBrainTests: XCTestCase {
             let h = Harness()
             h.sendsRequest = reason != "request_preparation_failed"
             var outcomes: [[String: String]] = []
-            h.brain.onAttemptOutcome = { _, fields in outcomes.append(fields) }
+            let terminated = expectation(description: reason)
+            h.brain.onAttemptOutcome = { _, fields in outcomes.append(fields); terminated.fulfill() }
             h.brain.requestBound = reason == "timeout" ? 0.03 : 10
             h.brain.user("read the current email", turn: 1)
             h.brain.begin("d1", live: true, turn: 1); h.brain.settle(turn: 1)
@@ -109,11 +110,13 @@ final class LiveClientBrainTests: XCTestCase {
             switch reason {
             case "completed": h.reply([])
             case "provider_failure", "request_preparation_failed": h.replies.removeFirst().resume(throwing: URLError(.badServerResponse))
-            case "timeout": try await Task.sleep(for: .milliseconds(80)); h.reply([])
+            case "timeout": break
             case "superseded": h.brain.user("another request", turn: 2); h.reply([])
             default: h.brain.close(); h.reply([])
             }
-            await drain(); h.brain.close()
+            await fulfillment(of: [terminated], timeout: 2)
+            if reason == "timeout" { h.reply([]) }
+            h.brain.close()
             XCTAssertEqual(outcomes.count, 1, reason)
             XCTAssertEqual(outcomes.first?["reason"], reason)
             XCTAssertEqual(outcomes.first?["request_sent"], String(h.sendsRequest))
@@ -703,7 +706,12 @@ extension LiveClientBrainTests {
         }
         XCTAssertEqual(reconstructed, original)
         XCTAssertEqual(h.calls.count, 1, "Chunk reads stay local and do not repeat provider calls or writes")
-        h.replies.removeFirst().resume(throwing: NSError(domain: "network", code: 1)); await drain()
+        let failedPresentation = expectation(description: "Injected presentation failure settled")
+        h.brain.onAttemptOutcome = { _, fields in
+            if fields["reason"] == "provider_failure" { failedPresentation.fulfill() }
+        }
+        h.replies.removeFirst().resume(throwing: NSError(domain: "network", code: 1))
+        await fulfillment(of: [failedPresentation], timeout: 2)
         h.brain.user("Try again", turn: 2)
         h.brain.begin("d2", live: true, turn: 2); h.brain.settle(turn: 2)
         await waitForRequest(pages + 2, in: h)

@@ -25,6 +25,70 @@ struct DispatchJob: Codable, Identifiable, Hashable {
     /// Captured from the authorized handoff, never reconstructed from result prose or a subject.
     var origin: MailOrigin? = nil
     var command: CommandRun? = nil
+    var context: TaskContext? = nil
+    var inFlightOperation: String? = nil
+    var completionPreference: CompletionPreference? = nil
+    var inputChoices: [InputChoice]? = nil
+
+    struct InputChoice: Codable, Hashable, Identifiable {
+        let id: String
+        let label: String
+    }
+
+    enum CompletionPreference: String, Codable, CaseIterable {
+        case quiet
+        case bringBack = "bring_back"
+        var label: String { self == .quiet ? "Finish quietly" : "Bring result back" }
+
+        static func requested(in text: String) -> Self? {
+            let text = SpokenAnswerText.words(text).joined(separator: " ")
+            if ["finish quietly", "no need to tell me", "don t tell me when", "do not tell me when"].contains(where: text.contains) { return .quiet }
+            if ["bring result back", "bring me the result", "tell me when it finishes", "let me know when it"].contains(where: text.contains) { return .bringBack }
+            return nil
+        }
+    }
+
+    var effectivePreference: CompletionPreference { completionPreference ?? (reportBack == false ? .quiet : .bringBack) }
+    var ownsFeedSource: Bool { context?.parksSource == true && origin != nil && state != "cancelled" }
+    var sourceSelection: MailSelection? { origin.map { .init(account: $0.account, messageID: $0.messageID) } }
+    var needsReview: Bool {
+        guard deliveredAt == nil, !isRunning else { return false }
+        if ["awaiting_input", "failed", "partial", "unknown"].contains(state) { return true }
+        return isDone && effectivePreference == .bringBack && (context != nil || completionPreference != nil)
+    }
+
+    struct TaskContext: Codable, Hashable {
+        var revision: Int = 1
+        var scope: String
+        var expects: String
+        var facts: [String] = []
+        var authoredAt: Date
+        var timeZone: String
+        var input: String
+        var parksSource: Bool? = nil
+        var linkChoice: String? = nil
+        var deferredFeedbackArchive: Bool? = nil
+    }
+
+    var taskRevision: Int { context?.revision ?? 1 }
+    var hasCommittedWrites: Bool { receipts?.contains { $0.outcome == "success" } == true }
+
+    var spokenReceipt: String? {
+        guard !isRunning else { return nil }
+        let status: String
+        switch state {
+        case "done": status = "completed"
+        case "failed": status = "failed"
+        case "partial": status = "only partially completed"
+        case "unknown": status = "has an unknown outcome; check its receipts before retrying"
+        case "awaiting_input": status = "needs your input"
+        case "cancelled": status = "was cancelled"
+        default: return nil
+        }
+        let source = origin.map { "For the email “\($0.subject)” from \($0.sender) in \($0.account), " }
+            ?? "For your request “\(task)”, "
+        return source + "the task " + status + ". " + (result ?? "Review its result in Background activity.")
+    }
 
     struct CommandRun: Codable, Hashable, Sendable {
         let keyword: String
@@ -49,7 +113,7 @@ struct DispatchJob: Codable, Identifiable, Hashable {
         }
         guard saved.enabled, command.completedSteps >= 0,
               command.completedSteps < saved.actions.count,
-              Array(command.actions.prefix(command.completedSteps)) == Array(saved.actions.prefix(command.completedSteps)) else {
+              command.actions.prefix(command.completedSteps).map(\.definition) == saved.actions.prefix(command.completedSteps).map(\.definition) else {
             throw RetryRefusal(message: "The command is disabled, finished, or its already completed steps changed. Review its result before starting different work.")
         }
         guard (receipts ?? []).filter({ $0.outcome == "success" }).allSatisfy({
@@ -88,10 +152,11 @@ struct DispatchJob: Codable, Identifiable, Hashable {
         let outcome: String
         var targetHash: String? = nil
         var commandStep: Int? = nil
+        var revision: Int? = nil
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, task, state, result, receipts, historyOwner, operation, foregroundContinuation, origin, command
+        case id, task, state, result, receipts, historyOwner, operation, foregroundContinuation, origin, command, context, inFlightOperation, completionPreference, inputChoices
         case userId = "user_id"
         case conversationId = "conversation_id"
         case turnId = "turn_id"
@@ -102,7 +167,7 @@ struct DispatchJob: Codable, Identifiable, Hashable {
         case reportBack = "report_back"
     }
 
-    var isRunning: Bool { state == "running" }
+    var isRunning: Bool { state == "running" || state == "queued" || state == "cancel_requested" }
     var didFail: Bool { state == "failed" || state == "partial" }
     var isDone: Bool { state == "done" }
 
@@ -134,7 +199,7 @@ struct DispatchJob: Codable, Identifiable, Hashable {
                 + "or what it managed to do. Do not tell the user it did nothing — say it "
                 + "is unresolved, and offer to check the part that matters."
         }
-        guard isDone || didFail || state == "unknown", let result, !result.isEmpty else { return nil }
+        guard isDone || didFail || state == "unknown" || state == "awaiting_input", let result, !result.isEmpty else { return nil }
         return result
     }
 }

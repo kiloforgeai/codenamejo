@@ -24,7 +24,8 @@ enum CalendarSearch {
     /// Local first, coverage-gated; live from the phone when the requested window isn't
     /// fully synced.
     static func run(
-        timeMinMs: Int64, timeMaxMs: Int64, query: String, account: String?, store: CalendarStore
+        timeMinMs: Int64, timeMaxMs: Int64, query: String, account: String?, store: CalendarStore,
+        forceRefresh: Bool = false
     ) async -> Result {
         let started = Date()
         let resolvedAccount = account ?? GoogleAccountStore.primary()?.email ?? ""
@@ -36,7 +37,7 @@ enum CalendarSearch {
             return timeMinMs >= coveredMin && timeMaxMs <= coveredMax
         } ?? false
 
-        if covered {
+        if covered && !forceRefresh {
             let cached = await store.search(
                 account: resolvedAccount, timeMinMs: timeMinMs, timeMaxMs: timeMaxMs,
                 query: query, limit: limit
@@ -85,7 +86,7 @@ enum CalendarSearch {
     /// The Feed's calendar stage, read before the stage is reached: every account's rest of
     /// today, merged in start order. Nil when any account could not be read, so the stage
     /// falls back to the model's own lookup rather than speaking a partial day.
-    static func feedAgenda(accounts: [String], store: CalendarStore) async -> Result? {
+    static func feedAgenda(accounts: [String], store: CalendarStore, forceRefresh: Bool = false) async -> Result? {
         guard !accounts.isEmpty else { return nil }
         let window = CalendarFeedCadence.restOfLocalDay()
         var events: [CalendarStore.Event] = []
@@ -94,7 +95,7 @@ enum CalendarSearch {
         for account in accounts {
             let result = await run(
                 timeMinMs: window.startMs, timeMaxMs: window.endMs, query: "", account: account,
-                store: store)
+                store: store, forceRefresh: forceRefresh)
             guard result.successful else { return nil }
             events += result.events
             attendees += result.attendees

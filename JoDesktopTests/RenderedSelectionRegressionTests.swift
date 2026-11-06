@@ -34,7 +34,7 @@ final class RenderedSelectionRegressionTests: XCTestCase {
         XCTAssertEqual(key.messageId, "A")
         XCTAssertEqual(key.selectedIDs, ["A"])
         XCTAssertEqual(key.messageIDs.count, 28)
-        XCTAssertTrue(LiveEmailPreparationCache.candidates(current: step, readAhead: [key]).isEmpty)
+        XCTAssertEqual(LiveEmailPreparationCache.candidates(current: step, readAhead: [key]).map(\.messageIDs), [["A"]])
         let selection = MailSelection(account: "work@example.test", messageID: "A")
         let client = FullDuplexVoiceClient()
         client.standingStep = step
@@ -44,6 +44,60 @@ final class RenderedSelectionRegressionTests: XCTestCase {
         XCTAssertNotNil(client.renderedSelectionRefusal(), "Long threads must still reject a genuinely changed selection")
         XCTAssertTrue(LiveFastAction.allowsFollowup(name: "gmail_get_message",
             arguments: #"{"message_id":"A","account":"work@example.test"}"#, step: step))
+    }
+
+    func testReceiptDraftAndHandledMetadataDoNotEraseTheCurrentSelection() throws {
+        let selected = MailSelection(account: "work@example.test", messageID: "A")
+        let client = FullDuplexVoiceClient()
+        service.renderedWorkspace = .init(profileID: "work", conversationID: nil, focus: selected, queueCurrent: selected)
+        for metadata: [String: Any] in [
+            ["dispatchOutcome": ["status": "completed", "summary": "Reply sent"]],
+            ["presentedForOutcome": true],
+            ["hasDraft": true], ["alreadyDone": "sent"]
+        ] {
+            var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(step("A").utf8)) as? [String: Any])
+            if metadata["hasDraft"] != nil || metadata["alreadyDone"] != nil {
+                var item = try XCTUnwrap(payload["item"] as? [String: Any])
+                item.merge(metadata, uniquingKeysWith: { _, value in value }); payload["item"] = item
+            } else { payload.merge(metadata, uniquingKeysWith: { _, value in value }) }
+            let output = GmailReadTools.json(payload)
+            client.standingStep = output
+            XCTAssertNil(LiveEmailPresentation.Key.step(output), "Summary eligibility must stay bounded")
+            let key = try XCTUnwrap(LiveEmailPresentation.Key.selection(output))
+            XCTAssertEqual(key.selectedIDs, ["A"])
+            XCTAssertNil(client.renderedSelectionRefusal(), "A follow-up archive/next can target the unchanged rendered email")
+            XCTAssertTrue(LiveFastAction.Anchor(key: key, profileId: "work", revision: 2)
+                .matches(step: step("A"), profileId: "work", revision: 2))
+            XCTAssertTrue(LiveFastAction.allowsFollowup(name: "gmail_get_message",
+                arguments: #"{"message_id":"A","account":"work@example.test"}"#, step: output))
+            service.renderedWorkspace?.queueCurrent = .init(account: "work@example.test", messageID: "B")
+            XCTAssertNotNil(client.renderedSelectionRefusal(), "Receipt metadata cannot bypass the queue guard")
+            service.renderedWorkspace?.queueCurrent = selected
+        }
+    }
+
+    func testFailedBackgroundReceiptKeepsForegroundIdentityAndRejectsOldAnchors() throws {
+        var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(step("F").utf8)) as? [String: Any])
+        payload["dispatchOutcome"] = ["status": "failed", "sourceMessageID": "D"]
+        let output = GmailReadTools.json(payload)
+        let client = FullDuplexVoiceClient()
+        client.standingStep = output
+        let foreground = MailSelection(account: "work@example.test", messageID: "F")
+        service.renderedWorkspace = .init(profileID: "work", conversationID: nil, focus: foreground, queueCurrent: foreground)
+        XCTAssertEqual(LiveEmailPresentation.Key.selection(output)?.messageId, "F")
+        XCTAssertNil(client.renderedSelectionRefusal())
+        client.liveQueueActionAnchor = .init(step: step("D"), profileId: "work", revision: 1)
+        XCTAssertNotNil(client.renderedSelectionRefusal(), "The background receipt must not reauthorize D")
+        client.liveQueueActionAnchor = .init(step: output, profileId: "other", revision: 2)
+        XCTAssertNotNil(client.renderedSelectionRefusal())
+    }
+
+    func testReceiptWithoutAnEmailIdentityNeverAuthorizesAnAction() {
+        for output in [#"{"done":false,"dispatchOutcome":{"status":"completed"}}"#,
+                       #"{"done":false,"item":{"account":"","id":"A","threadId":"t"}}"#,
+                       #"{"done":true,"item":{"account":"work@example.test","id":"A","threadId":"t"}}"#] {
+            XCTAssertNil(LiveEmailPresentation.Key.selection(output))
+        }
     }
 
     func testDelayedAndOutOfOrderSnapshotsHoldTheVisibleCardWithoutAuthorizingActions() {
@@ -86,6 +140,58 @@ final class RenderedSelectionRegressionTests: XCTestCase {
         model.profileID = "another"
         XCTAssertNil(model.displayedFocus)
         XCTAssertNil(model.feedActionContext)
+    }
+
+    func testPreviewSurvivesStartupUntilFocusAndQueueCommitTogether() {
+        let model = DesktopWorkspaceModel()
+        model.profileID = "work"
+        let row = DesktopFeedRow.email(account: "work@example.test", messageID: "A", subject: "Subject", sender: "Sender")
+        model.feedPreview = .init(mail: .init(rows: [row], count: 40), slack: .init())
+        model.previewSelection = row
+        let visible = model.displayedFocus
+        model.conversationID = UUID()
+        model.inSession = true
+        XCTAssertEqual(model.feedRows, [row])
+        XCTAssertEqual(model.currentFeedRowID, row.id, "Keep the reader and scroll identity through handoff")
+        XCTAssertEqual(model.displayedFocus, visible)
+        XCTAssertTrue(model.isStartingFeed)
+        XCTAssertNil(model.feedActionContext)
+        model.applySessionFeed(.init(status: .loading, revision: 1))
+        model.focus = row.previewFocus
+        XCTAssertEqual(model.feedRows, [row])
+        XCTAssertNil(model.feedActionContext)
+        let fields = VoiceDiagnostics.safeFields(model.renderedState.diagnosticFields(session: VoiceDiagnostics().begin(engine: "test"), revision: 1))
+        XCTAssertEqual(fields["sidebar_source"], "held_preview")
+        XCTAssertEqual(fields["session_phase"], "starting")
+        XCTAssertEqual(fields["visible_count"], "1")
+        model.applySessionFeed(.init(rows: [row], current: row.selection, status: .ready, revision: 2))
+        XCTAssertFalse(model.isStartingFeed)
+        XCTAssertEqual(model.currentFeedRowID, row.id)
+        XCTAssertNotNil(model.feedActionContext)
+        model.conversationID = UUID()
+        XCTAssertTrue(model.isStartingFeed, "Same-profile restart keeps the last coherent surface")
+        XCTAssertEqual(model.feedRows, [row])
+        XCTAssertNil(model.feedActionContext)
+        model.profileID = "other"
+        XCTAssertNil(model.displayedFocus)
+        XCTAssertTrue(model.feedRows.isEmpty)
+        XCTAssertNil(model.feedPreview)
+    }
+
+    func testColdStartupAndUnavailableFeedDoNotLookCompleteOrRetainOtherSessions() {
+        let model = DesktopWorkspaceModel()
+        model.conversationID = UUID(); model.inSession = true
+        XCTAssertTrue(model.selectionIsTransitioning)
+        XCTAssertFalse(model.feedComplete)
+        XCTAssertNil(model.feedActionContext)
+        model.applySessionFeed(.init(status: .unavailable, revision: 1))
+        XCTAssertFalse(model.isStartingFeed)
+        XCTAssertFalse(model.feedComplete)
+        model.inSession = false; model.conversationID = nil
+        XCTAssertFalse(model.isStartingFeed)
+        model.sessionIntent = .quickAction
+        model.conversationID = UUID(); model.inSession = true
+        XCTAssertFalse(model.isStartingFeed)
     }
 
     func testCalendarAndCompletionCanReplaceAnEmailWithoutWaitingForMailQueueToMove() {

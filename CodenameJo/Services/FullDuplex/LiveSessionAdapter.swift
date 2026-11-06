@@ -13,7 +13,13 @@ final class LiveSessionAdapter {
     let wire: ([String: Any]) -> Void
     let emit: (RealtimeSignal) -> Void
     private var clientBrain: LiveClientBrain?
+    var calendarWindow: CalendarRequestWindow? { clientBrain?.calendarWindow }
     private var presentationDelegations = Set<String>()
+    private var abandonedPresentations = Set<String>()
+    private var resultPresentationState: (turn: Int, scope: String?, selection: LiveSelectionGrounding.Selection)?
+    private var buttonPresentationWatchdog: Task<Void, Never>?
+    private var buttonPresentationText = ""
+    var buttonPresentationBound: TimeInterval = 10
     private var lastSettledInput = ""
     var clientBrainState: (() -> (text: String, scope: String?))?
     private var started = false
@@ -106,7 +112,8 @@ final class LiveSessionAdapter {
     private var pendingFunctionOutputs: [[String: Any]] = []
     private var continuationOwed = false
     private var pendingContext: Set<String> = []
-    private var speechRequest: String?
+    private var speechRequest: String? { didSet { speechIsCurrent = nil } }
+    private var speechIsCurrent: (() -> Bool)?
     private var preparedSpeechPending = false
     private var speechRequestedAt: Double?
     /// Live takes a few seconds to turn a speech request into audio; nothing is audible yet.
@@ -134,6 +141,9 @@ final class LiveSessionAdapter {
     private var inputEnd: Double = 0
     private var outputEnd: Double = 0
     private var inputFinalizer: Task<Void, Never>?
+    private var silentInputWatchdog: Task<Void, Never>?
+    var silentInputRecoveryDelay: TimeInterval = 1.5
+    var silentInputBound: TimeInterval = 10
     private var audible = false
     private var lastAudio = Date.distantPast
     private var lastInputAt: Date?
@@ -142,6 +152,7 @@ final class LiveSessionAdapter {
     private var delegationHandoffMs: [String: Int] = [:]
     private var delegationStepTools: [String: [String]] = [:]
     private var clockAppendedAt: Date?
+    private var clockZone: String?
     /// Presence lines for a quiet tool turn; none names a tool or matches a stall phrase in `announcesLookup`.
     static let waitBeats = ["Still working on that.", "Still here, still working on that."]
     var waitBeatQuiet: TimeInterval = 4
@@ -200,18 +211,31 @@ final class LiveSessionAdapter {
                       value["request_id"] as? String == id, let message = value["message"] as? String else { return }
                 spoken = message
             }
-            append(spoken, type: "session.commentary.append", delegation: delegation)
+            if calendarWindow != nil { speakExactly(spoken) }
+            else { append(spoken, type: "session.commentary.append", delegation: delegation) }
         }, failed: { [weak self] message in
             guard let self, !closed else { return }
             backendStarting = false
             continuationOwed = false
             resolvedInputTurns.insert(inputTurn)
             stopQueueActionRecovery()
-            emit(.event(.error(message: message, code: "live_client_brain_failed")))
+            if fastResults[inputTurn] != nil {
+                buttonPresentationWatchdog?.cancel()
+                emit(.event(.error(message: "Jo couldn't present the action's result. Check Live Activity before trying it again; you can continue with the feed buttons.", code: "live_button_presentation_timeout")))
+            } else {
+                emit(.event(.error(message: message, code: "live_client_brain_failed")))
+            }
         })
         clientBrain?.onRequestTransition = { [weak self] reason, request, delegation, turn in
             self?.diagnostics?.record(.turnTransition, ["transition": reason, "request_id": request,
                 "delegation_id": delegation, "input_turn": String(turn)])
+        }
+        clientBrain?.present = { [weak self] text in
+            guard let self, !closed else { return }
+            let expected = resultPresentationState
+            refreshBrainState()
+            if expected != nil, resultPresentationState == nil { return }
+            speakExactly(text)
         }
         clientBrain?.onAttemptOutcome = { [weak self] turn, fields in
             guard let self else { return }
@@ -240,8 +264,23 @@ final class LiveSessionAdapter {
         clientBrain?.jobCompleted(id: id, result: result)
     }
 
+    func turn(for delegation: String) -> Int { delegationTurns[delegation] ?? inputTurn }
+
+    func correctEmailInterpretation() {
+        cancelPreparedEmail()
+        refreshBrainState()
+        clientBrain?.correctEmailInterpretation()
+        append("The user corrected the selected email's interpretation. Discard its earlier assistant summary and use the source-scoped userCorrection in the application context. Do not repeat the old introduction or treat feedback as authorization to act.", type: "session.instructions.append")
+    }
+
     private func refreshBrainState() {
-        if let state = clientBrainState?() { clientBrain?.updateState(state.text, scope: state.scope) }
+        if let state = clientBrainState?() {
+            if let expected = resultPresentationState,
+               expected.scope != state.scope || expected.selection != LiveSelectionGrounding.selection(state.text) {
+                releaseResultPresentation(turn: expected.turn, reason: "selection_changed")
+            }
+            clientBrain?.updateState(state.text, scope: state.scope)
+        }
     }
 
     /// Live answers a question itself, so assessing it again, now or on a later turn, repeats the answer.
@@ -294,10 +333,31 @@ final class LiveSessionAdapter {
     ]
 
     /// A click owns a new turn. It cannot inherit unfinished speech or overtake another tool.
+    var buttonActionBlockReason: String? {
+        if !started || closed { return "The Live connection is not ready." }
+        if farewell != nil { return "This session is ending." }
+        if activeCall != nil || activeFastCall != nil || !calls.isEmpty || !pendingFunctionOutputs.isEmpty {
+            if let call = activeCall, presentationDelegations.contains(call.delegation) {
+                return "The action returned. Jo is reading context for its spoken result."
+            }
+            return "An action is still running. Its result must arrive before another action can start."
+        }
+        if backendRunning || continuationOwed {
+            return fastResults[inputTurn] == nil ? "Jo is finishing the current request." : "The action returned. Jo is preparing its spoken result."
+        }
+        if hasUnresolvedQueueAction { return "Jo is resolving your previous spoken request." }
+        if inputTurn > 0 && !finalizedInput { return "Finish speaking before using a feed action." }
+        return nil
+    }
+
     func beginButtonAction(callId: String, action: LiveFastAction) -> Bool {
-        guard canSelectReturnedWork, farewell == nil, !hasUnresolvedQueueAction, !unworkedPending,
-              pendingFunctionOutputs.isEmpty, pendingContext.isEmpty,
-              inputTurn == 0 || finalizedInput else { return false }
+        trace("button_action_attempt", call: callId)
+        guard buttonActionBlockReason == nil else {
+            trace("button_action_refused", call: callId)
+            return false
+        }
+        buttonPresentationWatchdog?.cancel()
+        silentInputWatchdog?.cancel()
         inputFinalizer?.cancel()
         finishTranscript()
         cancelPreparedEmail()
@@ -317,11 +377,10 @@ final class LiveSessionAdapter {
         delegationTurns[callId] = inputTurn
         turnsWithTools.insert(inputTurn)
         turnsWithQueueActions.insert(inputTurn)
-        emit(.liveUserActivity)
-        emit(.liveDelegation(callId, userTurn: inputTurn))
         refreshBrainState()
         clientBrain?.user(action.requestText, turn: inputTurn)
         trace("button_action_started", call: callId, delegation: callId)
+        emit(.liveButtonAction(callId, action))
         return true
     }
 
@@ -424,6 +483,7 @@ final class LiveSessionAdapter {
         continuationDelegation = fast.delegation
         activeFastCall = nil
         trace("fast_result", call: id, delegation: fast.delegation)
+        watchButtonPresentation(turn: fast.turn)
         if let clientBrain {
             let preamble = output.prefix { $0 != "{" }
             let alreadyPresented = preamble.contains("The application is presenting")
@@ -435,6 +495,9 @@ final class LiveSessionAdapter {
                 fastResults[inputTurn] = result
                 emit(.liveDelegation(id, userTurn: inputTurn))
                 refreshBrainState()
+                if let state = clientBrainState?() {
+                    resultPresentationState = (inputTurn, state.scope, LiveSelectionGrounding.selection(state.text))
+                }
                 clientBrain.presentResult(result, delegation: id, turn: inputTurn)
             }
         } else {
@@ -576,8 +639,9 @@ final class LiveSessionAdapter {
     /// Refreshed on a new user turn once it is five minutes old or the day has changed.
     func appendClock(now: Date = Date(), zone: TimeZone = .current) {
         if let last = clockAppendedAt, now.timeIntervalSince(last) < 300,
-           Calendar.current.isDate(last, inSameDayAs: now) { return }
+           clockZone == zone.identifier, Calendar.current.isDate(last, inSameDayAs: now) { return }
         clockAppendedAt = now
+        clockZone = zone.identifier
         append(Self.clockLine(now: now, zone: zone), type: "session.thinking.append", awaitingAcknowledgement: false)
     }
 
@@ -654,9 +718,11 @@ final class LiveSessionAdapter {
 
     /// Recite one supplied line and stop. The model composes from thinking appends; it recites
     /// only from the commentary channel.
-    func speakExactly(_ line: String) {
+    func speakExactly(_ line: String, ifCurrent: (() -> Bool)? = nil) {
         guard !closed, farewell == nil, !line.isEmpty else { return }
+        guard ifCurrent?() != false else { return }
         speechRequest = "Say exactly: \(line) Then stop speaking. Say nothing else and call no tool."
+        speechIsCurrent = ifCurrent
         preparedSpeechPending = false
         flushSpeech()
     }
@@ -684,7 +750,7 @@ final class LiveSessionAdapter {
                     if let start = toolStartedAt.removeValue(forKey: id) {
                         fields["duration_ms"] = String(Int((ProcessInfo.processInfo.systemUptime - start) * 1000))
                     }
-                    diagnostics?.record(.toolFinished, fields)
+                    diagnostics?.record(.toolResultDelivered, fields)
                 }
                 if ["dispatch", "dispatch_command"].contains(activeCall?.name ?? ""),
                    output.hasPrefix("Started."),
@@ -702,8 +768,10 @@ final class LiveSessionAdapter {
                 callWatchdog?.cancel()
                 callWatchdog = nil
                 continuationOwed = true
+                trace("continuation_owed", delegation: continuationDelegation)
                 flushFunctionOutputs()
                 runNextCall()
+                continueBackendIfReady()
             } else if let content = item["content"] as? [[String: Any]] {
                 let text = content.compactMap { $0["text"] as? String }.joined(separator: "\n")
                 send(["type": "response.item.create", "event_id": UUID().uuidString,
@@ -715,6 +783,11 @@ final class LiveSessionAdapter {
             }
         case "response.create":
             guard farewell == nil else { return }
+            if clientBrain != nil, fastResults[inputTurn] != nil {
+                continueBackendIfReady()
+                flushSpeech()
+                return
+            }
             if let instructions = (payload["response"] as? [String: Any])?["instructions"] as? String {
                 // A thinking append outlives its response, so an unscoped grant would become a
                 // standing order to narrate actions without delegating.
@@ -785,6 +858,7 @@ final class LiveSessionAdapter {
                 }
             }
         case "response.event":
+            if let delegation = event["delegation_id"] as? String, abandonedPresentations.contains(delegation) { return }
             guard let nested = event["event"] as? [String: Any], let kind = nested["type"] as? String else { return }
             let responseID = nested["response_id"] as? String
                 ?? (nested["response"] as? [String: Any])?["id"] as? String
@@ -898,6 +972,11 @@ final class LiveSessionAdapter {
                 emit(.liveFirstSpeech(afterInputMs: Int(start - inputEnd)))
             }
             let speech = speechOutsideWaitBeat(fragment)
+            buttonPresentationText += speech ?? ""
+            if Self.hasSubstantiveSpeech(buttonPresentationText), !backendRunning, !continuationOwed, activeCall == nil {
+                buttonPresentationWatchdog?.cancel()
+                buttonPresentationWatchdog = nil
+            }
             lastOutputAt = Date()
             // Presence speech is heard, not recorded: it never joins a reply, settles a turn or feeds recovery.
             guard let delta = speech, !delta.isEmpty else {
@@ -921,6 +1000,7 @@ final class LiveSessionAdapter {
             guard event["client_event_id"] == nil,
                   (event["end_ms"] as? Double) != (event["start_ms"] as? Double) else { return }
             guard let delta = event["delta"] as? String else { return }
+            silentInputWatchdog?.cancel()
             lastInputAt = Date()
             let start = event["start_ms"] as? Double ?? inputEnd
             let suffix = delta.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
@@ -936,9 +1016,14 @@ final class LiveSessionAdapter {
             let unfinishedPrefix = LiveRequestRecovery.hasUnfinishedAuthorizationPrefix(authorizationText)
             let backchannel = finalizedInput && !authorizationText.isEmpty && LiveRequestRecovery.isBackchannel(delta)
             let startsTurn = inputText.isEmpty || (!finishesAssent && !unfinishedPrefix && !backchannel
-                && ((finalizedInput && (newIntent || (answered && start - inputEnd > 1000)))
+                && ((finalizedInput && (newIntent || (answered && start - inputEnd > 1000) || start - inputEnd > 5000))
                     || (newIntent && start - inputEnd > 1000)))
             if startsTurn {
+                releaseResultPresentation(turn: inputTurn, reason: "new_user_request")
+                if speechIsCurrent != nil {
+                    speechRequest = nil
+                    speechIsCurrent = nil
+                }
                 if queueActionRecovery?.finished == false { trace("queue_action_superseded") }
                 finishTranscript()
                 // Caption pauses and backchannels do not finish the user's authorization.
@@ -1017,6 +1102,10 @@ final class LiveSessionAdapter {
                 }
                 if LiveRequestRecovery.isQuestion(self.authorizationText) { self.questionTurn = self.inputTurn }
                 self.trace("input_settled")
+                if let window = self.calendarWindow {
+                    self.append(window.rangeExplanation + " Use each event date's own daylight-saving offset. Calendar availability and scheduling replies must use this range, never an email's timestamp.",
+                        type: "session.thinking.append", awaitingAcknowledgement: false)
+                }
                 self.lastSettledInput = self.inputText
                 self.emit(.liveInputFinished(self.inputText))
                 if self.clientBrain != nil {
@@ -1026,6 +1115,7 @@ final class LiveSessionAdapter {
                     }
                 }
                 self.clientBrain?.settle(turn: self.inputTurn)
+                self.watchSilentInput()
                 self.emitIdleIfSettled()
                 self.emitUnworkedTurnIfSettled()
             }
@@ -1044,6 +1134,7 @@ final class LiveSessionAdapter {
                                code: error["code"] as? String)))
         case "session.closed":
             closed = true
+            silentInputWatchdog?.cancel()
             inputFinalizer?.cancel()
             finishTranscript()
             emit(.closed(reason: "Live session closed"))
@@ -1139,6 +1230,7 @@ final class LiveSessionAdapter {
         guard farewell == nil, continuationOwed, !backendRunning, activeCall == nil, activeFastCall == nil, calls.isEmpty else { return }
         flushFunctionOutputs()
         continuationOwed = false
+        trace("continuation_resumed", delegation: continuationDelegation)
         backendStarting = true
         send(["type": "response.create", "event_id": UUID().uuidString])
     }
@@ -1155,9 +1247,12 @@ final class LiveSessionAdapter {
 
     private func flushSpeech() {
         guard pendingContext.isEmpty, let request = speechRequest else { return }
+        let current = speechIsCurrent?() != false
         speechRequest = nil
         preparedSpeechPending = false
+        guard current else { return }
         speechRequestedAt = ProcessInfo.processInfo.systemUptime
+        diagnostics?.record(.speechRequested, ["engine": "live", "turn_id": historyIDForTurn?(inputTurn) ?? String(inputTurn), "phase": "scheduled"])
         append(request, type: "session.commentary.append")
     }
 
@@ -1199,6 +1294,7 @@ final class LiveSessionAdapter {
         let working = backendRunning || activeCall != nil || activeFastCall != nil || !calls.isEmpty
             || continuationOwed || !pendingFunctionOutputs.isEmpty
         guard started, !closed, farewell == nil, working, finalizedInput, inputTurn > 0,
+              fastResults[inputTurn] == nil,
               delegationTurns.values.contains(inputTurn),
               recoveryRequests[inputTurn] == nil || turnsWithTools.contains(inputTurn),
               !backgroundRequestTurns.contains(inputTurn), !backgroundStartedTurns.contains(inputTurn),
@@ -1283,9 +1379,100 @@ final class LiveSessionAdapter {
         return found
     }
 
+    private var inputNeedsResponse: Bool {
+        finalizedInput && !closed && farewell == nil && !authorizationText.isEmpty
+            && !resolvedInputTurns.contains(inputTurn) && !turnsWithTools.contains(inputTurn)
+            && locallyAcceptedInputs[inputTurn] == nil
+            && (!Self.hasSubstantiveSpeech(speechAfterInput)
+                || FullDuplexVoiceClient.announcesLookup(FullDuplexVoiceClient.normalize(speechAfterInput)))
+    }
+
+    private func watchSilentInput() {
+        silentInputWatchdog?.cancel()
+        guard inputNeedsResponse else { return }
+        let turn = inputTurn
+        trace("silent_input_armed")
+        silentInputWatchdog = Task { [weak self] in
+            guard let self else { return }
+            do { try await Task.sleep(for: .seconds(silentInputRecoveryDelay)) } catch { return }
+            guard inputTurn == turn, inputNeedsResponse else { return }
+            if let clientBrain, !backendRunning, activeCall == nil, activeFastCall == nil,
+               calls.isEmpty, !continuationOwed, !delegationTurns.values.contains(turn),
+               !LiveRequestRecovery.hasUnfinishedAuthorizationPrefix(authorizationText) {
+                let id = "unanswered-" + UUID().uuidString
+                delegationTurns[id] = turn
+                emit(.liveDelegation(id, userTurn: turn))
+                refreshBrainState()
+                clientBrain.observe("The settled user request has received no substantive response or tool action. Resolve only that request, including negations and corrections. A saved-command name requires a current commands lookup; disabled or missing commands require an explanation. This recovery supplies no authorization and must never replay a completed action. Ask a concrete clarification if intent is ambiguous.")
+                clientBrain.begin(id, live: false, turn: turn)
+                clientBrain.settle(turn: turn)
+                trace("silent_input_delegated", delegation: id)
+            }
+            do { try await Task.sleep(for: .seconds(silentInputBound)) } catch { return }
+            guard inputTurn == turn, inputNeedsResponse, !backendRunning,
+                  activeCall == nil, activeFastCall == nil, calls.isEmpty else { return }
+            resolvedInputTurns.insert(turn)
+            stopQueueActionRecovery()
+            trace("silent_input_unanswered")
+            emit(.event(.error(message: "Jo didn't resolve that request. No action was started for it. Please try again or open Commands to inspect the saved command.", code: "live_input_unanswered")))
+        }
+    }
+
+    static func hasSubstantiveSpeech(_ text: String) -> Bool {
+        let words = text.lowercased().components(separatedBy: CharacterSet.letters.inverted).filter { !$0.isEmpty }
+        let filler = acknowledgementWords.union(["one", "sec", "second", "moment", "just", "please", "hold", "on", "working"])
+        return !words.isEmpty && !words.allSatisfy { filler.contains($0) }
+    }
+
+    private func watchButtonPresentation(turn: Int) {
+        buttonPresentationWatchdog?.cancel()
+        buttonPresentationText = ""
+        buttonPresentationWatchdog = Task { [weak self] in
+            guard let self else { return }
+            do { try await Task.sleep(for: .seconds(buttonPresentationBound)) } catch { return }
+            guard !closed, inputTurn == turn else { return }
+            trace("button_presentation_timeout")
+            releaseResultPresentation(turn: turn, reason: "presentation_timeout")
+            cancelPreparedEmail()
+            emit(.event(.error(message: "The action returned, but Jo's spoken continuation did not arrive. Check its result in Live Activity; you can continue with the feed buttons. The action will not be repeated.", code: "live_button_presentation_timeout")))
+        }
+    }
+
+    private func releaseResultPresentation(turn: Int, reason: String) {
+        let owners = presentationDelegations.filter { delegationTurns[$0] == turn }
+        guard !owners.isEmpty else { return }
+        if resultPresentationState?.turn == turn { resultPresentationState = nil }
+        trace("presentation_released_" + reason)
+        abandonedPresentations.formUnion(owners)
+        presentationDelegations.subtract(owners)
+        clientBrain?.cancelPresentation(delegations: owners)
+        let active = activeCall.map { owners.contains($0.delegation) } == true
+        if active, let call = activeCall {
+            releasedCalls.insert(call.id)
+            activeCall = nil
+            callWatchdog?.cancel(); callWatchdog = nil
+        }
+        for call in calls where owners.contains(call.delegation) { releasedCalls.insert(call.id) }
+        calls.removeAll { owners.contains($0.delegation) }
+        runningResponses = runningResponses.filter { !owners.contains(responseDelegations[$0] ?? "") }
+        if owners.contains(continuationDelegation ?? "") {
+            continuationOwed = false
+            continuationDelegation = nil
+            pendingFunctionOutputs.removeAll()
+            backendStarting = false
+        }
+        if turn == inputTurn { buttonPresentationWatchdog?.cancel(); buttonPresentationWatchdog = nil }
+    }
+
     private func trace(_ transition: String, call: String? = nil, delegation: String? = nil) {
         var fields = ["transition": transition, "turn_id": historyIDForTurn?(inputTurn) ?? String(inputTurn),
-                      "pending_calls": String(calls.count), "pending_responses": String(runningResponses.count)]
+                      "pending_calls": String(calls.count), "pending_responses": String(runningResponses.count),
+                      "pending_context": String(pendingContext.count), "backend_starting": String(backendStarting),
+                      "active_call": activeCall?.id ?? "none", "active_fast_call": activeFastCall?.id ?? "none",
+                      "input_finalized": String(finalizedInput), "speech_pending": String(speechRequest != nil),
+                      "continuation_owed": String(continuationOwed), "continuation_owner": continuationDelegation ?? "none",
+                      "pending_phase": fastResults[inputTurn] == nil ? "action_or_answer" : "result_presentation",
+                      "button_block_reason": buttonActionBlockReason ?? "none"]
         fields["call_id"] = call
         fields["delegation_id"] = delegation
         diagnostics?.record(transition.hasPrefix("queue_action") ? .queueRecovery : .turnTransition, fields)
@@ -1359,6 +1546,8 @@ final class LiveSessionAdapter {
     }
 
     func close() {
+        silentInputWatchdog?.cancel()
+        buttonPresentationWatchdog?.cancel()
         guard !closed else { return }
         finishObservedPlayback(phase: "closed")
         finishTranscript()

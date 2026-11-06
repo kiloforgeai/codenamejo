@@ -451,6 +451,8 @@ targets:
       - CodenameJoTests/DispatchQueueReturnPolicyTests.swift
       - CodenameJoTests/LiveEmailPresentationTests.swift
       - CodenameJoTests/CustomCommandStoreTests.swift
+      - CodenameJoTests/LocalEmailPresentationTests.swift
+      - CodenameJoTests/EmailQueueSpeechContractTests.swift
     configFiles:
       Debug: Config/Version.xcconfig
       Release: Config/Version.xcconfig

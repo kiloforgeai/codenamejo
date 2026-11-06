@@ -143,6 +143,10 @@ extension Container {
             .singleton
     }
 
+    var applicationTasks: Factory<ApplicationTasks> {
+        self { MainActor.assumeIsolated { ApplicationTasks() } }.singleton
+    }
+
     /// Writes the assistant performed, with a link to each item
     /// (`record_type = "action"`, written by the broker).
     var actions: Factory<ActionStore> {

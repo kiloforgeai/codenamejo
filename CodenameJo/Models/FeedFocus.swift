@@ -26,8 +26,8 @@ enum FeedFocus: Hashable, Sendable {
         var isBackgroundResult = false
         var isFeedSelection = false
 
-        var displayedPosition: Int? { isBackgroundResult || isFeedSelection ? nil : position }
-        var displayedTotal: Int? { isBackgroundResult || isFeedSelection ? nil : total }
+        var displayedPosition: Int? { isBackgroundResult || isFeedSelection || total == nil ? nil : position }
+        var displayedTotal: Int? { displayedPosition == nil ? nil : total }
 
         var pageTotal: Int? {
             guard let total, total > 0 else { return nil }
@@ -171,11 +171,25 @@ struct FeedFocusTracker: Sendable {
 
     mutating func refreshEmailProgress(_ progress: LocalTriageQueue.Progress) -> FeedFocus? {
         guard case .email(var email) = focus,
+              !email.isBackgroundResult, !email.isFeedSelection,
+              let id = email.messageId, !id.isEmpty,
               email.messageId == progress.messageId,
               email.threadId == progress.threadId,
               email.account.caseInsensitiveCompare(progress.account ?? "") == .orderedSame else { return focus }
-        email.position = progress.displayPosition ?? progress.position
-        email.total = progress.displayQueued ?? progress.queued
+        let position: Int, total: Int
+        if let groupedPosition = progress.displayPosition, let groupedTotal = progress.displayQueued {
+            position = groupedPosition; total = groupedTotal
+        } else {
+            position = progress.position; total = progress.queued
+        }
+        // An incomplete or terminal snapshot cannot describe an actionable email's counter.
+        guard !progress.done, position > 0, total >= position else {
+            email.total = nil
+            focus = .email(email)
+            return focus
+        }
+        email.position = position
+        email.total = total
         focus = .email(email)
         return focus
     }
@@ -185,10 +199,7 @@ struct FeedFocusTracker: Sendable {
     @discardableResult
     mutating func applyTriage(
         output: String,
-        queuePosition: Int? = nil,
-        queueTotal: Int? = nil,
-        displayPosition: Int? = nil,
-        displayTotal: Int? = nil
+        progress: LocalTriageQueue.Progress? = nil
     ) -> FeedFocus? {
         guard let object = Self.object(from: output) else {
             return focus
@@ -226,14 +237,14 @@ struct FeedFocusTracker: Sendable {
             return focus
         }
         if let item = object["item"] as? [String: Any] {
-            let position = displayPosition ?? Self.int(object["position"]) ?? queuePosition ?? 1
+            let position = Self.int(object["position"]) ?? 1
             let email = FeedFocus.Email(
                 sender: Self.string(item["from"], fallback: "Unknown sender"),
                 subject: Self.string(item["subject"], fallback: "No subject"),
                 snippet: Self.string(item["snippet"], fallback: ""),
                 account: Self.string(item["account"], fallback: ""),
                 position: position,
-                total: displayTotal ?? queueTotal,
+                total: nil,
                 messageId: item["id"] as? String,
                 threadId: item["threadId"] as? String,
                 isBackgroundResult: Self.bool(object["presentedForOutcome"]) == true,
@@ -247,6 +258,7 @@ struct FeedFocusTracker: Sendable {
             summary.email = .reviewing
             terminalResponsePending = false
             focus = .email(email)
+            if let progress { return refreshEmailProgress(progress) }
             return focus
         }
 
@@ -274,7 +286,7 @@ struct FeedFocusTracker: Sendable {
 
         terminalResponsePending = interstitial == "feed"
         let priorFocus = focus
-        let queued = Self.int(object["queued"]) ?? queueTotal
+        let queued = Self.int(object["queued"])
         let emailStatus: FeedFocus.EmailStatus
         if queued == 0 || Self.bool(object["empty"]) == true {
             emailStatus = .empty

@@ -15,8 +15,8 @@ final class AppCoreContractTests: XCTestCase {
         }
         let data = try JSONSerialization.data(withJSONObject: catalogs, options: [.sortedKeys])
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        XCTAssertEqual(digest, "ea28646757e00b960bbe97bf002a462eba4ddbf850d1cef2061fe146052f4380",
-                       "A refactor must preserve the public tool contracts, including account-scoped wording")
+        XCTAssertEqual(digest, "0e337a3c94437291b52c9e0effa210494974db452b3c121bed6af737a27ce77d",
+                       "Tool contract changes require deliberate review, including account-scoped wording")
     }
 
     func testToolArgumentsPreserveAbsentFalseEmptyAndMalformedValues() throws {

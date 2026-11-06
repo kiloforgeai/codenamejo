@@ -195,6 +195,8 @@ extension LocalTriageQueue {
         let about: About?
         /// An answer to a request unrelated to the mail; it rides a step but is never about it.
         var independent = false
+        var taskRevision: Int? = nil
+        var taskState: String? = nil
 
         /// The fields that name a message and let a write land on it. Not the `Item` itself: `snippet`
         /// is content and `internalDate` is a cursor, and neither belongs in a referent.
@@ -241,6 +243,7 @@ extension LocalTriageQueue {
     /// Where the queue is, for the chip.
     struct Progress: Sendable, Equatable {
         let account: String?
+        // Both values include pruned positions in this pass; remaining counts only buffered mail.
         let position: Int
         let queued: Int
         let remaining: Int

@@ -49,6 +49,9 @@ struct CommandRecord: Codable, Identifiable, Hashable {
         /// stored as nil.
         var milliseconds: Int?
         var outcome: String? = nil
+        var callID: String? = nil
+        var reason: String? = nil
+        var targetHash: String? = nil
     }
 
     /// One delegated backend response on Live: when it finished, counted from the hand-off, and what it called.
@@ -64,6 +67,27 @@ struct CommandRecord: Codable, Identifiable, Hashable {
         var userSpokeMs: Int?
     }
     var brainSteps: [BrainStep]?
+    var feedbackID: UUID? = nil
+
+    func preservingTerminalAttempts(from previous: CommandRecord?) -> CommandRecord {
+        guard let previous else { return self }
+        var record = self
+        var steps = record.toolSteps ?? []
+        for prior in previous.toolSteps ?? [] {
+            guard let id = prior.callID,
+                  ["success", "refused", "failed", "cancelled", "partial", "unknown"].contains(prior.outcome ?? "") else { continue }
+            if let index = steps.firstIndex(where: { $0.callID == id }) { steps[index] = prior }
+            else { steps.append(prior) }
+        }
+        record.toolSteps = steps.isEmpty ? nil : steps
+        record.feedbackID = record.feedbackID ?? previous.feedbackID
+        if steps.contains(where: { $0.outcome == "refused" }) {
+            record.status = steps.contains(where: { $0.outcome == "success" }) ? .partial : .failed
+        } else if record.feedbackID != nil, record.status == .pending || record.status == .conversational {
+            record.status = .success
+        }
+        return record
+    }
 
     /// Appended to a reply the user cut off, so a transcript can't read it as complete.
     /// Deliberately not shared with `ClaudeVoiceClient`'s marker, which tells the model instead.

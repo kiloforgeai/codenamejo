@@ -17,6 +17,9 @@ class CustomCommandStore: ObservableObject {
     /// Every saved command, newest first, enabled or not. Settings draws all of them — a
     /// switched-off command still has to be visible to be switched back on.
     @Published var commands: [CustomCommand] = []
+    var labelLoader: (String) async throws -> [GmailManageTools.Label] = { account in
+        try await GmailManageTools.labels(GmailReadTools.token(account))
+    }
 
     /// What `run` and `list` hand the model: switched-on ones only. A switched-off command is
     /// *absent* rather than marked, so the model has nothing to follow.
@@ -103,7 +106,11 @@ class CustomCommandStore: ObservableObject {
                 return .refused("That user label was not found. List the labels and choose an existing label.")
             }
             var actions = command.actions
-            actions[indices[0]].resolvedLabel = .init(id: label.id, name: label.name, account: target)
+            let old = actions[indices[0]].resolvedLabel
+            var mappings = old?.name.caseInsensitiveCompare(label.name) == .orderedSame ? old?.mappings ?? [:] : [:]
+            mappings[target.lowercased()] = label.id
+            actions[indices[0]].resolvedLabel = .init(id: label.id, name: label.name, account: target,
+                scope: old?.scope, mappings: mappings)
             actions[indices[0]].detail = "Apply the saved label \(label.name)."
             guard backend.userId == owner, Self.profileKey == profile else {
                 return .refused("The active profile changed. The command correction was not saved.")
@@ -115,6 +122,57 @@ class CustomCommandStore: ObservableObject {
             await refresh()
             return .saved(corrected)
         } catch { return .failed("The command correction did not save: \(error.localizedDescription)") }
+    }
+
+    func resolveLabels(_ steps: [CommandAction], keyword: String?, account: String?,
+                       ownerID: String?, profileID: String?) async throws -> [CommandAction] {
+        guard steps.contains(where: { $0.resolvedLabel != nil }) else { return steps }
+        guard let scope = editScope, scope.owner == ownerID, ProfileRuntime.snapshot?.profileId == profileID,
+              let account, !account.isEmpty, let keyword else {
+            throw CustomCommandRules.Refusal("The command's source or profile is unavailable. Select its original email and retry.")
+        }
+        if let reason = CustomCommandRules.accountRefusal(steps, account: account) { throw CustomCommandRules.Refusal(reason) }
+        _ = try GmailReadTools.targets(["account": account])
+        let labels = try await labelLoader(account)
+        guard editScope == scope, ProfileRuntime.snapshot?.profileId == profileID else {
+            throw CustomCommandRules.Refusal("The profile changed while checking labels. Nothing was changed.")
+        }
+        _ = try GmailReadTools.targets(["account": account])
+        guard let saved = try await rows.all(userId: scope.owner, profileId: scope.profile).first(where: { $0.keyword == keyword }), saved.enabled else {
+            throw CustomCommandRules.Refusal("That command is disabled or no longer exists.")
+        }
+        var actions = saved.actions
+        var resolved = steps
+        for index in steps.indices {
+            guard let requested = steps[index].resolvedLabel else { continue }
+            let matches = labels.filter { $0.user && $0.name.caseInsensitiveCompare(requested.name) == .orderedSame }
+            guard matches.count == 1, let label = matches.first else {
+                throw CustomCommandRules.Refusal("\(matches.isEmpty ? "Missing" : "Ambiguous") label “\(requested.name)” in \(account). Choose its existing label in Commands; no command steps were run.")
+            }
+            let savedIndices = actions.indices.filter { i in
+                let current = actions[i].resolvedLabel
+                return actions[i].tool == steps[index].tool && actions[i].detail == steps[index].detail
+                    && current?.name == requested.name && current?.effectiveScope == requested.effectiveScope
+                    && current?.account == requested.account
+            }
+            guard !savedIndices.isEmpty else { throw CustomCommandRules.Refusal("The command changed. Read its current definition before retrying.") }
+            for i in savedIndices {
+                var mapping = actions[i].resolvedLabel?.mappings ?? [requested.account.lowercased(): requested.id]
+                mapping[account.lowercased()] = label.id
+                actions[i].resolvedLabel?.mappings = mapping
+            }
+            resolved[index].resolvedLabel = .init(id: label.id, name: label.name, account: account, scope: .savedAccount)
+        }
+        if actions != saved.actions {
+            guard try await rows.correctLabel(userId: scope.owner, profileId: scope.profile, expected: saved, actions: actions) != nil else {
+                throw CustomCommandRules.Refusal("The command changed while checking its labels. Nothing was run; retry its current definition.")
+            }
+            await refresh()
+        }
+        guard editScope == scope, ProfileRuntime.snapshot?.profileId == profileID else {
+            throw CustomCommandRules.Refusal("The profile changed. No command steps were run.")
+        }
+        return resolved
     }
 
     /// Delete one command, by exact keyword. A keyword that matches nothing is refused by name

@@ -383,13 +383,27 @@ class RealtimeService: ObservableObject {
     private var diagnostics: VoiceDiagnostics.Session?
     var renderedWorkspace: RenderedFeedState?
     private var renderRevision = 0
+    var renderedRevision: Int { renderRevision }
 
     func selectReturnedResult(_ id: UUID) async -> String? {
         guard isConversing, let client = fullDuplex else { return "Start a Live session to work on this email." }
         return await client.selectReturnedResult(id)
     }
 
+    func parkAcceptedTask(_ id: UUID) async {
+        guard isConversing, let client = fullDuplex else { return }
+        _ = await client.parkAcceptedTask(id)
+        answerIsStale = !responseText.isEmpty
+    }
+
     #if targetEnvironment(macCatalyst)
+    func advanceDesktopFeed(_ context: FeedActionContext) async -> String? {
+        guard let client = fullDuplex else { return "The feed session ended. Select an item from the refreshed feed." }
+        let error = await client.advanceDesktopFeed(context)
+        if error == nil { answerIsStale = !responseText.isEmpty }
+        return error
+    }
+
     func selectFeedItem(_ row: DesktopFeedRow) async -> String? {
         guard isConversing, let client = fullDuplex else { return "Start a Live session to work on this item." }
         let error = await client.selectFeedItem(row)
@@ -401,6 +415,14 @@ class RealtimeService: ObservableObject {
     func performFeedAction(_ action: LiveFastAction, context: FeedActionContext) -> String? {
         guard isConversing, let client = fullDuplex else { return "Start a Live feed session to use these actions." }
         return client.performFeedAction(action, context: context)
+    }
+
+    var feedActionBlockReason: String? { fullDuplex?.feedActionBlockReason }
+
+    func recordCommandPanel(open: Bool) {
+        diagnostics?.record(.turnTransition, ["transition": open ? "commands_panel_opened" : "commands_panel_closed",
+            "turn_id": fullDuplex?.historyTurnID.uuidString ?? "none",
+            "input_turn": String(fullDuplex?.liveUserTurn ?? 0)])
     }
 
     func recordRenderedWorkspace(_ state: RenderedFeedState) {
@@ -735,6 +757,7 @@ class RealtimeService: ObservableObject {
             // late reads as an unrelated animation.
             self?.finishLiveDispatch(jobId)
         }
+        client.onRecoverableNotice = { [weak self] message in self?.voiceNotice = message }
         client.onError = { [weak self] message in
             guard let self else { return }
             RealtimeLog.log("fullduplex: onError \(message)")
@@ -1522,6 +1545,7 @@ class RealtimeService: ObservableObject {
         // it actually caused.
         fullDuplex?.checkpointHistory()
         fullDuplex?.emitFinalTranscript(responseCompleted: false)
+        if let client = fullDuplex { client.onHistoryInterrupted?(client.historyTurnID) }
         finishConversation(reason: reason)
         // Pause the durable queue on the same action that ends the call, not on the
         // next dial. The latter is too late: a queued continuation can advance and
@@ -1924,6 +1948,20 @@ class RealtimeService: ObservableObject {
     private var turnHistory = TurnHistory()
 
     func bindLiveHistory(_ client: FullDuplexVoiceClient) {
+        client.onToolRefused = { [weak self] origin, attempt in
+            guard let self else { return }
+            self.lastCompletedTurn = self.turnHistory.refused(origin, attempt: attempt, conversationID: self.activeConversationId)
+        }
+        client.onFeedbackSettled = { [weak self] ids, feedbackID, status in
+            guard let self else { return }
+            for record in self.turnHistory.feedbackSettled(ids: ids, feedbackID: feedbackID, status: status) {
+                self.lastCompletedTurn = record
+            }
+        }
+        client.onHistoryInterrupted = { [weak self] id in
+            guard let self, let record = self.turnHistory.cancelUnanswered(id: id) else { return }
+            self.lastCompletedTurn = record
+        }
         client.onTurnFailed = { [weak self, weak client] _ in
             guard let self, let client else { return }
             self.lastCompletedTurn = self.turnHistory.fail(id: client.historyTurnID, text: client.historyUserText,

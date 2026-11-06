@@ -1,4 +1,5 @@
 import Foundation
+import FactoryKit
 
 /// Owns the active Responses exchange; completed tool chains never accumulate in the next request.
 @MainActor
@@ -10,6 +11,13 @@ final class LiveClientBrain {
     let failed: (String) -> Void
     private var history: [[String: Any]] = []
     private var context: [String] = []
+    var now: () -> Date = Date.init
+    var timeZone: () -> TimeZone = { .current }
+    private var requestDate: Date?
+    private var requestZone: TimeZone?
+    private(set) var calendarWindow: CalendarRequestWindow?
+    private var calendarReadIncomplete = false
+    private var calendarReadAt: Date?
     private var completedJobs: [(id: UUID, result: String)] = []
     private var jobRevision = 0
     private var input: [[String: Any]] = []
@@ -42,6 +50,7 @@ final class LiveClientBrain {
     private var turnState = ""
     private var scope: String?
     private var presentationOnly = false
+    var present: ((String) -> Void)?
     private var pendingPresentation: (id: String, turn: Int, result: String)?
     private var steps = 0
     private var requestTurn = 0
@@ -120,6 +129,8 @@ final class LiveClientBrain {
         state = LiveCompactContext.bounded(text, bytes: 24_000)
         let selected = LiveSelectionGrounding.selection(state)
         if selected != previousSelection {
+            calendarWindow = nil
+            calendarReadIncomplete = false
             invalidatePresentation(reason: "selection_changed")
             rejectingAssistantPresentation = false
             if selected.identity != nil { correctedEmptySelection = false }
@@ -127,6 +138,19 @@ final class LiveClientBrain {
     }
 
     func user(_ text: String, turn: Int) {
+        if turn != currentTurn {
+            requestDate = now()
+            requestZone = timeZone()
+            let followup = text.range(of: #"\b(?:send|reply|draft|those|slots|times|yes)\b"#,
+                options: [.regularExpression, .caseInsensitive]) != nil
+            if !followup { calendarWindow = nil }
+        }
+        let resolved = CalendarRequestWindow(request: text, reference: requestDate ?? now(), zone: requestZone ?? timeZone())
+        if let resolved, calendarWindow != resolved {
+            calendarWindow = resolved
+            calendarReadIncomplete = true
+            calendarReadAt = nil
+        }
         if LiveRequestRecovery.isFeedback(text) {
             invalidatePresentation(reason: "feedback")
         }
@@ -188,6 +212,13 @@ final class LiveClientBrain {
         return correctedEmptySelection ? LiveSelectionGrounding.noSelection : LiveSelectionGrounding.correction
     }
 
+    func correctEmailInterpretation() {
+        transcriptRevision += 1
+        turnState = state
+        context.removeAll()
+        invalidatePresentation(reason: "factual_correction")
+    }
+
     func jobCompleted(id: UUID, result: String) {
         let compact = LiveCompactContext.text(result, includeEmailContent: false)
         let result = String(decoding: compact.utf8.prefix(2048), as: UTF8.self)
@@ -211,6 +242,10 @@ final class LiveClientBrain {
         var item = item
         if item["type"] as? String == "function_call_output", let output = item["output"] as? String,
            let id = item["call_id"] as? String, pendingCalls.contains(id) || scopeSwitchCalls.contains(id) {
+            if functionItems[id]?["name"] as? String == CalendarTools.list {
+                calendarReadIncomplete = !CalendarRequestWindow.completeRead(output, window: calendarWindow)
+                calendarReadAt = now()
+            }
             attemptFields["tool_result_bytes"] = String(max(Int(attemptFields["tool_result_bytes"] ?? "0") ?? 0, output.utf8.count))
         }
         if let text = item["content"] as? String { item["content"] = LiveCompactContext.text(text) }
@@ -376,6 +411,21 @@ final class LiveClientBrain {
         startPresentationIfReady()
     }
 
+    func cancelPresentation(delegations: Set<String>) {
+        if let pending = pendingPresentation, delegations.contains(pending.id) { pendingPresentation = nil }
+        guard let delegation, delegations.contains(delegation) else { return }
+        endAttempt(reason: "cancelled", stage: "result_presentation", recovery: "retain_completed_action")
+        cancelRequest()
+        pendingCalls.removeAll()
+        unclaimedCalls.removeAll()
+        functionItems.removeAll()
+        functionOrigins.removeAll()
+        input.removeAll()
+        self.delegation = nil
+        liveDelegation = nil
+        presentationOnly = false
+    }
+
     private func startPresentationIfReady() {
         guard !busy, let pending = pendingPresentation else { return }
         pendingPresentation = nil
@@ -439,6 +489,20 @@ final class LiveClientBrain {
                          "recordedActions": Array(actionRecords.suffix(12)), "completedJobs": completedJobs.map {
                              ["job_id": $0.id.uuidString, "state": "finished", "result": $0.result]
                          }, "applicationUpdates": context] as [String: Any]
+        mandatory["selectedTask"] = Container.shared.applicationTasks().selectedContext
+        mandatory["clock"] = LiveSessionAdapter.clockLine(now: now(), zone: timeZone())
+        mandatory["requestClock"] = LiveSessionAdapter.clockLine(now: requestDate ?? now(), zone: requestZone ?? timeZone())
+        if let calendarWindow {
+            if let calendarReadAt, now().timeIntervalSince(calendarReadAt) > CalendarTools.cacheFreshness {
+                calendarReadIncomplete = true
+            }
+            mandatory["calendarWindow"] = calendarWindow.context
+            mandatory["calendarCoverage"] = calendarReadIncomplete ? "Incomplete or stale. Do not propose availability or send scheduling times until all requested calendars have been checked." : "Use the recorded tool results; this clock is not evidence of availability."
+            attemptFields["reference_now"] = calendarWindow.stamp(calendarWindow.reference)
+            attemptFields["range_start"] = calendarWindow.stamp(calendarWindow.start)
+            attemptFields["range_end"] = calendarWindow.stamp(calendarWindow.end)
+            attemptFields["time_zone"] = calendarWindow.zone.identifier
+        }
         var optionalUpdates = context
         while !optionalUpdates.isEmpty,
               let data = try? JSONSerialization.data(withJSONObject: mandatory), data.count > 64_000 {
@@ -539,6 +603,21 @@ final class LiveClientBrain {
                 if !calls.isEmpty { armCallWatchdog(for: calls) }
                 var localResultCalls = false
                 for item in output {
+                    if calendarWindow != nil, calendarReadIncomplete, let id = item["call_id"] as? String,
+                       CalendarRequestWindow.schedulingReply(name: item["name"] as? String ?? "", arguments: item["arguments"] as? String ?? "") {
+                        self.item(["type": "function_call_output", "call_id": id,
+                            "output": "Not executed: scheduling times require complete fresh coverage across the requested calendars. Read the resolved window before proposing or sending availability."])
+                        localResultCalls = true
+                        continue
+                    }
+                    if let name = item["name"] as? String, let id = item["call_id"] as? String,
+                       let raw = item["arguments"] as? String,
+                       let refusal = calendarWindow?.toolRefusal(name: name, arguments: raw, now: now()) {
+                        onRequestTransition?("calendar_range_refused", requestID, delegation, requestTurn)
+                        self.item(["type": "function_call_output", "call_id": id, "output": refusal])
+                        localResultCalls = true
+                        continue
+                    }
                     if item["name"] as? String == "read_tool_result", let id = item["call_id"] as? String {
                         let args = (item["arguments"] as? String).flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
                         self.item(["type": "function_call_output", "call_id": id,
@@ -552,6 +631,19 @@ final class LiveClientBrain {
                 if functions.isEmpty {
                     let text = output.flatMap { $0["content"] as? [[String: Any]] ?? [] }
                         .compactMap { $0["text"] as? String }.joined(separator: "\n")
+                    if calendarWindow != nil, calendarReadIncomplete,
+                       text.range(of: #"\b(?:available|free|slots?)\b"#, options: [.regularExpression, .caseInsensitive]) != nil {
+                        finish(responseID: responseID, delegation: delegation, response: [:])
+                        fail("I couldn't confirm availability across all the requested calendars. One or more reads were incomplete or stale; no free times are confirmed.",
+                             reason: "calendar_coverage_incomplete", stage: "presentation")
+                        return
+                    }
+                    if let window = calendarWindow, window.containsOutsideDate(text) {
+                        finish(responseID: responseID, delegation: delegation, response: [:])
+                        fail("I couldn't confirm those proposed dates. " + window.rangeExplanation + " Please ask me to recheck availability.",
+                             reason: "calendar_date_outside_range", stage: "presentation")
+                        return
+                    }
                     // An earlier receipt is history, not proof that this turn's command ran.
                     let hasCurrentAction = actionRecords.contains { record in
                         guard record["origin_turn"] as? Int == requestTurn,
@@ -565,7 +657,10 @@ final class LiveClientBrain {
                         fail("I haven't executed this new archive request. Please try again.", reason: "no_action", stage: "presentation")
                         return
                     }
-                    if !text.isEmpty { speak(groundedReply(text), liveDelegation) }
+                    if requestPresentation, let present {
+                        present(LiveSessionAdapter.hasSubstantiveSpeech(text) ? groundedReply(text)
+                            : "The action returned, but I couldn't explain the next item. Check Live Activity for its result. You can continue with the feed buttons.")
+                    } else if !text.isEmpty { speak(groundedReply(text), liveDelegation) }
                     endAttempt(reason: "completed", stage: "presentation_queued", recovery: "none")
                     completedTurns.insert(requestTurn)
                     input.removeAll()

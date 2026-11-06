@@ -850,6 +850,7 @@ final class ProfileViewInteractor: ViewModelInteractor<ProfileViewModel> {
 }
 
 extension ProfileViewInteractor: ProfileViewHandler {
+
     func refresh(viewModel: ProfileViewModel) {
         Task {
             await self.connections.refresh()

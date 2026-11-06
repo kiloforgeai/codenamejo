@@ -19,7 +19,7 @@ final class DesktopEmailReaderTests: XCTestCase {
 
     private func content(_ id: String) -> DesktopEmailReader.Content {
         .init(selectedID: id, messages: [.init(id: id, from: "Sender", to: "", cc: "", subject: id, date: "",
-                                             text: "Complete \(id)", attachments: [], error: nil)])
+                                             body: AttributedString("Complete \(id)"), attachments: [], error: nil)])
     }
 
     func testCompleteLongBodiesAndQuotedRepliesAreNotTruncatedToTheSnippet() async throws {
@@ -59,10 +59,45 @@ final class DesktopEmailReaderTests: XCTestCase {
         XCTAssertTrue(text.contains("FIRST & 🙂"))
         XCTAssertTrue(text.contains("• One\n• Two"))
         XCTAssertTrue(text.contains("Details (https://example.test/detail)"))
+        XCTAssertEqual(decoded.messages[0].body.runs.compactMap(\.link), [URL(string: "https://example.test/detail")!])
         XCTAssertTrue(text.contains("FINAL"))
         XCTAssertFalse(text.contains("bad()"))
         XCTAssertFalse(text.contains("File contents"))
         XCTAssertEqual(fetched, ["selected:body"])
+    }
+
+    func testPlainEmailLinksPreserveUnicodeParagraphsQuotedRepliesAndDestinations() async throws {
+        let text = "🙂 Café — published yesterday! https://lnkd.in/p/eyAWMxPb\n\n"
+            + "On Monday someone wrote:\n> Details (https://example.com/path?q=one&other=two#section).\n"
+            + "> Contact reader@example.com or visit www.example.org.\nFINAL"
+        let decoded = try await DesktopEmailReader.decode(.init(id: "thread", messages: [message(body: part(text))]),
+            request: request(), attachment: { _, _ in Data() })
+        let body = try XCTUnwrap(decoded.messages.first?.body)
+        XCTAssertEqual(String(body.characters), text)
+        let links = body.runs.compactMap { run -> (String, String)? in
+            guard let url = run.link else { return nil }
+            return (String(body[run.range].characters), url.absoluteString)
+        }
+        XCTAssertEqual(links.map(\.0), ["https://lnkd.in/p/eyAWMxPb", "https://example.com/path?q=one&other=two#section",
+                                       "reader@example.com", "www.example.org"])
+        XCTAssertEqual(links.map(\.1), ["https://lnkd.in/p/eyAWMxPb", "https://example.com/path?q=one&other=two#section",
+                                       "mailto:reader@example.com", "http://www.example.org"])
+    }
+
+    func testEveryThreadMessageKeepsItsOwnLinks() async throws {
+        let decoded = try await DesktopEmailReader.decode(.init(id: "thread", messages: [
+            message("earlier", body: part("Earlier: https://example.com/first"), date: "1"),
+            message(body: part("Selected: https://example.com/second"))]),
+            request: request(), attachment: { _, _ in Data() })
+        XCTAssertEqual(decoded.messages.map { $0.body.runs.compactMap { $0.link?.absoluteString } },
+                       [["https://example.com/first"], ["https://example.com/second"]])
+    }
+
+    func testEmailTextIsNotInterpretedAsMarkdownOrExecutableLinks() throws {
+        let text = "*Keep literal markup* [a label](javascript:alert(1))\nfile:///tmp/private.txt\ncustomapp://run/action"
+        let body = try DesktopEmailReader.linkedBody(text)
+        XCTAssertEqual(String(body.characters), text)
+        XCTAssertTrue(body.runs.compactMap(\.link).isEmpty)
     }
 
     func testPlainAlternativeIsShownOnceAndMissingBodiesAreExplicitFailures() async throws {
@@ -165,6 +200,26 @@ final class DesktopEmailReaderTests: XCTestCase {
         reader.show(selected)
         let calls = await gate.calls
         XCTAssertEqual(calls, 2)
+    }
+
+    func testStartingConversationReusesLoadedBodyOnlyWithinItsAuthorizedScope() async throws {
+        let gate = ReaderGate()
+        var allowed = true
+        let reader = DesktopEmailReader(loader: { try await gate.load($0) }, allowed: { _ in allowed })
+        let preview = request()
+        reader.show(preview)
+        try await waitFor { await gate.contains(preview) }
+        await gate.finish(preview, with: .success(content("selected")))
+        try await waitFor { reader.state == .ready(preview, self.content("selected")) }
+        let live = DesktopEmailReader.Request(selection: preview.selection, threadID: preview.threadID,
+            ownerID: preview.ownerID, profileID: preview.profileID, conversationID: UUID(), headersOnly: false)
+        reader.show(live)
+        XCTAssertEqual(reader.state, .ready(live, content("selected")), "No loading flash for the same authorized content")
+        let calls = await gate.calls
+        XCTAssertEqual(calls, 1)
+        allowed = false
+        reader.show(preview)
+        guard case .failed = reader.state else { return XCTFail("Lost access must clear even a cached body") }
     }
 
     func testWorkspaceReadsTheDisplayedEmailDuringTransitionAndClearsOnProfileSwitch() {

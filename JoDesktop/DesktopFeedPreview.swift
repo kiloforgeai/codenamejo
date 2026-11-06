@@ -11,6 +11,7 @@ class DesktopFeedPreview: ObservableObject {
         let emails: [String]
         let slackTeams: [String]
         var sections: [FeedSection]? = nil
+        var forceRefresh = false
     }
 
     struct Part: Sendable {
@@ -62,7 +63,7 @@ class DesktopFeedPreview: ObservableObject {
         self.load = load
     }
 
-    func update(context: Context?, inSession: Bool, now: Date = Date()) {
+    func update(context: Context?, inSession: Bool, now: Date = Date(), force: Bool = false) {
         if self.context != context {
             pause()
             self.context = context
@@ -70,13 +71,15 @@ class DesktopFeedPreview: ObservableObject {
         }
         guard let context else { return }
         guard !inSession else { pause(); return }
-        guard task == nil, lastAttempt.map({ now.timeIntervalSince($0) >= Self.refreshInterval }) ?? true else { return }
+        guard task == nil, force || (lastAttempt.map({ now.timeIntervalSince($0) >= Self.refreshInterval }) ?? true) else { return }
         lastAttempt = now
         refreshing = true
         let request = UUID()
         generation = request
         task = Task { [weak self, load] in
-            let result = await load(context)
+            var requestContext = context
+            requestContext.forceRefresh = force
+            let result = await load(requestContext)
             guard let self, !Task.isCancelled, self.generation == request, self.context == context else { return }
             self.snapshot = result.retainingUnavailable(from: self.snapshot)
             self.refreshing = false
@@ -93,6 +96,14 @@ class DesktopFeedPreview: ObservableObject {
     }
 
     deinit { task?.cancel() }
+
+    func remove(_ selection: MailSelection) {
+        guard var value = snapshot else { return }
+        let count = value.mail.rows.count
+        value.mail.rows.removeAll { $0.selection == selection }
+        if value.mail.rows.count < count, let total = value.mail.count { value.mail.count = max(0, total - 1) }
+        snapshot = value
+    }
 }
 
 enum DesktopFeedPreviewLoader {
@@ -183,7 +194,7 @@ enum DesktopFeedPreviewLoader {
         let accounts = context.emails.filter { email in granted.contains { $0.caseInsensitiveCompare(email) == .orderedSame } }
         guard !accounts.isEmpty else { return .init() }
         guard let result = await CalendarSearch.feedAgenda(accounts: accounts,
-            store: CalendarStore(database: Container.shared.localContext().dbPool)), result.successful else { return .unavailable }
+            store: CalendarStore(database: Container.shared.localContext().dbPool), forceRefresh: context.forceRefresh), result.successful else { return .unavailable }
         return .init(rows: result.events.map(DesktopFeedRow.calendar), count: result.events.count)
     }
 }

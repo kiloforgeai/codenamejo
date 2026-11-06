@@ -29,7 +29,11 @@ enum SessionExport {
         try append("export_manifest", ["includes_content": includeContent,
             "app_version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown",
             "app_build": Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown",
-            "source_revision": Bundle.main.infoDictionary?["JoSourceRevision"] as? String ?? "unknown"])
+            "source_revision": Bundle.main.infoDictionary?["JoSourceRevision"] as? String ?? "unknown",
+            "timing_definitions": ["issuedAt": "transcript record time, not word or playback timing",
+            "durationSeconds": "exchange duration, not silent latency", "latency": "measured turn phases; missing values are unknown",
+            "speechRequested": "speech scheduled", "speechStarted": "audio playback started",
+            "toolResultDelivered": "result supplied to the model; not an action outcome"]])
         if includeContent {
             data.append(diagnostics)
         } else {
@@ -62,6 +66,7 @@ enum SessionExport {
                         "target_hash": job.receipts?.compactMap(\.targetHash).first
                             ?? hash(MailSelection(account: operation.account, messageID: operation.messageID).canonical)]
                 }
+                if let input = job.context?.input, ["voice", "button", "keyboard", "typed", "unknown"].contains(input) { value["input_source"] = input }
             }
             try append(includeContent ? "job_export" : "job_metadata", value)
         }
@@ -70,9 +75,9 @@ enum SessionExport {
 
     private static let diagnosticKeys: Set<String> = ["event", "timestamp", "elapsed_ms", "sequence", "session_sequence", "core_sequence",
         "session_id", "conversation_id", "app_version", "schema_version", "source_revision", "fields",
-        "feedback_id", "source", "engine", "session_state", "render_revision", "turn_id", "user_id", "profile_id"]
+        "feedback_id", "fragment_turn_ids", "source", "engine", "session_state", "render_revision", "turn_id", "user_id", "profile_id"]
     private static let historyKeys: Set<String> = ["id", "serviceName", "serviceIcon", "status", "durationSeconds",
-        "issuedAt", "profile_id", "conversationId", "toolSteps", "latency", "brainSteps"]
+        "issuedAt", "profile_id", "conversationId", "toolSteps", "latency", "brainSteps", "feedbackID"]
     private static let jobKeys: Set<String> = ["id", "state", "receipts", "user_id", "conversation_id", "turn_id",
         "started_at", "completed_at", "delivered_at", "profile_id", "report_back", "foregroundContinuation"]
 }

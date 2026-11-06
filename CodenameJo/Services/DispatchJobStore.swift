@@ -1,11 +1,14 @@
 import Foundation
 import FactoryKit
+import Combine
 
 /// The dispatch log, kept on the phone: `DispatchWorker` writes each job's row, and the next call
 /// reads back answers nobody heard and marks them delivered.
 /// Not `final`: `PreviewDispatchJobStore` overrides `history()` and `recover()` to serve fixtures.
 @MainActor
-class DispatchJobStore {
+class DispatchJobStore: ObservableObject {
+    @Published var persistenceError: String?
+    @Published var changes = 0
     @Injected(\.backend) private var backend
     private let persistence = DispatchQueue(label: "jo.dispatch-jobs.persistence", qos: .utility)
     private let url: URL
@@ -18,6 +21,13 @@ class DispatchJobStore {
             decoder.dateDecodingStrategy = .iso8601
             return try? decoder.decode([DispatchJob].self, from: $0)
         } ?? []
+        for index in jobs.indices where jobs[index].context != nil && jobs[index].isRunning {
+            let queued = jobs[index].state == "queued"
+            jobs[index].state = queued ? "awaiting_input" : "unknown"
+            jobs[index].result = queued ? "The app closed before this task started. Review its source and instructions before resuming."
+                : "The app closed while this task was running. Check its receipts and provider state before retrying; its outcome is unknown."
+            jobs[index].reportBack = true
+        }
     }
 
     nonisolated static var defaultURL: URL {
@@ -75,6 +85,68 @@ class DispatchJobStore {
         visible.first { $0.id == id && $0.command != nil }
     }
 
+    func existing(_ id: UUID) -> DispatchJob? { visible.first { $0.id == id } }
+    func contains(_ id: UUID) -> Bool { jobs.contains { $0.id == id } }
+
+    func shouldPresent(_ id: UUID, revision: Int? = nil) -> Bool {
+        guard contains(id) else { return true }
+        guard let job = existing(id), revision == nil || job.taskRevision == revision else { return false }
+        return job.deliveredAt == nil && !(job.isDone && job.effectivePreference == .quiet) && job.state != "cancelled"
+    }
+
+    func matches(_ id: UUID, revision: Int?) -> Bool {
+        guard let revision else { return true }
+        return jobs.first { $0.id == id }?.taskRevision == revision
+    }
+
+    func acceptContext(_ id: UUID, context: DispatchJob.TaskContext, preference: DispatchJob.CompletionPreference = .bringBack) async -> Bool {
+        guard let index = jobs.firstIndex(where: { $0.id == id }) else { return false }
+        jobs[index].context = context
+        jobs[index].state = "queued"
+        jobs[index].completionPreference = preference
+        return await save()
+    }
+
+    func setPreference(_ id: UUID, revision: Int, preference: DispatchJob.CompletionPreference) async -> Bool {
+        guard matches(id, revision: revision), let index = jobs.firstIndex(where: { $0.id == id }),
+              jobs[index].completionPreference != preference else { return false }
+        jobs[index].completionPreference = preference
+        if jobs[index].isDone {
+            jobs[index].reportBack = preference == .bringBack
+            jobs[index].deliveredAt = preference == .quiet ? Date() : nil
+        }
+        return await save()
+    }
+
+    func revise(_ id: UUID, revision: Int, task: String, linkChoice: String? = nil) async -> Bool {
+        guard let index = jobs.firstIndex(where: { $0.id == id }), jobs[index].taskRevision == revision,
+              !jobs[index].isRunning, !jobs[index].hasCommittedWrites,
+              jobs[index].state != "unknown", jobs[index].inFlightOperation == nil,
+              jobs[index].context != nil else { return false }
+        jobs[index].task = task
+        jobs[index].context?.revision += 1
+        jobs[index].context?.authoredAt = Date()
+        jobs[index].context?.linkChoice = linkChoice
+        jobs[index].inputChoices = nil
+        jobs[index].state = "queued"
+        jobs[index].result = nil
+        jobs[index].completedAt = nil
+        jobs[index].deliveredAt = nil
+        return await save()
+    }
+
+    func requireChoice(_ id: UUID, revision: Int?, choices: [DispatchJob.InputChoice]) async -> Bool {
+        guard matches(id, revision: revision), let index = jobs.firstIndex(where: { $0.id == id }) else { return false }
+        jobs[index].inputChoices = choices
+        return await save()
+    }
+
+    func markOperation(_ id: UUID, revision: Int?, callID: String?) async -> Bool {
+        guard matches(id, revision: revision), let index = jobs.firstIndex(where: { $0.id == id }) else { return false }
+        jobs[index].inFlightOperation = callID
+        return await save()
+    }
+
     func latestCommandAttempt(from id: UUID) -> DispatchJob? {
         guard var current = commandResult(id) else { return nil }
         var seen: Set<UUID> = [id]
@@ -92,13 +164,22 @@ class DispatchJobStore {
             && $0.receipts?.contains(where: { $0.outcome == "success" }) == true }
     }
 
-    func previousOperation(_ operation: DispatchMailOperation, profileID: String?) -> DispatchJob? {
-        jobs.last { $0.userId == backend.userId && $0.profileId == profileID && $0.operation == operation
+    func previousOperation(_ operation: DispatchMailOperation, profileID: String?, excluding id: UUID? = nil) -> DispatchJob? {
+        jobs.last { $0.id != id && $0.userId == backend.userId && $0.profileId == profileID && $0.operation == operation
             && ($0.isDone || $0.isRunning || $0.state == "unknown") }
     }
 
     /// A job has started; a retried memo reuses its id and starts its row again.
     func begin(id: UUID, task: String, profileId: String?, conversationId: UUID? = nil, turnId: String? = nil, operation: DispatchMailOperation? = nil, origin: DispatchJob.MailOrigin? = nil, command: DispatchJob.CommandRun? = nil) async {
+        if let index = jobs.firstIndex(where: { $0.id == id && $0.context != nil }) {
+            if jobs[index].state == "queued" { jobs[index].state = "running"; await save() }
+            return
+        }
+        if let index = jobs.firstIndex(where: { $0.id == id && $0.state == "queued" }) {
+            jobs[index].state = "running"
+            await save()
+            return
+        }
         jobs.removeAll { $0.id == id }
         let profiles = Container.shared.workspaceProfiles()
         let defaultProfile = profileId == nil || profiles.profiles.first(where: { $0.id == profileId })?.isDefault == true
@@ -109,17 +190,23 @@ class DispatchJobStore {
         await recordHistoryOutcome(jobs.first { $0.id == id }, status: .pending)
     }
 
-    func receipt(_ id: UUID, callId: String, tool: String, failed: Bool, targetHash: String? = nil, commandStep: Int? = nil) async {
+    func setState(_ id: UUID, state: String, revision: Int? = nil) async {
+        guard matches(id, revision: revision), let index = jobs.firstIndex(where: { $0.id == id }) else { return }
+        jobs[index].state = state
+        await save()
+    }
+
+    func receipt(_ id: UUID, callId: String, tool: String, failed: Bool, targetHash: String? = nil, commandStep: Int? = nil, revision: Int? = nil) async {
         guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
         var receipts = jobs[index].receipts ?? []
-        guard !receipts.contains(where: { $0.callId == callId }) else { return }
-        receipts.append(.init(callId: callId, tool: tool, outcome: failed ? "failed" : "success", targetHash: targetHash, commandStep: commandStep))
+        guard !receipts.contains(where: { $0.callId == callId && $0.revision == revision }) else { return }
+        receipts.append(.init(callId: callId, tool: tool, outcome: failed ? "failed" : "success", targetHash: targetHash, commandStep: commandStep, revision: revision))
         jobs[index].receipts = receipts
         await save()
     }
 
-    func completeCommandStep(_ id: UUID, index: Int, result: String) async {
-        guard let row = jobs.firstIndex(where: { $0.id == id }), var command = jobs[row].command,
+    func completeCommandStep(_ id: UUID, index: Int, result: String, revision: Int? = nil) async {
+        guard matches(id, revision: revision), let row = jobs.firstIndex(where: { $0.id == id }), var command = jobs[row].command,
               index == command.completedSteps, index < command.actions.count else { return }
         command.completedSteps += 1
         command.completedResults.append(LiveCompactContext.bounded(result, bytes: 4_000, includeEmailContent: false))
@@ -127,13 +214,17 @@ class DispatchJobStore {
         await save()
     }
 
-    func finish(_ id: UUID, state: String, result: String, reportBack: Bool? = nil, historyStatus: CommandRecord.CommandStatus? = nil, foregroundContinuation: Bool? = nil) async {
-        guard let index = jobs.firstIndex(where: { $0.id == id }) else { return }
+    func finish(_ id: UUID, state: String, result: String, reportBack: Bool? = nil, historyStatus: CommandRecord.CommandStatus? = nil, foregroundContinuation: Bool? = nil, revision: Int? = nil) async {
+        guard matches(id, revision: revision), let index = jobs.firstIndex(where: { $0.id == id }) else { return }
         jobs[index].state = state
         jobs[index].foregroundContinuation = foregroundContinuation
         jobs[index].result = result
         jobs[index].completedAt = Date()
         jobs[index].reportBack = reportBack
+        if let preference = jobs[index].completionPreference {
+            jobs[index].reportBack = state == "done" ? preference == .bringBack : state != "cancelled"
+            if state == "done", preference == .quiet { jobs[index].deliveredAt = Date() }
+        }
         let job = jobs[index]
         await save()
         let status: CommandRecord.CommandStatus = state == "done" ? .success : state == "partial" ? .partial : state == "unknown" ? .unknown : .failed
@@ -173,9 +264,10 @@ class DispatchJobStore {
         if jobs.count != before { await save() }
     }
 
-    private func save() async {
+    @discardableResult
+    private func save() async -> Bool {
         let snapshot = jobs, url = url
-        await withCheckedContinuation { continuation in
+        let error: String? = await withCheckedContinuation { continuation in
             persistence.async {
                 do {
                     let encoder = JSONEncoder()
@@ -183,9 +275,15 @@ class DispatchJobStore {
                     let data = try encoder.encode(snapshot)
                     try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
                     try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-                } catch { RealtimeLog.log("dispatch: could not persist job receipts — \(error.localizedDescription)") }
-                continuation.resume()
+                    continuation.resume(returning: nil)
+                } catch {
+                    RealtimeLog.log("dispatch: could not persist job receipts — \(error.localizedDescription)")
+                    continuation.resume(returning: "Task history could not be saved. Check available disk space before starting more work.")
+                }
             }
         }
+        persistenceError = error
+        changes += 1
+        return error == nil
     }
 }

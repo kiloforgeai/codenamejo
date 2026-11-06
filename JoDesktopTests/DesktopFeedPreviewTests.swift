@@ -31,6 +31,25 @@ final class DesktopFeedPreviewTests: XCTestCase {
         try await eventually { service.snapshot?.mail.count == 121 }
     }
 
+    func testManualRefreshBypassesPollingIntervalAndCoalescesClicksWithoutClearingRows() async throws {
+        let loader = DeferredPreviewLoader()
+        let service = DesktopFeedPreview(load: { await loader.load($0) })
+        let now = Date()
+        service.update(context: context, inSession: false, now: now)
+        try await eventually { loader.requests.count == 1 }
+        loader.finish(0, with: snapshot("original"))
+        try await eventually { !service.refreshing }
+        service.update(context: context, inSession: false, now: now, force: true)
+        service.update(context: context, inSession: false, now: now, force: true)
+        try await eventually { loader.requests.count == 2 }
+        XCTAssertEqual(service.snapshot?.rows.first?.id, "original")
+        XCTAssertTrue(loader.requests[1].forceRefresh)
+        loader.finish(1, with: snapshot("new", count: 121))
+        try await eventually { !service.refreshing }
+        XCTAssertEqual(service.snapshot?.rows.first?.id, "new")
+        XCTAssertEqual(loader.requests.count, 2)
+    }
+
     func testProfileAndMembershipChangesDiscardLateResponses() async throws {
         let loader = DeferredPreviewLoader()
         let service = DesktopFeedPreview(load: { await loader.load($0) })
@@ -100,7 +119,8 @@ final class DesktopFeedPreviewTests: XCTestCase {
             slack: .init(rows: [.init(id: "slack", source: "Slack", title: "Channel", detail: "Team", reason: nil)], count: 14))
         XCTAssertEqual(model.feedCountLabel, "≈134")
         XCTAssertEqual(model.filteredQueue.map(\.id), ["message", "slack"])
-        XCTAssertEqual(model.renderedState.queueOrder, ["live"])
+        XCTAssertEqual(model.renderedState.queueOrder, ["message", "slack"])
+        XCTAssertEqual(model.sessionFeed.rows.map(\.id), ["live"])
         model.filter = "Slack"
         XCTAssertEqual(model.feedCountLabel, "≈14")
         XCTAssertEqual(model.filteredQueue.map(\.id), ["slack"])

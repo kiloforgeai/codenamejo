@@ -73,7 +73,8 @@ enum FullDuplexBroker {
     }
 
     /// This email's spoken summary and suggestion, prepared on the phone with the user's key.
-    static func prepareEmail(_ key: LiveEmailPresentation.Key, scope: ProfileRuntime.Scope?) async -> LiveEmailPresentation? {
+    static func prepareEmail(_ key: LiveEmailPresentation.Key, scope: ProfileRuntime.Scope?,
+                             correction: LiveEmailPreparationCache.Correction? = nil) async -> LiveEmailPresentation? {
         guard let scope, scope.containsMailbox(key.account) else {
             RealtimeLog.log("livePreparation: deferred — email profile connections unavailable or mismatched")
             return nil
@@ -86,7 +87,8 @@ enum FullDuplexBroker {
         func elapsedMs() -> Int { Int((ProcessInfo.processInfo.systemUptime - preparationUptime) * 1000) }
         RealtimeLog.log("preparation.request: id=\(preparationId) profile=\(scope.profileId) email=\(key.messageId) startedAt=\(preparationStarted.timeIntervalSince1970)")
         do {
-            var prepared = try await LocalEmailPresentation.prepare(key, scope: scope)
+            var prepared = try await LocalEmailPresentation.prepare(key, scope: scope, correction: correction?.text)
+            prepared.correctionRevision = correction?.revision
             func encode(_ value: some Encodable) -> String {
                 String(decoding: (try? JSONEncoder().encode(value)) ?? Data(), as: UTF8.self)
             }

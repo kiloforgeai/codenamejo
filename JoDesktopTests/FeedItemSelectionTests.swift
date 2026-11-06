@@ -64,7 +64,7 @@ final class FeedItemSelectionTests: XCTestCase {
         XCTAssertEqual(current, "m4")
     }
 
-    func testIdlePreviewPinsSelectionAndRequestsReaderWithoutEnablingActions() {
+    func testIdlePreviewPinsSelectionAndEnablesActionsForThatExactSource() {
         let model = DesktopWorkspaceModel()
         let rows = (1...3).map { DesktopFeedRow.email(account: account, messageID: "m\($0)", subject: "Message \($0)", sender: "Sender") }
         model.feedPreview = .init(mail: .init(rows: rows), slack: .init())
@@ -72,9 +72,97 @@ final class FeedItemSelectionTests: XCTestCase {
         XCTAssertEqual(model.feedRows.map(\.id), [rows[2].id, rows[0].id, rows[1].id])
         XCTAssertTrue(model.isCurrentRow(rows[2]))
         XCTAssertEqual(model.readerRequest(ownerID: "fixture", headersOnly: false)?.selection, rows[2].selection)
-        XCTAssertNil(model.feedActionContext)
+        XCTAssertEqual(model.feedActionContext?.selection, rows[2].selection)
         model.profileID = "another-profile"
         XCTAssertNil(model.previewSelection)
+    }
+
+    func testActivityFocusDisarmsHiddenEmailAndReturningRestoresItsPlace() throws {
+        let model = DesktopWorkspaceModel()
+        let row = DesktopFeedRow.email(account: account, messageID: "held", subject: "Held email", sender: "Sender")
+        model.feedPreview = .init(mail: .init(rows: [row]), slack: .init())
+        model.previewSelection = row
+        let job = try JSONDecoder().decode(DispatchJob.self, from: Data(#"{"id":"00000000-0000-0000-0000-000000000001","task":"Research","state":"done","result":"Recorded result"}"#.utf8))
+        XCTAssertNotNil(model.feedActionContext)
+        model.selectedJob = job
+        XCTAssertNil(model.feedActionContext)
+        XCTAssertNil(model.renderedState.focus)
+        XCTAssertEqual(model.renderedState.displayBranch, "activity")
+        XCTAssertEqual(model.renderedState.activityID, job.id)
+        XCTAssertFalse(model.isCurrentRow(row))
+        XCTAssertEqual(model.feedRows, [row])
+        model.selectedJob = nil
+        XCTAssertEqual(model.feedActionContext?.selection, row.selection)
+        XCTAssertTrue(model.isCurrentRow(row))
+        model.selectedJob = job
+        model.profileID = "other"
+        XCTAssertNil(model.selectedJob)
+    }
+
+    func testManualRefreshAddsPreparedWorkWithoutMovingCurrentOrRestoringHandledItems() async throws {
+        let old = ProfileRuntime.snapshot
+        ProfileRuntime.install(nil)
+        defer { ProfileRuntime.install(old) }
+        let source = RefreshSectionSource()
+        let queue = LocalTriageQueue(mailAccounts: { ["selection@example.test", "second@example.test"] },
+            feedSectionLoader: { await source.load($0) }, unreadOpeningLoader: { _ in nil })
+        await queue.configure(coachingPlan: nil, forceOnboardingFeedLesson: false, sequentialFeed: true,
+            calendarFeedDue: false, localCalendar: false,
+            feedSections: ["selection@example.test", "second@example.test"].map { .init(kind: .remaining, account: $0) })
+        _ = await queue.openingStep(store: store)
+        await queue.awaitFeedSectionPreparation()
+        _ = await queue.step(.init(), store: store, dealtWith: true)
+        let before = await queue.desktopSnapshot()
+        await source.setCount(4)
+        let error = await queue.refreshDesktopFeed(store: store)
+        XCTAssertNil(error)
+        let after = await queue.desktopSnapshot()
+        XCTAssertEqual(after.currentID, before.currentID)
+        XCTAssertEqual(after.account, before.account)
+        let rows = DesktopSessionFeed(mail: after).rows
+        XCTAssertTrue(rows.contains { $0.selection == .init(account: account, messageID: "m4") })
+        XCTAssertTrue(rows.contains { $0.selection == .init(account: "second@example.test", messageID: "m4") })
+        XCTAssertFalse(rows.contains { $0.selection == .init(account: account, messageID: "m1") })
+        await source.setCount(nil)
+        let failed = await queue.refreshDesktopFeed(store: store)
+        XCTAssertNotNil(failed)
+        let retained = await queue.desktopSnapshot()
+        XCTAssertEqual(DesktopSessionFeed(mail: retained).rows, rows)
+    }
+
+    func testRefreshCoalescesAndDiscardsALateResponseAfterProfileSwitch() async throws {
+        let old = ProfileRuntime.snapshot
+        ProfileRuntime.install(nil)
+        defer { ProfileRuntime.install(old) }
+        let source = RefreshSectionSource()
+        let queue = LocalTriageQueue(mailAccounts: { ["selection@example.test"] },
+            feedSectionLoader: { await source.load($0) }, unreadOpeningLoader: { _ in nil })
+        await queue.configure(coachingPlan: nil, forceOnboardingFeedLesson: false, sequentialFeed: true,
+            calendarFeedDue: false, localCalendar: false,
+            feedSections: [.init(kind: .remaining, account: account)])
+        _ = await queue.openingStep(store: store)
+        let before = await queue.desktopSnapshot()
+        await source.setCount(4)
+        await source.pauseNextLoad()
+        let refresh = Task { await queue.refreshDesktopFeed(store: store) }
+        for _ in 0..<100 {
+            if await source.isPaused { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let paused = await source.isPaused
+        XCTAssertTrue(paused)
+        let calls = await source.calls
+        _ = await queue.refreshDesktopFeed(store: store)
+        let afterSecondClick = await source.calls
+        XCTAssertEqual(afterSecondClick, calls)
+        ProfileRuntime.install(.init(profileId: "other", isDefault: false, emails: ["other@example.test"]))
+        await source.resume()
+        let error = await refresh.value
+        XCTAssertNotNil(error)
+        ProfileRuntime.install(nil)
+        let after = await queue.desktopSnapshot()
+        XCTAssertEqual(after.items, before.items)
+        XCTAssertEqual(after.currentID, before.currentID)
     }
 
     func testSelectionAcrossPreparedSectionsKeepsTheOriginalAccountAndQueue() async throws {
@@ -105,5 +193,25 @@ final class FeedItemSelectionTests: XCTestCase {
         XCTAssertEqual(resumed.current, .init(account: accounts[0], messageID: "m1"))
         XCTAssertFalse(resumed.rows.contains { $0.selection == selected })
         XCTAssertTrue(resumed.rows.contains { $0.selection == .init(account: accounts[0], messageID: "m3") })
+    }
+}
+
+private actor RefreshSectionSource {
+    var count: Int? = 2
+    var calls = 0
+    private var pause = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    var isPaused: Bool { continuation != nil }
+    func pauseNextLoad() { pause = true }
+    func resume() { continuation?.resume(); continuation = nil }
+    func setCount(_ value: Int?) { count = value }
+    func load(_ section: FeedSection) async -> [LocalTriageQueue.Item]? {
+        calls += 1
+        if pause { pause = false; await withCheckedContinuation { continuation = $0 } }
+        guard let count else { return nil }
+        return (1...count).map { index in
+            .init(account: section.account!, id: "m\(index)", threadId: "t\(index)", from: "Sender",
+                  subject: "Message \(index)", date: "", snippet: "Synthetic", internalDate: Int64(100 - index), acted: nil)
+        }
     }
 }

@@ -12,6 +12,7 @@ struct FeedbackContext: Sendable {
     var state = "ready"
     var renderRevision: Int? = nil
     var turnID: String? = nil
+    var fragmentTurnIDs: [String]? = nil
 }
 
 enum FeedbackError: LocalizedError {
@@ -80,7 +81,8 @@ class UserFeedback: ObservableObject {
 
     /// Solicited notes stay local and survive pauses without depending on the mail brain.
     func voiceInput(_ text: String, turnID: String, reply: @escaping (String) -> Void,
-                    transition: @escaping (String) -> Void) -> Bool {
+                    transition: @escaping (String) -> Void,
+                    settled: @escaping ([String], UUID?, CommandRecord.CommandStatus) -> Void = { _, _, _ in }) -> Bool {
         let captured = capture()
         var context = captured.context
         context.turnID = turnID
@@ -105,6 +107,7 @@ class UserFeedback: ObservableObject {
             voiceDraft = nil
             handledVoiceTurns = Array((handledVoiceTurns + [draft.requestTurnID] + draft.turns.map(\.id)).suffix(128))
             transition("cancelled")
+            settled(Array(Set([draft.requestTurnID, turnID] + draft.turns.map(\.id))).sorted(), nil, .cancelled)
             reply("Feedback cancelled. Nothing was saved.")
             return true
         }
@@ -140,13 +143,18 @@ class UserFeedback: ObservableObject {
             voiceDraft = nil
             handledVoiceTurns = Array((handledVoiceTurns + [draft.requestTurnID] + draft.turns.map(\.id)).suffix(128))
             do {
-                _ = try await save(draft.text, source: .voice, submission: draft.submission)
+                let ids = Array(Set([draft.requestTurnID, turnID] + draft.turns.map(\.id))).sorted()
+                var context = draft.submission.context
+                context.fragmentTurnIDs = ids
+                let id = try await save(draft.text, source: .voice, submission: .init(userID: draft.submission.userID, context: context))
+                settled(ids, id, .success)
                 transition("saved")
                 guard sameOwner(draft.submission, capture()) else { return }
                 voiceReceipt = "Feedback saved"
                 reply("Feedback saved locally. Your current email is unchanged.")
             } catch {
                 if voiceDraft == nil { voiceDraft = draft }
+                settled(Array(Set([draft.requestTurnID, turnID] + draft.turns.map(\.id))).sorted(), nil, .failed)
                 transition("failed")
                 guard sameOwner(draft.submission, capture()) else { return }
                 reply("Feedback was not saved. Your draft is kept; use the Feedback button or ask to try again.")

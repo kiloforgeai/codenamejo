@@ -37,18 +37,28 @@ struct RenderedFeedState: Equatable, Sendable {
     var rawFocus: MailSelection?
     var transitioning = false
     var displayBranch = "current"
+    var feedActionError: String?
+    var sidebarSource = "session"
+    var sessionPhase = "active"
+    var activityID: UUID?
 
     func diagnosticFields(session: VoiceDiagnostics.Session, revision: Int) -> [String: String] {
         var fields = ["render_revision": String(revision), "queue_revision": String(queueRevision),
             "queue_scope": queueScope, "observation_phase": "layout_applied", "window_id": "workspace",
             "profile_hash": session.target(profileID ?? "default"), "response_hash": session.target(response),
             "response_role": previousResponse ? "previous" : "current", "focus_mode": String(focusMode),
-            "visible_count": String(queueOrder.count), "mismatch": String(transitioning || focus != queueCurrent),
-            "selection_state": transitioning || focus != queueCurrent ? "transitioning" : focus == nil ? "none" : "ready",
+            "visible_count": String(queueOrder.count), "mismatch": String(activityID == nil && (transitioning || focus != queueCurrent)),
+            "selection_state": activityID != nil ? "activity" : transitioning || focus != queueCurrent ? "transitioning" : focus == nil ? "none" : "ready",
             "display_branch": displayBranch, "raw_focus_state": rawFocus == nil ? "none" : "selected",
             "response_item_id": responseItemID ?? "unknown", "turn_id": responseTurnID ?? "unknown",
             "queue_order": queueOrder.map { session.target($0) }.joined(separator: ","),
             "job_states": jobStates.prefix(12).joined(separator: ",")]
+        fields["action_error_visible"] = String(feedActionError != nil)
+        if let activityID { fields["activity_id"] = activityID.uuidString }
+        fields["sidebar_source"] = sidebarSource
+        fields["session_phase"] = sessionPhase
+        fields["handoff_reason"] = sessionPhase == "starting" ? "awaiting_coherent_selection" : "none"
+        fields["action_error_hash"] = feedActionError.map { session.target($0) } ?? "none"
         if let focus { fields["target_hash"] = session.target(focus.canonical) }
         if let rawFocus { fields["raw_target_hash"] = session.target(rawFocus.canonical) }
         if let queueCurrent { fields["queue_target_hash"] = session.target(queueCurrent.canonical) }
@@ -58,7 +68,7 @@ struct RenderedFeedState: Equatable, Sendable {
     }
 
     func permits(_ selection: MailSelection, profileID: String?) -> Bool {
-        !transitioning && self.profileID == profileID && focus?.matches(account: selection.account, messageID: selection.messageID) == true
+        activityID == nil && !transitioning && self.profileID == profileID && focus?.matches(account: selection.account, messageID: selection.messageID) == true
             && queueCurrent?.matches(account: selection.account, messageID: selection.messageID) == true
     }
 }
@@ -67,16 +77,16 @@ struct RenderedFeedState: Equatable, Sendable {
 struct FeedActionContext: Equatable, Sendable {
     let selection: MailSelection
     let profileID: String?
-    let conversationID: UUID
+    let conversationID: UUID?
     let queueRevision: Int
     let queueScope: String
 
     init?(_ rendered: RenderedFeedState) {
-        guard let selection = rendered.focus, let conversationID = rendered.conversationID,
+        guard let selection = rendered.focus,
               rendered.permits(selection, profileID: rendered.profileID) else { return nil }
         self.selection = selection
         self.profileID = rendered.profileID
-        self.conversationID = conversationID
+        self.conversationID = rendered.conversationID
         queueRevision = rendered.queueRevision
         queueScope = rendered.queueScope
     }

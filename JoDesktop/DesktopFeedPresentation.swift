@@ -7,9 +7,11 @@ struct DesktopFeedPresentation {
     let isTransitioning: Bool
 
     init(focus: FeedFocus?, committedFocus: FeedFocus?, feed: DesktopSessionFeed,
-         inSession: Bool, intent: DesktopSessionIntent) {
+         inSession: Bool, intent: DesktopSessionIntent, holdingStartup: Bool = false) {
         rawFocus = focus
-        if case .email = focus {
+        if holdingStartup {
+            isTransitioning = true
+        } else if case .email = focus {
             let selection = Self.selection(for: focus)
             isTransitioning = selection == nil || selection != feed.current
         } else if focus == nil, inSession, intent == .feed {

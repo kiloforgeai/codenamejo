@@ -328,13 +328,30 @@ extension FullDuplexVoiceClient {
         scheduleLivePreparation()
     }
 
-    func resetLivePreparation() {
+    func resetLivePreparation(keepingCorrections: Bool = true) {
         livePreparationSchedule?.cancel()
         livePreparationSchedule = nil
         for task in livePreparationTasks.values { task.cancel() }
         livePreparationTasks.removeAll()
-        livePreparation = LiveEmailPreparationCache(profileId: ProfileRuntime.snapshot?.profileId)
+        let corrections = keepingCorrections && livePreparation.profileId == ProfileRuntime.snapshot?.profileId
+            ? livePreparation.corrections : [:]
+        livePreparation = LiveEmailPreparationCache(profileId: ProfileRuntime.snapshot?.profileId, corrections: corrections)
         transport?.liveAdapter?.cancelPreparedEmail()
+    }
+
+    func captureEmailCorrection(_ text: String) {
+        guard liveQueueActionAnchor == nil || liveQueueActionAnchor?.profileId == ProfileRuntime.snapshot?.profileId,
+              LiveEmailPreparationCache.isFactualCorrection(text), let step = liveQueueActionAnchor?.step ?? standingStep,
+              let key = LiveEmailPresentation.Key.step(step), key.selectedIDs.count == 1 else { return }
+        resetLivePreparation()
+        livePreparation.correct(key, text: text)
+        if let current = standingStep { standingStep = livePreparation.annotatingCorrection(current) }
+        transport?.liveAdapter?.correctEmailInterpretation()
+        diagnostics?.record(.turnTransition, ["transition": "email_interpretation_corrected",
+            "target_hash": diagnostics?.target(MailSelection(account: key.account, messageID: key.messageId).canonical) ?? "unknown",
+            "task_revision": String(livePreparation.corrections[key.identity]?.revision ?? 0),
+            "phase": "explicit_user_statement"])
+        scheduleLivePreparation()
     }
 
     private func scheduleLivePreparation() {
@@ -367,15 +384,24 @@ extension FullDuplexVoiceClient {
             // Entries outlive the read-ahead window: the TTL is the eviction, so the summary for
             // the item the cursor is about to land on is still here when it lands.
             for key in candidates where self.livePreparation.attempted.insert(key.identity).inserted {
+                let correction = self.livePreparation.corrections[key.identity]
                 self.livePreparationTasks[key.identity] = Task { [weak self] in
                     let started = Date()
-                    let result = await FullDuplexBroker.prepareEmail(key, scope: scope)
+                    let result = await FullDuplexBroker.prepareEmail(key, scope: scope, correction: correction)
                     guard let self, !Task.isCancelled, self.isActive, self.dialGeneration == dial,
                           self.livePreparation.generation == generation,
                           ProfileRuntime.snapshot?.profileId == scope?.profileId,
                           !MailHeadersOnly.withholdsBodies else { return }
                     self.livePreparationTasks.removeValue(forKey: key.identity)
-                    if let result { self.livePreparation.entries[key.identity] = (result, Date()) }
+                    if let result {
+                        self.livePreparation.entries[key.identity] = (result, Date())
+                        self.diagnostics?.record(.turnTransition, ["transition": "email_summary_prepared",
+                            "phase": result.summaryProvenance ?? "selected_messages",
+                            "complete": String(result.summaryProvenance != "uncertain_missing_ancestry"
+                                && result.emailContent?.messages.allSatisfy(\.textComplete) == true),
+                            "task_revision": String(result.correctionRevision ?? 0),
+                            "target_hash": self.diagnostics?.target(MailSelection(account: key.account, messageID: key.messageId).canonical) ?? "unknown"])
+                    }
                     RealtimeLog.log("livePreparation: \(result == nil ? "miss" : "ready") in \(Int(Date().timeIntervalSince(started) * 1000))ms")
                 }
             }
@@ -383,6 +409,8 @@ extension FullDuplexVoiceClient {
     }
 
     func preparedEmailStep(_ step: String) -> String {
+        let step = livePreparation.profileId == ProfileRuntime.snapshot?.profileId
+            ? livePreparation.annotatingCorrection(step) : step
         guard transport != nil, !MailHeadersOnly.withholdsBodies,
               let prepared = livePreparation.ready(for: step, profileId: ProfileRuntime.snapshot?.profileId)
         else { return step }
@@ -688,7 +716,7 @@ extension FullDuplexVoiceClient {
                   self.endCueTask == nil else { return }
             let store = Container.shared.mailStore()
             let profileScope = ProfileRuntime.snapshot
-            let step = await localTriage.step(input, store: store)
+            let step = await Container.shared.applicationTasks().next(queue: localTriage, input: input, store: store)
             let progress = await localTriage.progress
             let standing = await localTriage.standing
             // Read in the same sequence as the two above: any job whose answer this step just
@@ -830,14 +858,9 @@ extension FullDuplexVoiceClient {
             }
         }
         if sequentialFeed {
-            // The buffer count, not `standing.total`: on the whole-inbox pile that is Gmail's
-            // INBOX message total, and the card read "2 of <INBOX total>" (2026-09-09).
+            // Progress is one source-keyed pass snapshot, distinct from the mailbox estimate.
             onFeedFocus?(feedFocusTracker.applyTriage(
-                output: output,
-                queuePosition: progress?.position,
-                queueTotal: progress?.queued,
-                displayPosition: progress?.displayPosition,
-                displayTotal: progress?.displayQueued))
+                output: output, progress: progress))
         }
         if Self.isFeedInterstitial(output) || Self.isPageInterstitial(output) {
             terminalFeedReached = Self.isFeedInterstitial(output)
@@ -847,6 +870,9 @@ extension FullDuplexVoiceClient {
                     + "calendar pending=\(calendarFeedPending)")
         }
         for jobId in served {
+            if Container.shared.dispatchJobs().existing(jobId)?.state == "awaiting_input" {
+                Container.shared.applicationTasks().select(jobId)
+            }
             if let report = heldOutcomes[jobId]?.report {
                 pendingJobSpeech = .init(id: jobId, finishedAt: report.finishedAt)
                 diagnostics?.record(.jobInjected, ["job_id": jobId.uuidString, "outcome": "queue_result",
@@ -1342,7 +1368,7 @@ extension FullDuplexVoiceClient {
             guard let adapter = self.transport?.liveAdapter,
                   let line = LiveEmailPresentation.cleanupSpeakerLine(for: step.output)
                     ?? prepared?.speakerLine(for: step.output, lead: "First up, ")
-                    ?? LiveSpokenStepContract.line(step: step.output, lead: "First up, ", prepared: prepared) else {
+                    ?? LiveSpokenStepContract.line(step: self.livePreparation.annotatingCorrection(step.output), lead: "First up, ", prepared: prepared) else {
                 self.deliverUnaskedStep(step, speakNow: true,
                     ms: Date().timeIntervalSince(started) * 1000, progress: progress)
                 return
@@ -1350,7 +1376,7 @@ extension FullDuplexVoiceClient {
             self.transport?.sendContextItem(
                 "The user said yes to cleanup and the queue is on its first message. The application "
                     + "is presenting it; do not call triage_next or present it again.\n"
-                    + (prepared?.annotating(step.output) ?? step.output),
+                    + self.preparedEmailStep(step.output),
                 role: "system")
             adapter.presentPreparedEmail(line)
             self.markPresentationUnheard(self.standingStep)
@@ -1393,7 +1419,7 @@ extension FullDuplexVoiceClient {
             guard let adapter = self.transport?.liveAdapter,
                   let line = LiveEmailPresentation.cleanupSpeakerLine(for: step.output)
                     ?? prepared?.speakerLine(for: step.output, lead: lead)
-                    ?? LiveSpokenStepContract.line(step: step.output, lead: lead, prepared: prepared),
+                    ?? LiveSpokenStepContract.line(step: self.livePreparation.annotatingCorrection(step.output), lead: lead, prepared: prepared),
                   line.utf8.count <= 450 else {
                 self.deliverUnaskedStep(step, speakNow: true,
                     ms: Date().timeIntervalSince(started) * 1000, progress: progress)
@@ -1402,7 +1428,7 @@ extension FullDuplexVoiceClient {
             self.transport?.sendContextItem(
                 "The user said yes to going through their inbox and the queue is on its first message. "
                     + "The application is presenting it; do not call triage_next or present it again.\n"
-                    + (prepared?.annotating(step.output) ?? step.output),
+                    + self.preparedEmailStep(step.output),
                 role: "system")
             // Anything audible now is the speaker's "Okay." to this yes, not an email to cut off.
             adapter.presentPreparedEmail(line, interruptsSpeech: false)
@@ -1582,11 +1608,11 @@ extension FullDuplexVoiceClient {
                     + "advance you owed them after acting. " + lead + " Do not call "
                     + "triage_next in this turn — this is its answer. Do not mention this "
                     + "note, and do not apologise or explain.\n"
-                    + (prepared?.annotating(step.output) ?? step.output),
+                    + preparedEmailStep(step.output),
                 role: "system",
                 speakerBrief: script
                     ?? (speakNow
-                        ? LiveSpokenStepContract.line(step: step.output, lead: "Next, ", prepared: prepared) : nil))
+                        ? LiveSpokenStepContract.line(step: livePreparation.annotatingCorrection(step.output), lead: "Next, ", prepared: prepared) : nil))
             if speakNow {
                 transport?.createResponse(instructions: script != nil
                     ? Self.recitePreparedLine : liveStepInstructions(step: step.output))
@@ -1984,22 +2010,21 @@ extension FullDuplexVoiceClient {
         pastTense: String,
         subsystem: String
     ) {
-        let deferArchive = tool == "archive_message" && transport != nil
-        let deferSpam = tool == "mark_spam" && transport != nil
-        let deferTrash = tool == "trash_message" && transport != nil
-        let deferLabel = tool == "label_message" && transport != nil
-        RealtimeLog.log("\(subsystem): \(tool) — \(deferArchive || deferSpam || deferTrash || deferLabel ? "queueing the action, then advancing" : "writing, then advancing")")
+        RealtimeLog.log("\(subsystem): \(tool) — accepting application action")
         FullDuplexTrace.note("!! \(tool) on device")
         functionCallTask?.cancel()
         let started = Date()
         let dial = dialGeneration
         let userTurn = liveUserTurn
         let profileId = ProfileRuntime.snapshot?.profileId
+        let origin = DispatchJob.MailOrigin.from(DispatchWorker.target(standingOnJSON: standingStep, facts: []))
+        let taskConversation = diagnostics?.conversationID
+        let taskTurn = historyTurnID.uuidString
+        let taskDiagnostics = diagnostics
+        let inputSource = callId.hasPrefix("button-") ? "button" : "voice"
         functionCallTask = Task { [weak self, localContext, localTriage] in
-            let result = await FullDuplexBroker.runTool(
-                name: tool, argumentsJSON: argumentsJSON,
-                conversationId: self?.conversationId(),
-                deferArchive: deferArchive, deferSpam: deferSpam, deferTrash: deferTrash, deferLabel: deferLabel)
+            let result = await Container.shared.applicationTasks().perform(name: tool, arguments: argumentsJSON,
+                profile: profileId, origin: origin, conversationID: taskConversation, turnID: taskTurn, diagnostics: taskDiagnostics, inputSource: inputSource)
             guard let self, self.isActive, dial == self.dialGeneration else { return }
             guard !Task.isCancelled else {
                 self.finishSupersededTool(callId: callId, tool: tool, result: result.text,
@@ -2101,7 +2126,7 @@ extension FullDuplexVoiceClient {
         let profileId = ProfileRuntime.snapshot?.profileId
         var args = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8))) as? [String: Any] ?? [:]
         if name == LocalCalendarWrites.respond, let anchor = liveQueueActionAnchor,
-           let key = LiveEmailPresentation.Key.step(anchor.step), key.selectedIDs.count == 1,
+           let key = LiveEmailPresentation.Key.selection(anchor.step), key.selectedIDs.count == 1,
            LiveRequestRecovery.refersToCurrentMessage(latestCompletedUserUtterance) {
             args["source_message_id"] = key.messageId
             args["source_account"] = key.account
