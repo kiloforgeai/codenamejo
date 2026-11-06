@@ -388,6 +388,9 @@ final class FullDuplexVoiceClient {
     var greetingSentAt: ContinuousClock.Instant?
 
 
+    var liveActivitySourceID: UUID?
+    var activityRecoveryCalls = Set<String>()
+    let activitySourceRecovery = ActivitySourceRecovery()
     var transport: FullDuplexTransport?
     private var audio: FullDuplexAudioSession?
     private var pump: Task<Void, Never>?
@@ -1622,6 +1625,7 @@ final class FullDuplexVoiceClient {
             if emailReadTurn != liveUserTurn { _ = resumeFeedAfterLessonIfSettled() }
             emitFinalTranscript(responseCompleted: false)
         case .liveUserActivity:
+            liveActivitySourceID = Container.shared.realtimeService().renderedWorkspace?.activityID
             emailReader.pause()
             cancelJobSpeech(reason: "user_started")
             checkpointHistory()
@@ -2802,7 +2806,7 @@ final class FullDuplexVoiceClient {
         let dealtWith: Bool
     }
     var liveConfiguration: FullDuplexBroker.LiveConfiguration?
-    private var liveAnchors: [String: Int] = [:]
+    var liveAnchors: [String: Int] = [:]
     private struct DelegationScope: Equatable {
         let owner: String?
         let profile: String?
@@ -2820,7 +2824,7 @@ final class FullDuplexVoiceClient {
     var unheardPresentation: (revision: Int, sender: Set<String>, spoken: String, at: Date)?
     /// Turns, and their delegations, that began before the current email was heard; they cannot act on it.
     private var liveTurnsBeforeHearing: Set<Int> = []
-    private var liveUnheardDelegations: Set<String> = []
+    var liveUnheardDelegations: Set<String> = []
     private var liveFastAnchor: LiveFastAction.Anchor?
     private var modelRoute: (text: String, task: Task<LiveFastAction?, Never>)?
     var liveQueueActionAnchor: LiveQueueActionRecovery.Anchor?
@@ -3142,7 +3146,8 @@ final class FullDuplexVoiceClient {
         }
     }
 
-    private func runLiveFunction(_ call: LiveSessionAdapter.Call) {
+    func runLiveFunction(_ call: LiveSessionAdapter.Call) {
+        if recoverActivitySource(call) { return }
         #if targetEnvironment(macCatalyst)
         let currentWrite = LiveWriteTarget.mailWrites.contains(ToolNarration.canonical(call.name))
             || ["send_email", "forward_email", "create_draft", "reply_email", "dispatch", "dispatch_command"].contains(ToolNarration.canonical(call.name))
