@@ -597,8 +597,10 @@ extension FullDuplexVoiceClient {
 
     func startDispatch(callId: String, argumentsJSON: String,
                        requestedBackground: Bool = false, commandRetry: DispatchJob.CommandRun? = nil) {
-        if let reason = LiveRequestRecovery.dispatchRefusal(latestCompletedUserUtterance)
-            ?? (transport?.liveAdapter.map { $0.allowsNewDispatch ? nil : "stale_or_unsettled_request" } ?? nil) {
+        let request: String?
+        if let adapter = transport?.liveAdapter { request = adapter.dispatchRequest(for: callId) }
+        else { request = latestCompletedUserUtterance }
+        if let reason = request.map(LiveRequestRecovery.dispatchRefusal) ?? "stale_or_unsettled_request" {
             diagnostics?.record(.turnTransition, ["transition": "dispatch_request_refused", "reason": reason,
                 "call_id": callId, "turn_id": historyTurnID.uuidString, "input_source": "current_user_request"])
             postDispatchOutput(callId: callId, startedWork: false, output:
@@ -607,6 +609,7 @@ extension FullDuplexVoiceClient {
                     "Wait for a complete user request; nonverbal input requires no response or action."))
             return
         }
+        let authorizedRequest = request ?? ""
         let arguments = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8)))
             as? [String: Any]
         let requestedCommand = (arguments?["command"] as? String)?
@@ -712,7 +715,7 @@ extension FullDuplexVoiceClient {
             return
         }
         if dependency != nil || (standingStep.flatMap(LiveEmailPresentation.Key.selection) != nil
-            && DispatchScope.refersToSelectedEmail(latestCompletedUserUtterance)) { scope = .currentEmail }
+            && DispatchScope.refersToSelectedEmail(authorizedRequest)) { scope = .currentEmail }
         if !isSavedCommand, scope == nil, dispatchScopeRequired || arguments?["scope"] != nil {
             postDispatchOutput(callId: callId, startedWork: false, output:
                 "Not started. Set scope to current_email only when the task concerns the email "
@@ -886,11 +889,11 @@ extension FullDuplexVoiceClient {
         // as dealing with the message the user is standing on, and its answer comes back on
         // a step of the queue rather than in a separate ack.
         let mailQueueLive = queueStanding() != nil
-        let completionPreference = DispatchJob.CompletionPreference.requested(in: latestCompletedUserUtterance)
+        let completionPreference = DispatchJob.CompletionPreference.requested(in: authorizedRequest)
             ?? DispatchJob.CompletionPreference(rawValue: Self.stringArgument("completion_preference", in: argumentsJSON) ?? "")
-        let userRequest = latestCompletedUserUtterance
+        let userRequest = authorizedRequest
         let holdsQuestion = DispatchScope.holdsDecision(related: relatesToEmail,
-            continuing: DispatchScope.explicitlyContinuesFeed(latestCompletedUserUtterance), savedCommand: isSavedCommand)
+            continuing: DispatchScope.explicitlyContinuesFeed(authorizedRequest), savedCommand: isSavedCommand)
         let parksSource = relatesToEmail && commandRetry == nil && !holdsQuestion
             && (expects != .receipt || requestedBackground || completionPreference == .bringBack)
         let dispatchUsesQueue = mailQueueLive && relatesToEmail && commandRetry == nil && !holdsQuestion
@@ -941,7 +944,7 @@ extension FullDuplexVoiceClient {
             guard expects == .receipt, !isSavedCommand, relatesToEmail,
                   let anchor = liveQueueActionAnchor?.step ?? standingStep,
                   let key = LiveEmailPresentation.Key.selection(anchor) else { return nil }
-            return DispatchMailOperation.archiveRequest(latestCompletedUserUtterance, account: key.account, messageID: key.messageId)
+            return DispatchMailOperation.archiveRequest(authorizedRequest, account: key.account, messageID: key.messageId)
         }()
         dispatchHistory[jobId] = (historyTurnID, historyUserText)
         onDispatchStarted?(jobId, displayTask)
