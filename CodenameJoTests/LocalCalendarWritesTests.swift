@@ -46,6 +46,11 @@ final class LocalCalendarWritesTests: XCTestCase {
         let scripted = ScriptedGmail { call in
             guard call.path.hasPrefix("/calendar/v3/calendars/primary/events/") else { return (404, "application/json", "{}") }
             if call.method == "GET" { return read == 200 ? (200, "application/json", body) : (read, "application/json", "{}") }
+            if call.method == "PATCH", write == 200,
+               let patch = try? JSONSerialization.jsonObject(with: Data(call.body.utf8)) as? [String: Any] {
+                let saved = event.merging(patch) { _, value in value }
+                return (200, "application/json", String(decoding: try! JSONSerialization.data(withJSONObject: saved), as: UTF8.self))
+            }
             return (write, "application/json", write == 200 ? body : "{}")
         }
         Container.shared.providerHTTP.register { scripted }
@@ -207,12 +212,13 @@ final class LocalCalendarWritesTests: XCTestCase {
                 + "sent and the organizer wasn't told. Remove and re-add the account in Settings, then try again.")
     }
 
-    func testADeferredWriteUpdatesTheCacheOnceItLands() async throws {
+    func testConfirmedRSVPAndDeferredCancellationUpdateTheCache() async throws {
         let store = CalendarStore(database: Container.shared.localContext().dbPool)
         await store.cache(events: [cached("e1"), cached("e2")], attendees: [])
         calendar(invitation())
         let answered = await run("respond_to_calendar_event", ["event_id": "e1", "response": "accepted"], defer: true)
-        XCTAssertTrue(answered.deferred)
+        XCTAssertFalse(answered.deferred, "RSVPs wait for provider confirmation before advancing the feed")
+        XCTAssertEqual(answered.ok, true)
         calendar(invitation(id: "e2", organizer: true))
         _ = await run("cancel_calendar_event", ["event_id": "e2"], defer: true)
         for _ in 0..<100 {

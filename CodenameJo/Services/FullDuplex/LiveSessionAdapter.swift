@@ -935,8 +935,9 @@ final class LiveSessionAdapter {
             let answered = !speechAfterInput.isEmpty || turnsWithTools.contains(inputTurn) || resolvedInputTurns.contains(inputTurn)
             let unfinishedPrefix = LiveRequestRecovery.hasUnfinishedAuthorizationPrefix(authorizationText)
             let backchannel = finalizedInput && !authorizationText.isEmpty && LiveRequestRecovery.isBackchannel(delta)
-            let startsTurn = inputText.isEmpty || (finalizedInput && !finishesAssent && !unfinishedPrefix
-                && !backchannel && (newIntent || (answered && start - inputEnd > 1000)))
+            let startsTurn = inputText.isEmpty || (!finishesAssent && !unfinishedPrefix && !backchannel
+                && ((finalizedInput && (newIntent || (answered && start - inputEnd > 1000)))
+                    || (newIntent && start - inputEnd > 1000)))
             if startsTurn {
                 if queueActionRecovery?.finished == false { trace("queue_action_superseded") }
                 finishTranscript()
@@ -999,7 +1000,13 @@ final class LiveSessionAdapter {
                    LiveRequestRecovery.isBackchannel(self.authorizationText) {
                     self.resolvedInputTurns.insert(self.inputTurn)
                 }
-                if LiveRequestRecovery.requiresQueueAction(self.authorizationText),
+                #if targetEnvironment(macCatalyst)
+                let needsRecovery = LiveRequestRecovery.requiresQueueAction(self.authorizationText)
+                #else
+                // Preserve the phone's unanswered-turn recovery while desktop actions require explicit intent.
+                let needsRecovery = !LiveRequestRecovery.isFeedback(self.authorizationText)
+                #endif
+                if needsRecovery,
                    !self.turnsWithQueueActions.contains(self.inputTurn),
                    !self.resolvedInputTurns.contains(self.inputTurn), self.queueActionRecovery == nil {
                     self.queueActionRecovery = LiveQueueActionRecovery(now: ProcessInfo.processInfo.systemUptime)
@@ -1308,7 +1315,7 @@ final class LiveSessionAdapter {
             && lastTranscriptAt.map({ ProcessInfo.processInfo.systemUptime - $0 >= 0.8 }) ?? true
         guard settled else { return }
         guard let decision = queueActionRecovery?.poll(now: ProcessInfo.processInfo.systemUptime) else { return }
-        if settled, questionTurn == inputTurn, !speechAfterInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if settled, questionTurn == inputTurn, Self.answersQuestion(speechAfterInput) {
             retireAnsweredQuestion()
             trace("queue_action_answered")
             return

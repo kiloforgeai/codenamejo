@@ -58,7 +58,12 @@ final class WorkspaceProfileRefreshTests: XCTestCase {
     private func withStore(_ run: (Store, BackendService) async throws -> Void) async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let database = try DatabasePool(path: url.path)
-        try await database.write { try WorkspaceProfileRows.createSchema($0) }
+        try await database.write { db in
+            try WorkspaceProfileRows.createSchema(db)
+            try WorkspaceProfileRows.addFeedOrder(db)
+            try WorkspaceProfileRows.addFeedSections(db)
+            try WorkspaceProfileRows.addFeedProgress(db)
+        }
         let container = Container.shared
         let scope = ProfileRuntime.snapshot
         container.manager.push()

@@ -30,7 +30,11 @@ final class InstallIdentityMigrationTests: XCTestCase {
         // What the Better Auth build left behind.
         let profiles = WorkspaceProfileRows(dbPool: pool)
         let work = try await profiles.create(userId: old, name: "Work")
-        try await profiles.adopt(userId: old, emails: ["me@example.test"], into: work.id)
+        // Seed the v44 layout directly; current writers also require later migrations.
+        try await pool.write { db in
+            try db.execute(sql: "INSERT INTO workspace_profile_mailbox(user_id, email, profile_id) VALUES (?, ?, ?)",
+                           arguments: [self.old, "me@example.test", work.id])
+        }
         try await pool.write { db in
             try db.execute(sql: "INSERT INTO email_category VALUES (?, ?, ?, ?, ?, ?)",
                            arguments: [self.old, "me@example.test", "receipts", "Receipts", Date(), "Archive receipts."])
