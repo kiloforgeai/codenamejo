@@ -29,16 +29,16 @@ struct DispatchJob: Codable, Identifiable, Hashable {
     var inFlightOperation: String? = nil
     var completionPreference: CompletionPreference? = nil
     var inputChoices: [InputChoice]? = nil
+    var mailAction: MailActionReceipt? = nil
 
     struct InputChoice: Codable, Hashable, Identifiable {
         let id: String
         let label: String
     }
 
-    enum CompletionPreference: String, Codable, CaseIterable {
+    enum CompletionPreference: String, Codable {
         case quiet
         case bringBack = "bring_back"
-        var label: String { self == .quiet ? "Finish quietly" : "Bring result back" }
 
         static func requested(in text: String) -> Self? {
             let text = SpokenAnswerText.words(text).joined(separator: " ")
@@ -57,6 +57,12 @@ struct DispatchJob: Codable, Identifiable, Hashable {
         return isDone && effectivePreference == .bringBack && (context != nil || completionPreference != nil)
     }
 
+    var belongsInWorkQueue: Bool {
+        if needsReview { return true }
+        guard deliveredAt == nil, effectivePreference != .quiet else { return false }
+        return context?.expects == "answer" || completionPreference == .bringBack
+    }
+
     struct TaskContext: Codable, Hashable {
         var revision: Int = 1
         var scope: String
@@ -66,6 +72,9 @@ struct DispatchJob: Codable, Identifiable, Hashable {
         var timeZone: String
         var input: String
         var parksSource: Bool? = nil
+        var holdsDecision: Bool? = nil
+        var decisionReleased: Bool? = nil
+        var dependencyID: UUID? = nil
         var linkChoice: String? = nil
         var deferredFeedbackArchive: Bool? = nil
     }
@@ -156,7 +165,7 @@ struct DispatchJob: Codable, Identifiable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, task, state, result, receipts, historyOwner, operation, foregroundContinuation, origin, command, context, inFlightOperation, completionPreference, inputChoices
+        case id, task, state, result, receipts, historyOwner, operation, foregroundContinuation, origin, command, context, inFlightOperation, completionPreference, inputChoices, mailAction
         case userId = "user_id"
         case conversationId = "conversation_id"
         case turnId = "turn_id"
@@ -181,6 +190,7 @@ struct DispatchJob: Codable, Identifiable, Hashable {
 
     /// True once this job has stopped, one way or another.
     func hasStopped(asOf now: Date = Date()) -> Bool {
+        if mailAction?.state == .queued { return false }
         guard isRunning else { return true }
         guard let startedAt else { return true }
         return now.timeIntervalSince(startedAt) > Self.runningTolerance

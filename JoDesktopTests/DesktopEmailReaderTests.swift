@@ -114,6 +114,75 @@ final class DesktopEmailReaderTests: XCTestCase {
         XCTAssertTrue(decoded.messages[1].error?.contains("incomplete") == true)
     }
 
+    func testHTMLNoticeUsesArticleAcrossReaderToolAndPreparation() async throws {
+        let html = "<h1>FIRST &amp; article</h1><p>MIDDLE paragraph</p><ul><li>One</li><li>Two</li></ul>"
+            + "<p><a href=\"https://example.test/long-tracking-token\">Details</a></p>"
+            + "<script>hiddenScript()</script><div style=\"display:none\">hidden preheader</div><p>FINAL</p>"
+        let related = GmailAPI.FullPart(mimeType: "multipart/related", filename: nil, headers: nil, body: nil,
+            parts: [part(html, mime: "text/html"), part("attachment secret", filename: "notes.txt")])
+        for notice in ["Your email software can't display HTML emails. https://example.test/tracking",
+                       "This message was sent in HTML. Please use a browser.",
+                       "To view this email in your browser visit https://example.test/tracking", " \n "] {
+            let mime = GmailAPI.FullPart(mimeType: "multipart/alternative", filename: nil, headers: nil, body: nil,
+                parts: [part(notice), related])
+            let selected = message(body: mime)
+            let prepared = LocalEmailPresentation.envelope(selected, authorship: false)
+            for text in [MailBodyText.plainText(mime), GmailReadTools.envelope(selected)["body"] as? String ?? "",
+                         prepared.body, try XCTUnwrap(prepared.source).text] {
+                XCTAssertTrue(text.contains("FIRST & article"))
+                XCTAssertTrue(text.contains("MIDDLE paragraph"))
+                XCTAssertTrue(text.contains("FINAL"))
+                XCTAssertFalse(text.contains("display HTML"))
+                XCTAssertFalse(text.contains("https://"), "Preparation keeps link labels without spelling tracking URLs")
+                XCTAssertFalse(text.contains("hidden"))
+                XCTAssertFalse(text.contains("attachment secret"))
+            }
+            let decoded = try await DesktopEmailReader.decode(.init(id: "thread", messages: [selected]),
+                request: request(), attachment: { _, _ in XCTFail("No remote content required"); return Data() })
+            XCTAssertEqual(decoded.selectedID, "selected")
+            XCTAssertTrue(decoded.messages[0].text.hasSuffix("FINAL"))
+            XCTAssertTrue(decoded.messages[0].text.contains("• One\n• Two"))
+            XCTAssertEqual(decoded.messages[0].body.runs.compactMap(\.link), [URL(string: "https://example.test/long-tracking-token")!])
+        }
+    }
+
+    func testHTMLFallbackDoesNotReplaceRealTextOrExposeHiddenOnlyAlternative() async throws {
+        for (plain, html, expected) in [
+            ("Short real reply.", "<p>" + String(repeating: "Long duplicate. ", count: 100) + "</p>", "Short real reply."),
+            ("Your email software can't display HTML emails.", "<script>secret()</script>", "Your email software can't display HTML emails."),
+            ("", "<p>Malformed but readable &amp; complete", "Malformed but readable & complete")
+        ] {
+            let mime = GmailAPI.FullPart(mimeType: "multipart/alternative", filename: nil, headers: nil, body: nil,
+                parts: [part(plain), part(html, mime: "text/html")])
+            XCTAssertEqual(MailBodyText.plainText(mime), expected)
+            XCTAssertEqual(LocalEmailPresentation.flattenBody(mime).text, expected)
+            let decoded = try await DesktopEmailReader.decode(.init(id: "thread", messages: [message(body: mime)]),
+                request: request(), attachment: { _, _ in Data() })
+            XCTAssertEqual(decoded.messages[0].text, expected)
+        }
+    }
+
+    func testExternalHTMLFallbackLoadsCompleteArticleOnRepeatedReadsAndReportsFailure() async throws {
+        let html = "<p>FIRST</p>" + String(repeating: "<p>Article paragraph.</p>", count: 4_000) + "<p>FINAL</p>"
+        let external = GmailAPI.FullPart(mimeType: "text/html", filename: nil, headers: nil,
+            body: .init(size: html.utf8.count, data: nil, attachmentId: "article"), parts: nil)
+        let mime = GmailAPI.FullPart(mimeType: "multipart/alternative", filename: nil, headers: nil, body: nil,
+            parts: [part("Your email software cannot display HTML emails."), external])
+        for _ in 0..<2 {
+            let decoded = try await DesktopEmailReader.decode(.init(id: "thread", messages: [message(body: mime)]),
+                request: request(), attachment: { id, bodyID in
+                    XCTAssertEqual(id, "selected"); XCTAssertEqual(bodyID, "article"); return Data(html.utf8)
+                })
+            XCTAssertTrue(decoded.messages[0].text.hasPrefix("FIRST"))
+            XCTAssertTrue(decoded.messages[0].text.hasSuffix("FINAL"))
+            XCTAssertGreaterThan(decoded.messages[0].text.count, 24_000)
+        }
+        let failed = try await DesktopEmailReader.decode(.init(id: "thread", messages: [message(body: mime)]),
+            request: request(), attachment: { _, _ in throw URLError(.timedOut) })
+        XCTAssertNotNil(failed.messages[0].error)
+        XCTAssertFalse(failed.messages[0].text.contains("cannot display"))
+    }
+
     func testWrongThreadMissingSelectionAndDuplicateMessagesFailClosed() async {
         for messages in [[message("other", body: part("Wrong email"))],
                          [message(body: part("Wrong thread"), thread: "other")],

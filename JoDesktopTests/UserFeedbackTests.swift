@@ -31,13 +31,49 @@ final class UserFeedbackTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(120))
         XCTAssertEqual(feedback.saved.map { $0.0 }, ["Yeah, basically this weird error of the inbox being too full"])
         XCTAssertEqual(feedback.saved.first?.1.context.profileID, "work")
-        XCTAssertEqual(feedback.saved.first?.1.context.turnID, "request")
+        XCTAssertEqual(feedback.saved.first?.1.context.turnID, "note")
         XCTAssertEqual(phases.filter { $0 == "saved" }.count, 1)
         XCTAssertTrue(replies.last?.hasPrefix("Feedback saved") == true)
         XCTAssertTrue(input("Yeah, just file some feedback.", "request"))
         XCTAssertTrue(input("Yeah, basically this weird error of the inbox being too full", "note"))
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(feedback.saved.count, 1)
+    }
+
+    func testNaturalFeedbackAboutBackgroundWorkRetriesTheWholeNoteAndRequiresAReceipt() async throws {
+        let feedback = CaptureHarness()
+        feedback.voiceSaveDelay = .milliseconds(20)
+        feedback.failSave = true
+        var replies: [String] = [], receipts: [UUID] = []
+        func input(_ text: String, _ turn: String) -> Bool {
+            feedback.voiceInput(text, turnID: turn, reply: { replies.append($0) }, transition: { _ in },
+                settled: { _, id, _ in if let id { receipts.append(id) } })
+        }
+        XCTAssertTrue(input("Hey, can you stop for one second? I wanna give you some feedback.", "intro"))
+        let note = "So, the feedback is a couple fold. I'm clicking archive and you're talking. Do it in the background. Related research should churn on the left. Replies belong on the right."
+        XCTAssertTrue(input(note, "note"))
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(feedback.pendingVoiceText, note)
+        XCTAssertTrue(receipts.isEmpty)
+        XCTAssertTrue(replies.last?.contains("not saved") == true)
+        feedback.failSave = false
+        XCTAssertTrue(input("Could you try to save the feedback again?", "retry"))
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(feedback.saved.map(\.0), [note])
+        XCTAssertEqual(receipts.count, 1)
+        XCTAssertTrue(input("Save the feedback again", "duplicate"))
+        XCTAssertEqual(feedback.saved.count, 1)
+        XCTAssertEqual(receipts.count, 2)
+        XCTAssertEqual(receipts.first, receipts.last)
+        XCTAssertEqual(replies.last, FeedbackText.savedAcknowledgment)
+        feedback.owner = .init(userID: "other", context: .init(profileID: "personal"))
+        XCTAssertTrue(input("Save the feedback again", "other"))
+        XCTAssertTrue(replies.last?.contains("don't have a saved feedback receipt") == true)
+        XCTAssertEqual(receipts.count, 2)
+        XCTAssertFalse(LiveSessionAdapter.explicitlyRequestsBackground(note))
+        XCTAssertTrue(LiveSessionAdapter.explicitlyRequestsBackground("Find the database in the background"))
+        XCTAssertNil(VoiceFeedbackText.request("The email says I wanna give you some feedback"))
+        XCTAssertNil(VoiceFeedbackText.request("I don't want to give you feedback"))
     }
 
     func testVoiceFeedbackSurvivesSaveFailureAndTransfersToButtonWithoutAnotherSave() async throws {
@@ -54,6 +90,40 @@ final class UserFeedbackTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(60))
         XCTAssertTrue(feedback.saved.isEmpty)
         XCTAssertNil(feedback.pendingVoiceText)
+    }
+
+    func testFeedbackPolarityAndSubstantiveTurnSurviveTwoTurnRequestsAndCorrections() async throws {
+        for (request, note) in [
+            ("Can I give some feedback?", "You talk too much and repeatedly prod me. The emoji reactions aren't dictated."),
+            ("Could I give some feedback?", "The emoji reactions shouldn't be dictated."),
+            ("May I give feedback?", "Reactions are not read out. Actually, I mean the important reactions are not read out.")
+        ] {
+            let feedback = CaptureHarness()
+            feedback.voiceSaveDelay = .seconds(5)
+            var replies: [String] = []
+            func input(_ text: String, _ turn: String) -> Bool {
+                feedback.voiceInput(text, turnID: turn, reply: { replies.append($0) }, transition: { _ in })
+            }
+            XCTAssertTrue(input(request, "request"))
+            XCTAssertEqual(feedback.pendingVoiceText, "")
+            XCTAssertTrue(input(String(note.prefix(20)), "substantive"))
+            XCTAssertTrue(input(note, "substantive"))
+            XCTAssertTrue(input("Save it", "confirmation"))
+            for _ in 0..<100 where feedback.saved.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
+            XCTAssertEqual(feedback.saved.map(\.0), [note])
+            let saved = try XCTUnwrap(feedback.saved.first)
+            XCTAssertEqual(saved.1.context.turnID, "substantive")
+            XCTAssertEqual(saved.1.context.fragmentTurnIDs, ["confirmation", "request", "substantive"])
+            XCTAssertEqual(replies, ["What would you like the feedback to say?", FeedbackText.savedAcknowledgment])
+            XCTAssertNil(feedback.pendingVoiceText)
+            let log = VoiceDiagnostics(directory: try directory())
+            _ = try await log.saveFeedback(saved.0, source: .voice, userID: "user", context: saved.1.context)
+            let rows = try rows(await log.snapshot(userID: "user"))
+            XCTAssertEqual(rows.first?["message"] as? String, note)
+            XCTAssertEqual(rows.first?["turn_id"] as? String, "substantive")
+        }
+        XCTAssertNil(VoiceFeedbackText.request("I can't give feedback"))
+        XCTAssertNil(VoiceFeedbackText.request("The email says can I give feedback?"))
     }
 
     func testVoiceFeedbackCancelsAndDoesNotCrossProfileOrUserBoundaries() async throws {
@@ -82,6 +152,35 @@ final class UserFeedbackTests: XCTestCase {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         addTeardownBlock { try FileManager.default.removeItem(at: url) }
         return url
+    }
+
+    func testFeedbackToolRunsWithoutDispatchAndRefusalsAreDiagnosed() async throws {
+        let log = VoiceDiagnostics(directory: try directory())
+        var calls: [String] = [], wire: [[String: Any]] = []
+        let adapter = LiveSessionAdapter(wire: { wire.append($0) }, emit: {
+            if case .liveFunction(let call) = $0 { calls.append(call.name) }
+        })
+        adapter.diagnostics = log.begin(engine: "live")
+        func receive(_ event: [String: Any]) throws { adapter.receive(try JSONSerialization.data(withJSONObject: event)) }
+        func call(_ id: String, _ name: String) throws {
+            try receive(["type": "response.event", "delegation_id": "d", "event": ["type": "response.output_item.done", "response_id": "r",
+                "item": ["type": "function_call", "call_id": id, "name": name, "arguments": "{}"]]])
+        }
+        try receive(["type": "session.started"])
+        try receive(["type": "session.input_transcript.delta", "start_ms": 100, "end_ms": 200,
+            "delta": "So, the feedback is: do it in the background when I click archive."])
+        try receive(["type": "session.delegation.created", "delegation": ["id": "d", "response_id": "r"]])
+        try call("feedback", "log_feedback")
+        XCTAssertEqual(calls, ["log_feedback"])
+        adapter.outbound(["type": "conversation.item.create", "item": ["type": "function_call_output", "call_id": "feedback",
+            "output": "Feedback saved locally in Jo's logs. Reference: " + UUID().uuidString]])
+        try call("write", "dispatch")
+        try receive(["type": "response.event", "event": ["type": "response.completed", "response": ["id": "r", "output": []]]])
+        XCTAssertEqual(calls, ["log_feedback"])
+        XCTAssertTrue(wire.contains { (($0["item"] as? [String: Any])?["output"] as? String)?.contains("current request is feedback") == true })
+        adapter.close()
+        let events = try rows(await log.snapshot()).filter { $0["event"] as? String == "toolResultDelivered" }
+        XCTAssertEqual(events.compactMap { ($0["fields"] as? [String: String])?["outcome"] }, ["success", "refused"])
     }
 
     private func rows(_ data: Data) throws -> [[String: Any]] {

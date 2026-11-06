@@ -12,6 +12,7 @@ final class VoiceDiagnostics: @unchecked Sendable {
         case turnTransition, toolStarted, toolFinished, toolResultDelivered, brainRequest, brainResponse, brainAttemptEnded
         case jobStarted, jobFinished, jobDeferred, jobInjected, jobSpeechStarted, jobSpeechCancelled, queueRecovery, calendarReceipt, modelAvailability, audioRouteChanged
         case workspaceRendered, presentationBound, playbackBoundary, offerTransition, resultSelected
+        case feedRefresh
     }
 
     struct Session: Sendable {
@@ -85,12 +86,15 @@ final class VoiceDiagnostics: @unchecked Sendable {
         "tools_bytes", "context_bytes", "input_bytes", "pending_calls", "pending_responses", "time_zone",
         "pending_context", "backend_starting", "active_call", "active_fast_call", "input_finalized",
         "speech_pending", "button_block_reason", "function_task_active",
+        "chunk_index", "chunk_count", "source_bytes", "completed_bytes", "cached",
+        "browser_step", "browser_url_hash",
         "continuation_owed", "continuation_owner", "pending_phase",
         "action_error_visible", "action_error_hash",
         "reference_now", "range_start", "range_end", "clock_bytes", "requestClock_bytes", "calendarWindow_bytes", "calendarCoverage_bytes",
         "calendar_count", "covered_calendars", "result_age_seconds",
         "requested_start", "requested_end", "stored_start", "stored_end", "available", "provider_request_id", "provider_response_id",
         "render_revision", "queue_scope", "observation_phase", "window_id", "profile_hash", "response_hash",
+        "inserted_count", "updated_count", "removed_count",
         "response_role", "focus_mode", "visible_count", "queue_target_hash", "queue_order", "mismatch",
         "response_item_id", "playback_id", "selection_state", "displayed_position", "displayed_total", "job_states", "attribution",
         "raw_target_hash", "raw_focus_state", "display_branch", "sidebar_source", "session_phase", "handoff_reason",
@@ -144,7 +148,7 @@ final class VoiceDiagnostics: @unchecked Sendable {
                 let line = String(decoding: data, as: UTF8.self)
                 logger.notice("\(line, privacy: .public)")
                 data.append(0x0a)
-                if event != .workspaceRendered {
+                if event != .workspaceRendered || span.expected <= 40 {
                     let file = sessionPath(span, suffix: "jsonl")
                     let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
                     if size + data.count <= lifecycleMaximumBytes { try appendFile(data, file: file, durable: true) }

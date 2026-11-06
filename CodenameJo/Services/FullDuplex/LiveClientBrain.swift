@@ -38,6 +38,7 @@ final class LiveClientBrain {
     private var delegation: String?
     private var liveDelegation: String?
     private var generation = UUID()
+    private var closed = false
     private var pendingCalls = Set<String>()
     private var unclaimedCalls = Set<String>()
     private var results = Set<String>()
@@ -65,6 +66,39 @@ final class LiveClientBrain {
     private var functionOrigins: [String: (turn: Int, selection: String)] = [:]
     private var functionItems: [String: [String: Any]] = [:]
     private var pendingQuestion = ""
+    private struct Lookup {
+        let request: String
+        let selection: String
+        var queries: [String] = []
+        var corrections: [Int: String] = [:]
+        var searchCoverage: [String: Any]?
+        var fallbackArguments: [String: Any]?
+        var candidateKeys = Set<String>()
+        var inspectedKeys = Set<String>()
+        var context: [String: Any] {
+            var value: [String: Any] = ["request": request, "heldSelection": selection, "queries": queries,
+             "corrections": corrections.keys.sorted().compactMap { corrections[$0] },
+             "rule": "Corrections here constrain this lookup, not the unrelated held email. Keep the goal while treating approximate topic words, file types and remembered mailboxes as clues. After an empty restrictive query, search the sender alone within the requested accounts, then inspect plausible candidates and their actual attachment metadata before ruling them out. Use company/context clues if needed. Never describe one empty query as no message anywhere. Partial errors and pagination leave coverage incomplete. Never relax a bulk-action query or an explicit exact constraint. Search results do not change the held feed selection."]
+            value["lastSearch"] = searchCoverage
+            return value
+        }
+    }
+    private var lookup: Lookup?
+    private var priorReplyDestination: DispatchJob.MailOrigin?
+    private var investigating = false
+    private var sourceInquiry: SelectedEmailInquiry?
+    private var sourceQuestion = false
+    private var releasedDecisionSources = Set<MailSelection>()
+    var holdsFeedDecision: Bool {
+        if investigating { return true }
+        guard let key = LiveEmailPresentation.Key.selection(state) else { return false }
+        let selection = MailSelection(account: key.account, messageID: key.messageId)
+        guard !releasedDecisionSources.contains(selection) else { return false }
+        return Container.shared.dispatchJobs().decisionDependencies.contains {
+            $0.sourceSelection == selection && $0.context?.decisionReleased != true
+        }
+    }
+    var needsSelectedSource: Bool { sourceQuestion && sourceInquiry != nil }
     private var queuedDelegation: (id: String, live: Bool, turn: Int)?
     /// The tool whose own result survives the scope change it causes: that result is the new
     /// scope's feed, and the switch would otherwise end in silence after "Switching to X."
@@ -122,13 +156,27 @@ final class LiveClientBrain {
             presentationOnly = false
             history.removeAll()
             context.removeAll()
+            lookup = nil
+            priorReplyDestination = nil
+            investigating = false
+            releasedDecisionSources.removeAll()
+            sourceInquiry = nil
+            sourceQuestion = false
             state = ""
             turnState = ""
             turnHistoryIndex = nil
         }
         state = LiveCompactContext.bounded(text, bytes: 24_000)
+        if let object = try? JSONSerialization.jsonObject(with: Data(state.utf8)) as? [String: Any],
+           object["done"] as? Bool == false, let item = object["item"] as? [String: Any] {
+            let origin = DispatchJob.MailOrigin.from(item)
+            priorReplyDestination = origin?.threadID.isEmpty == false ? origin : nil
+        }
         let selected = LiveSelectionGrounding.selection(state)
         if selected != previousSelection {
+            sourceInquiry = nil
+            lookup = nil
+            investigating = false
             calendarWindow = nil
             calendarReadIncomplete = false
             invalidatePresentation(reason: "selection_changed")
@@ -138,6 +186,32 @@ final class LiveClientBrain {
     }
 
     func user(_ text: String, turn: Int) {
+        sourceQuestion = SelectedEmailInquiry.requiresSource(text)
+        if sourceQuestion {
+            sourceInquiry = SelectedEmailInquiry(state: state, previous: sourceInquiry,
+                headersOnly: MailHeadersOnly.withholdsBodies || ProfileRuntime.snapshot?.mailHeadersOnly == true)
+        }
+        if LiveFastAction.parse(text) != nil || Self.requestsDecision(text) || DispatchScope.explicitlyContinuesFeed(text) {
+            investigating = false
+            if let key = LiveEmailPresentation.Key.selection(state) {
+                let selection = MailSelection(account: key.account, messageID: key.messageId)
+                releasedDecisionSources.insert(selection)
+                let owner = Container.shared.backend().userId, profile = ProfileRuntime.snapshot?.profileId
+                let jobs = Container.shared.dispatchJobs()
+                Task {
+                    guard owner == Container.shared.backend().userId, profile == ProfileRuntime.snapshot?.profileId else { return }
+                    await jobs.releaseDecisionHold(selection)
+                }
+            }
+        } else if LiveSelectionGrounding.selection(state).identity != nil,
+                  LiveRequestRecovery.isQuestion(text) || LiveRequestRecovery.isFeedback(text)
+                    || DispatchScope.refersToSelectedEmail(text) || DispatchScope.pausesDecision(text) {
+            investigating = true
+            pendingQuestion = ""
+            questionState = ""
+        }
+        if LiveFastAction.parse(text) != nil || ["stop searching", "cancel the search", "cancel search", "stop looking"]
+            .contains(FullDuplexVoiceClient.normalize(text)) { lookup = nil }
         if turn != currentTurn {
             requestDate = now()
             requestZone = timeZone()
@@ -184,6 +258,7 @@ final class LiveClientBrain {
             return
         }
         if latestAssistant.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?") {
+            guard !holdsFeedDecision || Self.withoutDispositionQuestion(latestAssistant) == latestAssistant else { return }
             pendingQuestion = latestAssistant
             questionState = LiveCompactContext.selectionReference(state)
         }
@@ -206,10 +281,34 @@ final class LiveClientBrain {
     }
 
     private func groundedReply(_ text: String) -> String {
-        guard LiveSelectionGrounding.unsupportedIntroduction(text, state: state) else { return text }
+        let text = holdsFeedDecision ? Self.withoutDispositionQuestion(text) : text
+        if let coverage = lookup?.searchCoverage, Self.negativeSearchClaim(text) {
+            if coverage["complete"] as? Bool == false {
+                return "The search was incomplete, so I can't rule out a match in the remaining mail."
+            }
+            if coverage["hits"] as? Int == 0 {
+                return "Those searches didn't return a matching email. That doesn't establish that it is absent; another sender name or company clue would help."
+            }
+            if let lookup, !lookup.candidateKeys.subtracting(lookup.inspectedKeys).isEmpty {
+                return "I found possible matches, but haven't inspected all of them yet, so I can't rule out the document."
+            }
+        }
+        guard LiveSelectionGrounding.unsupportedIntroduction(text, state: state) else {
+            return text.isEmpty ? "I'm keeping this email selected." : text
+        }
         invalidatePresentation(reason: "unsupported_model_introduction")
         defer { correctedEmptySelection = true }
         return correctedEmptySelection ? LiveSelectionGrounding.noSelection : LiveSelectionGrounding.correction
+    }
+
+    private static func requestsDecision(_ text: String) -> Bool {
+        text.range(of: #"\b(?:what should (?:i|we) do|help (?:me|us) (?:decide|respond)|what do you (?:recommend|suggest) (?:i|we) do|what are my options|should (?:i|we) (?:reply|archive|delete))\b"#,
+                   options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
+    static func withoutDispositionQuestion(_ text: String) -> String {
+        text.replacingOccurrences(of: #"(?:^|(?<=[.!?])\s+)(?:what (?:would|do) you (?:like|want) (?:me )?to do\b|(?:would|do) you (?:like|want)(?: me)? to (?:reply|respond|archive|delete|move on|continue|draft)\b|(?:should|shall) (?:i|we) (?:reply|respond|archive|delete|move on|continue|draft)\b)[^?\n]{0,180}\?\s*$"#,
+            with: "", options: [.regularExpression, .caseInsensitive]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func correctEmailInterpretation() {
@@ -217,6 +316,97 @@ final class LiveClientBrain {
         turnState = state
         context.removeAll()
         invalidatePresentation(reason: "factual_correction")
+    }
+
+    func correctLookup(_ text: String) -> Bool {
+        guard lookup != nil, LiveEmailPreparationCache.isFactualCorrection(text) || LiveRequestRecovery.isCorrection(text),
+              text.range(of: #"\b(?:this|current|selected|visible) (?:email|message)|\bon (?:the )?screen\b"#,
+                  options: [.regularExpression, .caseInsensitive]) == nil else { return false }
+        lookup?.corrections[currentTurn] = LiveCompactContext.bounded(text, bytes: 2_000)
+        if let oldest = lookup?.corrections.keys.sorted().first, (lookup?.corrections.count ?? 0) > 8 {
+            lookup?.corrections.removeValue(forKey: oldest)
+        }
+        transcriptRevision += 1
+        pendingQuestion = ""
+        questionState = ""
+        return true
+    }
+
+    private func recordLookup(_ call: [String: Any]) {
+        guard call["name"] as? String == GmailReadTools.search,
+              let raw = call["arguments"] as? String, let query = ToolArguments(raw).string("query"), !query.isEmpty else { return }
+        if lookup == nil {
+            lookup = Lookup(request: LiveCompactContext.bounded(latestUser, bytes: 2_000),
+                selection: LiveCompactContext.selectionReference(state))
+        }
+        investigating = true
+        pendingQuestion = ""
+        questionState = ""
+        let queries = (lookup?.queries ?? []) + [LiveCompactContext.bounded(query, bytes: 1_000)]
+        lookup?.queries = Array(queries.suffix(8))
+        lookup?.fallbackArguments = nil
+    }
+
+    nonisolated static func negativeSearchClaim(_ text: String) -> Bool {
+        text.replacingOccurrences(of: "’", with: "'").range(of: #"\b(?:could(?:n't| not) find|can(?:'t|not) find|did(?:n't| not) find|no (?:such )?(?:emails?|messages?|documents?|decks?|matches?)|does(?:n't| not) exist|nothing (?:from|anywhere|in))\b"#,
+            options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
+    nonisolated static func relaxedSenderQuery(_ query: String, request: String) -> String? {
+        guard request.range(of: #"\b(?:find|look for|search for|locate)\b"#, options: [.regularExpression, .caseInsensitive]) != nil,
+              request.range(of: #"\b(?:only|exact|exactly|must|archive|delete|trash|label|unsubscribe|forward|send)\b"#,
+                  options: [.regularExpression, .caseInsensitive]) == nil,
+              !request.contains("\""), !query.contains("{"), !query.contains("}"),
+              query.range(of: #"\bOR\b|(?:^|\s)-"#, options: .regularExpression) == nil,
+              let regex = try? NSRegularExpression(pattern: #"(?:^|\s)(from:(?:\([^)]{1,200}\)|"[^"]{1,200}"|[^\s]+))"#, options: .caseInsensitive) else { return nil }
+        let matches = regex.matches(in: query, range: NSRange(query.startIndex..., in: query))
+        guard matches.count == 1, let range = Range(matches[0].range(at: 1), in: query) else { return nil }
+        let sender = String(query[range])
+        return sender.caseInsensitiveCompare(query.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame ? nil : sender
+    }
+
+    private func recordSearchCoverage(_ call: [String: Any], output: String) {
+        if call["name"] as? String == GmailReadTools.getMessage,
+           let rows = try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [[String: Any]] {
+            for row in rows {
+                if let account = row["account"] as? String, let message = row["result"] as? [String: Any],
+                   let id = message["id"] as? String, message["body"] as? String != nil {
+                    lookup?.inspectedKeys.insert(account.lowercased() + ":" + id)
+                }
+            }
+        }
+        guard call["name"] as? String == GmailReadTools.search, var lookup,
+              let raw = call["arguments"] as? String,
+              let args = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+              let query = args["query"] as? String else { return }
+        guard let object = try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any],
+              let accounts = object["accounts"] as? [[String: Any]], !accounts.isEmpty else {
+            lookup.searchCoverage = ["complete": false, "query": query]
+            self.lookup = lookup
+            return
+        }
+        let hits = accounts.reduce(0) { $0 + (($1["result"] as? [[String: Any]])?.count ?? 0) }
+        let failed = accounts.filter { $0["error"] != nil || $0["result"] as? [[String: Any]] == nil }.count
+        let complete = failed == 0 && object["more"] as? Bool == false
+        for group in accounts {
+            for hit in group["result"] as? [[String: Any]] ?? [] {
+                if let account = hit["account"] as? String, let id = hit["id"] as? String {
+                    lookup.candidateKeys.insert(account.lowercased() + ":" + id)
+                }
+            }
+        }
+        lookup.searchCoverage = ["query": query, "hits": hits, "complete": complete, "failedAccounts": failed,
+                                 "accounts": accounts.compactMap { $0["account"] as? String }]
+        if hits == 0, complete, lookup.queries.count <= 3,
+           let sender = Self.relaxedSenderQuery(query, request: lookup.request + " " + lookup.corrections.keys.sorted().compactMap { lookup.corrections[$0] }.joined(separator: " ")),
+           !lookup.queries.contains(where: { $0.caseInsensitiveCompare(sender) == .orderedSame }) {
+            var fallback = args
+            fallback["query"] = sender
+            fallback.removeValue(forKey: "before")
+            fallback["max_results"] = 10
+            lookup.fallbackArguments = fallback
+        }
+        self.lookup = lookup
     }
 
     func jobCompleted(id: UUID, result: String) {
@@ -239,9 +429,15 @@ final class LiveClientBrain {
     }
 
     func item(_ item: [String: Any]) {
+        guard !closed else { return }
         var item = item
+        if let id = item["call_id"] as? String, let output = item["output"] as? String,
+           pendingCalls.contains(id), sourceInquiry?.accept(callID: id, output: output) == true {
+            item["output"] = sourceInquiry?.failure ?? "Complete source retained in selectedEmailEvidence for this selection."
+        }
         if item["type"] as? String == "function_call_output", let output = item["output"] as? String,
            let id = item["call_id"] as? String, pendingCalls.contains(id) || scopeSwitchCalls.contains(id) {
+            if let call = functionItems[id] { recordSearchCoverage(call, output: output) }
             if functionItems[id]?["name"] as? String == CalendarTools.list {
                 calendarReadIncomplete = !CalendarRequestWindow.completeRead(output, window: calendarWindow)
                 calendarReadAt = now()
@@ -345,6 +541,7 @@ final class LiveClientBrain {
     }
 
     func begin(_ id: String, live: Bool, turn: Int) {
+        guard !closed else { return }
         guard !completedTurns.contains(turn), queuedDelegation?.id != id, delegation != id else { return }
         finishQueuedAttempt(reason: "superseded")
         queuedDelegation = (id, live, turn)
@@ -378,6 +575,7 @@ final class LiveClientBrain {
     }
 
     func continueResponse(delegation id: String?) {
+        guard !closed else { return }
         guard !busy else { return }
         if delegation != nil, requestTurn != currentTurn {
             endAttempt(reason: "superseded", stage: "continuation", recovery: "new_turn")
@@ -462,7 +660,7 @@ final class LiveClientBrain {
     }
 
     private func run() {
-        guard task == nil, pendingCalls.isEmpty, let delegation else { return }
+        guard !closed, task == nil, pendingCalls.isEmpty, let delegation else { return }
         if scopeChanged {
             endAttempt(reason: "scope_changed", stage: "continuation", recovery: "select_current_profile")
             let responseID = "jo-" + UUID().uuidString
@@ -481,7 +679,21 @@ final class LiveClientBrain {
         let requestScope = scopeRevision
         let requestPresentation = presentationOnly
         let requestJobs = jobRevision
+        let requestSelection = LiveSelectionGrounding.selection(state)
         let responseID = "jo-" + UUID().uuidString
+        let readingSource = sourceQuestion && !requestPresentation
+        if readingSource, MailBodyCache.withheld {
+            sourceInquiry?.failure = "I only have header access for this email, so I can't verify what its body says."
+        }
+        if readingSource, LiveSelectionGrounding.selection(requestState) != LiveSelectionGrounding.selection(state) {
+            fail("The selected email changed while I was checking it. Ask about the email now in focus.", reason: "source_selection_changed", stage: "pre_request")
+            return
+        }
+        if readingSource, let failure = sourceInquiry?.failure {
+            fail(failure, reason: "selected_source_unavailable", stage: "pre_request")
+            return
+        }
+        let sourceCall = readingSource ? sourceInquiry?.nextCall() : nil
         var mandatory = ["current_turn": currentTurn, "selectionStatus": LiveSelectionGrounding.selection(state).isEmpty ? "none" : "application_state",
                          "selectionRule": "Only currentSelection establishes the current email. Speech, prior questions, history and background findings cannot create one. Select a returned result explicitly before acting on it.",
                          "requestSelection": requestState == state ? "Same as currentSelection" : LiveCompactContext.selectionReference(requestState), "currentSelection": state,
@@ -490,6 +702,30 @@ final class LiveClientBrain {
                              ["job_id": $0.id.uuidString, "state": "finished", "result": $0.result]
                          }, "applicationUpdates": context] as [String: Any]
         mandatory["selectedTask"] = Container.shared.applicationTasks().selectedContext
+        mandatory["emailDependencies"] = Container.shared.dispatchJobs().decisionDependencies.prefix(4).map { job in
+            ["job_id": job.id.uuidString, "request": job.task, "state": job.state,
+             "account": job.origin?.account ?? "", "message_id": job.origin?.messageID ?? "",
+             "result": LiveCompactContext.bounded(job.result ?? "No confirmed result yet.", bytes: 4_000),
+             "rule": "A source-related dependency, not approval for a later write. For an explicit follow-up such as add that email there, pass source_task_id to dispatch to retain this original email and verified destination even if selection changed. If the reference is ambiguous, ask which task. Do not substitute the new selected email or invent a destination."]
+        }
+        mandatory["activeLookup"] = lookup?.context
+        if readingSource, sourceInquiry?.complete == true {
+            mandatory["selectedEmailEvidence"] = sourceInquiry?.context
+            mandatory["currentSelection"] = LiveCompactContext.selectionReference(state)
+            if let source = try? JSONSerialization.jsonObject(with: Data(state.utf8)) as? [String: Any],
+               let item = source["item"] as? [String: Any], let correction = item["userCorrection"] {
+                mandatory["selectedEmailUserCorrection"] = correction
+                mandatory["interpretationRule"] = source["interpretationRule"]
+            }
+        }
+        if let destination = priorReplyDestination {
+            mandatory["priorReplyDestination"] = ["account": destination.account, "thread_id": destination.threadID,
+                "reply_message_id": destination.messageID, "from": destination.sender, "subject": destination.subject,
+                "rule": "This is the last unambiguous email discussed in this profile, retained when the feed stops. It is a historical reply destination, not the current feed selection and not permission to act. Resolve explicit references such as the email we were discussing or the one back in the feed from these exact IDs. Search results and source attachments do not replace this destination. A reply uses its thread/account/message; derive recipients from that thread rather than asking which same-name contact. Never substitute a forward or new message. Honor an explicit different destination; ask once if the user's reference is still ambiguous. General this/next/archive instructions use currentSelection only."]
+        }
+        if holdsFeedDecision {
+            mandatory["feedDecision"] = "Held while the user gathers information. Answer only the current question or lookup. Do not repeat the email introduction or ask what to do with it. A pause, okay, correction or arriving result does not request another disposition question. Ask only a concrete clarification required for this request; wait for an explicit action, continuation or request for decision help."
+        }
         mandatory["clock"] = LiveSessionAdapter.clockLine(now: now(), zone: timeZone())
         mandatory["requestClock"] = LiveSessionAdapter.clockLine(now: requestDate ?? now(), zone: requestZone ?? timeZone())
         if let calendarWindow {
@@ -557,19 +793,22 @@ final class LiveClientBrain {
         task = Task { [weak self] in
             guard let self, !Task.isCancelled else { return }
             do {
-                let response = try await request(body)
+                let response: [String: Any]
+                if let sourceCall { response = ["output": [sourceCall]] }
+                else { response = try await request(body) }
                 guard !Task.isCancelled, generation == requestGeneration else { return }
                 task = nil
                 requestWatchdog?.cancel()
                 requestWatchdog = nil
                 activeRequest = nil
-                guard let output = response["output"] as? [[String: Any]] else {
+                guard var output = response["output"] as? [[String: Any]] else {
                     throw NSError(domain: "LiveClientBrain", code: 1)
                 }
-                let functions = output.filter { $0["type"] as? String == "function_call" }
-                if requestTurn != currentTurn || requestRevision != transcriptRevision
+                var functions = output.filter { $0["type"] as? String == "function_call" }
+                let staleSource = readingSource && (requestSelection != LiveSelectionGrounding.selection(state) || MailBodyCache.withheld)
+                if requestTurn != currentTurn || requestRevision != transcriptRevision || staleSource
                     || requestScope != scopeRevision || (!requestPresentation && completedTurns.contains(requestTurn)) {
-                    let retry = requestTurn == currentTurn && requestScope == scopeRevision
+                    let retry = requestTurn == currentTurn && requestScope == scopeRevision && !staleSource
                         && !completedTurns.contains(requestTurn)
                     endAttempt(reason: "superseded", stage: "provider_response", recovery: retry ? "revised_transcript" : "new_turn")
                     if retry {
@@ -591,10 +830,18 @@ final class LiveClientBrain {
                     run()
                     return
                 }
+                let repeatedSearch = functions.count == 1 && functions[0]["name"] as? String == GmailReadTools.search
+                    && (functions[0]["arguments"] as? String).flatMap { ToolArguments($0).string("query") } == lookup?.queries.last
+                if (functions.isEmpty || repeatedSearch), let fallback = lookup?.fallbackArguments, !requestPresentation {
+                    output = [["type": "function_call", "call_id": "search-recovery-" + UUID().uuidString,
+                               "name": GmailReadTools.search, "arguments": GmailReadTools.json(fallback)]]
+                    functions = output
+                }
                 input += output
                 let calls = Set(functions.compactMap { $0["call_id"] as? String })
                 pendingCalls.formUnion(calls)
                 for function in functions {
+                    recordLookup(function)
                     if let id = function["call_id"] as? String {
                         functionItems[id] = function
                         functionOrigins[id] = (requestTurn, LiveCompactContext.text(requestState, includeEmailContent: false))
@@ -796,6 +1043,10 @@ final class LiveClientBrain {
     }
 
     func close() {
+        closed = true
+        lookup = nil
+        priorReplyDestination = nil
+        investigating = false
         endAttempt(reason: "cancelled", stage: "session_close", recovery: "none")
         finishQueuedAttempt(reason: "cancelled")
         cancelRequest(); queuedDelegation = nil

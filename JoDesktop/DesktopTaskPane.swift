@@ -17,7 +17,7 @@ struct DesktopTaskPane<Handler: DesktopWorkspaceHandler>: View {
                         .buttonStyle(.borderless).accessibilityIdentifier("backToFeed")
                         .disabled(viewModel.selectingResult)
                 }
-                Text(job.task).font(.title2.weight(.medium))
+                Text(job.mailAction?.subject ?? job.task).font(.title2.weight(.medium))
                 Label(job.desktopStatusLabel, systemImage: job.didFail ? "exclamationmark.triangle" : "bolt.horizontal.circle")
                     .foregroundStyle(.secondary)
                 Text(job.result ?? (job.hasStopped()
@@ -25,12 +25,47 @@ struct DesktopTaskPane<Handler: DesktopWorkspaceHandler>: View {
                     : "This job is still running. Its result will appear here."))
                     .font(.system(size: 15)).lineSpacing(5).textSelection(.enabled)
                 Divider()
+                if let browser = viewModel.browserTasks[job.id] {
+                    DesktopBrowserTaskPanel(browser: browser, canResume: !job.isRunning && !viewModel.updatingTask) { action in
+                        interactor.controlBrowser(action, job: job, model: viewModel)
+                    }
+                }
+                if let action = job.mailAction {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(action.confirmed ? "Gmail-confirmed message" : "Requested message").font(.headline)
+                        Text("From: \(action.account)")
+                        Text("To: \(action.to)")
+                        if !action.cc.isEmpty { Text("Cc: \(action.cc.joined(separator: ", "))") }
+                        if !action.bcc.isEmpty { Text("Bcc: \(action.bcc.joined(separator: ", "))") }
+                        if let date = job.completedAt ?? job.startedAt { Text(date, format: .dateTime).font(.caption).foregroundStyle(.secondary) }
+                        Divider()
+                        Text(action.body).font(.system(size: 15)).lineSpacing(5).fixedSize(horizontal: false, vertical: true)
+                        ForEach(Array(action.attachments.enumerated()), id: \.offset) { _, file in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Label("\(file.filename) · \(AttachmentText.describeSize(file.size))", systemImage: "paperclip")
+                                Text("SHA-256: \(file.sha256)").font(.caption2.monospaced()).foregroundStyle(.secondary)
+                            }
+                        }
+                        if let id = action.providerID { Text("Gmail confirmation: \(id)").font(.caption.monospaced()).foregroundStyle(.secondary) }
+                        if let thread = action.providerThreadID ?? action.threadID { Text("Thread: \(thread)").font(.caption.monospaced()).foregroundStyle(.secondary) }
+                        if let header = action.inReplyTo { Text("In reply to: \(header)").font(.caption.monospaced()).foregroundStyle(.secondary) }
+                        if let url = action.providerURL {
+                            Link(action.kind == .send ? "Open sent message in Gmail" : "Open draft in Gmail", destination: url)
+                                .accessibilityIdentifier("openMailActionInGmail")
+                        }
+                    }.textSelection(.enabled).padding(20).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                }
                 if let origin = job.origin {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Source email").font(.caption).foregroundStyle(.secondary)
                         Text(origin.subject).font(.headline)
                         Text(origin.sender).textSelection(.enabled)
                         Text(origin.account).font(.caption).foregroundStyle(.secondary)
+                        Text("Message \(origin.messageID)").font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                        if !origin.threadID.isEmpty {
+                            Text("Thread \(origin.threadID)").font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                        }
                         if job.hasStopped() {
                             Button("Work on this email") { interactor.selectReturnedResult(job.id) }
                                 .buttonStyle(.borderedProminent)
@@ -65,11 +100,6 @@ struct DesktopTaskPane<Handler: DesktopWorkspaceHandler>: View {
                         }
                         Text("Reads the selected page only. Does not submit an RSVP.").font(.caption).foregroundStyle(.secondary)
                     }
-                    Picker("On success", selection: Binding(get: { job.effectivePreference }, set: {
-                        interactor.setTaskPreference(job, preference: $0, model: viewModel)
-                    })) {
-                        ForEach(DispatchJob.CompletionPreference.allCases, id: \.self) { Text($0.label).tag($0) }
-                    }.pickerStyle(.segmented)
                     TextField("Correct this task’s instructions…", text: $viewModel.taskCorrection, axis: .vertical)
                         .textFieldStyle(.roundedBorder).lineLimit(3...6)
                     HStack {

@@ -22,8 +22,10 @@ struct JoDesktopApp: App {
     var body: some Scene {
         WindowGroup {
             #if JO_QA
-            DesktopFixtureComponent.make()
-                .preferredColorScheme(appearance.colorScheme)
+            if NSClassFromString("XCTestCase") != nil { Color.clear } else {
+                DesktopFixtureComponent.make()
+                    .preferredColorScheme(appearance.colorScheme)
+            }
             #else
             if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil { Color.clear } else {
             RootViewComponent.make()

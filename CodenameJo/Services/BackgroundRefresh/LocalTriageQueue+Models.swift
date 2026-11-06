@@ -198,6 +198,8 @@ extension LocalTriageQueue {
         var taskRevision: Int? = nil
         var taskState: String? = nil
 
+        var deliveryKey: String { jobId.uuidString + ":" + (taskRevision.map(String.init) ?? "legacy") }
+
         /// The fields that name a message and let a write land on it. Not the `Item` itself: `snippet`
         /// is content and `internalDate` is a cursor, and neither belongs in a referent.
         struct About: Sendable {

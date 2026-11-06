@@ -48,7 +48,10 @@ final class UnsupportedPresentationReplayTests: XCTestCase {
 
     func testFactualCorrectionRejectsInflightInterpretationAndClearsOldPresentationContext() async throws {
         let h = Harness()
-        let source = selected("same-source")
+        let source = GmailReadTools.json(["done": false, "item": ["account": "fixture@example.test",
+            "id": "same-source", "threadId": "thread-same-source", "from": "Same Sender", "subject": "Same Subject",
+            "emailContent": ["messages": [["id": "same-source", "threadId": "thread-same-source",
+                "text": "I ordered a book.", "textComplete": true, "fullReadComplete": true]]]]])
         h.brain.updateState(source, scope: "fixture")
         h.brain.observe("Stale interpretation: ordered the newsletter")
         h.start("Summarize this email", turn: 1)

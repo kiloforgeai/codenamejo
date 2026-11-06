@@ -688,7 +688,21 @@ extension FullDuplexVoiceClient {
         // above is not for reading back.
         let displayTask = savedCommand.map { "Run saved command “\($0.title)”" } ?? freeTextTask
         let requestedBackground = requestedBackground || (arguments?["requested_background"] as? Bool == true)
-        let scope = (arguments?["scope"] as? String).flatMap(DispatchScope.init(rawValue:))
+        var scope = (arguments?["scope"] as? String).flatMap(DispatchScope.init(rawValue:))
+        let dependencyReference = arguments?["source_task_id"] as? String
+        let dependency = dependencyReference.flatMap(UUID.init(uuidString:)).flatMap { id in
+            dispatchJobs.decisionDependencies.first { $0.id == id }
+        }
+        if dependencyReference != nil, dependency == nil {
+            postDispatchOutput(callId: callId, startedWork: false, output: "Not started. That source task is unavailable in this profile. Select the original task before continuing.")
+            return
+        }
+        if let dependency, !dependency.isDone || dependency.result?.isEmpty != false {
+            postDispatchOutput(callId: callId, startedWork: false, output: "Not started. The related lookup has no confirmed answer yet. Keep its original email and wait for the result or resolve the task's error before using its destination.")
+            return
+        }
+        if dependency != nil || (standingStep.flatMap(LiveEmailPresentation.Key.selection) != nil
+            && DispatchScope.refersToSelectedEmail(latestCompletedUserUtterance)) { scope = .currentEmail }
         if !isSavedCommand, scope == nil, dispatchScopeRequired || arguments?["scope"] != nil {
             postDispatchOutput(callId: callId, startedWork: false, output:
                 "Not started. Set scope to current_email only when the task concerns the email "
@@ -702,7 +716,7 @@ extension FullDuplexVoiceClient {
             return
         }
         #if targetEnvironment(macCatalyst)
-        if relatesToEmail, let refusal = renderedSelectionRefusal() {
+        if relatesToEmail, dependency == nil, let refusal = renderedSelectionRefusal() {
             postDispatchOutput(callId: callId, startedWork: false, output: refusal)
             return
         }
@@ -718,7 +732,7 @@ extension FullDuplexVoiceClient {
         // sends one comma-joined string instead of an array will happen. Same lesson as
         // `copyAddresses` in the broker: a shape check that fails silently leaves the
         // model reporting it did something it did not.
-        let account = (arguments?["account"] as? String)?
+        let account = (dependency?.origin?.account ?? (arguments?["account"] as? String))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanupScope: LocalTriageQueue.DispatchCleanupScope? = {
             guard transport != nil, !isSavedCommand, let raw = arguments?["queue_cleanup"] as? [String: Any],
@@ -840,9 +854,15 @@ extension FullDuplexVoiceClient {
         let mailQueueLive = queueStanding() != nil
         let completionPreference = DispatchJob.CompletionPreference.requested(in: latestCompletedUserUtterance)
             ?? DispatchJob.CompletionPreference(rawValue: Self.stringArgument("completion_preference", in: argumentsJSON) ?? "")
-        let parksSource = relatesToEmail && commandRetry == nil
+        let holdsQuestion = DispatchScope.holdsDecision(related: relatesToEmail,
+            continuing: DispatchScope.explicitlyContinuesFeed(latestCompletedUserUtterance), savedCommand: isSavedCommand)
+        let parksSource = relatesToEmail && commandRetry == nil && !holdsQuestion
             && (expects != .receipt || requestedBackground || completionPreference == .bringBack)
-        let dispatchUsesQueue = mailQueueLive && relatesToEmail && commandRetry == nil && (!requestedBackground || parksSource)
+        let dispatchUsesQueue = mailQueueLive && relatesToEmail && commandRetry == nil && !holdsQuestion
+            && (!requestedBackground || parksSource)
+        diagnostics?.record(.turnTransition, ["transition": "dispatch_source_policy",
+            "reason": relatesToEmail ? "source_related" : "independent", "outcome": holdsQuestion ? "decision_held" : parksSource ? "source_parked" : "unchanged",
+            "queue_revision": String(liveQueueRevision), "turn_id": historyTurnID.uuidString])
         // Mid-queue the answer comes back as a step of the queue rather than out of the blue,
         // so the ack says which — a model told to expect a note is a model that treats the
         // step carrying it as something else.
@@ -868,7 +888,9 @@ extension FullDuplexVoiceClient {
                 queueAdvance: relatesToEmail ? "The foreground email is unchanged. Do not advance it or archive it merely because this task started." : "\n" + DispatchScope.independentNote)
         } else if !dispatchUsesQueue {
             postDispatchOutput(callId: callId, output: ack,
-                queueAdvance: relatesToEmail ? "The foreground email is unchanged. Do not advance it or archive it merely because this task started." : "\n" + DispatchScope.independentNote)
+                queueAdvance: holdsQuestion
+                    ? "This work is a dependency for handling the source email. Keep that email selected while the result is prepared. Do not introduce another item or ask for disposition. Present the requested result when it arrives, then wait for the user's next decision."
+                    : relatesToEmail ? "The foreground email is unchanged. Do not advance it or archive it merely because this task started." : "\n" + DispatchScope.independentNote)
         }
 
         // The row this job will be recorded as. Generated here, before the request, so
@@ -899,7 +921,11 @@ extension FullDuplexVoiceClient {
         let acceptedProfile = ProfileRuntime.snapshot?.profileId
         let acceptedOwner = Container.shared.backend().userId
         let backgroundSource: String? = {
-            guard (requestedBackground || parksSource), relatesToEmail, let step = liveQueueActionAnchor?.step ?? standingStep,
+            if let source = dependency?.origin {
+                return GmailReadTools.json(["account": source.account, "id": source.messageID,
+                    "threadId": source.threadID, "from": source.sender, "subject": source.subject])
+            }
+            guard (requestedBackground || parksSource || holdsQuestion), relatesToEmail, let step = liveQueueActionAnchor?.step ?? standingStep,
                   let data = step.data(using: .utf8), let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
             return GmailReadTools.json(root["item"] as? [String: Any] ?? root)
         }()
@@ -929,7 +955,7 @@ extension FullDuplexVoiceClient {
             var presentAbout: LocalTriageQueue.Outcome.About? = retrySource?.about
                 ?? DispatchJob.MailOrigin.from(DispatchWorker.target(standingOnJSON: backgroundSource, facts: []))?.about
             var pinnedCleanupQuery: String?
-            let reconciliation = commandRetry == nil && relatesToEmail && expects != .answer
+            let reconciliation = commandRetry == nil && relatesToEmail && !holdsQuestion && expects != .answer
                 ? await localTriage.dispatchReconciliation(account: account) : nil
             if dispatchUsesQueue && !parksSource {
                 // **`localTriage.currentId` is non-nil exactly when this phone owns the walk,
@@ -1023,6 +1049,9 @@ extension FullDuplexVoiceClient {
             // No queue cursor to hand over: the last message opened this call is the one
             // "you are looking at". Carried as a fact so the worker has an id to read.
             var handoverFacts = facts
+            if let dependency {
+                handoverFacts.append("This request explicitly follows task \(dependency.id). Use its original source email and this verified result, not a later feed selection: \(dependency.result ?? "No result is confirmed yet; do not guess the destination.")")
+            }
             if let pinnedCleanupQuery, let account {
                 handoverFacts.append("The authorized inbox cleanup is exactly query \(pinnedCleanupQuery) in account \(account). Use this query for the batch archive; do not widen or narrow it. The local queue has already excluded these matches while the write runs.")
             }
@@ -1051,7 +1080,8 @@ extension FullDuplexVoiceClient {
                 commandSteps: savedCommand.map { Array($0.actions.dropFirst(commandRun?.completedSteps ?? 0)) },
                 command: commandRun, profileId: acceptedProfile, progress: progress, diagnostics: self?.diagnostics,
                 turnID: self?.dispatchHistory[jobId]?.id.uuidString, operation: operation,
-                completionPreference: completionPreference, ownerID: acceptedOwner, parksSource: parksSource)
+                completionPreference: completionPreference, ownerID: acceptedOwner, parksSource: parksSource,
+                holdsDecision: holdsQuestion, dependencyID: dependency?.id)
             let tasks = Container.shared.applicationTasks()
             let accepted = await tasks.submit(job)
             if parksSource, dispatchUsesQueue, let self, self.isActive, dial == self.dialGeneration {
@@ -1351,6 +1381,11 @@ extension FullDuplexVoiceClient {
             reportDrain = nil
             return
         }
+        if transport?.liveAdapter?.desktopQuiet == true {
+            reportDrain?.cancel()
+            reportDrain = nil
+            return
+        }
 
         // Ordinary reports past the speak window go in *now*, gap or no gap. Putting
         // an item into the conversation interrupts nobody — only the `response.create`
@@ -1403,7 +1438,7 @@ extension FullDuplexVoiceClient {
         pendingReports = stillWaiting
 
         // Reserve synchronously so another arrival cannot speak before response.created acknowledges this one.
-        if !pendingReports.isEmpty, Self.reserveDispatchReportTurn(
+        if !emailReader.ownsSpeech, !pendingReports.isEmpty, Self.reserveDispatchReportTurn(
             responseInFlight: &responseInFlight, userSpeaking: userSpeaking,
             assistantAudible: assistantAudible,
             foregroundToolPending: functionCallTask != nil || runningTool != nil,

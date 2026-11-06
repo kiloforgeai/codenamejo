@@ -394,6 +394,7 @@ enum FullDuplexBroker {
         var pendingDraft: PendingDraft? = nil
         var deferred: Bool = false
         var performedTool: String? = nil
+        var outcomeUnknown = false
     }
 
     /// Run one client-executed write on this phone and return the text for the `function_call_output` item.
@@ -403,7 +404,8 @@ enum FullDuplexBroker {
     static func runTool(
         name: String, argumentsJSON: String,
         conversationId: String? = nil, deferArchive: Bool = false, deferDraft: Bool = false, deferSpam: Bool = false, deferTrash: Bool = false, deferSend: Bool = false, deferCalendar: Bool = false, deferLabel: Bool = false,
-        profileId: String? = ProfileRuntime.snapshot?.profileId, onboardingReply: Bool = false
+        profileId: String? = ProfileRuntime.snapshot?.profileId, onboardingReply: Bool = false, mailSource: GmailManageTools.WriteSource? = nil,
+        mailJobID: UUID? = nil, mailCallID: String? = nil
     ) async -> ToolResult {
         // Notion's MCP, called from this phone with the profile's own grant.
         if NotionTools.names.contains(name) {
@@ -413,14 +415,14 @@ enum FullDuplexBroker {
             let deferred = (name == "archive_message" && deferArchive) || (name == "mark_spam" && deferSpam)
                 || (name == "trash_message" && deferTrash) || (name == "label_message" && deferLabel)
             return await LocalMailWrites.run(name: name, argumentsJSON: argumentsJSON, defer: deferred,
-                                             conversationId: conversationId)
+                                             conversationId: conversationId, source: mailSource)
         }
         // A send or forward defers only inside a call, where a failure has a conversation to be told in.
         let inCall = deferSend && !(conversationId ?? "").isEmpty
         if LocalCompose.names.contains(name) {
             return await LocalCompose.run(name: name, argumentsJSON: argumentsJSON,
                                           defer: name == "create_draft" ? deferDraft : inCall, conversationId: conversationId,
-                                          onboardingReply: onboardingReply)
+                                          onboardingReply: onboardingReply, parentJobID: mailJobID, callID: mailCallID)
         }
         if name == LocalForward.name {
             return await LocalForward.run(argumentsJSON: argumentsJSON, defer: inCall, conversationId: conversationId)

@@ -102,7 +102,7 @@ extension FullDuplexVoiceClient {
         functionCallTask?.cancel()
         functionCallTask = Task { [weak self] in
             let result = await FullDuplexBroker.runTool(
-                name: name, argumentsJSON: argumentsJSON)
+                name: name, argumentsJSON: argumentsJSON, conversationId: self?.conversationId(), mailCallID: callId)
             guard let self, self.isActive else { return }
             guard !Task.isCancelled else {
                 // `functionCallTask` now belongs to whoever cancelled this one; only the answer is owed.

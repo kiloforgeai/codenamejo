@@ -147,6 +147,12 @@ extension Container {
         self { MainActor.assumeIsolated { ApplicationTasks() } }.singleton
     }
 
+    #if targetEnvironment(macCatalyst)
+    var backgroundBrowsers: Factory<BackgroundBrowserStore> {
+        self { MainActor.assumeIsolated { BackgroundBrowserStore() } }.singleton
+    }
+    #endif
+
     /// Writes the assistant performed, with a link to each item
     /// (`record_type = "action"`, written by the broker).
     var actions: Factory<ActionStore> {

@@ -43,4 +43,38 @@ final class ReturnedResultSelectionTests: XCTestCase {
             "returnedWorkSelection": "not-a-job", "item": ["id": "R", "threadId": "R", "account": "work@example.test"]])
         XCTAssertNil(LiveEmailPresentation.Key.step(invalid))
     }
+
+    func testRestoredCompletedResultRetainsReadableSourceWithoutPreparingAnUnresolvedIntroduction() {
+        let result = GmailReadTools.json(["done": false, "presentedForOutcome": true,
+            "returnedWorkSelection": UUID().uuidString, "dispatchOutcome": ["state": "done", "outcome": "Archived"],
+            "item": ["id": "R", "threadId": "thread-R", "account": "work@example.test"]])
+        XCTAssertEqual(LiveEmailPresentation.Key.selection(result)?.messageId, "R")
+        XCTAssertNil(LiveEmailPresentation.Key.step(result), "Restored results may lack an alreadyDone badge")
+        XCTAssertTrue(LiveFastAction.allowsFollowup(name: "gmail_get_message",
+            arguments: #"{"message_id":"R","account":"work@example.test"}"#, step: result))
+    }
+
+    func testCompactActivityUsesConfirmedActionsAndKeepsWarningsAndFullDetails() {
+        let origin = DispatchJob.MailOrigin(account: "work@example.test", messageID: "A", threadID: "T", sender: "Dana", subject: "Café ☕ update")
+        var job = DispatchJob(id: UUID(), task: String(repeating: "Long original request. ", count: 20), state: "done",
+            result: String(repeating: "Full confirmed result. ", count: 20),
+            receipts: [.init(callId: "archive", tool: "archive_message", outcome: "success")], origin: origin)
+        XCTAssertEqual(job.activityTitle, "Archived · Café ☕ update")
+        XCTAssertFalse(job.activityNeedsAttention)
+        XCTAssertTrue(job.activityAccessibilityLabel.contains("Dana, work@example.test"))
+        XCTAssertGreaterThan(job.task.count, 200)
+        XCTAssertGreaterThan(job.result?.count ?? 0, 200)
+        job.receipts?.append(.init(callId: "label", tool: "label_message", outcome: "success"))
+        XCTAssertEqual(job.activityTitle, "Archived + Labeled · Café ☕ update")
+        job.state = "partial"
+        XCTAssertTrue(job.activityTitle.hasPrefix("Needs attention"))
+        job.state = "unknown"
+        XCTAssertTrue(job.activityTitle.hasPrefix("Outcome unknown"))
+        job.state = "done"; job.result = "The archive was not confirmed."
+        XCTAssertTrue(job.activityNeedsAttention)
+        XCTAssertEqual(job.desktopStatusLabel, "Needs attention")
+        XCTAssertFalse(job.activityTitle.hasPrefix("Archived"))
+        job.result = "Archived"; job.receipts = nil
+        XCTAssertEqual(job.activityTitle, "Completed · Café ☕ update", "Unstructured prose cannot invent an action receipt")
+    }
 }

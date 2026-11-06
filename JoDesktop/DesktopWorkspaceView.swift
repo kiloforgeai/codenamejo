@@ -101,8 +101,10 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
 
     private var header: some View {
         HStack(spacing: 10) {
-            Text("jo").font(.system(size: 27, weight: .semibold, design: .serif)).foregroundStyle(DesktopWorkspaceStyle.brand)
-                .padding(.trailing, 8)
+            Image("JoWordmark").resizable().scaledToFit()
+                .foregroundStyle(DesktopWorkspaceStyle.brand)
+                .frame(width: 36, height: 32).padding(.trailing, 10)
+                .accessibilityLabel("Jo").accessibilityIdentifier("desktopBrand")
             DesktopToolbarButton(title: viewModel.focusMode ? "Show feed" : "Hide feed", symbol: "sidebar.left",
                                  active: !viewModel.focusMode) { viewModel.focusMode.toggle() }
             Text("Workspace").font(.system(size: 14, weight: .medium))
@@ -221,14 +223,8 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             } else if context != nil, viewModel.requestedActionContext == context {
                 Text("Action requested · follow its result in Live Activity").font(.caption).foregroundStyle(.secondary)
             }
-            HStack(spacing: 12) {
-                Text("On success").font(.caption).foregroundStyle(.secondary)
-                Picker("Task completion", selection: $viewModel.taskPreference) {
-                    ForEach(DispatchJob.CompletionPreference.allCases, id: \.self) { Text($0.label).tag($0) }
-                }.pickerStyle(.segmented).frame(maxWidth: 310)
-                if let origin = context.flatMap(viewModel.taskOrigin) {
-                    Text(origin.account).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                }
+            if let origin = context.flatMap(viewModel.taskOrigin) {
+                Text(origin.account).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             if let receipt = viewModel.taskReceipt { Text(receipt).font(.caption).foregroundStyle(.secondary) }
         }

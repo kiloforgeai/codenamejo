@@ -37,11 +37,14 @@ final class LiveFixtureTests: XCTestCase {
         Container.shared.googleTokenProvider.register { tokens }
         let jobs = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
         Container.shared.dispatchJobs.register { jobs }
+        let mail = MailStore(database: context.dbPool, userId: "live-fixture-user")
+        Container.shared.mailStore.register { mail }
         let transport = FixtureTransport(account: account, token: token.accessToken, namespace: folder.lastPathComponent)
         Container.shared.providerHTTP.register { transport }
         var evidence: [[String: Any]] = []
+        var fixtures: [MailStore.Ingest] = []
         for index in 1...2 {
-            let raw = "From: \(account)\r\nTo: \(account)\r\nSubject: \(folder.lastPathComponent) fixture \(index)\r\nMessage-ID: <\(UUID().uuidString)@jo-qa.invalid>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nSynthetic Jo archive test \(index). No reply required.\r\n"
+            let raw = "From: \(account)\r\nTo: \(account)\r\nSubject: \(folder.lastPathComponent) fixture same subject\r\nMessage-ID: <\(UUID().uuidString)@jo-qa.invalid>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nSynthetic Jo archive test \(index). No reply required.\r\n"
             let encoded = Data(raw.utf8).base64EncodedString().replacingOccurrences(of: "+", with: "-")
                 .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
             let sent = try await GmailAPI.call("POST", path: "messages/send", body: ["raw": encoded], token: token.accessToken)
@@ -49,8 +52,24 @@ final class LiveFixtureTests: XCTestCase {
             let thread = try XCTUnwrap(sent["threadId"] as? String)
             // Ensure the synthetic message starts in Inbox, even under account delivery filters.
             _ = try await GmailAPI.call("POST", path: "messages/\(id)/modify", body: ["addLabelIds": ["INBOX"]], token: token.accessToken)
-            let before = try await GmailAPI.call("GET", path: "messages/\(id)", query: ["format": "minimal"], token: token.accessToken)
+            let before = try await GmailAPI.call("GET", path: "messages/\(id)", query: ["format": "metadata"], token: token.accessToken)
             XCTAssertTrue((before["labelIds"] as? [String] ?? []).contains("INBOX"))
+            let detail = try JSONDecoder().decode(GmailAPI.MessageDetail.self, from: JSONSerialization.data(withJSONObject: before))
+            XCTAssertEqual(detail.threadId, thread)
+            fixtures.append(.init(detail: detail, account: account))
+        }
+        fixtures.sort { ($0.message.internalDate ?? 0) > ($1.message.internalDate ?? 0) }
+        XCTAssertEqual(fixtures[0].message.subject, fixtures[1].message.subject)
+        XCTAssertNotEqual(fixtures[0].message.id, fixtures[1].message.id)
+        await mail.cache(fixtures)
+        let queue = LocalTriageQueue(mailAccounts: { [account] }, unreadOpeningLoader: { _ in nil })
+        await queue.adopt(fixtures.map(\.message), store: mail)
+        let moved = await queue.step(.init(direction: "next"), store: mail, dealtWith: false)
+        XCTAssertEqual(LiveEmailPresentation.Key.selection(moved.output)?.messageId, fixtures[1].message.id, moved.output)
+        var center = FeedFocusTracker()
+        _ = center.applyTriage(output: moved.output)
+        for (index, fixture) in fixtures.enumerated() {
+            let id = fixture.message.id, thread = fixture.message.threadId
             var job = DispatchWorker.Job(id: UUID(), task: "Archive this email", account: account,
                 standingOnJSON: GmailReadTools.json(["id": id, "threadId": thread, "account": account, "from": account]),
                 expects: .receipt, profileId: profile.id,
@@ -64,6 +83,31 @@ final class LiveFixtureTests: XCTestCase {
             let duration = Date().timeIntervalSince(started)
             let after = try await GmailAPI.call("GET", path: "messages/\(id)", query: ["format": "minimal"], token: token.accessToken)
             XCTAssertFalse((after["labelIds"] as? [String] ?? ["INBOX"]).contains("INBOX"))
+            _ = await queue.applyConfirmedEffects([.init(account: account, scope: "message", threadId: thread,
+                messageIds: [id], messageIdsComplete: true, operation: "modify", removeLabelIds: ["INBOX"])], store: mail)
+            if index == 0 {
+                let nextID = fixtures[1].message.id
+                let remaining = try await GmailAPI.call("GET", path: "messages/\(nextID)", query: ["format": "minimal"], token: token.accessToken)
+                XCTAssertTrue((remaining["labelIds"] as? [String] ?? []).contains("INBOX"))
+                let feed = DesktopSessionFeed(mail: await queue.desktopSnapshot())
+                XCTAssertEqual(feed.current?.messageID, nextID)
+                XCTAssertFalse(feed.rows.contains { $0.selection?.messageID == id })
+                guard case .email(let focused) = center.focus else { XCTFail("The center lost the selected email"); return }
+                XCTAssertEqual(focused.messageId, nextID)
+                let held = await queue.hold(.init(jobId: job.id, task: "Archive this email", text: "Archive receipt already reported",
+                    ok: true, expects: .answer, about: .init(account: account, id: id, threadId: thread, from: account, subject: "Same fixture subject")))
+                XCTAssertTrue(held)
+                await jobs.settle(job.id)
+                let finished = await queue.step(.init(direction: "next"), store: mail, dealtWith: false)
+                XCTAssertFalse(finished.output.contains("Archive receipt already reported"), finished.output)
+                XCTAssertFalse(finished.output.contains("presentedForOutcome"), finished.output)
+                XCTAssertTrue(finished.output.contains("inbox is NOT clear"), finished.output)
+                let served = await queue.takeServedOutcomes()
+                XCTAssertTrue(served.isEmpty)
+                _ = center.applyTriage(output: finished.output)
+                XCTAssertNil(center.focus, "A finished search batch must clear its old email card")
+            }
+            await jobs.settle(job.id)
             let writes = await transport.writes
             job.id = UUID()
             let repeated = await DispatchWorker.run(job) { _ in XCTFail("A duplicate must reuse its receipt"); return [] }
@@ -71,16 +115,22 @@ final class LiveFixtureTests: XCTestCase {
             let finalWrites = await transport.writes
             XCTAssertEqual(finalWrites, writes)
             evidence.append(["message_id": id, "thread_id": thread,
-                "before_inbox": (before["labelIds"] as? [String] ?? []).contains("INBOX"),
+                "before_inbox": fixture.labels.contains("INBOX"),
                 "after_inbox": (after["labelIds"] as? [String] ?? []).contains("INBOX"),
                 "outcome": outcome.status?.rawValue ?? "unknown", "archive_seconds": duration,
                 "duplicate_extra_writes": finalWrites - writes])
         }
+        await queue.end()
         let history = await jobs.history()
         XCTAssertEqual(history.count, 2)
         XCTAssertTrue(history.allSatisfy { $0.isDone && $0.receipts?.first?.outcome == "success" })
+        let restored = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        let recovered = await restored.recover()
+        XCTAssertTrue(recovered.isEmpty, "Restart must not replay delivered archive results")
         let manifest = try JSONSerialization.data(withJSONObject: ["namespace": folder.lastPathComponent,
-            "profile": "Jo QA", "account": account, "fixtures": evidence, "audibility": "not_tested"], options: [.prettyPrinted, .sortedKeys])
+            "profile": "Jo QA", "account": account, "fixtures": evidence, "audibility": "not_tested",
+            "assertion_failures": testRun?.failureCount ?? -1,
+            "checks": ["equal_subject_identity", "off_cursor_archive", "sidebar_and_center_model", "held_result_delivery", "scoped_completion", "restart_receipts"]], options: [.prettyPrinted, .sortedKeys])
         try manifest.write(to: folder.appendingPathComponent("manifest.json"))
         let attachment = XCTAttachment(data: manifest, uniformTypeIdentifier: "public.json")
         attachment.name = "Self-addressed Gmail fixture results"

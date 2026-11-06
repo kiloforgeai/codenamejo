@@ -23,10 +23,18 @@ protocol DesktopWorkspaceHandler {
 
 @MainActor
 extension DesktopWorkspaceHandler {
-    func setTaskPreference(_ job: DispatchJob, preference: DispatchJob.CompletionPreference, model: DesktopWorkspaceModel) {
+    func controlBrowser(_ action: String, job: DispatchJob, model: DesktopWorkspaceModel) {
+        guard !model.updatingTask, let browser = model.browserTasks[job.id], browser.current() else { return }
+        if action == "pause" { browser.pause(); return }
+        if action == "takeover" { browser.takeOver(); return }
+        model.updatingTask = true
+        model.resultSelectionError = nil
         Task {
-            do { try await Container.shared.applicationTasks().setPreference(job.id, version: job.taskRevision, preference: preference) }
-            catch { model.resultSelectionError = error.localizedDescription }
+            defer { model.updatingTask = false }
+            do {
+                try await Container.shared.applicationTasks().resumeBrowser(job.id, version: job.taskRevision,
+                    approval: action == "approve" ? browser.approval?.id : nil)
+            } catch { model.resultSelectionError = error.localizedDescription }
             model.jobs = await Container.shared.dispatchJobs().history()
             if model.selectedJob?.id == job.id { model.selectedJob = model.jobs.first { $0.id == job.id } }
         }
@@ -100,12 +108,14 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
     @Injected(\.desktopFeedPreview) private var feedPreview
     @Injected(\.desktopEmailReader) private var emailReader
     @Injected(\.applicationTasks) private var tasks
+    @Injected(\.backgroundBrowsers) private var browsers
     private var feedbackSubmission: UserFeedback.Submission?
     private let hasMicrophone: @Sendable () -> Bool
     private weak var model: DesktopWorkspaceModel?
     private var checkingMicrophone = false
     private var loading = false
     private var refreshPending = false
+    private var refreshGeneration = 0
     private var pendingActions = Set<MailSelection>()
 
     init(hasMicrophone: @escaping @Sendable () -> Bool = { OnboardingAudioSession.hasInputDevice }) {
@@ -117,6 +127,10 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
     override func onLoad(viewModel: DesktopWorkspaceModel) -> [AnyCancellable] {
         super.onLoad(viewModel: viewModel)
         model = viewModel
+        viewModel.onFeedTransition = { [weak self] phase, feed in self?.feedPreview.recordSession(phase, feed: feed) }
+        viewModel.reconcileScope(owner: backend.userId, profile: ProfileRuntime.snapshot?.profileId, context: previewContext)
+        feedPreview.update(context: previewContext, inSession: realtime.isConversing,
+                           hydratingOwner: backend.userId, hydratingProfile: ProfileRuntime.snapshot?.profileId)
         voiceCall.onMicrophoneDenied = { [weak viewModel] in viewModel?.showMicDenied = true }
         launcher.$pendingLaunch.combineLatest(realtime.$sessionState)
             .receive(on: DispatchQueue.main)
@@ -142,26 +156,33 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
             .receive(on: DispatchQueue.main)
             .sink { [weak self, weak viewModel] _ in
                 guard let viewModel else { return }
+                self?.refreshGeneration += 1
                 self?.refresh(viewModel: viewModel)
             }
         feedPreview.$snapshot.combineLatest(feedPreview.$refreshing)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak viewModel] snapshot, refreshing in
-                viewModel?.feedPreview = snapshot
-                viewModel?.previewRefreshing = refreshing
+            .sink { [weak self, weak viewModel] snapshot, refreshing in
+                guard let viewModel else { return }
+                viewModel.applyPreview(snapshot)
+                viewModel.previewRefreshing = refreshing
+                if !viewModel.inSession { self?.updateReader(viewModel) }
             }
         feedback.$voiceReceipt.sink { [weak viewModel] in viewModel?.feedbackReceipt = $0 }
+        browsers.$sessions.sink { [weak viewModel] in viewModel?.browserTasks = $0 }
         tasks.$revision.dropFirst().sink { [weak self, weak viewModel] _ in
             guard let viewModel else { return }
             self?.refresh(viewModel: viewModel)
         }
         emailReader.$state.receive(on: DispatchQueue.main).sink { [weak self, weak viewModel] state in
             guard let self, let viewModel else { return }
+            guard !viewModel.scopeHydrating else { return }
             let request = viewModel.readerRequest(ownerID: self.backend.userId, headersOnly: MailHeadersOnly.withholdsBodies)
             viewModel.emailReader = state.request == request ? state : .idle
         }
-        backend.$userId.dropFirst().receive(on: DispatchQueue.main).sink { [weak self, weak viewModel] _ in
-            viewModel?.selectedJob = nil
+        backend.$userId.dropFirst().sink { [weak self, weak viewModel] owner in
+            guard owner != viewModel?.ownerID else { return }
+            self?.browsers.purge()
+            viewModel?.reconcileScope(owner: owner, profile: nil, context: nil)
+            self?.feedPreview.update(context: nil, inSession: false)
             self?.tasks.select(nil)
             viewModel?.emailReader = .idle
             self?.emailReader.show(nil)
@@ -171,8 +192,6 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
     override func onViewDisappear(viewModel: DesktopWorkspaceModel) {
         super.onViewDisappear(viewModel: viewModel)
         feedPreview.pause()
-        emailReader.show(nil)
-        viewModel.emailReader = .idle
     }
 
     @CancellableBuilder
@@ -189,7 +208,12 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
     }
 
     private func copySession(to model: DesktopWorkspaceModel) {
-        model.profileID = ProfileRuntime.snapshot?.profileId
+        let context = previewContext
+        model.reconcileScope(owner: backend.userId, profile: ProfileRuntime.snapshot?.profileId, context: context)
+        guard backend.userId != nil else { updateReader(model); return }
+        if model.inSession && !realtime.isConversing, let context {
+            feedPreview.seed(.visible(model.feedRows), context: context)
+        }
         model.conversationID = realtime.activeConversationId
         if realtime.isConversing && !model.inSession { model.startedAt = Date() }
         if !realtime.isConversing { model.startedAt = nil }
@@ -210,6 +234,7 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
     }
 
     private func updateReader(_ model: DesktopWorkspaceModel, retry: Bool = false) {
+        guard !model.scopeHydrating else { return }
         emailReader.show(model.readerRequest(ownerID: backend.userId, headersOnly: MailHeadersOnly.withholdsBodies), retry: retry)
     }
 
@@ -244,7 +269,7 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
     func rendered(_ state: RenderedFeedState) { realtime.recordRenderedWorkspace(state) }
 
     func selectFeedItem(_ row: DesktopFeedRow) {
-        guard let model, !model.isStartingFeed, !model.selectingFeedItem, !model.selectingResult,
+        guard let model, !model.isStartingFeed, !model.scopeHydrating, !model.selectingFeedItem, !model.selectingResult,
               model.feedRows.contains(where: { $0.id == row.id }) else { return }
         model.selectedJob = nil
         tasks.select(nil)
@@ -256,6 +281,7 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
             return
         }
         model.selectingFeedItem = true
+        refreshGeneration += 1
         model.feedSelectionError = nil
         Task { [weak self, weak model] in
             guard let self, let model else { return }
@@ -272,6 +298,7 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
             return
         }
         guard pendingActions.insert(context.selection).inserted else { return }
+        if model.inSession { realtime.beginDesktopInteraction() }
         model.feedActionError = nil
         model.requestedActionContext = context
         let owner = backend.userId
@@ -281,7 +308,7 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
             if action != .next {
                 let result = await tasks.perform(name: action.rawValue,
                     arguments: GmailReadTools.json(["account": origin.account, "message_id": origin.messageID]),
-                    profile: context.profileID, origin: origin, conversationID: context.conversationID)
+                    profile: context.profileID, origin: origin, conversationID: context.conversationID, inputSource: "button")
                 guard owner == backend.userId, context.profileID == ProfileRuntime.snapshot?.profileId else { return }
                 if let effects = result.effects {
                     _ = await mailQueue.applyConfirmedEffects(effects, store: Container.shared.mailStore())
@@ -293,6 +320,7 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
                 }
                 feedPreview.remove(context.selection)
             }
+            refreshGeneration += 1
             guard model.profileID == context.profileID, model.conversationID == context.conversationID,
                   model.renderedState.rawFocus == context.selection,
                   model.renderedState.focus == context.selection else { refresh(viewModel: model); return }
@@ -315,7 +343,7 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
         guard let model, !model.submittingTask, let origin = model.taskOrigin(context),
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         do {
-            let job = try tasks.job(request: text, commandID: commandID, origin: origin, profile: context.profileID, preference: model.taskPreference)
+            let job = try tasks.job(request: text, commandID: commandID, origin: origin, profile: context.profileID)
             model.submittingTask = true
             model.showingActivity = true
             model.feedActionError = nil
@@ -395,6 +423,7 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
         model.feedRefreshError = nil
         if !model.inSession { refresh(viewModel: model, force: true); return }
         let owner = backend.userId, profile = model.profileID, conversation = model.conversationID
+        refreshGeneration += 1
         model.refreshingFeed = true
         Task { [weak self, weak model] in
             guard let self, let model else { return }
@@ -406,20 +435,28 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
         }
     }
 
-    private func refresh(viewModel: DesktopWorkspaceModel, force: Bool = false) {
+    private var previewContext: DesktopFeedPreview.Context? {
         let scope = ProfileRuntime.snapshot
-        let context = backend.userId.flatMap { owner in
+        return backend.userId.flatMap { owner in
             scope.flatMap { scope in scope.emails.map { emails in
                 DesktopFeedPreview.Context(userID: owner, profileID: scope.profileId, emails: emails,
                     slackTeams: connections.status.slackTeamIDs.sorted(), sections: scope.feedSections)
             } }
         }
-        feedPreview.update(context: context, inSession: realtime.isConversing, force: force)
+    }
+
+    private func refresh(viewModel: DesktopWorkspaceModel, force: Bool = false) {
+        let context = previewContext
+        viewModel.reconcileScope(owner: backend.userId, profile: ProfileRuntime.snapshot?.profileId, context: context)
+        feedPreview.update(context: context, inSession: realtime.isConversing, force: force,
+                           hydratingOwner: backend.userId, hydratingProfile: ProfileRuntime.snapshot?.profileId)
+        guard context != nil else { return }
         guard !loading else { refreshPending = true; return }
         loading = true
         let profile = ProfileRuntime.snapshot?.profileId
         let conversation = realtime.activeConversationId
         let owner = backend.userId
+        let generation = refreshGeneration
         Task { [weak self, weak viewModel] in
             guard let self else { return }
             defer {
@@ -433,7 +470,8 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
             let slack = await slackQueue.desktopPreparedItems()
             let jobs = await dispatchJobs.history()
             guard let viewModel, ProfileRuntime.snapshot?.profileId == profile,
-                  realtime.activeConversationId == conversation, backend.userId == owner else { return }
+                  realtime.activeConversationId == conversation, backend.userId == owner,
+                  generation == refreshGeneration else { return }
             viewModel.applySessionFeed(.init(mail: mail, slack: slack))
             if let error = mail.selectionError { viewModel.feedSelectionError = error }
             updateReader(viewModel)

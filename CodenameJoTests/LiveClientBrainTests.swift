@@ -39,6 +39,283 @@ final class LiveClientBrainTests: XCTestCase {
         "name": "archive_message", "arguments": "{\"message_id\":\"a\"}"]
     @MainActor private func drain() async { for _ in 0..<20 { await Task.yield() } }
 
+    @MainActor func testReplyDestinationSurvivesFeedStopAndOtherMailboxDocumentLookup() async throws {
+        let h = Harness()
+        let selected = #"{"done":false,"item":{"id":"J","threadId":"thread-J","account":"work@example.test","from":"Jordan One <jordan1@example.test>","subject":"Original request"}}"#
+        h.brain.updateState(selected, scope: "work")
+        h.brain.updateState(#"{"done":true,"stopped":true}"#, scope: "work")
+        h.brain.user("Find the slides from S", turn: 1)
+        h.brain.begin("d1", live: true, turn: 1); h.brain.settle(turn: 1)
+        await waitForRequest(1, in: h)
+        h.reply([["type": "function_call", "call_id": "read", "name": GmailReadTools.getMessage,
+                  "arguments": #"{"account":"personal@example.test","message_id":"S"}"#]])
+        await waitForCalls(1, in: h)
+        h.brain.item(["type": "function_call_output", "call_id": "read", "output": GmailReadTools.json([
+            ["account": "personal@example.test", "result": ["id": "S", "threadId": "thread-S", "body": "Slides attached: deck.pptx"]]])])
+        h.brain.continueResponse(delegation: "d1"); await waitForRequest(2, in: h)
+        h.reply([["type": "message", "content": [["text": "S sent the slides as a PowerPoint."]]]]); await drain()
+        for (index, request) in ["Reply to the email we were discussing", "The one back in the feed, not the other Jordan"].enumerated() {
+            let turn = index + 2
+            h.brain.user(request, turn: turn)
+            h.brain.begin("d\(turn)", live: true, turn: turn); h.brain.settle(turn: turn)
+            await waitForRequest(turn + 1, in: h)
+            let raw = try XCTUnwrap(h.requests.last?["context"] as? String)
+            let context = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
+            let destination = try XCTUnwrap(context["priorReplyDestination"] as? [String: String])
+            XCTAssertEqual(destination["account"], "work@example.test")
+            XCTAssertEqual(destination["thread_id"], "thread-J")
+            XCTAssertEqual(destination["reply_message_id"], "J")
+            XCTAssertEqual(destination["from"], "Jordan One <jordan1@example.test>")
+            XCTAssertEqual(context["selectionStatus"] as? String, "none", "Retaining a destination must not restart the feed")
+            XCTAssertTrue(destination["rule"]?.contains("Never substitute a forward") == true)
+            XCTAssertTrue(raw.contains("personal@example.test"), "The attachment source remains distinct")
+            h.reply([]); await drain()
+        }
+        XCTAssertEqual(h.calls.count, 1, "Context retention itself must not send mail or search for another recipient")
+        h.brain.close()
+    }
+
+    @MainActor func testRememberedReplyDoesNotCrossSelectionProfileOrAmbiguousGroups() async throws {
+        let h = Harness()
+        let initial = #"{"done":false,"item":{"id":"J","threadId":"thread-J","account":"work@example.test"}}"#
+        h.brain.updateState(initial, scope: "work")
+        for (index, change) in [
+            (initial.replacingOccurrences(of: "J", with: "K"), "work", "K"),
+            (#"{"done":true,"stopped":true}"#, "personal", ""),
+            (#"{"done":false,"item":{"id":"J","threadId":"thread-J","account":"work@example.test","messages":[{"id":"J"},{"id":"K"}]}}"#, "personal", "")
+        ].enumerated() {
+            h.brain.updateState(change.0, scope: change.1)
+            let turn = index + 1
+            h.brain.user("Reply to the email we were discussing", turn: turn)
+            h.brain.begin("d\(turn)", live: true, turn: turn); h.brain.settle(turn: turn)
+            await waitForRequest(turn, in: h)
+            let raw = try XCTUnwrap(h.requests.last?["context"] as? String)
+            let context = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
+            let destination = context["priorReplyDestination"] as? [String: String]
+            if change.2.isEmpty { XCTAssertNil(destination) }
+            else { XCTAssertEqual(destination?["reply_message_id"], change.2) }
+            h.reply([]); await drain()
+        }
+        h.brain.close()
+        let restarted = Harness()
+        restarted.brain.updateState(#"{"done":true}"#, scope: "work")
+        restarted.brain.user("That's the one", turn: 1)
+        restarted.brain.begin("restart", live: true, turn: 1); restarted.brain.settle(turn: 1)
+        await waitForRequest(1, in: restarted)
+        XCTAssertFalse((restarted.requests[0]["context"] as? String ?? "").contains("priorReplyDestination"), "Restart requires renewed source context, not an invented recipient")
+        restarted.reply([]); await drain(); restarted.brain.close()
+    }
+
+    @MainActor func testApproximateLookupRelaxesEmptyQueryAndInspectsArchivedPresentationInItsOwnAccount() async throws {
+        let h = Harness()
+        let selected = #"{"done":false,"item":{"id":"J","threadId":"thread-J","account":"work@example.test"}}"#
+        h.brain.updateState(selected, scope: "work")
+        h.brain.user("Find the biotech PDF from Sender S", turn: 1)
+        h.brain.begin("d1", live: true, turn: 1); h.brain.settle(turn: 1)
+        await waitForRequest(1, in: h)
+        let query = "from:(Sender S) biotech has:attachment filename:pdf"
+        h.reply([["type": "function_call", "call_id": "search", "name": GmailReadTools.search,
+                  "arguments": GmailReadTools.json(["query": query])]])
+        await waitForCalls(1, in: h)
+        let accounts = ["work@example.test", "other@example.test", "personal@example.test"]
+        h.brain.item(["type": "function_call_output", "call_id": "search", "output": GmailReadTools.json([
+            "accounts": accounts.map { ["account": $0, "result": []] as [String: Any] }, "more": false])])
+        h.brain.continueResponse(delegation: "d1"); await waitForRequest(2, in: h)
+        h.reply([["type": "message", "content": [["text": "No email from Sender S exists anywhere."]]]])
+        await waitForCalls(2, in: h)
+        let recovery = try XCTUnwrap(h.calls.last)
+        let args = ToolArguments(try XCTUnwrap(recovery["arguments"] as? String))
+        XCTAssertEqual(args.string("query"), "from:(Sender S)")
+        XCTAssertNil(args.string("account"), "Recovery preserves the original requested account scope")
+        XCTAssertTrue(h.speech.isEmpty, "The unsupported negative claim must never reach speech")
+        h.brain.item(["type": "function_call_output", "call_id": recovery["call_id"]!, "output": GmailReadTools.json([
+            "accounts": [["account": accounts[0], "result": []],
+                         ["account": accounts[1], "result": [["account": accounts[1], "id": "invite", "subject": "Invitation"]]],
+                         ["account": accounts[2], "result": [["account": accounts[2], "id": "deck", "subject": "Company slides"]]]], "more": false])])
+        h.brain.continueResponse(delegation: "d1"); await waitForRequest(3, in: h)
+        let context = try XCTUnwrap(h.requests.last?["context"] as? String)
+        XCTAssertTrue(context.contains("attachment metadata"))
+        h.reply([["type": "function_call", "call_id": "read", "name": GmailReadTools.getMessage,
+                  "arguments": GmailReadTools.json(["account": accounts[2], "message_id": "deck"])]])
+        await waitForCalls(3, in: h)
+        h.brain.item(["type": "function_call_output", "call_id": "read", "output": GmailReadTools.json([
+            ["account": accounts[2], "result": ["id": "deck", "threadId": "deck-thread", "body": "Company slides. [Attachments: presentation.pptx]"]]])])
+        h.brain.continueResponse(delegation: "d1"); await waitForRequest(4, in: h)
+        h.reply([["type": "message", "content": [["text": "I found the slides in your personal mailbox. The attachment is PowerPoint rather than PDF."]]]])
+        await drain()
+        XCTAssertTrue(h.speech.last?.contains("PowerPoint") == true)
+        XCTAssertEqual(h.calls.compactMap { $0["name"] as? String }, [GmailReadTools.search, GmailReadTools.search, GmailReadTools.getMessage])
+        XCTAssertTrue(h.failures.isEmpty)
+        h.brain.close()
+    }
+
+    @MainActor func testNegativeSearchClaimsRetainCoverageAndUninspectedCandidates() async throws {
+        let fixtures: [([String: Any], String)] = [
+            (["accounts": [["account": "work", "result": []]], "more": false], "doesn't establish"),
+            (["accounts": [["account": "work", "error": "unavailable"]], "more": true], "incomplete"),
+            (["accounts": [["account": "work", "result": [["account": "work", "id": "candidate"]]]], "more": false], "possible matches")
+        ]
+        for (result, expected) in fixtures {
+            let h = Harness()
+            h.brain.updateState("No selection", scope: "work")
+            h.brain.user("Find Sender S's document", turn: 1)
+            h.brain.begin("d1", live: true, turn: 1); h.brain.settle(turn: 1)
+            await waitForRequest(1, in: h)
+            h.reply([["type": "function_call", "call_id": "search", "name": GmailReadTools.search, "arguments": #"{"query":"from:S"}"#]])
+            await waitForCalls(1, in: h)
+            h.brain.item(["type": "function_call_output", "call_id": "search", "output": GmailReadTools.json(result)])
+            h.brain.continueResponse(delegation: "d1"); await waitForRequest(2, in: h)
+            h.reply([["type": "message", "content": [["text": "I couldn't find the document anywhere."]]]])
+            for _ in 0..<200 where h.speech.isEmpty {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertTrue(h.speech.last?.contains(expected) == true, h.speech.description)
+            XCTAssertEqual(h.calls.count, 1, "A sender-only query is not broadened or repeated")
+            h.brain.close()
+        }
+    }
+
+    func testRecoveryNeverRelaxesBulkWritesOrExplicitConstraints() {
+        let query = "from:S filename:pdf biotech"
+        XCTAssertEqual(LiveClientBrain.relaxedSenderQuery(query, request: "Find the biotech PDF from S, already archived"), "from:S")
+        for request in ["Find and archive every biotech PDF", "Find only PDFs from S", "Find the exact phrase biotech", "Delete these", "Find and forward S's deck"] {
+            XCTAssertNil(LiveClientBrain.relaxedSenderQuery(query, request: request), request)
+        }
+        for query in ["from:S", "from:S OR from:T biotech", "from:S -label:personal biotech", "{from:S from:T} biotech"] {
+            XCTAssertNil(LiveClientBrain.relaxedSenderQuery(query, request: "Find S's deck"), query)
+        }
+    }
+
+    @MainActor func testSearchCorrectionsKeepLookupSeparateFromHeldEmailAndSurviveAnotherTurn() async throws {
+        let h = Harness()
+        let selected = #"{"done":false,"item":{"id":"J","threadId":"thread-J","account":"work@example.test"}}"#
+        h.brain.updateState(selected, scope: "work")
+        h.brain.user("Find the biotech deck from S", turn: 1)
+        h.brain.begin("d1", live: true, turn: 1); h.brain.settle(turn: 1)
+        await waitForRequest(1, in: h)
+        h.reply([["type": "function_call", "call_id": "search", "name": GmailReadTools.search,
+                  "arguments": #"{"query":"in:inbox from:S filename:pdf"}"#]])
+        await waitForCalls(1, in: h)
+        h.brain.item(["type": "function_call_output", "call_id": "search", "output": #"{"results":[]}"#])
+        h.brain.user("It's not in the inbox, it was already archived", turn: 2)
+        XCTAssertTrue(h.brain.correctLookup("It's not in the inbox, it was already archived"))
+        h.brain.begin("d2", live: true, turn: 2); h.brain.settle(turn: 2)
+        await waitForRequest(2, in: h)
+        let raw = try XCTUnwrap(h.requests.last?["context"] as? String)
+        let fields = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
+        let lookup = try XCTUnwrap(fields["activeLookup"] as? [String: Any])
+        XCTAssertEqual(lookup["request"] as? String, "Find the biotech deck from S")
+        XCTAssertEqual(lookup["queries"] as? [String], ["in:inbox from:S filename:pdf"])
+        XCTAssertEqual(lookup["corrections"] as? [String], ["It's not in the inbox, it was already archived"])
+        XCTAssertEqual(LiveSelectionGrounding.selection(fields["currentSelection"] as? String ?? ""), LiveSelectionGrounding.selection(selected))
+        XCTAssertFalse(raw.contains("userCorrection"), "Lookup constraints must not rewrite J's interpretation")
+        XCTAssertFalse(h.brain.correctLookup("No, this email is about the meeting"), "Explicit selected-email corrections retain their original route")
+        h.reply([]); await drain()
+        h.brain.user("No, it was a presentation rather than a PDF", turn: 3)
+        XCTAssertTrue(h.brain.correctLookup("No, it was a presentation rather than a PDF"))
+        h.brain.begin("d3", live: true, turn: 3); h.brain.settle(turn: 3)
+        await waitForRequest(3, in: h)
+        let next = try XCTUnwrap(h.requests.last?["context"] as? String)
+        XCTAssertTrue(next.contains("already archived"))
+        XCTAssertTrue(next.contains("presentation rather than a PDF"))
+        h.reply([]); await drain()
+        h.brain.updateState(selected, scope: "personal")
+        XCTAssertFalse(h.brain.correctLookup("No, it was already archived"))
+        h.brain.close()
+    }
+
+    @MainActor func testLookupCorrectionDoesNotHijackGenuineEmailCorrectionOrNextSelection() async {
+        let h = Harness()
+        let selected = #"{"done":false,"item":{"id":"J","threadId":"thread-J","account":"work@example.test"}}"#
+        h.brain.updateState(selected, scope: "work")
+        XCTAssertFalse(h.brain.correctLookup("No, it was already archived"))
+        h.brain.user("Find S's deck", turn: 1)
+        h.brain.begin("d1", live: true, turn: 1); h.brain.settle(turn: 1)
+        await waitForRequest(1, in: h)
+        h.reply([["type": "function_call", "call_id": "search", "name": GmailReadTools.search,
+                  "arguments": #"{"query":"from:S"}"#]])
+        await waitForCalls(1, in: h)
+        h.brain.item(["type": "function_call_output", "call_id": "search", "output": #"{"results":[]}"#])
+        h.brain.updateState(selected.replacingOccurrences(of: "\"J\"", with: "\"K\""), scope: "work")
+        XCTAssertFalse(h.brain.correctLookup("No, it was already archived"))
+        h.brain.close()
+    }
+
+    @MainActor func testInformationGatheringHoldsDispositionAcrossQuestionsCorrectionsAndBackchannels() async throws {
+        let h = Harness()
+        let selected = #"{"done":false,"item":{"id":"J","threadId":"thread-J","account":"work@example.test","emailContent":{"messages":[{"id":"J","threadId":"thread-J","text":"I recommend reviewing the deck.","textComplete":true,"fullReadComplete":true}]}}}"#
+        h.brain.updateState(selected, scope: "work")
+        h.brain.assistant("What would you like to do with it?")
+        for (index, user) in ["What did the sender recommend?", "No, I meant the archived deck", "Okay"].enumerated() {
+            let turn = index + 1
+            h.brain.user(user, turn: turn)
+            XCTAssertTrue(h.brain.holdsFeedDecision)
+            h.brain.begin("d\(turn)", live: true, turn: turn); h.brain.settle(turn: turn)
+            await waitForRequest(turn, in: h)
+            let raw = try XCTUnwrap(h.requests.last?["context"] as? String)
+            let fields = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
+            XCTAssertNotNil(fields["feedDecision"])
+            XCTAssertEqual(fields["pendingQuestion"] as? String, "")
+            h.reply([["type": "message", "content": [["text": "The source recommends reviewing the deck. What would you like to do with it?"]]]])
+            await drain()
+            XCTAssertEqual(h.speech.last, "The source recommends reviewing the deck.")
+            h.brain.assistant("What would you like to do with it?")
+        }
+        h.brain.user("Help me decide what to do", turn: 4)
+        XCTAssertFalse(h.brain.holdsFeedDecision)
+        h.brain.begin("d4", live: true, turn: 4); h.brain.settle(turn: 4)
+        await waitForRequest(4, in: h)
+        h.reply([["type": "message", "content": [["text": "Would you like to draft a reply?"]]]])
+        await drain()
+        XCTAssertEqual(h.speech.last, "Would you like to draft a reply?")
+        h.brain.user("What does the attachment say?", turn: 5)
+        XCTAssertTrue(h.brain.holdsFeedDecision)
+        h.brain.user("What's next?", turn: 6)
+        XCTAssertFalse(h.brain.holdsFeedDecision)
+        h.brain.user("What does it mean?", turn: 7)
+        h.brain.updateState(selected.replacingOccurrences(of: "\"J\"", with: "\"K\""), scope: "work")
+        XCTAssertFalse(h.brain.holdsFeedDecision)
+        h.brain.close()
+    }
+
+    @MainActor func testRelatedNotionLookupAndPauseHoldDecisionUntilExplicitProgression() async throws {
+        let h = Harness()
+        h.brain.updateState(#"{"done":false,"item":{"id":"A","threadId":"thread-A","account":"work@example.test"}}"#, scope: "work")
+        for (index, text) in ["Part of this I want to file inside of Notion. Find the company page and investor updates database",
+                              "One second, I'm doing that now", "Okay", "Add this email there; that's the first step"].enumerated() {
+            let turn = index + 1
+            h.brain.user(text, turn: turn)
+            XCTAssertTrue(h.brain.holdsFeedDecision)
+            h.brain.begin("d\(turn)", live: true, turn: turn); h.brain.settle(turn: turn)
+            await waitForRequest(turn, in: h)
+            XCTAssertTrue((h.requests.last?["context"] as? String)?.contains("feedDecision") == true)
+            h.reply([["type": "message", "content": [["text": "The database is Investor Updates. What would you like to do with it?"]]]])
+            await drain()
+            XCTAssertEqual(h.speech.last, "The database is Investor Updates.")
+        }
+        h.brain.user("Do that in the background and move on", turn: 5)
+        XCTAssertFalse(h.brain.holdsFeedDecision)
+        XCTAssertTrue(DispatchScope.refersToSelectedEmail("Part of this I want to file inside of Notion"))
+        XCTAssertFalse(DispatchScope.refersToSelectedEmail("Unrelated: find a different email"))
+        XCTAssertFalse(DispatchScope.explicitlyContinuesFeed("Find the database in the background"))
+        XCTAssertFalse(DispatchScope.explicitlyContinuesFeed("Find the database in the background, don't move on"))
+        XCTAssertTrue(DispatchScope.explicitlyContinuesFeed("Find it in the background and move on"))
+        XCTAssertTrue(DispatchScope.holdsDecision(related: true, continuing: false, savedCommand: false))
+        XCTAssertFalse(DispatchScope.holdsDecision(related: false, continuing: false, savedCommand: false))
+        h.brain.close()
+    }
+
+    @MainActor func testDispositionGuardRetainsConcreteClarificationsAndAnswerContent() {
+        for question in ["What would you like to do with it?", "Would you like me to draft a reply or move on?",
+                         "Do you want to archive this?", "Should I reply or archive it?"] {
+            XCTAssertEqual(LiveClientBrain.withoutDispositionQuestion("The deck is attached. " + question), "The deck is attached.")
+        }
+        for question in ["Which of these two recipients do you mean?", "What date should the meeting use?",
+                         "Should I use the work address or personal address?"] {
+            XCTAssertEqual(LiveClientBrain.withoutDispositionQuestion(question), question)
+        }
+    }
+
     @MainActor func testPreRequestFailuresHaveOneTerminalReasonWithoutAProviderRequest() async throws {
         for reason in ["context_limit", "context_encoding_failed", "step_limit"] {
             let h = Harness()
@@ -154,15 +431,15 @@ final class LiveClientBrainTests: XCTestCase {
     }
 
     @MainActor func testCommandSaveRetainsReceiptWithoutRepeatingItsDefinition() async throws {
-        let h = Harness(); h.start(); await drain()
+        let h = Harness(); h.start(); await waitForRequest(1, in: h)
         let detail = String(repeating: "saved instruction ", count: 6_000)
         let args: [String: Any] = ["action": "save", "keyword": "follow up",
             "actions": [["tool": "label_message", "detail": detail]]]
         let raw = String(decoding: try JSONSerialization.data(withJSONObject: args), as: UTF8.self)
         h.reply([["type": "function_call", "call_id": "save", "name": "commands", "arguments": raw]])
-        await drain()
+        await waitForCalls(1, in: h)
         h.brain.item(["type": "function_call_output", "call_id": "save", "output": "Saved follow up."])
-        h.brain.continueResponse(delegation: "d1"); await drain()
+        h.brain.continueResponse(delegation: "d1"); await waitForRequest(2, in: h)
         XCTAssertTrue(h.failures.isEmpty)
         guard h.requests.count == 2 else { return XCTFail("Saved definition blocked its own receipt") }
         let context = try XCTUnwrap(h.requests.last?["context"] as? String)
@@ -261,7 +538,8 @@ final class LiveClientBrainTests: XCTestCase {
         XCTAssertTrue(context.contains("Archived the selected email."))
         h.brain.jobCompleted(id: job, result: "Archived the selected email.")
         h.reply([["type": "message", "content": [["type": "output_text", "text": "Archived."]]]])
-        await drain()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while h.speech.isEmpty, .now < deadline { try await Task.sleep(for: .milliseconds(1)) }
         XCTAssertEqual(h.speech, ["Archived."])
         XCTAssertEqual(h.requests.count, 2, "A duplicate completion must not trigger another reasoning round")
     }

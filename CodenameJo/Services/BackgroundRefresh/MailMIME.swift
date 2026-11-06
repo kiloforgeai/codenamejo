@@ -18,6 +18,7 @@ enum MailMIME {
         /// The Message-ID being answered, written to both `In-Reply-To` and `References`.
         var inReplyTo: String?
         var footer = false
+        var attachments: [ReplyAttachments.File]? = nil
     }
 
     /// Gmail supplies From, Date and Message-ID. Branded mail includes a linked HTML alternative.
@@ -26,23 +27,44 @@ enum MailMIME {
         if !message.cc.isEmpty { headers.append("Cc: \(message.cc.joined(separator: ", "))") }
         if !message.bcc.isEmpty { headers.append("Bcc: \(message.bcc.joined(separator: ", "))") }
         headers.append("Subject: \(encodeHeader(message.subject))")
-        if !message.footer { headers.append("Content-Type: text/plain; charset=UTF-8") }
+        let simple = !message.footer && (message.attachments ?? []).isEmpty
+        if simple { headers.append("Content-Type: text/plain; charset=UTF-8") }
         if let inReplyTo = message.inReplyTo, !inReplyTo.isEmpty {
             headers.append("In-Reply-To: \(inReplyTo)")
             headers.append("References: \(inReplyTo)")
         }
-        guard message.footer else {
-            return base64url((headers + ["", message.body]).joined(separator: "\r\n"))
+        if simple { return base64url((headers + ["", message.body]).joined(separator: "\r\n")) }
+        let content = replyContent(message)
+        return base64url((headers + ["MIME-Version: 1.0", content]).joined(separator: "\r\n"))
+    }
+
+    private static func replyContent(_ message: Outgoing) -> String {
+        let textPart = "Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+            + base64Lines(Data(message.body.utf8))
+        let body = message.footer ? brandedContent(message) : textPart
+        guard let files = message.attachments, !files.isEmpty else { return body }
+        let marker = "b_\(UUID().uuidString.lowercased())"
+        let parts = [body] + files.map { file in
+            let cleaned = file.filename.replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "")
+            let name = encodeHeader(cleaned).replacingOccurrences(of: #"(["\\])"#, with: #"\\$1"#, options: .regularExpression)
+            let mime = file.mimeType.range(of: #"^[A-Za-z0-9!#$&^_.+\-]+/[A-Za-z0-9!#$&^_.+\-]+$"#,
+                                          options: .regularExpression) != nil ? file.mimeType : "application/octet-stream"
+            return "Content-Type: \(mime); name=\"\(name)\"\r\nContent-Disposition: attachment; filename=\"\(name)\"\r\n"
+                + "Content-Transfer-Encoding: base64\r\n\r\n\(base64Lines(file.bytes))"
         }
+        return "Content-Type: multipart/mixed; boundary=\"\(marker)\"\r\n\r\n"
+            + parts.map { "--\(marker)\r\n\($0)\r\n" }.joined() + "--\(marker)--"
+    }
+
+    private static func brandedContent(_ message: Outgoing) -> String {
         let boundary = "b_\(UUID().uuidString.lowercased())"
-        headers += ["MIME-Version: 1.0", "Content-Type: multipart/alternative; boundary=\"\(boundary)\""]
         let parts = [("plain", "\(message.body)\n\n\(footer)"),
                      ("html", "\(plainHTML(message.body))\n<p>\(htmlFooter)</p>")]
         let body = parts.map { type, content in
             "--\(boundary)\r\nContent-Type: text/\(type); charset=UTF-8\r\n"
                 + "Content-Transfer-Encoding: base64\r\n\r\n\(base64Lines(Data(content.utf8)))\r\n"
         }.joined() + "--\(boundary)--"
-        return base64url((headers + ["", body]).joined(separator: "\r\n"))
+        return "Content-Type: multipart/alternative; boundary=\"\(boundary)\"\r\n\r\n" + body
     }
 
     // MARK: - Forwards

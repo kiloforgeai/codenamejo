@@ -21,6 +21,11 @@ class DispatchJobStore: ObservableObject {
             decoder.dateDecodingStrategy = .iso8601
             return try? decoder.decode([DispatchJob].self, from: $0)
         } ?? []
+        for index in jobs.indices where jobs[index].mailAction?.state == .pending {
+            jobs[index].mailAction?.state = .unknown
+            jobs[index].state = "unknown"
+            jobs[index].result = "The app closed before Gmail's response was saved. Check Gmail before trying again; this action will not be repeated automatically."
+        }
         for index in jobs.indices where jobs[index].context != nil && jobs[index].isRunning {
             let queued = jobs[index].state == "queued"
             jobs[index].state = queued ? "awaiting_input" : "unknown"
@@ -43,6 +48,18 @@ class DispatchJobStore: ObservableObject {
     }
 
     /// Every stored row, newest first — the History screen's Dispatch panel reads this. Read-only.
+    var decisionDependencies: [DispatchJob] {
+        visible.filter { $0.context?.holdsDecision == true && $0.origin != nil && $0.state != "cancelled" }
+            .sorted { ($0.startedAt ?? .distantPast) > ($1.startedAt ?? .distantPast) }
+    }
+
+    func releaseDecisionHold(_ selection: MailSelection) async {
+        let ids = Set(decisionDependencies.filter { $0.sourceSelection == selection }.map(\.id))
+        guard !ids.isEmpty else { return }
+        for index in jobs.indices where ids.contains(jobs[index].id) { jobs[index].context?.decisionReleased = true }
+        await save()
+    }
+
     func history() async -> [DispatchJob] {
         visible.sorted {
             ($0.completedAt ?? $0.startedAt ?? .distantPast) > ($1.completedAt ?? $1.startedAt ?? .distantPast)
@@ -99,7 +116,7 @@ class DispatchJobStore: ObservableObject {
         return jobs.first { $0.id == id }?.taskRevision == revision
     }
 
-    func acceptContext(_ id: UUID, context: DispatchJob.TaskContext, preference: DispatchJob.CompletionPreference = .bringBack) async -> Bool {
+    func acceptContext(_ id: UUID, context: DispatchJob.TaskContext, preference: DispatchJob.CompletionPreference? = nil) async -> Bool {
         guard let index = jobs.firstIndex(where: { $0.id == id }) else { return false }
         jobs[index].context = context
         jobs[index].state = "queued"
@@ -223,8 +240,8 @@ class DispatchJobStore: ObservableObject {
         jobs[index].reportBack = reportBack
         if let preference = jobs[index].completionPreference {
             jobs[index].reportBack = state == "done" ? preference == .bringBack : state != "cancelled"
-            if state == "done", preference == .quiet { jobs[index].deliveredAt = Date() }
         }
+        if state == "done", jobs[index].reportBack == false { jobs[index].deliveredAt = Date() }
         let job = jobs[index]
         await save()
         let status: CommandRecord.CommandStatus = state == "done" ? .success : state == "partial" ? .partial : state == "unknown" ? .unknown : .failed
@@ -260,7 +277,7 @@ class DispatchJobStore: ObservableObject {
     /// Delivered rows past `DispatchJob.retention`. An undelivered answer is never pruned.
     private func prune(asOf now: Date) async {
         let before = jobs.count
-        jobs.removeAll { job in job.deliveredAt.map { now.timeIntervalSince($0) > DispatchJob.retention } ?? false }
+        jobs.removeAll { job in job.mailAction == nil && (job.deliveredAt.map { now.timeIntervalSince($0) > DispatchJob.retention } ?? false) }
         if jobs.count != before { await save() }
     }
 
@@ -285,5 +302,57 @@ class DispatchJobStore: ObservableObject {
         persistenceError = error
         changes += 1
         return error == nil
+    }
+}
+
+extension DispatchJobStore {
+    func beginMailAction(_ action: MailActionReceipt, ownerID: String, profileID: String?,
+                         conversationID: String?, origin: DispatchJob.MailOrigin?) async throws -> (DispatchJob, Bool) {
+        guard backend.userId == ownerID, ProfileRuntime.snapshot?.profileId == profileID else {
+            throw GmailReadTools.Refusal(text: "Nothing was sent or saved. The active user or profile changed.")
+        }
+        if let key = action.requestKey, let existing = jobs.first(where: {
+            $0.userId == ownerID && $0.profileId == profileID && $0.mailAction?.requestKey == key
+        }) { return (existing, false) }
+        let job = DispatchJob(id: UUID(), task: action.title + " · " + action.subject, state: "running",
+            result: "Waiting for Gmail to confirm this action.", startedAt: Date(), deliveredAt: Date(), profileId: profileID,
+            reportBack: false, userId: ownerID, conversationId: conversationID.flatMap(UUID.init(uuidString:)),
+            origin: origin, mailAction: action)
+        jobs.append(job)
+        guard await save() else {
+            throw GmailReadTools.Refusal(text: "Nothing was sent or saved because the action history could not be saved.")
+        }
+        return (job, true)
+    }
+
+    func mailAction(_ id: UUID) -> DispatchJob? { jobs.first { $0.id == id && $0.mailAction != nil } }
+
+    @discardableResult
+    func recordMailAction(_ id: UUID, state: MailActionReceipt.State, result: String,
+                          provider: [String: Any]? = nil) async -> Bool {
+        guard let index = jobs.firstIndex(where: { $0.id == id }), var action = jobs[index].mailAction else { return false }
+        if action.confirmed, state != action.state { return true }
+        if let provider {
+            action.providerID = provider["id"] as? String
+            let message = action.kind == .draft ? provider["message"] as? [String: Any] : provider
+            action.providerMessageID = message?["id"] as? String
+            action.providerThreadID = message?["threadId"] as? String
+            if let providerID = action.providerID, jobs.contains(where: {
+                $0.id != id && $0.userId == jobs[index].userId && $0.profileId == jobs[index].profileId
+                    && $0.mailAction?.account == action.account && $0.mailAction?.kind == action.kind
+                    && $0.mailAction?.providerID == providerID && $0.mailAction?.confirmed == true
+            }) {
+                jobs.remove(at: index)
+                return await save()
+            }
+        }
+        action.state = state
+        jobs[index].mailAction = action
+        jobs[index].state = action.confirmed ? "done" : state == .failed ? "failed" : state == .unknown ? "unknown" : "running"
+        jobs[index].result = result
+        jobs[index].completedAt = state == .pending || state == .queued ? nil : Date()
+        jobs[index].receipts = [.init(callId: id.uuidString, tool: action.tool,
+            outcome: action.confirmed ? "success" : state == .failed ? "failed" : state == .unknown ? "unknown" : "pending")]
+        return await save()
     }
 }

@@ -100,6 +100,54 @@ final class LocalEmailPresentationTests: XCTestCase {
             XCTAssertEqual(failure.reason, "incomplete_email_context")
         }
     }
+
+    func testReactionExtractionPreservesJoinedEmojiAndVisibleAltWithoutFetchingImages() {
+        let html = "<p>👩🏽&zwj;💻 ❤️ 👍🏾</p><img src='https://example.test/reaction' alt='clapping hands'>"
+            + "<img data-alt='fake'><img hidden alt='hidden reaction'><div style='display:none'><img alt='tracker'></div>"
+        let extracted = P.envelope(message(parts: [part("text/html", html)]), authorship: true)
+        XCTAssertEqual(extracted.body, "👩🏽‍💻 ❤️ 👍🏾\nclapping hands")
+        XCTAssertEqual(extracted.source?.text, extracted.body)
+        XCTAssertEqual(P.reactionOnly("👩🏽‍💻 ❤️ 👍🏾"), "👩🏽‍💻❤️👍🏾")
+        XCTAssertEqual(P.reactionOnly("👍🏾\n\nOn Monday Dana wrote:\n> ❤️"), "👍🏾")
+        XCTAssertNil(P.reactionOnly("> 👍"))
+        XCTAssertNil(P.reactionOnly("Please send the report.\nDana ☀️"))
+        XCTAssertNil(P.reactionOnly("123"))
+        XCTAssertNil(P.reactionOnly(""))
+    }
+
+    func testReactionSourceReachesSummaryAndSpokenLineWithItsIdentity() async throws {
+        let fixtures: [(String, String, String)] = [
+            ("text/plain", "👍🏽", "Dana reacted with a thumbs up. The referenced message is unclear."),
+            ("text/html", "<p>❤️ 👩🏽&zwj;💻</p>", "Dana replied with a heart and woman technologist emoji. The referenced message is unclear."),
+            ("text/html", "<p>Dana reacted with <img alt='thumbs up' src='https://example.test/pixel'></p>", "Dana reacted with a thumbs up. The referenced message is unclear.")
+        ]
+        for (mime, raw, summary) in fixtures {
+            let fetched = message(parts: [part(mime, raw)])
+            let deps = P.Dependencies(read: { account, id in
+                XCTAssertEqual(account, "owner@example.test"); XCTAssertEqual(id, "m1")
+                return fetched
+            }, respond: { request, _ in
+                let input = try XCTUnwrap((request["input"] as? [[String: Any]])?.first?["content"] as? String)
+                let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(input.utf8)) as? [String: Any])
+                let source = try XCTUnwrap((json["messages"] as? [[String: Any]])?.first)
+                XCTAssertEqual(source["body"] as? String, mime == "text/html" ? P.htmlToText(raw) : raw)
+                XCTAssertEqual(source["id"] as? String, "m1")
+                XCTAssertEqual(source["threadId"] as? String, "t1")
+                XCTAssertEqual(source["reactionOnly"] as? String, P.reactionOnly(mime == "text/html" ? P.htmlToText(raw) : raw))
+                let instructions = try XCTUnwrap(request["instructions"] as? String)
+                XCTAssertTrue(instructions.contains("name the actual reaction in spoken words"))
+                XCTAssertTrue(instructions.contains("Quoted emoji belong to the quoted author"))
+                return String(decoding: try JSONSerialization.data(withJSONObject: ["summary": summary]), as: UTF8.self)
+            }, timeZone: { _ in nil })
+            let key = LiveEmailPresentation.Key(account: "owner@example.test", threadId: "t1", messageId: "m1",
+                exchangeId: "", messageIDs: ["m1"], selectedIDs: ["m1"])
+            let prepared = try await P.prepare(key, scope: .init(profileId: "p", isDefault: true), deps: deps)
+            let step = #"{"done":false,"item":{"account":"owner@example.test","id":"m1","threadId":"t1"}}"#
+            XCTAssertTrue(try XCTUnwrap(prepared.speakerLine(for: step)).contains(summary))
+            XCTAssertNil(prepared.speakerLine(for: step.replacingOccurrences(of: "m1", with: "m2")))
+            XCTAssertEqual(prepared.emailContent?.messages.first?.text, mime == "text/html" ? P.htmlToText(raw) : raw)
+        }
+    }
 }
 
 private actor RequestLog {

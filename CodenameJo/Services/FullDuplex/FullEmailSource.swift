@@ -42,10 +42,14 @@ enum FullEmailSource {
         let mime = (part.mimeType ?? "").lowercased().components(separatedBy: ";")[0]
         if let children = part.parts, !children.isEmpty {
             if mime == "multipart/alternative" {
-                let preferred = children.first { ($0.mimeType ?? "").lowercased().hasPrefix("text/plain") }
-                    ?? children.first { ($0.mimeType ?? "").lowercased().hasPrefix("text/html") }
-                    ?? children.last
-                return try await body(preferred, attachment: attachment)
+                let plainIndex = children.firstIndex { ($0.mimeType ?? "").lowercased().hasPrefix("text/plain") }
+                let plain = try await body(plainIndex.map { children[$0] }, attachment: attachment)
+                if plainIndex != nil, !MailBodyText.isHTMLPlaceholder(plain) { return plain }
+                for (index, child) in children.enumerated() where index != plainIndex {
+                    let alternative = try await body(child, attachment: attachment)
+                    if MailBodyText.preferHTML(over: plain, alternative: alternative) { return alternative }
+                }
+                return plain
             }
             var pieces: [String] = [], bytes = 0
             for child in children {
