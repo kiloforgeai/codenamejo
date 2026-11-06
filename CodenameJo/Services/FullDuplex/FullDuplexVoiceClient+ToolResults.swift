@@ -10,12 +10,12 @@ extension FullDuplexVoiceClient {
     ) {
         guard isActive else { return }
         if let dial, dial != dialGeneration { return }
-        sendFunctionOutput(callId: callId, output: output)
         if visible {
             if !alreadyStarted { onToolUse?(tool) }
             onToolDone?(tool)
             if failed { onToolFailed?(tool) }
         }
+        sendFunctionOutput(callId: callId, output: output)
         RealtimeLog.log("\(subsystem): \(tool) — \(detail) [\(outcome)] in "
             + String(format: "%.0f ms", ms))
         continueAfterFunctionResult()

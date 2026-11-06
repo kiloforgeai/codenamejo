@@ -21,7 +21,8 @@ class DesktopEmailReader: ObservableObject {
         let cc: String
         let subject: String
         let date: String
-        let text: String
+        let body: AttributedString
+        var text: String { String(body.characters) }
         let attachments: [String]
         let error: String?
     }
@@ -75,6 +76,13 @@ class DesktopEmailReader: ObservableObject {
         task = nil
         guard let request else { state = .idle; return }
         guard !request.headersOnly else { state = .headersOnly(request); return }
+        if !retry, case .ready(let previous, let content) = state,
+           previous.selection == request.selection, previous.threadID == request.threadID,
+           previous.ownerID == request.ownerID, previous.profileID == request.profileID,
+           previous.headersOnly == request.headersOnly {
+            state = .ready(request, content)
+            return
+        }
         state = .loading(request)
         task = Task { [weak self, loader] in
             do {
@@ -150,24 +158,39 @@ class DesktopEmailReader: ObservableObject {
         }.map(\.element)
         for message in ordered {
             try Task.checkCancellation()
-            var text = "", failure: String?
+            var body = AttributedString(), failure: String?
             do {
-                text = try await FullEmailSource.read(
+                let text = try await FullEmailSource.read(
                     selection: .init(account: request.selection.account, messageID: message.id),
                     threadID: threadID, prepared: nil, fetch: { message },
                     attachment: { try await attachment(message.id, $0) }).text
+                bytes += text.utf8.count
+                body = try linkedBody(text)
             } catch is CancellationError { throw CancellationError() }
             catch { failure = error.localizedDescription }
-            bytes += text.utf8.count
             guard bytes <= 24_000_000 else {
                 throw FullEmailSource.Failure(message: "This thread is too large to display here. Open it in Gmail to read every message.")
             }
             messages.append(Message(id: message.id, from: message.header("From") ?? "Unknown sender",
                 to: message.header("To") ?? "", cc: message.header("Cc") ?? "",
                 subject: message.header("Subject") ?? "No subject", date: message.header("Date") ?? "",
-                text: text, attachments: GmailReadTools.attachments(in: message.payload).map(\.filename), error: failure))
+                body: body, attachments: GmailReadTools.attachments(in: message.payload).map(\.filename), error: failure))
         }
         return Content(selectedID: request.selection.messageID, messages: messages)
+    }
+
+    nonisolated static func linkedBody(_ text: String) throws -> AttributedString {
+        var body = AttributedString(text)
+        let detector = try NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+        for match in detector.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+            guard let url = match.url, let scheme = url.scheme?.lowercased(),
+                  ["http", "https", "mailto"].contains(scheme),
+                  let range = Range(match.range, in: text),
+                  let start = AttributedString.Index(range.lowerBound, within: body),
+                  let end = AttributedString.Index(range.upperBound, within: body) else { continue }
+            body[start..<end].link = url
+        }
+        return body
     }
 }
 #endif

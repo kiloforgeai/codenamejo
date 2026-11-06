@@ -39,6 +39,7 @@ enum CalendarTools {
                     + "Include the offset for the user's timezone, also in your instructions."],
                  "time_max": ["type": "string", "description":
                     "End of the window, RFC3339. Keep windows tight — a week at most for a summary."],
+                 "time_zone": ["type": "string", "description": "IANA zone for interpreting the requested dates. Defaults to the Mac's zone. Use the resolved calendar request window."],
                  "query": ["type": "string", "description": "Optional free-text filter on title, description, attendees."],
                  "ical_uid": ["type": "string", "description": "Exact UID from an invitation attachment. Prefer this stable identity over title search."],
                  "max_results": ["type": "number", "description": "Default 25, max 50."],
@@ -146,7 +147,7 @@ enum CalendarTools {
         do {
             let output: String
             switch name {
-            case list: output = try await runList(args, accounts: connected)
+            case list: output = try await runList(args, accounts: connected, diagnostics: diagnostics, callID: callID)
             case create: output = try await runCreate(args, accounts: connected, receipt: receipt)
             default: output = try await runUpdate(args, accounts: connected, receipt: receipt)
             }
@@ -227,11 +228,15 @@ enum CalendarTools {
     /// Older or incomplete cache windows fall through to Google.
     static let cacheFreshness = BackgroundCalendarRefresh.pushThrottle
 
-    private static func runList(_ args: [String: Any], accounts: [String]) async throws -> String {
+    private static func runList(_ args: [String: Any], accounts: [String], diagnostics: VoiceDiagnostics.Session?, callID: String?) async throws -> String {
         let timeMin = string(args["time_min"]) ?? "", timeMax = string(args["time_max"]) ?? ""
         guard !timeMin.isEmpty, !timeMax.isEmpty else {
             throw Refusal(text: "Need both time_min and time_max as RFC3339 timestamps.")
         }
+        guard let from = instant(timeMin), let to = instant(timeMax), from < to else {
+            throw Refusal(text: "The calendar window must contain valid RFC3339 times with its end after its start.")
+        }
+        let timeZone = try CalendarWriteTiming.zone(args["time_zone"] as? String)
         let asked = (args["max_results"] as? NSNumber)?.intValue ?? 25
         let max = Swift.min(Swift.max(1, asked), 50)
         let availability = args["availability_check"] as? Bool == true
@@ -253,7 +258,7 @@ enum CalendarTools {
                             $0.status != "cancelled" && (availability || mentions($0, cached.attendees, term))
                         }
                         if availability && cached.events.count < 500 {
-                            let intervals = busy(events, attendees: cached.attendees, account: account, window: window, offset: zone)
+                            let intervals = busy(events, attendees: cached.attendees, account: account, window: window, offset: zone, zone: timeZone)
                             return (index, ["account": account, "availability":
                                 ["timeMin": timeMin, "timeMax": timeMax, "busy": intervals]], state.lastSyncedAt)
                         }
@@ -296,7 +301,21 @@ enum CalendarTools {
         if let oldest = synced.min(), Date().timeIntervalSince(oldest) > cacheFreshness {
             Task { await BackgroundCalendarRefresh.run(trigger: .staleRead) }
         }
-        return GmailReadTools.json(rows.map { $0.1 })
+        let observed = Date()
+        let covered = rows.filter { $0.1["error"] == nil && ($0.1["availability"] != nil || $0.1["complete"] as? Bool == true) }.count
+        diagnostics?.record(.turnTransition, ["transition": "calendar_read_range", "call_id": callID ?? "none",
+            "range_start": timeMin, "range_end": timeMax, "time_zone": timeZone.identifier,
+            "calendar_count": String(rows.count), "covered_calendars": String(covered),
+            "result_age_seconds": String(Int(synced.map { observed.timeIntervalSince($0) }.max() ?? 0))])
+        return GmailReadTools.json(rows.map { _, value, syncedAt in
+            var row = value
+            row["requested_window"] = ["time_min": timeMin, "time_max": timeMax, "time_zone": timeZone.identifier]
+            row["checked_at"] = ISO8601DateFormatter().string(from: observed)
+            row["result_age_seconds"] = Swift.max(0, observed.timeIntervalSince(syncedAt ?? observed))
+            row["coverage"] = covered == rows.count ? "complete" : "partial"
+            if availability { row["complete"] = row["availability"] != nil && row["error"] == nil }
+            return row
+        })
     }
 
     private static func liveEvents(params: [String: String], token: String, limit: Int) async throws
@@ -358,7 +377,7 @@ enum CalendarTools {
     /// Google's free/busy rule over cached rows: an event blocks time unless it is cancelled,
     /// marked free, or one the user declined. Clipped to the window and merged, soonest first.
     static func busy(_ events: [CalendarStore.Event], attendees: [CalendarStore.Attendee], account: String,
-                     window: (Int64, Int64), offset: String, zone: TimeZone = .current) -> [[String: String]] {
+                     window: (Int64, Int64), offset: String, zone: TimeZone? = nil) -> [[String: String]] {
         var spans: [(Int64, Int64)] = []
         for event in events where event.status != "cancelled" && event.transparency != "transparent" {
             let own = attendees.first {
@@ -366,7 +385,7 @@ enum CalendarTools {
                     && $0.email.caseInsensitiveCompare(account) == .orderedSame
             }
             if own?.responseStatus == "declined" { continue }
-            guard let span = span(of: event, zone: zone) else { continue }
+            guard let span = span(of: event, zone: zone ?? .current) else { continue }
             let from = Swift.max(span.0, window.0), to = Swift.min(span.1, window.1)
             if to > from { spans.append((from, to)) }
         }
@@ -379,7 +398,10 @@ enum CalendarTools {
                 merged.append(span)
             }
         }
-        return merged.map { ["start": atOffset(Double($0.0), offset), "end": atOffset(Double($0.1), offset)] }
+        func stamp(_ ms: Int64) -> String {
+            atOffset(Double(ms), zone.map { offsetString($0, at: Date(timeIntervalSince1970: Double(ms) / 1000)) } ?? offset)
+        }
+        return merged.map { ["start": stamp($0.0), "end": stamp($0.1)] }
     }
 
     /// An event's epoch-ms span. All-day dates are cached at UTC midnight for sorting; here they

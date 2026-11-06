@@ -134,6 +134,15 @@ struct TurnStore: Sendable {
 
     // MARK: - Writing
 
+    private static func preservingAttempts(_ turn: Turn, db: Database) throws -> Turn {
+        guard let prior = try Turn.filter(Column("user_id") == turn.userId && Column("id") == turn.id).fetchOne(db),
+              let oldData = prior.record, let newData = turn.record else { return turn }
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        let previous = try decoder.decode(CommandRecord.self, from: oldData)
+        let current = try decoder.decode(CommandRecord.self, from: newData)
+        return Turn(current.preservingTerminalAttempts(from: previous), userId: turn.userId)
+    }
+
     static func createJobOutcomes(_ db: Database) throws {
         try db.create(table: "turn_job_outcome") { table in
             table.column("user_id", .text).notNull()
@@ -151,7 +160,7 @@ struct TurnStore: Sendable {
             try db.execute(sql: "INSERT INTO turn_job_outcome(user_id, turn_id, job_id, outcome) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, turn_id, job_id) DO UPDATE SET outcome = excluded.outcome, updated_at = CURRENT_TIMESTAMP",
                            arguments: [userID, turnID, jobID.uuidString, outcome.rawValue])
             if let row = try Turn.filter(Column("user_id") == userID && Column("id") == turnID).fetchOne(db) {
-                try Self.applyingJobOutcomes(row, db: db).save(db)
+                try Self.preservingAttempts(Self.applyingJobOutcomes(row, db: db), db: db).save(db)
             }
             try Self.trim(db)
         }
@@ -188,7 +197,7 @@ struct TurnStore: Sendable {
     func save(_ turn: Turn) async throws -> Turn {
         guard let dbPool else { throw BackendError.invalidResponse }
         return try await dbPool.write { db in
-            let updated = try Self.applyingJobOutcomes(turn, db: db)
+            let updated = try Self.preservingAttempts(Self.applyingJobOutcomes(turn, db: db), db: db)
             try updated.save(db)
             try Self.trim(db)
             return updated
@@ -200,7 +209,7 @@ struct TurnStore: Sendable {
         guard let dbPool else { return }
         do {
             try await dbPool.write { db in
-                try Self.applyingJobOutcomes(turn, db: db).save(db)
+                try Self.preservingAttempts(Self.applyingJobOutcomes(turn, db: db), db: db).save(db)
                 try Self.trim(db)
             }
         } catch {

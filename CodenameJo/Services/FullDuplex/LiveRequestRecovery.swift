@@ -1,6 +1,16 @@
 import Foundation
 
 enum LiveRequestRecovery {
+    static func feedbackAfterArchive(_ text: String) -> String? {
+        let pattern = #"(?is)^\s*(?:(?:great|okay|ok|thanks|thank you|yeah)[\s,.!]+)*(?:(?:you can|can you|could you|would you|please|go ahead and)\s+)?archive\s+(?:it|this(?: email| message)?|that(?: email| message)?)(?:\s*[.;!]\s*|\s*,?\s+(?:and(?: then)?|then)\s+)(.+)$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let range = Range(match.range(at: 1), in: text) else { return nil }
+        let feedback = String(text[range])
+        guard VoiceFeedbackText.request(feedback) != nil else { return nil }
+        return feedback
+    }
+
     static func isFeedback(_ text: String) -> Bool {
         let words = Set(FullDuplexVoiceClient.normalize(text).split(separator: " "))
         return words.contains("feedback") || (words.contains("report") && words.contains("bug"))

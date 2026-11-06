@@ -7,6 +7,7 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
     @StateObject var viewModel: DesktopWorkspaceModel
     @StateObject var interactor: Interactor
     @ObservedObject private var localSpeech = Container.shared.localSpeech()
+    @ObservedObject private var commands = Container.shared.customCommands()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -14,15 +15,20 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             Divider()
             HStack(spacing: 0) {
                 if !viewModel.focusMode {
-                    DesktopFeedSidebar(viewModel: viewModel, select: interactor.selectFeedItem).frame(width: 280)
+                    DesktopFeedSidebar(viewModel: viewModel, select: interactor.selectFeedItem, refresh: interactor.refreshFeed).frame(width: 280)
                     Divider()
                 }
                 GeometryReader { geometry in
                     VStack(spacing: 0) {
-                        DesktopReaderPane(viewModel: viewModel, retryEmailReader: interactor.retryEmailReader)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        Group {
+                            if let job = viewModel.selectedJob {
+                                DesktopTaskPane(viewModel: viewModel, interactor: interactor, job: job)
+                            } else {
+                                DesktopReaderPane(viewModel: viewModel, retryEmailReader: interactor.retryEmailReader)
+                            }
+                        }.frame(maxWidth: .infinity, maxHeight: .infinity)
                             .accessibilityIdentifier("workspaceReaderPane")
-                        if viewModel.inSession, case .email = viewModel.displayedFocus {
+                        if viewModel.selectedJob == nil, case .email = viewModel.displayedFocus {
                             Divider()
                             feedActions.padding(.horizontal, 28).padding(.vertical, 10)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -71,45 +77,10 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             NavigationStack { HistoryViewComponent.make(onClose: { viewModel.showingHistory = false }) }
                 .frame(minWidth: 680, minHeight: 600)
         }
-        .onChange(of: viewModel.selectedJob?.id) { _, _ in viewModel.resultSelectionError = nil }
-        .sheet(item: $viewModel.selectedJob) { job in
-            NavigationStack {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 20) {
-                        Text(job.task).font(.title2.weight(.medium))
-                        Label(job.desktopStatusLabel, systemImage: job.didFail ? "exclamationmark.triangle" : "bolt.horizontal.circle")
-                            .foregroundStyle(.secondary)
-                        if let origin = job.origin {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Source email").font(.caption).foregroundStyle(.secondary)
-                                Text(origin.subject).font(.headline)
-                                Text(origin.sender).textSelection(.enabled)
-                                Text(origin.account).font(.caption).foregroundStyle(.secondary)
-                                if job.hasStopped() {
-                                    Button("Work on this email") { interactor.selectReturnedResult(job.id) }
-                                        .buttonStyle(.borderedProminent)
-                                        .disabled(!viewModel.inSession || viewModel.selectingResult)
-                                        .accessibilityIdentifier("workOnReturnedEmail")
-                                    Text(viewModel.inSession
-                                        ? "Your place in the feed is kept while you work on this result."
-                                        : "Start a session, then select this email to continue its work.")
-                                        .font(.caption).foregroundStyle(.secondary)
-                                }
-                            }.padding(20).frame(maxWidth: .infinity, alignment: .leading)
-                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
-                        } else if job.hasStopped() {
-                            Text("This result has no saved source email. Select the intended email before acting.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        if let error = viewModel.resultSelectionError { Text(error).foregroundStyle(.red) }
-                        Text(job.result ?? (job.hasStopped()
-                            ? "This job stopped reporting. Its outcome is unknown. Ask Jo to check before trying it again."
-                            : "This job is still running. Its result will appear here."))
-                            .font(.body).textSelection(.enabled)
-                    }.padding(32).frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { viewModel.selectedJob = nil } } }
-            }.frame(minWidth: 600, minHeight: 440)
+        .onChange(of: viewModel.selectedJob?.id) { _, id in
+            viewModel.resultSelectionError = nil
+            viewModel.taskCorrection = ""
+            interactor.selectTask(id)
         }
         .alert("No microphone available", isPresented: $viewModel.showMicUnavailable) {
             Button("OK", role: .cancel) {}
@@ -228,14 +199,44 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                         } label: { Label(action.title, systemImage: action.symbol) }
                     }
                 }.menuStyle(.borderlessButton).fixedSize()
+                Menu("Run command", systemImage: "command") {
+                    ForEach(commands.commands.filter(\.enabled)) { command in
+                        Button(command.title) {
+                            if let context { interactor.submitTask(command.title, commandID: command.id, context: context) }
+                        }
+                    }
+                }.menuStyle(.borderlessButton).fixedSize()
             }
-            .disabled(context == nil || viewModel.state == .processing)
+            .disabled(context == nil)
+            HStack {
+                TextField("Ask Jo to work on this email…", text: $viewModel.taskText)
+                    .textFieldStyle(.roundedBorder).accessibilityIdentifier("desktopTaskRequest")
+                    .onSubmit { submitTask(context) }
+                Button("Run in background") { submitTask(context) }
+                    .disabled(context == nil || viewModel.taskText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.submittingTask)
+                    .accessibilityIdentifier("desktopRunTask")
+            }
             if let error = viewModel.feedActionError {
                 Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.red).font(.callout)
             } else if context != nil, viewModel.requestedActionContext == context {
                 Text("Action requested · follow its result in Live Activity").font(.caption).foregroundStyle(.secondary)
             }
+            HStack(spacing: 12) {
+                Text("On success").font(.caption).foregroundStyle(.secondary)
+                Picker("Task completion", selection: $viewModel.taskPreference) {
+                    ForEach(DispatchJob.CompletionPreference.allCases, id: \.self) { Text($0.label).tag($0) }
+                }.pickerStyle(.segmented).frame(maxWidth: 310)
+                if let origin = context.flatMap(viewModel.taskOrigin) {
+                    Text(origin.account).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            if let receipt = viewModel.taskReceipt { Text(receipt).font(.caption).foregroundStyle(.secondary) }
         }
+    }
+
+    private func submitTask(_ context: FeedActionContext?) {
+        guard let context else { return }
+        interactor.submitTask(viewModel.taskText, commandID: nil, context: context)
     }
 
     private var voiceBar: some View {
@@ -267,7 +268,9 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                 Button(action: interactor.quickAction) { Label("Quick action", systemImage: "bolt") }
                     .buttonStyle(.bordered).accessibilityIdentifier("desktopQuickAction")
                     .help("Ask Jo for one thing without starting the feed")
-                Button(action: interactor.toggleSession) { Label("Start session", systemImage: "play.fill") }
+                Button(action: interactor.toggleSession) {
+                    Label(viewModel.selectedJob == nil ? "Start session" : "Discuss activity", systemImage: "play.fill")
+                }
                     .buttonStyle(.borderedProminent)
                     .help("Begin working through your feed.")
                     .accessibilityIdentifier("desktopStartFeedBar")

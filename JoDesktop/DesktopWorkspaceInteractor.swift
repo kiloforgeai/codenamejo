@@ -16,7 +16,70 @@ protocol DesktopWorkspaceHandler {
     func selectReturnedResult(_ id: UUID)
     func selectFeedItem(_ row: DesktopFeedRow)
     func performFeedAction(_ action: LiveFastAction, context: FeedActionContext)
+    func submitTask(_ text: String, commandID: String?, context: FeedActionContext)
     func retryEmailReader()
+    func refreshFeed()
+}
+
+@MainActor
+extension DesktopWorkspaceHandler {
+    func setTaskPreference(_ job: DispatchJob, preference: DispatchJob.CompletionPreference, model: DesktopWorkspaceModel) {
+        Task {
+            do { try await Container.shared.applicationTasks().setPreference(job.id, version: job.taskRevision, preference: preference) }
+            catch { model.resultSelectionError = error.localizedDescription }
+            model.jobs = await Container.shared.dispatchJobs().history()
+            if model.selectedJob?.id == job.id { model.selectedJob = model.jobs.first { $0.id == job.id } }
+        }
+    }
+    func reviewTask(_ job: DispatchJob, model: DesktopWorkspaceModel) {
+        Task {
+            do { try await Container.shared.applicationTasks().reviewed(job.id, version: job.taskRevision) }
+            catch { model.resultSelectionError = error.localizedDescription }
+            model.jobs = await Container.shared.dispatchJobs().history()
+            if model.selectedJob?.id == job.id { model.selectedJob = model.jobs.first { $0.id == job.id } }
+        }
+    }
+    func selectTask(_ id: UUID?) { Container.shared.applicationTasks().select(id) }
+    func resumeTaskArchive(_ job: DispatchJob, model: DesktopWorkspaceModel) {
+        guard !model.updatingTask else { return }
+        model.updatingTask = true
+        model.resultSelectionError = nil
+        Task {
+            defer { model.updatingTask = false }
+            do { try await Container.shared.applicationTasks().resumeFeedbackArchive(job.id, version: job.taskRevision) }
+            catch { model.resultSelectionError = error.localizedDescription }
+            model.jobs = await Container.shared.dispatchJobs().history()
+            if model.selectedJob?.id == job.id { model.selectedJob = model.jobs.first { $0.id == job.id } }
+        }
+    }
+    func chooseTaskInput(_ job: DispatchJob, choice: String, model: DesktopWorkspaceModel) {
+        guard !model.updatingTask else { return }
+        model.updatingTask = true
+        model.resultSelectionError = nil
+        Task {
+            defer { model.updatingTask = false }
+            do { try await Container.shared.applicationTasks().choose(job.id, version: job.taskRevision, choice: choice) }
+            catch { model.resultSelectionError = error.localizedDescription }
+            model.jobs = await Container.shared.dispatchJobs().history()
+            if model.selectedJob?.id == job.id { model.selectedJob = model.jobs.first { $0.id == job.id } }
+        }
+    }
+    func updateTask(_ job: DispatchJob, instruction: String?, model: DesktopWorkspaceModel) {
+        guard !model.updatingTask else { return }
+        model.updatingTask = true
+        model.resultSelectionError = nil
+        Task {
+            defer { model.updatingTask = false }
+            do {
+                let tasks = Container.shared.applicationTasks()
+                if let instruction { try await tasks.correct(job.id, version: job.taskRevision, instruction: instruction) }
+                else { try await tasks.cancel(job.id, version: job.taskRevision) }
+                model.taskCorrection = ""
+            } catch { model.resultSelectionError = error.localizedDescription }
+            model.jobs = await Container.shared.dispatchJobs().history()
+            if model.selectedJob?.id == job.id { model.selectedJob = model.jobs.first { $0.id == job.id } }
+        }
+    }
 }
 
 @MainActor
@@ -36,12 +99,14 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
     @Injected(\.backend) private var backend
     @Injected(\.desktopFeedPreview) private var feedPreview
     @Injected(\.desktopEmailReader) private var emailReader
+    @Injected(\.applicationTasks) private var tasks
     private var feedbackSubmission: UserFeedback.Submission?
     private let hasMicrophone: @Sendable () -> Bool
     private weak var model: DesktopWorkspaceModel?
     private var checkingMicrophone = false
     private var loading = false
     private var refreshPending = false
+    private var pendingActions = Set<MailSelection>()
 
     init(hasMicrophone: @escaping @Sendable () -> Bool = { OnboardingAudioSession.hasInputDevice }) {
         self.hasMicrophone = hasMicrophone
@@ -86,12 +151,18 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
                 viewModel?.previewRefreshing = refreshing
             }
         feedback.$voiceReceipt.sink { [weak viewModel] in viewModel?.feedbackReceipt = $0 }
+        tasks.$revision.dropFirst().sink { [weak self, weak viewModel] _ in
+            guard let viewModel else { return }
+            self?.refresh(viewModel: viewModel)
+        }
         emailReader.$state.receive(on: DispatchQueue.main).sink { [weak self, weak viewModel] state in
             guard let self, let viewModel else { return }
             let request = viewModel.readerRequest(ownerID: self.backend.userId, headersOnly: MailHeadersOnly.withholdsBodies)
             viewModel.emailReader = state.request == request ? state : .idle
         }
         backend.$userId.dropFirst().receive(on: DispatchQueue.main).sink { [weak self, weak viewModel] _ in
+            viewModel?.selectedJob = nil
+            self?.tasks.select(nil)
             viewModel?.emailReader = .idle
             self?.emailReader.show(nil)
         }
@@ -118,8 +189,8 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
     }
 
     private func copySession(to model: DesktopWorkspaceModel) {
-        model.conversationID = realtime.activeConversationId
         model.profileID = ProfileRuntime.snapshot?.profileId
+        model.conversationID = realtime.activeConversationId
         if realtime.isConversing && !model.inSession { model.startedAt = Date() }
         if !realtime.isConversing { model.startedAt = nil }
         model.inSession = realtime.isConversing
@@ -149,6 +220,16 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
 
     func selectReturnedResult(_ id: UUID) {
         guard let model, !model.selectingResult else { return }
+        if !model.inSession {
+            guard let job = dispatchJobs.selectableResult(id, allowedAccounts: GoogleAccountStore.mailAccounts()), let origin = job.origin else {
+                model.resultSelectionError = "This source is not accessible in the current profile."
+                return
+            }
+            model.previewSelection = .email(account: origin.account, messageID: origin.messageID, subject: origin.subject, sender: origin.sender)
+            model.selectedJob = nil
+            updateReader(model)
+            return
+        }
         model.selectingResult = true
         model.resultSelectionError = nil
         Task { [weak self, weak model] in
@@ -163,8 +244,11 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
     func rendered(_ state: RenderedFeedState) { realtime.recordRenderedWorkspace(state) }
 
     func selectFeedItem(_ row: DesktopFeedRow) {
-        guard let model, !model.selectingFeedItem, !model.isCurrentRow(row),
+        guard let model, !model.isStartingFeed, !model.selectingFeedItem, !model.selectingResult,
               model.feedRows.contains(where: { $0.id == row.id }) else { return }
+        model.selectedJob = nil
+        tasks.select(nil)
+        guard !model.isCurrentRow(row) else { return }
         if !model.inSession {
             model.previewSelection = row
             model.feedSelectionError = nil
@@ -182,9 +266,82 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
     }
 
     func performFeedAction(_ action: LiveFastAction, context: FeedActionContext) {
-        guard let model else { return }
-        model.feedActionError = realtime.performFeedAction(action, context: context)
-        if model.feedActionError == nil { model.requestedActionContext = context }
+        guard let model, let origin = model.taskOrigin(context) else { return }
+        if let reason = tasks.refusal(owner: backend.userId, profile: context.profileID, origin: origin) {
+            model.feedActionError = reason
+            return
+        }
+        guard pendingActions.insert(context.selection).inserted else { return }
+        model.feedActionError = nil
+        model.requestedActionContext = context
+        let owner = backend.userId
+        Task { [self, weak model] in
+            defer { pendingActions.remove(context.selection) }
+            guard let model else { return }
+            if action != .next {
+                let result = await tasks.perform(name: action.rawValue,
+                    arguments: GmailReadTools.json(["account": origin.account, "message_id": origin.messageID]),
+                    profile: context.profileID, origin: origin, conversationID: context.conversationID)
+                guard owner == backend.userId, context.profileID == ProfileRuntime.snapshot?.profileId else { return }
+                if let effects = result.effects {
+                    _ = await mailQueue.applyConfirmedEffects(effects, store: Container.shared.mailStore())
+                }
+                guard result.ok == true, result.pendingArchive == nil, result.pendingDraft == nil, !result.deferred else {
+                    model.feedActionError = result.text
+                    refresh(viewModel: model)
+                    return
+                }
+                feedPreview.remove(context.selection)
+            }
+            guard model.profileID == context.profileID, model.conversationID == context.conversationID,
+                  model.renderedState.rawFocus == context.selection,
+                  model.renderedState.focus == context.selection else { refresh(viewModel: model); return }
+            if model.inSession {
+                model.feedActionError = await realtime.advanceDesktopFeed(context)
+                copySession(to: model)
+            } else {
+                let remaining = model.feedRows.filter { $0.selection != context.selection }
+                if let row = model.previewSelection { model.passedPreviewRows.insert(row.id) }
+                model.previewSelection = remaining.first
+                model.focus = nil
+                updateReader(model)
+            }
+            model.requestedActionContext = nil
+            refresh(viewModel: model)
+        }
+    }
+
+    func submitTask(_ text: String, commandID: String?, context: FeedActionContext) {
+        guard let model, !model.submittingTask, let origin = model.taskOrigin(context),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        do {
+            let job = try tasks.job(request: text, commandID: commandID, origin: origin, profile: context.profileID, preference: model.taskPreference)
+            model.submittingTask = true
+            model.showingActivity = true
+            model.feedActionError = nil
+            Task { [weak self, weak model] in
+                guard let self else { return }
+                let id = await tasks.submit(job)
+                guard let model else { return }
+                model.submittingTask = false
+                guard dispatchJobs.existing(id)?.context != nil else {
+                    model.feedActionError = (await tasks.result(id)).text
+                    return
+                }
+                if model.inSession { await realtime.parkAcceptedTask(id); copySession(to: model) }
+                else {
+                    model.jobs = await dispatchJobs.history()
+                    feedPreview.remove(context.selection)
+                    model.previewSelection = nil
+                    model.previewSelection = model.feedRows.first
+                }
+                model.taskText = ""
+                model.taskReceipt = dispatchJobs.existing(id)?.effectivePreference == .quiet
+                    ? "Task accepted · source saved in Activities · successful work will finish quietly"
+                    : "Task accepted · source saved in Activities · the result will return to the feed"
+                refresh(viewModel: model)
+            }
+        } catch { model.feedActionError = error.localizedDescription }
     }
 
     func exportDiagnostics() { exportSession(includeContent: false) }
@@ -233,7 +390,23 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
         }
     }
 
-    private func refresh(viewModel: DesktopWorkspaceModel) {
+    func refreshFeed() {
+        guard let model, !model.refreshingFeed, !model.previewRefreshing, !model.isStartingFeed else { return }
+        model.feedRefreshError = nil
+        if !model.inSession { refresh(viewModel: model, force: true); return }
+        let owner = backend.userId, profile = model.profileID, conversation = model.conversationID
+        model.refreshingFeed = true
+        Task { [weak self, weak model] in
+            guard let self, let model else { return }
+            defer { model.refreshingFeed = false }
+            let error = await mailQueue.refreshDesktopFeed(store: Container.shared.mailStore())
+            guard owner == backend.userId, profile == model.profileID, conversation == model.conversationID else { return }
+            model.feedRefreshError = error
+            refresh(viewModel: model)
+        }
+    }
+
+    private func refresh(viewModel: DesktopWorkspaceModel, force: Bool = false) {
         let scope = ProfileRuntime.snapshot
         let context = backend.userId.flatMap { owner in
             scope.flatMap { scope in scope.emails.map { emails in
@@ -241,7 +414,7 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
                     slackTeams: connections.status.slackTeamIDs.sorted(), sections: scope.feedSections)
             } }
         }
-        feedPreview.update(context: context, inSession: realtime.isConversing)
+        feedPreview.update(context: context, inSession: realtime.isConversing, force: force)
         guard !loading else { refreshPending = true; return }
         loading = true
         let profile = ProfileRuntime.snapshot?.profileId
@@ -273,7 +446,7 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
 
     func toggleSession() {
         if realtime.isConversing { realtime.endConversation() }
-        else { startSession() }
+        else { startSession(intent: model?.selectedJob == nil ? .feed : .quickAction) }
     }
     func quickAction() { startSession(intent: .quickAction) }
 

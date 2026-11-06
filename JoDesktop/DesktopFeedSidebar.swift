@@ -4,6 +4,7 @@ import SwiftUI
 struct DesktopFeedSidebar: View {
     @ObservedObject var viewModel: DesktopWorkspaceModel
     var select: (DesktopFeedRow) -> Void
+    var refresh: () -> Void
 
     var body: some View {
         let rows = viewModel.filteredQueue
@@ -11,9 +12,13 @@ struct DesktopFeedSidebar: View {
             HStack {
                 Text("Work feed").font(.system(size: 17, weight: .semibold))
                 Spacer()
-                if viewModel.selectingFeedItem || (!viewModel.inSession && viewModel.previewRefreshing) {
+                if viewModel.selectingFeedItem || viewModel.refreshingFeed || viewModel.previewRefreshing {
                     ProgressView().controlSize(.mini).accessibilityLabel("Refreshing work feed")
                 }
+                Button(action: refresh) { Image(systemName: "arrow.clockwise").frame(width: 26, height: 26) }
+                    .buttonStyle(.borderless).accessibilityLabel("Refresh feed")
+                    .accessibilityIdentifier("refreshDesktopFeed").help("Check for new work while keeping your place")
+                    .disabled(viewModel.refreshingFeed || viewModel.previewRefreshing || viewModel.isStartingFeed)
                 Text(viewModel.feedCountLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     .padding(.horizontal, 7).padding(.vertical, 3)
                     .background(Color.primary.opacity(0.05), in: Capsule())
@@ -26,7 +31,12 @@ struct DesktopFeedSidebar: View {
                 Text("Slack").tag("Slack")
                 Text("Calendar").tag("Calendar")
             }.pickerStyle(.menu).padding(.horizontal, 14).padding(.bottom, 12)
-            if !viewModel.inSession {
+            if viewModel.isStartingFeed {
+                Text("Starting session · keeping your place")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .padding(.horizontal, 18).padding(.bottom, 12)
+                    .accessibilityIdentifier("desktopFeedHandoff")
+            } else if !viewModel.inSession {
                 Text(viewModel.feedPreview?.incomplete == true
                      ? "Some sources couldn’t refresh. Showing available work; counts may be incomplete."
                      : "Inbox preview · refreshes every 2 min")
@@ -37,6 +47,22 @@ struct DesktopFeedSidebar: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 4) {
+                        if !viewModel.returnedTasks.isEmpty {
+                            Label("Returned work · \(viewModel.returnedTasks.count)", systemImage: "tray.and.arrow.down")
+                                .font(.caption.weight(.semibold)).padding(8)
+                            ForEach(viewModel.returnedTasks) { job in
+                                Button { viewModel.selectedJob = job } label: {
+                                    VStack(alignment: .leading, spacing: 5) {
+                                        Text(job.desktopStatusLabel).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                                        Text(job.task).font(.system(size: 13, weight: .medium)).lineLimit(2)
+                                        if let origin = job.origin { Text(origin.account).font(.caption).foregroundStyle(.secondary) }
+                                    }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(DesktopWorkspaceStyle.accent.opacity(viewModel.selectedJob?.id == job.id ? 0.16 : 0.07), in: RoundedRectangle(cornerRadius: 8))
+                                }.buttonStyle(.plain).accessibilityIdentifier("returnedTask_\(job.id)")
+                                    .disabled(viewModel.selectingResult)
+                            }
+                            Divider().padding(.vertical, 8)
+                        }
                         if rows.isEmpty {
                             feedEmptyState
                         }
@@ -54,7 +80,7 @@ struct DesktopFeedSidebar: View {
                                     .accessibilityIdentifier("feedSection_\(section.id)")
                             }
                             DesktopFeedRowButton(row: row, selected: viewModel.isCurrentRow(row)) { select(row) }
-                                .disabled(viewModel.selectingFeedItem)
+                                .disabled(viewModel.selectingFeedItem || viewModel.selectingResult || viewModel.isStartingFeed)
                                 .id(row.id)
                         }
                     }.padding(.horizontal, 10).padding(.bottom, 8)
@@ -65,6 +91,10 @@ struct DesktopFeedSidebar: View {
             }
             if let error = viewModel.feedSelectionError {
                 Text(error).font(.caption).foregroundStyle(.orange).padding(14)
+            }
+            if let error = viewModel.feedRefreshError {
+                Text(error).font(.caption).foregroundStyle(.orange).padding(14)
+                    .accessibilityIdentifier("feedRefreshError")
             }
             Divider().padding(.top, 12)
             Button { viewModel.showingHistory = true } label: {

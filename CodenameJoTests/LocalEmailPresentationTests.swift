@@ -57,9 +57,10 @@ final class LocalEmailPresentationTests: XCTestCase {
         XCTAssertTrue(attached.fromMe)
     }
 
-    func testSummaryKeepsWholeWordsWithinSpeechBudget() throws {
+    func testOversizedSummaryIsRejectedInsteadOfClippingAwayACondition() throws {
         XCTAssertEqual(try P.spokenSummary("  Short.  "), "Short.")
-        XCTAssertLessThanOrEqual(try P.spokenSummary(String(repeating: "Résumé ", count: 100)).utf8.count, 250)
+        XCTAssertThrowsError(try P.spokenSummary(String(repeating: "Résumé ", count: 100)))
+        XCTAssertThrowsError(try P.spokenSummary(String(repeating: "Meeting details. ", count: 16) + "Do not confirm yet."))
         XCTAssertThrowsError(try P.spokenSummary("   "))
     }
 

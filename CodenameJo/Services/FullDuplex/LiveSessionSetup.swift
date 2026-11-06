@@ -195,6 +195,9 @@ enum LiveSessionSetup {
                     (StandingRuleTool.run(argumentsJSON: call.arguments), false)
                 }
             },
+            PhoneTool(TaskManagementTool.schema) { client, call in
+                client.answerSettingsTool(callId: call.id, tool: call.name) { await TaskManagementTool.run(call.arguments) }
+            },
             PhoneTool(s.logFeedback) { client, call in
                 let feedback = Container.shared.userFeedback()
                 let submission = feedback.capture()
@@ -290,6 +293,7 @@ enum LiveSessionSetup {
         if !(interactiveCoaching && request.dispatch) { add("web_search") }
         add("set_rule")
         add(UserFeedbackTool.name)
+        add("manage_task")
         add("feed_items")
         if localCoachingDelivery { add("coach_capability") }
         for name in ["list_profiles", "switch_profile", "create_profile", "rename_profile",

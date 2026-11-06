@@ -14,11 +14,21 @@ struct CommandAction: Codable, Hashable, Sendable {
     var tool: String
     var detail: String
     var resolvedLabel: ResolvedLabel? = nil
+    var definition: CommandAction {
+        var value = self
+        value.resolvedLabel?.mappings = nil
+        value.resolvedLabel?.scope = resolvedLabel?.effectiveScope
+        return value
+    }
 
     struct ResolvedLabel: Codable, Hashable, Sendable {
+        enum Scope: String, Codable, CaseIterable, Sendable { case allInboxes, savedAccount }
         var id: String
         var name: String
         var account: String
+        var scope: Scope? = nil
+        var mappings: [String: String]? = nil
+        var effectiveScope: Scope { scope ?? .allInboxes }
     }
 
     /// The step as a line of text, for the tool's answer.

@@ -265,6 +265,7 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
             let initial = [partial ? label : .init(tool: "label_message", detail: "wrong name"), archive]
             var job = commandJob(steps: initial)
             job.command = .init(keyword: "follow up", actions: initial)
+            _ = await Container.shared.customCommands().save(keyword: "follow up", label: "", actions: initial)
             let failed = await DispatchWorker.run(job) { body in
                 let name = (body["tool_choice"] as? [String: Any])?["name"] as? String ?? "unknown"
                 let id = name == "archive_message" ? "booking-b" : "invite-a"
@@ -277,6 +278,7 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
             XCTAssertEqual(stopped.origin?.messageID, "invite-a")
             XCTAssertEqual(stopped.command?.completedSteps, partial ? 1 : 0)
             let saved = CustomCommand(id: "follow", keyword: "follow up", spoken: "Follow up", instruction: "", actions: [label, archive], enabled: true)
+            _ = await Container.shared.customCommands().save(keyword: "follow up", label: "", actions: saved.actions)
             let plan = try stopped.commandRetry(using: saved, profileID: nil, accounts: ["owner@example.test"])
             var resumed = commandJob(steps: Array(saved.actions.dropFirst(plan.completedSteps)))
             resumed.command = plan
@@ -362,7 +364,10 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
     func testSavedCommandExecutesEveryStoredStepWithoutAnExtraReceiptRound() async {
         let steps: [CommandAction] = [.init(tool: "label_message", detail: "follow up", resolvedLabel: .init(id: "Label_42", name: "#Followup", account: "owner@example.test")), .init(tool: "archive_message", detail: "this")]
         var names: [String] = []
-        let result = await DispatchWorker.run(commandJob(steps: steps)) { body in
+        _ = await Container.shared.customCommands().save(keyword: "follow up", label: "", actions: steps)
+        var job = commandJob(steps: steps)
+        job.command = .init(keyword: "follow up", actions: steps)
+        let result = await DispatchWorker.run(job) { body in
             let name = (body["tool_choice"] as? [String: Any])?["name"] as? String ?? "unexpected"
             names.append(name)
             return [["type": "function_call", "name": name, "call_id": "step-\(names.count)", "arguments": ##"{"message_id":"invite-a","account":"owner@example.test","label":"wrong name"}"##]]
@@ -650,6 +655,7 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
             let restarted = CustomCommandStore()
             await restarted.refresh()
             var job = commandJob(steps: try XCTUnwrap(restarted.commands.first?.actions))
+            job.command = .init(keyword: "follow up", actions: job.commandSteps ?? [])
             job.standingOnJSON = GmailReadTools.json(["id": message, "account": "owner@example.test",
                                                     "from": "sender@example.test", "threadId": message])
             var names: [String] = []

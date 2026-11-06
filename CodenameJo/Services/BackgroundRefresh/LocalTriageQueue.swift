@@ -118,6 +118,105 @@ actor LocalTriageQueue {
     }
     private var lastDesktopSnapshot: DesktopSnapshot?
     private var selectedSupplement: DesktopFeedRow?
+    private var refreshingDesktopFeed = false
+
+    /// Refresh prepared work without advancing, replacing the current item, or replaying actions.
+    func refreshDesktopFeed(store: MailStore) async -> String? {
+        guard !refreshingDesktopFeed else { return nil }
+        guard !mailboxUpdateInFlight, queueBuildsInFlight == 0 else {
+            return "The feed is changing. Try refreshing again in a moment."
+        }
+        refreshingDesktopFeed = true
+        defer { refreshingDesktopFeed = false }
+        refreshConfiguredSections()
+        let gen = generation, lifetime = reconciliationLifetime
+        let profile = ProfileRuntime.snapshot
+        func stillCurrent() -> Bool {
+            let current = ProfileRuntime.snapshot
+            return generation == gen && reconciliationLifetime == lifetime && current?.profileId == profile?.profileId
+                && current?.emails == profile?.emails && current?.membershipRevision == profile?.membershipRevision
+                && current?.feedSections == profile?.feedSections
+        }
+        var incomplete = false
+        if let plan = sectionState.plan {
+            await sectionState.preparation?.value
+            guard stillCurrent() else { return "The feed changed during refresh. Try again." }
+            var refreshedMailboxes: [String: Bool] = [:]
+            for section in plan where section.enabled && section.isMail {
+                if feedSectionLoader == nil {
+                    let account = (section.account ?? "").lowercased()
+                    if refreshedMailboxes[account] == nil {
+                        let page = await TriageMailSource.livePage(before: nil, scope: .all,
+                            accounts: [account], grouping: grouping, store: store,
+                            unreadOpeningLoader: unreadOpeningLoader, cached: { _ in })
+                        guard stillCurrent() else { return "The feed changed during refresh. Try again." }
+                        if case .success(_, _, let complete) = page { refreshedMailboxes[account] = complete }
+                        else { refreshedMailboxes[account] = false }
+                    }
+                    guard refreshedMailboxes[account] == true else { incomplete = true; continue }
+                }
+                let page = await loadFeedSection(section, store: store)
+                guard stillCurrent() else { return "The feed changed during refresh. Try again." }
+                guard !page.stage.stalled else { incomplete = true; continue }
+                let fresh = desktopRefreshEligible(page.stage.items)
+                if section.id == sectionState.active?.id {
+                    appendPage(fresh)
+                    total = max(total, items.reduce(0) { $0 + count($1) })
+                    stalled = false
+                } else {
+                    var stage = page.stage
+                    stage.items = fresh
+                    sectionState.prepared[section.id] = .init(stage: stage, band: page.band,
+                        score: page.score, beforeID: page.beforeID, preparedAt: page.preparedAt)
+                    if !fresh.isEmpty { sectionState.completed.remove(section.id) }
+                }
+            }
+        } else if running {
+            let page = await livePage(before: nil, store: store, scope: scope)
+            guard stillCurrent() else { return "The feed changed during refresh. Try again." }
+            if case .success(let incoming, _, let complete) = page {
+                appendPage(desktopRefreshEligible(incoming))
+                total = max(total, items.reduce(0) { $0 + count($1) })
+                incomplete = !complete
+                if complete { stalled = false }
+            } else { incomplete = true }
+        }
+        if dynamicSlackFeed {
+            let loaded = await SlackQueueRefresh.fetch(trigger: "desktop_refresh", scope: profile)
+            guard stillCurrent() else { return "The feed changed during refresh. Try again." }
+            if let loaded, let queue = loaded.queue {
+                slackFeedPrefetched = (profile?.profileId, loaded)
+                await Container.shared.localSlack().mergeDesktopRefresh(queue)
+                let report = queue.report
+                incomplete = incomplete || !(report.workspacesUnavailable ?? []).isEmpty
+                    || report.unchecked > 0 || report.unreachable > 0 || report.readStateUnknown > 0 || report.dmsUnavailable == true
+            } else { incomplete = true }
+        }
+        if sectionState.plan?.contains(where: { $0.enabled && $0.kind == .calendar }) == true {
+            let granted = GoogleAccountStore.all().filter { GoogleCredential.calendarScopes.allSatisfy($0.scopes.contains) }.map(\.email)
+            let accounts = ProfileRuntime.allowedMailAccounts(granted)
+            if !accounts.isEmpty {
+                let agenda = await CalendarSearch.feedAgenda(accounts: accounts,
+                    store: CalendarStore(database: Container.shared.localContext().dbPool), forceRefresh: true)
+                guard stillCurrent() else { return "The feed changed during refresh. Try again." }
+                if let agenda, agenda.successful { calendarAgendaPrepared = agenda; calendarAgendaPrefetch = Task { agenda } }
+                else { incomplete = true }
+            }
+        }
+        guard stillCurrent() else { return "The feed changed during refresh. Try again." }
+        await checkpoint(store: store)
+        await preparationChanged?()
+        return incomplete ? "Some sources couldn’t refresh. Your place and available work are kept. Try again." : nil
+    }
+
+    private func desktopRefreshEligible(_ incoming: [Item]) -> [Item] {
+        Self.gmailEligible(incoming, dealtWithThisWalk: gmailWalkDealtWith.union(dealtAt.keys)
+            .union(dispatchSweepIDs).union(navigationSuppressedIDs)).compactMap { item in
+            item.keeping(item.conversation.filter { member in
+                !pendingArchives.contains { $0.matches(account: item.account, ids: [member.id], threadId: member.threadId ?? item.threadId) }
+            })
+        }
+    }
     private var desktopSelectionError: String?
     private var preferredDesktopOpening: (row: DesktopFeedRow, profileID: String?)?
 
@@ -157,7 +256,7 @@ actor LocalTriageQueue {
         var seen = Self.messageKeys(current)
         let upcoming = future.compactMap { item in
             item.keeping(item.conversation.filter {
-                !gmailWalkDealtWith.union(navigationExcludedIDs).contains(Self.messageKey(account: item.account, id: $0.id))
+                !gmailWalkDealtWith.union(navigationSuppressedIDs).contains(Self.messageKey(account: item.account, id: $0.id))
                     && seen.insert(Self.messageKey(account: item.account, id: $0.id)).inserted
             })
         }
@@ -187,7 +286,7 @@ actor LocalTriageQueue {
                 rows = prepared.compactMap { item in
                     guard let kept = item.keeping(item.conversation.filter({ member in
                         let key = Self.messageKey(account: item.account, id: member.id)
-                        return !gmailWalkDealtWith.union(navigationExcludedIDs).contains(key) && seen.insert(key).inserted
+                        return !gmailWalkDealtWith.union(navigationSuppressedIDs).contains(key) && seen.insert(key).inserted
                     })) else { return nil }
                     return .email(account: kept.account, messageID: kept.id, subject: kept.subject,
                                   sender: kept.from, reason: kept.importanceWhy, section: section)
@@ -336,6 +435,48 @@ actor LocalTriageQueue {
     private var earlierStages: [NavigationStage] = []
     private var laterStages: [NavigationStage] = []
     private var navigationExcludedIDs: Set<String> = []
+    private var taskOwnedIDs: Set<String> = []
+    private var navigationSuppressedIDs: Set<String> { navigationExcludedIDs.union(taskOwnedIDs) }
+    private var taskResultVersions = Set<String>()
+    private var taskOwnershipScope = ""
+    private var suppressedTaskResult: UUID?
+
+    private func refreshTaskOwnership() async {
+        let snapshot = await MainActor.run { (Container.shared.backend().userId, ProfileRuntime.snapshot?.profileId) }
+        let taskStore = await MainActor.run { Container.shared.dispatchJobs() }
+        let jobs = await taskStore.history()
+        let current = await MainActor.run { (Container.shared.backend().userId, ProfileRuntime.snapshot?.profileId) }
+        guard snapshot == current else { return }
+        let scope = (snapshot.0 ?? "") + ":" + (snapshot.1 ?? "default")
+        if scope != taskOwnershipScope { taskResultVersions = []; taskOwnershipScope = scope }
+        taskOwnedIDs = Set(jobs.filter(\.ownsFeedSource).compactMap { $0.sourceSelection }.map {
+            Self.messageKey(account: $0.account, id: $0.messageID)
+        })
+        let pending = jobs.filter { $0.ownsFeedSource && $0.needsReview && $0.id != suppressedTaskResult }
+        let versions = Set(pending.map { $0.id.uuidString + ":" + String($0.taskRevision) })
+        for account in Array(pausedOutcomes.keys) {
+            pausedOutcomes[account]?.removeAll { $0.taskRevision != nil }
+        }
+        outcomes.removeAll { outcome in
+            outcome.taskRevision.map { !versions.contains(outcome.jobId.uuidString + ":" + String($0)) } ?? false
+        }
+        for job in pending.sorted(by: { ($0.completedAt ?? .distantPast) < ($1.completedAt ?? .distantPast) }) {
+            let version = job.id.uuidString + ":" + String(job.taskRevision)
+            guard !taskResultVersions.contains(version), !outcomes.contains(where: { $0.jobId == job.id }),
+                  let origin = job.origin, let receipt = job.spokenReceipt else { continue }
+            outcomes.append(.init(jobId: job.id, task: job.task, text: receipt, ok: job.isDone,
+                expects: .answer, about: origin.about, taskRevision: job.taskRevision, taskState: job.state))
+        }
+    }
+
+    func parkTaskSource(_ job: DispatchJob, store: MailStore) async -> String? {
+        guard job.ownsFeedSource, let source = job.origin,
+              job.profileId == ProfileRuntime.snapshot?.profileId,
+              standingOn(messageId: source.messageID, account: source.account) else { return nil }
+        suppressedTaskResult = job.id
+        defer { suppressedTaskResult = nil }
+        return await step(.init(direction: "next", defersCoaching: true), store: store, dealtWith: false).output
+    }
     /// Dispatched jobs that have come back, oldest first. One is served per step and the
     /// cursor does not move for it — see `hold` and `step`.
     private var outcomes: [Outcome] = []
@@ -604,7 +745,7 @@ actor LocalTriageQueue {
 
     private func navigableItem(_ item: Item, scope: Scope, grouping: Bool) -> Item? {
         guard let retained = item.keeping(item.conversation.filter({ member in
-            !navigationExcludedIDs.contains(
+            !navigationSuppressedIDs.contains(
                 Self.messageKey(account: item.account, id: member.id))
                 && !pendingArchives.contains {
                     $0.matches(account: item.account, ids: [member.id], threadId: member.threadId ?? item.threadId)
@@ -1051,24 +1192,24 @@ actor LocalTriageQueue {
     /// Where the queue is, or nil when none is running. Read by the chip.
     var progress: Progress? {
         guard !suppressesMailSelection else { return nil }
-        if let presented = actionOutcome, !running {
+        if let presented = actionOutcome {
             return Progress(account: presented.about.account, position: 1, queued: 1, remaining: 1,
                 done: false, displayPosition: nil, displayQueued: nil, displayRemaining: nil,
                 messageId: presented.messageId, threadId: presented.threadId)
         }
         guard rankedOverview == nil, running else { return nil }
         return Progress(
-            account: actionOutcome?.about.account ?? activeAccount ?? snapshotAccount ?? items.first?.account,
+            account: items.indices.contains(position - 1) ? items[position - 1].account : activeAccount ?? snapshotAccount,
             position: messageOrdinal,
-            queued: items.reduce(0) { $0 + count($1) },
+            queued: ordinalOffset + items.reduce(0) { $0 + count($1) },
             remaining: items.dropFirst(max(0, position - 1)).reduce(0) { $0 + count($1) },
             done: position > items.count && !more,
             displayPosition: topicGrouping && scope == .unread ? position : nil,
             displayQueued: topicGrouping && scope == .unread ? items.count : nil,
             displayRemaining: topicGrouping && scope == .unread
                 ? items.dropFirst(max(0, position - 1)).count : nil,
-            messageId: actionOutcome?.messageId ?? (items.indices.contains(position - 1) ? items[position - 1].id : nil),
-            threadId: actionOutcome?.threadId ?? (items.indices.contains(position - 1) ? items[position - 1].threadId : nil)
+            messageId: items.indices.contains(position - 1) ? items[position - 1].id : nil,
+            threadId: items.indices.contains(position - 1) ? items[position - 1].threadId : nil
         )
     }
 
@@ -1133,7 +1274,7 @@ actor LocalTriageQueue {
             if feedSectionLoader != nil { inbox = Set(item.ids) }
             else if let found = await store.inboxIds(among: item.ids, account: item.account) { inbox = found }
             else { return nil }
-            let excluded = gmailWalkDealtWith.union(navigationExcludedIDs).union(dealtAt.keys)
+            let excluded = gmailWalkDealtWith.union(navigationSuppressedIDs).union(dealtAt.keys)
             if let valid = item.keeping(item.conversation.filter {
                 inbox.contains($0.id) && !excluded.contains(Self.messageKey(account: item.account, id: $0.id))
             }) { kept.append(valid) }
@@ -1385,6 +1526,7 @@ actor LocalTriageQueue {
         _ input: Input, store: MailStore,
         startsNewSession: Bool = false, dealtWith finishesCurrent: Bool = true
     ) async -> (output: String, served: Served) {
+        await refreshTaskOwnership()
         #if targetEnvironment(macCatalyst)
         if selectedSupplement != nil {
             selectedSupplement = nil
@@ -2332,7 +2474,7 @@ actor LocalTriageQueue {
         // Everything unread still holds will be dealt with by the crossing, so a page of only
         // that is a page `pageRun` would skip — keep going, as it would.
         let walked = Self.messageKeys(items).union(gmailWalkDealtWith)
-            .union(dispatchSweepIDs).union(navigationExcludedIDs)
+            .union(dispatchSweepIDs).union(navigationSuppressedIDs)
         let pages = await TriageQueueBuilder.inboxAheadPages(walked: walked, budget: Self.gmailPageBudget, minimumItems: Self.refillTarget) { before in
             await self.livePage(before: before, store: store, scope: next)
         }
@@ -2361,7 +2503,7 @@ actor LocalTriageQueue {
             before = next
         }
         let walked = Self.messageKeys(items).union(gmailWalkDealtWith)
-            .union(dispatchSweepIDs).union(navigationExcludedIDs)
+            .union(dispatchSweepIDs).union(navigationSuppressedIDs)
         return Array(grouped(Self.gmailEligible(live, dealtWithThisWalk: walked)).prefix(n))
     }
 
@@ -2444,7 +2586,7 @@ actor LocalTriageQueue {
         // advance: no coaching count, read mark or cursor move. Only the head, so FIFO holds; not on "back".
         if !goingBack, let waiting = outcomes.first, waiting.presents {
             _ = takeOneOutcome()
-            let mail = items.first { $0.id == waiting.about?.id }
+            let mail = items.first { $0.id == waiting.about?.id && $0.account.lowercased() == waiting.about?.account.lowercased() }
             if let about = waiting.about {
                 actionOutcome = ActionOutcome(
                     about: about,
@@ -2768,7 +2910,7 @@ actor LocalTriageQueue {
             let eligible = Self.excludingSummarizedReadThreads(Self.gmailEligible(
                 fresh,
                 dealtWithThisWalk: finished.union(dispatchSweepIDs)
-                    .union(navigationExcludedIDs)), keys: summarizedReadThreads)
+                    .union(navigationSuppressedIDs)), keys: summarizedReadThreads)
             let dealt = fresh.count - eligible.count
             if dealt > 0 {
                 RealtimeLog.log(
@@ -3494,6 +3636,9 @@ actor LocalTriageQueue {
     /// to serve them one at a time.
     private func takeOutcomes() -> [Outcome] {
         defer {
+            for outcome in outcomes {
+                if let revision = outcome.taskRevision { taskResultVersions.insert(outcome.jobId.uuidString + ":" + String(revision)) }
+            }
             served.append(contentsOf: outcomes.map(\.jobId))
             outcomes = []
         }
@@ -3505,6 +3650,7 @@ actor LocalTriageQueue {
     private func takeOneOutcome() -> Outcome? {
         guard !outcomes.isEmpty else { return nil }
         let landed = outcomes.removeFirst()
+        if let revision = landed.taskRevision { taskResultVersions.insert(landed.jobId.uuidString + ":" + String(revision)) }
         served.append(landed.jobId)
         return landed
     }
@@ -4363,6 +4509,13 @@ actor LocalTriageQueue {
         }
 #endif
         var item = items[position - 1]
+        if item.conversation.contains(where: { taskOwnedIDs.contains(Self.messageKey(account: item.account, id: $0.id)) }) {
+            guard let remaining = item.keeping(item.conversation.filter {
+                !taskOwnedIDs.contains(Self.messageKey(account: item.account, id: $0.id))
+            }) else { return await advance(.init(direction: "next"), store: store, dealtWith: false).0 }
+            items[position - 1] = remaining
+            item = remaining
+        }
         if topicGrouping, !preparingDailySnapshot { presentedTopicKeys.formUnion(Self.messageKeys([item])) }
         if onboardingExcludedThreads.contains("\(item.account):\(item.threadId)") {
             return await advance(Input(), store: store, dealtWith: false).0
@@ -4779,7 +4932,7 @@ actor LocalTriageQueue {
         let incoming = batches.flatMap { $0.map(Self.liveItem(from:)) }
         let fullPage = batches.contains { $0.count >= Self.pageSize }
         let held = Self.messageKeys(items).union(gmailWalkDealtWith)
-            .union(dispatchSweepIDs).union(navigationExcludedIDs)
+            .union(dispatchSweepIDs).union(navigationSuppressedIDs)
         let eligible = Self.gmailEligible(incoming, dealtWithThisWalk: held).filter { item in
             !pendingArchives.contains { $0.matches(account: item.account, ids: item.ids, threadId: item.threadId) }
         }
@@ -4869,7 +5022,7 @@ actor LocalTriageQueue {
             let arrivals = await store.unreadPage(before: nil, limit: Self.pageSize,
                 account: activeAccount ?? snapshotAccount, importanceOrder: true)
             let held = Self.messageKeys(items).union(gmailWalkDealtWith)
-                .union(dispatchSweepIDs).union(navigationExcludedIDs)
+                .union(dispatchSweepIDs).union(navigationSuppressedIDs)
             let candidates = arrivals.filter { row in
                 !held.contains(Self.messageKey(account: row.account, id: row.id))
                     && !pendingArchives.contains { $0.matches(account: row.account, ids: [row.id], threadId: row.threadId) }
@@ -4902,7 +5055,7 @@ actor LocalTriageQueue {
         }
         let siblings = await store.topicSiblings(of: rows)
         let held = Self.messageKeys(items).union(Self.messageKeys(page)).union(gmailWalkDealtWith)
-            .union(dispatchSweepIDs).union(navigationExcludedIDs).union(excluding)
+            .union(dispatchSweepIDs).union(navigationSuppressedIDs).union(excluding)
         let candidates = siblings.filter { row in
             !held.contains(Self.messageKey(account: row.account, id: row.id))
                 && !pendingArchives.contains { $0.matches(account: row.account, ids: [row.id], threadId: row.threadId) }

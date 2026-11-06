@@ -4,6 +4,7 @@ import Foundation
 
 /// What the transport tells the session client about.
 enum RealtimeSignal {
+    case liveButtonAction(String, LiveFastAction)
     case liveDelegation(String, userTurn: Int)
     case liveFunction(LiveSessionAdapter.Call)
     case liveFarewellFinished

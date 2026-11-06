@@ -217,17 +217,19 @@ final class EmailQueueSpeechContractTests: XCTestCase {
 
         // 450 bytes is where `LiveSessionAdapter` starts chunking at an arbitrary boundary.
         XCTAssertLessThanOrEqual(line.utf8.count, 450, "The line must ride a single append")
-        XCTAssertTrue(line.contains("First up, Latest Lee. What the message says."))
-        XCTAssertTrue(line.contains("What would you like to do with it?"))
+        XCTAssertTrue(line.contains("First up, Latest Lee. I don't have a reliable summary yet."))
+        XCTAssertFalse(line.contains("What the message says."))
+        XCTAssertFalse(line.contains("What would you like to do with it?"))
         XCTAssertTrue(line.contains("Untrusted mail"))
 
-        // A long snippet is trimmed to fit; the identity never is.
+        // An unprepared snippet is never recited or clipped into a purported summary.
         let padded = String(repeating: "x", count: 900)
         let longStep = "{\"done\":false,\"item\":{\"identity\":\"Latest Lee\","
             + "\"snippet\":\"\(padded)\"}}"
         let trimmed = try! XCTUnwrap(LiveSpokenStepContract.line(step: longStep, lead: "Next, "))
         XCTAssertLessThanOrEqual(trimmed.utf8.count, 450)
         XCTAssertTrue(trimmed.contains("Next, Latest Lee."))
+        XCTAssertFalse(trimmed.contains("xxx"))
 
         for unwordable in [
             #"{"done":false,"interstitial":"feed","item":{"identity":"A"}}"#,
@@ -238,6 +240,25 @@ final class EmailQueueSpeechContractTests: XCTestCase {
         ] {
             XCTAssertNil(LiveSpokenStepContract.line(step: unwordable, lead: "Next, "),
                          "The app must not word a step it cannot: \(unwordable)")
+        }
+    }
+
+    func testMissingSummaryNeverReadsFootersHeadersAddressesOrClippedBodies() throws {
+        let snippets = [
+            "Done. Best, Pat. Subscribe to my publication! On Thu, 29 Oct at 13:00 -0400 Pat <pat@example.test> wrote:",
+            "---------- Forwarded message --------- From: pat@example.test Subject: Previous note",
+            "<html><body>Okay.<footer>Unsubscribe <a href='https://example.test'>Tracking</a></footer></body></html>",
+            "", String(repeating: "これは途中で切ってはいけない文です。", count: 200)
+        ]
+        for name in ["Pat <pat@example.test>", "pat@example.test", String(repeating: "長い名前", count: 100)] {
+            for snippet in snippets {
+                let data = try JSONSerialization.data(withJSONObject: ["done": false, "item": ["identity": name, "snippet": snippet]])
+                let line = try XCTUnwrap(LiveSpokenStepContract.line(step: String(decoding: data, as: UTF8.self), lead: "Next, "))
+                XCTAssertLessThanOrEqual(line.utf8.count, 450)
+                XCTAssertTrue(line.contains("I don't have a reliable summary yet."))
+                for unwanted in ["@", "Subscribe", "Forwarded", "<html>", "-0400", "これは"] { XCTAssertFalse(line.contains(unwanted), line) }
+                XCTAssertFalse(line.contains("What would you like to do with it?"))
+            }
         }
     }
 

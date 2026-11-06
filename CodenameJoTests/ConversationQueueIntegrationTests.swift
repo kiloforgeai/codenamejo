@@ -39,6 +39,60 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         }
     }
 
+    func testResumedPassCounterIncludesPrunedPrefixAndSurvivesResultAndArchive() async throws {
+        let fixture = try StoreFixture()
+        defer { fixture.close() }
+        UserDefaults.standard.set(false, forKey: ThreadQueue.storageKey)
+        let rows = (1...5).map { row("mail-\($0)", thread: "thread-\($0)", date: Int64(100 - $0), sender: "Sender") }
+        try await fixture.seed(rows, unread: Set(rows.map(\.id)))
+        try await saveSnapshot(rows.map(item), store: fixture.store, grouping: false, ordinalOffset: 9)
+        let queue = makeQueue()
+        let first = await queue.step(.init(scope: .unread), store: fixture.store)
+        let initialValue = await queue.progress
+        let initial = try XCTUnwrap(initialValue)
+        XCTAssertEqual(initial.position, 10)
+        XCTAssertEqual(initial.queued, 14)
+        await assertRenderedCounter(first.output, queue: queue, position: 10, total: 14)
+        let returned = LocalTriageQueue.Outcome(jobId: UUID(), task: "Research", text: "Done", ok: true,
+            expects: .answer, about: .init(account: account, id: "result", threadId: "result", from: "Sender", subject: "Result"))
+        let output = await queue.selectReturnedResult(returned, profileID: nil)
+        let returnedProgress = await queue.progress
+        XCTAssertEqual(returnedProgress?.position, 1)
+        XCTAssertEqual(returnedProgress?.queued, 1)
+        await assertRenderedCounter(try XCTUnwrap(output), queue: queue, position: nil, total: nil)
+        let resumed = await queue.step(.init(), store: fixture.store, dealtWith: false)
+        await assertRenderedCounter(resumed.output, queue: queue, position: 10, total: 14)
+        let effect = GmailWriteEffect(account: account, scope: "message", threadId: "thread-1", messageIds: ["mail-1"],
+            messageIdsComplete: true, operation: "modify", removeLabelIds: ["INBOX"])
+        _ = await queue.applyConfirmedEffects([effect], store: fixture.store)
+        let next = await queue.step(.init(), store: fixture.store, dealtWith: true)
+        let after = await queue.progress
+        XCTAssertEqual(after?.messageId, "mail-2")
+        XCTAssertGreaterThanOrEqual(after?.queued ?? 0, after?.position ?? 1)
+        await assertRenderedCounter(next.output, queue: queue, position: after?.position, total: after?.queued)
+        await queue.end()
+    }
+
+    private func assertRenderedCounter(_ output: String, queue: LocalTriageQueue, position: Int?, total: Int?,
+                                       file: StaticString = #filePath, line: UInt = #line) async {
+        #if targetEnvironment(macCatalyst)
+        let progress = await queue.progress
+        var tracker = FeedFocusTracker()
+        let model = DesktopWorkspaceModel()
+        model.inSession = true
+        model.focus = tracker.applyTriage(output: output, progress: progress)
+        model.sessionFeed = DesktopSessionFeed(mail: await queue.desktopSnapshot())
+        let state = model.renderedState
+        XCTAssertFalse(state.transitioning, file: file, line: line)
+        XCTAssertEqual(state.position, position, file: file, line: line)
+        XCTAssertEqual(state.total, total, file: file, line: line)
+        if let position = state.position, let total = state.total {
+            XCTAssertGreaterThanOrEqual(position, 1, file: file, line: line)
+            XCTAssertLessThanOrEqual(position, total, file: file, line: line)
+        }
+        #endif
+    }
+
     func testAnnotatedYesThroughAdapterConsumesOneOfferAndPresentsFirstQueueItem() async throws {
         let fixture = try StoreFixture()
         defer { fixture.close() }
@@ -618,6 +672,8 @@ final class ConversationQueueIntegrationTests: XCTestCase {
             let next = await queue.step(.init(), store: fixture.store, dealtWith: true)
             XCTAssertEqual(try current(next.output)["id"] as? String, "mail-\(index)")
             XCTAssertEqual(try object(next.output)["position"] as? Int, index)
+            let progress = await queue.progress
+            await assertRenderedCounter(next.output, queue: queue, position: progress?.position, total: progress?.queued)
         }
         await queue.end()
     }
@@ -1085,6 +1141,22 @@ final class ConversationQueueIntegrationTests: XCTestCase {
 
         XCTAssertEqual(seen, ["urgent", "bulk"], "the top band opens the walk and the bulk follows")
         XCTAssertEqual(last["done"] as? Bool, true, "and reaching the end closes the queue")
+        await queue.end()
+    }
+
+    func testQueueCanInitializeAnUnresolvedTaskStore() async throws {
+        let fixture = try StoreFixture()
+        defer { fixture.close() }
+        let path = fixture.directory.appendingPathComponent("tasks.json")
+        Container.shared.dispatchJobs.register {
+            MainActor.assumeIsolated { DispatchJobStore(url: path) }
+        }
+        defer { Container.shared.dispatchJobs.reset() }
+        let rows = [row("first", thread: "first", date: 20, sender: "Fixture")]
+        try await fixture.seed(rows, unread: ["first"])
+        let queue = makeQueue()
+        let step = await queue.step(.init(scope: .unread), store: fixture.store)
+        XCTAssertEqual(try current(step.output)["id"] as? String, "first")
         await queue.end()
     }
 
@@ -2440,11 +2512,11 @@ final class ConversationQueueIntegrationTests: XCTestCase {
     private func saveSnapshot(_ items: [LocalTriageQueue.Item], store: MailStore, grouping: Bool? = true,
                               handled: [String] = [], scope: String = "unread",
                               scopePlan: [String] = [],
-                              mailbox: String? = nil, position: Int = 1, band: String? = nil) async throws {
+                              mailbox: String? = nil, position: Int = 1, band: String? = nil, ordinalOffset: Int = 0) async throws {
         let mailbox = mailbox ?? account
         let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(items))
         var value: [String: Any] = [
-            "items": encoded, "accounts": [mailbox], "position": position, "more": false,
+            "items": encoded, "accounts": [mailbox], "position": position, "more": false, "ordinalOffset": ordinalOffset,
             "total": items.count, "mailboxUnreadAtStart": items.count, "scope": scope,
             "scopeUnsaid": false,
             "scopePlan": scopePlan, "adopted": false, "completed": false,

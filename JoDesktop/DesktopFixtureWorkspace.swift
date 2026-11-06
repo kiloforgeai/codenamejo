@@ -16,10 +16,20 @@ struct DesktopFixtureComponent {
             .appendingPathComponent("jo-fixture-\(UUID().uuidString).sqlite"))
         Container.shared.localContext.register { context }
         Container.shared.googleGrantStorage.register { FixtureGrants() }
+        Container.shared.googleTokenProvider.register { MainActor.assumeIsolated { FixtureTokens() } }
         Container.shared.providerHTTP.register { FixtureNoNetwork() }
         let jobs = DispatchJobStore(url: FileManager.default.temporaryDirectory
             .appendingPathComponent("jo-fixture-jobs-" + UUID().uuidString + ".json"))
         Container.shared.dispatchJobs.register { jobs }
+        let tasks = ApplicationTasks(request: { body in
+            let request = (body["input"] as? [[String: Any]])?.first?["content"] as? String ?? ""
+            if request.contains("pause fixture") { try await Task.sleep(for: .seconds(10)) }
+            let result = request.contains("input fixture")
+                ? #"{"status":"needs_input","report":"Which of the two synthetic dates should I use? No external action was taken."}"#
+                : "Synthetic task completed for the selected source. No external request was sent."
+            return [["type": "message", "content": [["type": "output_text", "text": result]]]]
+        })
+        Container.shared.applicationTasks.register { tasks }
         let realtime = RealtimeService()
         Container.shared.realtimeService.register { realtime }
         ProfileRuntime.install(nil)
@@ -54,6 +64,7 @@ struct DesktopFixtureView: View {
                     Button("Next") { interactor.next(delayProjection: false) }
                     Button("Archive fixture") { interactor.archive() }
                     Button("Delay projection") { interactor.next(delayProjection: true) }
+                    Button("Delay session startup") { interactor.delaySessionStartup() }
                     Button("Apply projection") { interactor.applyProjection() }
                     Button("Section feed") { interactor.sectionFeed() }
                     Button("Finish fixture") { interactor.finish() }
@@ -121,6 +132,13 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
     override func onLoad(viewModel: DesktopWorkspaceModel) -> [AnyCancellable] {
         super.onLoad(viewModel: viewModel)
         model = viewModel
+        Container.shared.applicationTasks().$revision.dropFirst().sink { [weak viewModel] _ in
+            Task { @MainActor in
+                guard let viewModel else { return }
+                viewModel.jobs = await Container.shared.dispatchJobs().history()
+                if let selected = viewModel.selectedJob { viewModel.selectedJob = viewModel.jobs.first { $0.id == selected.id } }
+            }
+        }
         viewModel.conversationID = runID
         client = FullDuplexVoiceClient(localContext: context, localTriage: queue)
         trace = log.begin(engine: "fixture", userID: "fixture-user")
@@ -139,6 +157,12 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
             _ = await Container.shared.customCommands().save(keyword: "research sender", label: "Find a company and summarize it",
                 actions: [.init(tool: "web_search", detail: "Look up the sender's company."),
                           .init(tool: "summarize", detail: "Give me the useful details.")])
+            _ = await Container.shared.customCommands().save(keyword: "summarize fixture", label: "Summarize the synthetic source",
+                actions: [.init(tool: "summarize", detail: "Summarize this synthetic source.")])
+            _ = await Container.shared.customCommands().save(keyword: "follow up fixture", label: "Label and archive the selected fixture",
+                actions: [.init(tool: "label_message", detail: "Apply Followup",
+                    resolvedLabel: .init(id: "fixture-label", name: "Followup", account: "qa@example.test")),
+                    .init(tool: "archive_message", detail: "Archive this email")])
             let now = Int64(Date().timeIntervalSince1970 * 1000)
             let rows = (1...40).map { index in
                 MailStore.Message(user_id: "fixture-user", id: "fixture-\(index)", account: "qa@example.test",
@@ -190,7 +214,7 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
     private func present(_ output: String, delayProjection: Bool) async {
         let progress = await queue.progress
         client.applyStep(output, progress: progress, standing: progress.map { ($0.position, $0.queued) },
-            served: [UUID()], dial: client.dialGeneration)
+            served: await queue.takeServedOutcomes(), dial: client.dialGeneration)
         let snapshot = await queue.desktopSnapshot()
         pendingProjection = snapshot
         if !delayProjection { applyProjection() }
@@ -211,6 +235,15 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
         pendingProjection = nil
     }
 
+    func delaySessionStartup() {
+        guard let model, !busy else { return }
+        model.conversationID = UUID()
+        model.inSession = true
+        Task {
+            if let step = client.standingStep { await present(step, delayProjection: true) }
+        }
+    }
+
     private func updateFixtureEmailReader() {
         guard let model else { return }
         if case .email(let email) = model.displayedFocus, let id = email.messageId {
@@ -218,15 +251,19 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
                 threadID: email.threadId, ownerID: "fixture-user", profileID: model.profileID,
                 conversationID: model.conversationID, headersOnly: false)
             let text = "FIRST MARKER · Complete synthetic email \(id).\n\n"
+                + "Email link: https://example.com/?jo-link-test=email\n\n"
                 + (1...30).map { "Paragraph \($0). This complete email remains readable while the conversation scrolls independently below it." }
                     .joined(separator: "\n\n")
                 + "\n\nOn Monday, the earlier sender wrote:\n> The original quoted reply stays visible.\n\nFINAL MARKER"
-            model.emailReader = .ready(request, .init(selectedID: id, messages: [
-                .init(id: "earlier-\(id)", from: "Earlier sender", to: email.account, cc: "", subject: email.subject,
-                      date: "Monday", text: "The complete earlier message in this synthetic thread.", attachments: [], error: nil),
-                .init(id: id, from: email.sender, to: email.account, cc: "", subject: email.subject,
-                      date: "Tuesday", text: text, attachments: ["Example.pdf"], error: nil)
-            ]))
+            do {
+                model.emailReader = .ready(request, .init(selectedID: id, messages: [
+                    .init(id: "earlier-\(id)", from: "Earlier sender", to: email.account, cc: "", subject: email.subject,
+                          date: "Monday", body: try DesktopEmailReader.linkedBody("The complete earlier message in this synthetic thread.\n\nThread link: https://example.com/?jo-link-test=thread"),
+                          attachments: [], error: nil),
+                    .init(id: id, from: email.sender, to: email.account, cc: "", subject: email.subject,
+                          date: "Tuesday", body: try DesktopEmailReader.linkedBody(text), attachments: ["Example.pdf"], error: nil)
+                ]))
+            } catch { model.emailReader = .failed(request, error.localizedDescription) }
         } else { model.emailReader = .idle }
     }
     func finish() {
@@ -253,10 +290,68 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
             return
         }
         model.requestedActionContext = context
+        if !model.inSession {
+            guard let origin = model.taskOrigin(context) else { return }
+            Task {
+                if action != .next {
+                    let result = await Container.shared.applicationTasks().perform(name: action.rawValue,
+                        arguments: GmailReadTools.json(["account": origin.account, "message_id": origin.messageID]),
+                        profile: context.profileID, origin: origin)
+                    guard result.ok == true else { model.feedActionError = result.text; return }
+                }
+                let rows = model.feedRows.filter { $0.selection != context.selection }
+                if let current = model.previewSelection { model.passedPreviewRows.insert(current.id) }
+                model.previewSelection = rows.first
+                updateFixtureEmailReader()
+                model.jobs = await Container.shared.dispatchJobs().history()
+                model.showingActivity = true
+                model.requestedActionContext = nil
+            }
+            return
+        }
         switch action {
         case .archive: archive()
         case .next: next(delayProjection: false)
         default: model.feedActionError = "This isolated fixture only simulates Archive and Next."
+        }
+    }
+
+    func submitTask(_ text: String, commandID: String?, context: FeedActionContext) {
+        guard let model, let origin = model.taskOrigin(context) else { return }
+        Task {
+            do {
+                let tasks = Container.shared.applicationTasks()
+                if text == "feedback archive fixture" {
+                    let id = UUID()
+                    try await tasks.deferFeedbackArchive(id: id, owner: Container.shared.backend().userId,
+                        profile: context.profileID, origin: origin, conversation: nil)
+                    model.taskText = ""
+                    model.taskReceipt = "Archive saved for after feedback"
+                    model.showingActivity = true
+                    model.jobs = await Container.shared.dispatchJobs().history()
+                    return
+                }
+                let job = try tasks.job(request: text, commandID: commandID, origin: origin, profile: context.profileID, preference: model.taskPreference)
+                let id = await tasks.submit(job)
+                if let accepted = Container.shared.dispatchJobs().existing(id),
+                   let step = await queue.parkTaskSource(accepted, store: mail) {
+                    await present(step, delayProjection: false)
+                }
+                model.taskText = ""
+                model.taskReceipt = "Task accepted · \(id.uuidString.prefix(8))"
+                model.showingActivity = true
+                model.jobs = await Container.shared.dispatchJobs().history()
+                _ = await tasks.result(id)
+                if text.contains("choice fixture") {
+                    let links = EmailLinkTool.links(html: #"<a href="https://events.example.test/morning">Morning workshop</a><a href="https://events.example.test/evening">Evening workshop</a>"#, text: "")
+                    if case .failure(let ambiguity) = EmailLinkTool.select(links, hint: "workshop") {
+                        let choices = EmailLinkTool.choices(in: ambiguity.text)
+                        _ = await Container.shared.dispatchJobs().requireChoice(id, revision: 1, choices: choices)
+                        await Container.shared.dispatchJobs().finish(id, state: "awaiting_input", result: "Which workshop page should I read? Reading does not submit an RSVP.", revision: 1)
+                    }
+                }
+                model.jobs = await Container.shared.dispatchJobs().history()
+            } catch { model.feedActionError = error.localizedDescription }
         }
     }
     func archive() {
@@ -337,6 +432,17 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
         }
         presenter.present(UIDocumentPickerViewController(forExporting: [folder], asCopy: true), animated: true)
     }
+    func refreshFeed() {
+        guard let model, !model.refreshingFeed else { return }
+        model.feedRefreshError = nil
+        model.refreshingFeed = true
+        Task {
+            model.feedRefreshError = await queue.refreshDesktopFeed(store: mail)
+            model.applySessionFeed(.init(mail: await queue.desktopSnapshot()))
+            model.refreshingFeed = false
+        }
+    }
+
     func selectReturnedResult(_ id: UUID) {
         guard let job = model?.jobs.first(where: { $0.id == id }), let origin = job.origin else { return }
         Task {
@@ -358,6 +464,8 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
     }
     func selectFeedItem(_ row: DesktopFeedRow) {
         guard !busy else { return }
+        model?.selectedJob = nil
+        Container.shared.applicationTasks().select(nil)
         model?.feedSelectionError = nil
         if model?.inSession == false {
             model?.previewSelection = row
@@ -383,12 +491,14 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
         if model.inSession {
             model.feedPreview = .init(mail: .init(rows: model.sessionFeed.rows, count: model.sessionFeed.rows.count), slack: .init())
             model.inSession = false
+            model.conversationID = nil
             model.focus = nil
             model.response = ""
             model.userWords = ""
             model.micLive = false
             model.startedAt = nil
         } else {
+            model.conversationID = runID
             model.inSession = true
             model.micLive = true
             model.startedAt = Date()
@@ -419,12 +529,30 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
 }
 
 private final class FixtureGrants: GoogleGrantStorage, @unchecked Sendable {
-    func all() -> [GoogleAccountStore.Grant] { [] }
+    func all() -> [GoogleAccountStore.Grant] {
+        ["qa@example.test", "second@example.test"].map { .init(email: $0, refreshToken: "fixture", scopes: ["https://www.googleapis.com/auth/gmail.modify"], grantedAt: Date(), isPrimary: $0.hasPrefix("qa")) }
+    }
     func save(_ grant: GoogleAccountStore.Grant) -> Bool { false }
     func remove(_ email: String) {}
     func removeAll() {}
 }
 private struct FixtureNoNetwork: HTTPDataTransport {
-    func data(for request: URLRequest) async throws -> (Data, URLResponse) { throw URLError(.notConnectedToInternet) }
+    func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        guard let url = request.url, url.host == "gmail.googleapis.com", url.path.contains("fixture-") || url.path.contains("thread-") else {
+            throw URLError(.notConnectedToInternet)
+        }
+        let parts = url.path.split(separator: "/")
+        let id = String(parts.last == "modify" ? parts.dropLast().last ?? "" : parts.last ?? "")
+        let number = id.split(separator: "-").last ?? "1"
+        let message: [String: Any] = ["id": "fixture-\(number)", "threadId": "thread-\(number)", "labelIds": ["INBOX"]]
+        let body: [String: Any] = url.path.contains("/threads/") ? ["id": "thread-\(number)", "messages": [message]] : message
+        return (try JSONSerialization.data(withJSONObject: body), HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+    }
+}
+@MainActor
+private final class FixtureTokens: GoogleTokenProvider {
+    func token(for email: String?, requiredScopes: [String]) async -> Result<GoogleCredential.Token, GoogleCredential.Failure> {
+        .success(.init(accessToken: "fixture", email: email ?? "qa@example.test", scopes: requiredScopes))
+    }
 }
 #endif

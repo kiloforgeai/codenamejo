@@ -195,9 +195,7 @@ final class LocalInbox {
         current = Email(step: output)
         let progress = await queue.progress
         standingOnJSON = await queue.standingOnJSON
-        onFocus?(tracker.applyTriage(output: output, queuePosition: progress?.position, queueTotal: progress?.queued,
-                                     displayPosition: progress?.displayPosition,
-                                     displayTotal: progress?.displayQueued))
+        onFocus?(tracker.applyTriage(output: output, progress: progress))
         Container.shared.triageQueue().applyLocal(progress)
         guard let current else { return "That's everything in your inbox for now." }
         return lead + (await summary(of: current, step: output))

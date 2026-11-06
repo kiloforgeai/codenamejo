@@ -73,14 +73,14 @@ enum LiveFastAction: String {
     /// so a feed that changed mid-turn is no reason to refuse them. Mail writes never belong here.
     static let feedIndependent: Set<String> = [
         "current_time", "list_calendar_events", "search_calendar", "coach_capability",
-        "set_rule", "web_search", "search_context", "save_context", "forget_context",
+        "manage_task", "set_rule", "web_search", "search_context", "save_context", "forget_context",
         "granola_list_meetings", "granola_get_meeting", "granola_action_items",
     ]
 
     static func allowsFollowup(name: String, arguments: String, step: String?) -> Bool {
         if feedIndependent.contains(name) || GitHubTools.readTools.contains(name)
             || CustomMCPTools.isCustomTool(name) { return true }
-        guard let step, let key = LiveEmailPresentation.Key.step(step),
+        guard let step, let key = LiveEmailPresentation.Key.selection(step),
               let args = try? JSONSerialization.jsonObject(with: Data(arguments.utf8)) as? [String: Any],
               (args["account"] as? String)?.lowercased() == key.account else { return false }
         if ["gmail_get_message", "get_message"].contains(name),
@@ -101,7 +101,7 @@ enum LiveFastAction: String {
 
         func matches(step: String?, profileId: String?, revision: Int) -> Bool {
             self.profileId == profileId && self.revision == revision
-                && step.flatMap(LiveEmailPresentation.Key.step) == key
+                && step.flatMap(LiveEmailPresentation.Key.selection) == key
         }
     }
 }

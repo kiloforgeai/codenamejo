@@ -2,9 +2,41 @@ import XCTest
 @testable import CodenameJo
 
 final class FeedFocusTests: XCTestCase {
+    func testApplyingAnOldStepCannotBorrowAnotherSelectionsCounter() throws {
+        var tracker = FeedFocusTracker()
+        let output = #"{"position":10,"item":{"id":"A","threadId":"tA","account":"work@example.com"}}"#
+        let next = LocalTriageQueue.Progress(account: "work@example.com", position: 1, queued: 5,
+            remaining: 5, done: false, messageId: "B", threadId: "tB")
+        let stale = try email(from: tracker.applyTriage(output: output, progress: next))
+        XCTAssertNil(stale.displayedPosition)
+        XCTAssertNil(stale.displayedTotal)
+        let current = LocalTriageQueue.Progress(account: "work@example.com", position: 10, queued: 14,
+            remaining: 5, done: false, messageId: "A", threadId: "tA")
+        let coherent = try email(from: tracker.refreshEmailProgress(current))
+        XCTAssertEqual(coherent.displayedPosition, 10)
+        XCTAssertEqual(coherent.displayedTotal, 14)
+        let empty = LocalTriageQueue.Progress(account: "work@example.com", position: 1, queued: 0,
+            remaining: 0, done: true, messageId: "A", threadId: "tA")
+        XCTAssertNil(try email(from: tracker.refreshEmailProgress(empty)).displayedTotal)
+    }
+
+    func testReturnedResultsAndProfileResetDoNotReusePassCounters() throws {
+        var tracker = FeedFocusTracker()
+        let progress = LocalTriageQueue.Progress(account: "work@example.com", position: 10, queued: 14,
+            remaining: 5, done: false, messageId: "A", threadId: "tA")
+        let output = #"{"presentedForOutcome":true,"position":10,"item":{"id":"A","threadId":"tA","account":"work@example.com"}}"#
+        let result = try email(from: tracker.applyTriage(output: output, progress: progress))
+        XCTAssertNil(result.displayedPosition)
+        XCTAssertNil(result.displayedTotal)
+        XCTAssertNil(try email(from: tracker.refreshEmailProgress(progress)).displayedTotal)
+        tracker.reset()
+        XCTAssertNil(tracker.refreshEmailProgress(progress))
+    }
+
     func testProgressFromAnotherMessageCannotRelabelTheCurrentCard() throws {
         var tracker = FeedFocusTracker()
-        _ = tracker.applyTriage(output: #"{"position":3,"item":{"id":"C","threadId":"thread-C","account":"work@example.com","subject":"Thanks"}}"#, queueTotal: 12)
+        _ = tracker.applyTriage(output: #"{"position":3,"item":{"id":"C","threadId":"thread-C","account":"work@example.com","subject":"Thanks"}}"#,
+            progress: .init(account: "work@example.com", position: 3, queued: 12, remaining: 10, done: false, messageId: "C", threadId: "thread-C"))
         let progress = LocalTriageQueue.Progress(account: "work@example.com", position: 4, queued: 20,
             remaining: 17, done: false, messageId: "D", threadId: "thread-D")
         let card = try email(from: tracker.refreshEmailProgress(progress))
@@ -21,11 +53,10 @@ final class FeedFocusTests: XCTestCase {
 
     func testBackgroundGroupingUpdatesCountWithoutReplacingCurrentCard() throws {
         var tracker = FeedFocusTracker()
-        _ = tracker.applyTriage(output: #"{"position":1,"item":{"account":"work@example.com","from":"Shop","subject":"Order"}}"#,
-                                queueTotal: 10)
+        _ = tracker.applyTriage(output: #"{"position":1,"item":{"id":"A","account":"work@example.com","from":"Shop","subject":"Order"}}"#)
         let progress = LocalTriageQueue.Progress(account: "work@example.com", position: 1,
             queued: 10, remaining: 10, done: false,
-            displayPosition: 1, displayQueued: 5, displayRemaining: 5)
+            displayPosition: 1, displayQueued: 5, displayRemaining: 5, messageId: "A")
         let card = try email(from: tracker.refreshEmailProgress(progress))
         XCTAssertEqual(card.subject, "Order")
         XCTAssertEqual(card.position, 1)
@@ -34,10 +65,10 @@ final class FeedFocusTests: XCTestCase {
 
     func testGroupedDisplayProgressOverridesMessageOrdinal() throws {
         var tracker = FeedFocusTracker()
-        let output = #"{"done":false,"position":6,"item":{"from":"Shop","subject":"Another order"}}"#
+        let output = #"{"done":false,"position":6,"item":{"id":"A","account":"work@example.com","from":"Shop","subject":"Another order"}}"#
         let card = try email(from: tracker.applyTriage(
-            output: output, queuePosition: 6, queueTotal: 6,
-            displayPosition: 2, displayTotal: 2))
+            output: output, progress: .init(account: "work@example.com", position: 6, queued: 6, remaining: 1,
+                done: false, displayPosition: 2, displayQueued: 2, messageId: "A")))
         XCTAssertEqual(card.position, 2)
         XCTAssertEqual(card.total, 2)
     }
@@ -45,9 +76,8 @@ final class FeedFocusTests: XCTestCase {
     func testActiveEmailUsesStructuredQueueItem() throws {
         var tracker = FeedFocusTracker()
         let focus = tracker.applyTriage(
-            output: #"{"done":false,"position":3,"item":{"account":"work@example.com","from":"Priya <priya@example.com>","subject":"Contract update","snippet":"I made the requested edit."}}"#,
-            queuePosition: 3,
-            queueTotal: 8)
+            output: #"{"done":false,"position":3,"item":{"id":"A","account":"work@example.com","from":"Priya <priya@example.com>","subject":"Contract update","snippet":"I made the requested edit."}}"#,
+            progress: .init(account: "work@example.com", position: 3, queued: 8, remaining: 6, done: false, messageId: "A"))
 
         let email = try email(from: focus)
         XCTAssertEqual(email.sender, "Priya <priya@example.com>")

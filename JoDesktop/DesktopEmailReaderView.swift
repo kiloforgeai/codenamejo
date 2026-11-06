@@ -77,7 +77,7 @@ struct DesktopEmailReaderView: View {
             Divider()
             if let reason = message.error { failure(reason) }
             else {
-                Text(message.text).font(.system(size: 16)).lineSpacing(5)
+                Text(message.body).font(.system(size: 16)).lineSpacing(5)
                     .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
                     .accessibilityIdentifier("fullEmailBody_\(message.id)")
             }

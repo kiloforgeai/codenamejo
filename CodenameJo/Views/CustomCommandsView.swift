@@ -8,10 +8,15 @@ struct CommandDraft: Identifiable {
         let original: CommandAction
         var tool: String
         var detail: String
-        init(_ action: CommandAction) { original = action; tool = action.tool; detail = action.detail }
+        var labelScope: CommandAction.ResolvedLabel.Scope
+        init(_ action: CommandAction) {
+            original = action; tool = action.tool; detail = action.detail
+            labelScope = action.resolvedLabel?.effectiveScope ?? .allInboxes
+        }
         var action: CommandAction {
-            .init(tool: tool, detail: detail,
-                  resolvedLabel: tool == original.tool && detail == original.detail ? original.resolvedLabel : nil)
+            var label = tool == original.tool && detail == original.detail ? original.resolvedLabel : nil
+            if label?.effectiveScope != labelScope { label?.scope = labelScope }
+            return .init(tool: tool, detail: detail, resolvedLabel: label)
         }
     }
     let id = UUID()
@@ -188,6 +193,14 @@ struct CustomCommandsView<Interactor: ViewWithModelLifecycleObserver<CustomComma
             }
             TextField("What should this step do?", text: step.detail, axis: .vertical)
                 .lineLimit(2...5).accessibilityLabel("Step instructions")
+            if let label = step.wrappedValue.action.resolvedLabel {
+                Picker("Inbox scope", selection: step.labelScope) {
+                    Text("All connected inboxes").tag(CommandAction.ResolvedLabel.Scope.allInboxes)
+                    Text("Only \(label.account)").tag(CommandAction.ResolvedLabel.Scope.savedAccount)
+                }.accessibilityIdentifier("commandLabelScope")
+                Text("“\(label.name)” is verified in the selected inbox before any command step runs.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }.padding(.vertical, 8)
     }
 
@@ -257,7 +270,13 @@ class CustomCommandsInteractor: ViewModelInteractor<CustomCommandsViewModel>, Cu
     @CancellableBuilder
     override func onViewAppear(viewModel: CustomCommandsViewModel) -> [AnyCancellable] {
         super.onViewAppear(viewModel: viewModel)
+        Container.shared.realtimeService().recordCommandPanel(open: true)
         Task { await store.refresh() }
+    }
+
+    override func onViewDisappear(viewModel: CustomCommandsViewModel) {
+        super.onViewDisappear(viewModel: viewModel)
+        Container.shared.realtimeService().recordCommandPanel(open: false)
     }
 
     private func currentScope(viewModel: CustomCommandsViewModel) -> CustomCommandStore.EditScope? {

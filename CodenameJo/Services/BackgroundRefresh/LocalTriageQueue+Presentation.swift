@@ -227,6 +227,10 @@ extension LocalTriageQueue {
             "dispatchOutcomeNote": presentNote + outcomeNaming,
         ]
         var job: [String: Any] = ["task": outcome.task, "outcome": outcome.text]
+        if let state = outcome.taskState {
+            job["state"] = state
+            payload["dispatchOutcomeNote"] = "This is one returned task result for the named source email. State and outcome below are authoritative. Present its result and any concrete blocker once. For completed informational work, ask whether the user wants to act on the source or continue; do not invent an approval requirement. For unfinished work, ask only for the missing input stated in the outcome. Do not repeat the task or introduce another email in this turn."
+        }
         if outcome.ok == false { job["unresolved"] = true }
         payload["dispatchOutcome"] = job
         return payload

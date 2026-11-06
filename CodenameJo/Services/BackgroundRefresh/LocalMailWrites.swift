@@ -195,8 +195,8 @@ enum LocalMailWrites {
         let existing = savedID.flatMap { id in labels.first { $0.id == id } }
             ?? (savedID == nil ? labels.first { $0.name.lowercased() == label.lowercased() }
                 ?? labels.first { $0.user && normalized($0.name) == normalized(label) } : nil)
-        if savedID != nil, existing == nil {
-            throw Refusal(text: "The command's saved label no longer exists on this account. Correct the command before running it again.")
+        if savedID != nil, existing?.user != true || existing?.name.caseInsensitiveCompare(label) != .orderedSame {
+            throw Refusal(text: "The command's saved label is missing or renamed in this account. Correct the command before running it again.")
         }
         if existing == nil, let refusal = similarRefusal(label, labels: labels, createNew: strictJSONBool(args["create_new"]) == true) {
             throw Refusal(text: refusal)

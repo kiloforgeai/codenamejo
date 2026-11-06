@@ -17,7 +17,8 @@ final class LiveSessionAdapterTests: XCTestCase {
         var brainSteps: [CommandRecord.BrainStep] = []
         var resets = 0
         var completedInputs: [String] = []
-        lazy var adapter = LiveSessionAdapter(wire: { [unowned self] in sent.append($0) }, emit: { [unowned self] in
+        lazy var adapter = LiveSessionAdapter(wire: { [weak self] in self?.sent.append($0) }, emit: { [weak self] in
+            guard let self else { return }
             if case .liveFunction(let call) = $0 { calls.append(call) }
             if case .liveQueueActionUnworked(let exhausted) = $0 { queueRecovery.append(exhausted) }
             if case .liveBackendIdle = $0 { idleCount += 1 }

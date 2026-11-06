@@ -204,7 +204,7 @@ final class LiveEmailPresentationTests: XCTestCase {
         XCTAssertLessThanOrEqual(line.utf8.count, 450)
 
         // Nothing prepared, a summary for another message, and one too long to ride a single
-        // append all fall back to the snippet line this replaced — never to a bodyless one.
+        // append all explicitly admit that a reliable summary is unavailable.
         let otherStep = opening.replacingOccurrences(of: #""id":"new""#, with: #""id":"other""#)
         let other = LiveEmailPresentation(key: try XCTUnwrap(LiveEmailPresentation.Key.step(otherStep)),
             summary: "Please approve $50 by Friday.", from: prepared.from, to: prepared.to,
@@ -214,7 +214,8 @@ final class LiveEmailPresentationTests: XCTestCase {
         for fallback in [nil, other, oversized] {
             let line = try XCTUnwrap(LiveSpokenStepContract.line(
                 step: opening, lead: "First up, ", prepared: fallback))
-            XCTAssertTrue(line.contains("First up, Dropbox. Get up and running."))
+            XCTAssertTrue(line.contains("First up, Dropbox. I don't have a reliable summary yet."))
+            XCTAssertFalse(line.contains("Get up and running"))
             XCTAssertLessThanOrEqual(line.utf8.count, 450)
         }
     }

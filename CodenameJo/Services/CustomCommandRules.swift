@@ -17,13 +17,23 @@ enum CustomCommandRules {
         raw.split(whereSeparator: \.isWhitespace).joined(separator: " ").lowercased()
     }
 
+    static func matching(_ raw: String, commands: [CustomCommand]) -> CustomCommand? {
+        let keyword = normalise(raw)
+        if let exact = commands.first(where: { $0.keyword == keyword }) { return exact }
+        func spoken(_ value: String) -> String {
+            normalise(value.map { "-‐‑‒–—".contains($0) ? " " : String($0) }.joined())
+        }
+        let matches = commands.filter { spoken($0.keyword) == spoken(keyword) }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
     /// Return only the named command; unrelated steps must never enter a run's context.
     static func run(keyword raw: String, commands: [CustomCommand]) -> Result<String, Refusal> {
         let keyword = normalise(raw)
         guard !keyword.isEmpty else {
             return .failure(Refusal("Specify the saved command's exact keyword. No command was run."))
         }
-        guard let command = commands.first(where: { $0.keyword == keyword }) else {
+        guard let command = matching(keyword, commands: commands) else {
             return .failure(Refusal("There is no saved command called \"\(keyword)\". No command was run. Do not guess another command."))
         }
         guard command.enabled else {
@@ -143,6 +153,15 @@ enum CustomCommandRules {
         !actions.isEmpty && actions.allSatisfy { receiptTools.contains($0.tool.lowercased()) } ? .receipt : .answer
     }
 
+    static func accountRefusal(_ actions: [CommandAction], account: String?) -> String? {
+        for label in actions.compactMap(\.resolvedLabel) where label.effectiveScope == .savedAccount {
+            if account?.caseInsensitiveCompare(label.account) != .orderedSame {
+                return "This command is restricted to \(label.account). Choose an email in that inbox or change its label scope in Commands. Nothing was started."
+            }
+        }
+        return nil
+    }
+
     /// Keep the steps that say something. A step **shaped** wrong (no tool) is dropped — a
     /// command worth having with two of its three steps should not be lost over the third. A
     /// step naming a tool a command may not call is **refused by name**: dropping it would save
@@ -189,8 +208,9 @@ enum CustomCommandRules {
         reserved.contains(keyword.replacingOccurrences(of: "['\u{2019}\u{02BC}]", with: "", options: .regularExpression))
     }
 
-    struct Refusal: Error, Equatable {
+    struct Refusal: LocalizedError, Equatable {
         let sentence: String
+        var errorDescription: String? { sentence }
         init(_ sentence: String) { self.sentence = sentence }
     }
 
