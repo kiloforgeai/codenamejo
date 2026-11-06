@@ -347,6 +347,10 @@ extension ProfileConnectionsView {
                     identifier: "connectGmailButton",
                     action: { interactor.connectGoogle(viewModel: viewModel) }
                 )
+                if viewModel.busyConnector == "gmail" {
+                    Button("Cancel sign-in") { interactor.cancelGoogleConnect(viewModel: viewModel) }
+                        .accessibilityIdentifier("cancelGoogleConnect")
+                }
 
                 connectorDetailRow(
                     name: "Google",

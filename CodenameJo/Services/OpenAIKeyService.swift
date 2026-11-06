@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-/// The user's own OpenAI key, kept in this phone's Keychain. This app pays for its calls with
+/// The user's own OpenAI key, kept in this device's Keychain. This app pays for its calls with
 /// it, and it goes only to OpenAI.
 enum OpenAIKeyService {
     struct Status: Decodable, Equatable {
@@ -11,11 +11,18 @@ enum OpenAIKeyService {
 
     enum Failure: LocalizedError {
         case rejected, unavailable
+        case secureStorage(OSStatus)
 
         var errorDescription: String? {
             switch self {
             case .rejected: "OpenAI didn't accept that key. Check it and try again."
             case .unavailable: "Couldn't reach OpenAI. Try again."
+            case .secureStorage(let status):
+                if status == errSecMissingEntitlement {
+                    "This build cannot access Keychain. Install a properly signed build of Jo. (\(status))"
+                } else {
+                    "Couldn't save or access your key in Keychain. Unlock your device and try again. (\(status))"
+                }
             }
         }
     }
@@ -76,18 +83,32 @@ enum OpenAIKeyService {
         if code == 401 || code == 403 { throw Failure.rejected }
         guard (200..<300).contains(code) else { throw Failure.unavailable }
 
-        // Delete-then-add: `kSecAttrAccessible` is fixed at insert.
-        SecItemDelete(base as CFDictionary)
-        var add = base
-        add[kSecValueData as String] = Data(key.utf8)
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else { throw Failure.unavailable }
-        UserDefaults.standard.set(true, forKey: savedHereKey)
-        return try await status()
+        return try storeVerifiedKey(key)
+    }
+
+    static func storeVerifiedKey(
+        _ key: String, defaults: UserDefaults = .standard,
+        update: (CFDictionary, CFDictionary) -> OSStatus = SecItemUpdate,
+        add: (CFDictionary) -> OSStatus = { SecItemAdd($0, nil) }
+    ) throws -> Status {
+        let attributes = [kSecValueData as String: Data(key.utf8)]
+        var result = update(base as CFDictionary, attributes as CFDictionary)
+        if result == errSecItemNotFound {
+            var item = base.merging(attributes) { _, new in new }
+            item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            result = add(item as CFDictionary)
+        }
+        guard result == errSecSuccess else { throw Failure.secureStorage(result) }
+        defaults.set(true, forKey: savedHereKey)
+        return Status(set: true, last4: String(key.suffix(4)))
     }
 
     static func remove() async throws -> Status {
-        SecItemDelete(base as CFDictionary)
+        let result = SecItemDelete(base as CFDictionary)
+        guard result == errSecSuccess || result == errSecItemNotFound else {
+            throw Failure.secureStorage(result)
+        }
+        UserDefaults.standard.removeObject(forKey: savedHereKey)
         return Status(set: false, last4: nil)
     }
 }

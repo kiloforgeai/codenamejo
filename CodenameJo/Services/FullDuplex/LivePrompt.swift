@@ -16,7 +16,8 @@ enum LivePrompt {
     struct Text {
         let root: URL
         static var bundled: Text {
-            Text(root: Bundle.main.bundleURL.appendingPathComponent("prompts", isDirectory: true))
+            Text(root: (Bundle.main.resourceURL ?? Bundle.main.bundleURL)
+                .appendingPathComponent("prompts", isDirectory: true))
         }
 
         func callAsFunction(_ name: String, _ values: [String: String] = [:]) throws -> String {

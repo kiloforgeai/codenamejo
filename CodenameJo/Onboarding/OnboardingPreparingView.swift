@@ -31,7 +31,7 @@ struct OnboardingPreparingView<Interactor: ViewWithModelLifecycleObserver<Onboar
             .animation(.easeInOut(duration: 0.25), value: viewModel.waitingForJo)
             .animation(.easeInOut(duration: 0.25), value: viewModel.index)
         } footer: {
-            Text("Jo will start talking in a moment.")
+            Text(viewModel.voiceAvailable ? "Jo will start talking in a moment." : "Your workspace will open in a moment.")
                 .font(.system(size: 13))
                 .foregroundStyle(OnboardingTheme.textSecondary)
                 .multilineTextAlignment(.center)
@@ -285,6 +285,7 @@ final class OnboardingPreparingViewModel: ViewModel {
 
     /// The bar is done and the screen is waiting on Jo's first word.
     @Published var waitingForJo = false
+    @Published var voiceAvailable = false
 
     /// The tally, each nil until its step settles. Spam never reaches the cache
     /// (`in:inbox` only), so `spamCount` stays nil unless something else supplies it.
@@ -315,6 +316,9 @@ final class OnboardingPreparingViewModel: ViewModel {
 
 @MainActor
 final class OnboardingPreparingViewInteractor: ViewModelInteractor<OnboardingPreparingViewModel> {
+    @Injected(\.onboardingAudioQueue) private var audioQueue
+    private let hasMicrophone: @Sendable () -> Bool
+    private var audioCheck: Task<Void, Never>?
     @Injected(\.connections) private var connections
     @Injected(\.voiceCall) private var voiceCall
     @Injected(\.realtimeService) private var realtimeService
@@ -336,7 +340,9 @@ final class OnboardingPreparingViewInteractor: ViewModelInteractor<OnboardingPre
     private var ticker: Task<Void, Never>?
     private var reader: Task<Void, Never>?
 
-    init(onNext: @escaping () -> Void) {
+    init(hasMicrophone: @escaping @Sendable () -> Bool = { OnboardingAudioSession.hasInputDevice },
+         onNext: @escaping () -> Void) {
+        self.hasMicrophone = hasMicrophone
         self.onNext = onNext
         super.init()
     }
@@ -346,11 +352,21 @@ final class OnboardingPreparingViewInteractor: ViewModelInteractor<OnboardingPre
         super.onViewAppear(viewModel: viewModel)
         nameTheInbox(viewModel: viewModel)
         readCache(viewModel: viewModel)
-        startClock(viewModel: viewModel)
+        audioCheck = Task { [weak self, weak viewModel] in
+            guard let self, let viewModel else { return }
+            do {
+                viewModel.voiceAvailable = try await audioQueue.run("preparing input availability", hasMicrophone)
+            } catch {
+                RealtimeLog.log("onboarding: preparing audio unavailable: \(error.localizedDescription)")
+            }
+            guard !Task.isCancelled, !advanced else { return }
+            startClock(viewModel: viewModel)
+        }
     }
 
     override func onViewDisappear(viewModel: OnboardingPreparingViewModel) {
         super.onViewDisappear(viewModel: viewModel)
+        audioCheck?.cancel()
         ticker?.cancel()
         ticker = nil
         reader?.cancel()
@@ -422,7 +438,7 @@ final class OnboardingPreparingViewInteractor: ViewModelInteractor<OnboardingPre
                 }
                 // Halfway, not at the top: a call placed on appear was up well before the
                 // bar ended and left Jo waiting on the flow.
-                if position == steps.count / 2 { self.placeTheCall() }
+                if position == steps.count / 2, viewModel.voiceAvailable { self.placeTheCall() }
                 try? await Task.sleep(for: .seconds(step))
                 self.settle(steps[position], viewModel: viewModel)
             }
@@ -439,7 +455,7 @@ final class OnboardingPreparingViewInteractor: ViewModelInteractor<OnboardingPre
     /// Ask Jo to speak, then hold the screen until she does. Asked only once the session exists: on
     /// a dialling session `speakOpening` would open the mic while this screen is up. Idempotent.
     private func waitForJo(viewModel: OnboardingPreparingViewModel) async {
-        guard realtimeService.isConversing else { return }
+        guard viewModel.voiceAvailable, realtimeService.isConversing else { return }
         viewModel.waitingForJo = true
         let deadline = Date().addingTimeInterval(Self.graceAfterBar)
 

@@ -146,6 +146,7 @@ final class Step1SignInViewInteractor: ViewModelInteractor<Step1SignInViewModel>
     /// Sign-in finishing is the parent flow's business, held as a closure because the destination
     /// differs by caller.
     private let onComplete: () -> Void
+    private var signInTask: Task<Void, Never>?
 
     init(onComplete: @escaping () -> Void) {
         self.onComplete = onComplete
@@ -154,12 +155,16 @@ final class Step1SignInViewInteractor: ViewModelInteractor<Step1SignInViewModel>
 }
 
 extension Step1SignInViewInteractor: Step1SignInViewHandler {
+    func cancelGoogle() { signInTask?.cancel() }
+
     /// The one consent: identity plus Gmail and Calendar, through the token server. Its grant is
     /// the sign-in — there is no account server.
     func handleGoogle(viewModel: Step1SignInViewModel) {
+        guard !viewModel.isWorking else { return }
         viewModel.isWorking = true
         viewModel.error = nil
-        Task {
+        signInTask = Task {
+            defer { signInTask = nil }
             switch await GoogleSignInFlow.run(hint: nil, isPrimary: GoogleCredential.storedAccounts().isEmpty) {
             case .failure(.cancelled):
                 viewModel.isWorking = false

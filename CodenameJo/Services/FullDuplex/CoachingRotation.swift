@@ -24,8 +24,8 @@ enum CoachingRotation {
     private struct Catalog: Decodable { let lessons: [Lesson] }
 
     static let catalog: [Lesson] = {
-        let url = Bundle.main.bundleURL.appendingPathComponent("prompts/coaching.json")
-        guard let data = try? Data(contentsOf: url),
+        guard let url = Bundle.main.url(forResource: "coaching", withExtension: "json", subdirectory: "prompts"),
+              let data = try? Data(contentsOf: url),
               let file = try? JSONDecoder().decode(Catalog.self, from: data) else { return [] }
         return file.lessons
     }()

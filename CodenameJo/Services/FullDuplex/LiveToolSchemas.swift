@@ -6,6 +6,15 @@ import Foundation
 ///
 /// Write a description for a voice turn, short and in our own words, not a vendor's verbatim schema.
 enum LiveToolSchemas {
+    static let logFeedback: [String: Any] = [
+        "type": "function", "name": UserFeedbackTool.name,
+        "description": "Save the user's feedback about Jo locally for later inspection. Use when the user asks to log feedback, report a bug, or record a complaint or suggestion about this app. Preserve their wording; never invent feedback or copy email, Slack, or tool content into it. If the feedback itself is missing, ask what to record. Only acknowledge saving after success. This does not upload, create a GitHub issue, change settings, or advance the feed.",
+        "parameters": ["type": "object", "properties": [
+            "message": ["type": "string", "description": "The user's feedback in their own words.",
+                        "minLength": 1, "maxLength": FeedbackText.maximumCharacters]
+        ], "required": ["message"], "additionalProperties": false]
+    ]
+
     /// The connectors' tools, run by `FullDuplexBroker.runTool` (Slack's on the phone's queue when it is up).
     static let notion: [[String: Any]] = [
         notionSearch, notionFetch, notionListRecentPages, notionQueryDataSources,

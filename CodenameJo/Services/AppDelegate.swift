@@ -9,10 +9,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
-        #if targetEnvironment(macCatalyst)
         // Unit tests inject their own providers and must not warm models or refresh accounts.
         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil { return true }
-        #endif
         // MARK: - Notification routing
         // First: a notification that launched the app is delivered during launch, so a delegate
         // installed later never hears about that tap.

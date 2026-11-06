@@ -13,6 +13,7 @@ protocol OnboardingWelcomeViewHandler {
     func allowMicrophone(viewModel: OnboardingWelcomeViewModel)
     func allowSpeech(viewModel: OnboardingWelcomeViewModel)
     func askForInbox(viewModel: OnboardingWelcomeViewModel)
+    func cancelGoogle(viewModel: OnboardingWelcomeViewModel)
     func connectGoogle(viewModel: OnboardingWelcomeViewModel)
     #if DEBUG
     /// Local builds only: walk past the Google connect without an account, so the
@@ -117,6 +118,10 @@ struct OnboardingWelcomeView<Interactor: ViewWithModelLifecycleObserver<Onboardi
             }
             if viewModel.phase == .connect {
                 VStack(spacing: 6) {
+                    if viewModel.isAsking {
+                        Button("Cancel sign-in") { interactor.cancelGoogle(viewModel: viewModel) }
+                            .accessibilityIdentifier("onboarding_cancel_google")
+                    }
                     Text("Any account works. Disconnect anytime.")
                         .font(.system(size: 13))
                         .foregroundStyle(Theme.textTertiary)
@@ -413,6 +418,9 @@ final class OnboardingWelcomeViewModel: ViewModel {
 @MainActor
 final class OnboardingWelcomeViewInteractor: ViewModelInteractor<OnboardingWelcomeViewModel> {
     @Injected(\.voiceCall) private var voiceCall
+    @Injected(\.backend) private var backend
+    @Injected(\.connections) private var connections
+    private var resumeCheck: Task<Void, Never>?
     @Injected(\.onboardingAudioQueue) private var audioQueue
     private let onNext: () -> Void
     private var player: AVAudioPlayer?
@@ -430,6 +438,8 @@ final class OnboardingWelcomeViewInteractor: ViewModelInteractor<OnboardingWelco
 
     override func onViewDisappear(viewModel: OnboardingWelcomeViewModel) {
         super.onViewDisappear(viewModel: viewModel)
+        resumeCheck?.cancel()
+        signIn.cancelGoogle()
         stopClip(viewModel: viewModel)
         player = nil
     }
@@ -492,7 +502,22 @@ extension OnboardingWelcomeViewInteractor: OnboardingWelcomeViewHandler {
 
     func askForInbox(viewModel: OnboardingWelcomeViewModel) {
         viewModel.phase = .connect
-        play("jo3", viewModel: viewModel)
+        resumeCheck = Task { [weak self, weak viewModel] in
+            guard let self, let viewModel else { return }
+            await connections.refresh()
+            guard !Task.isCancelled, !viewModel.isAsking else { return }
+            if backend.isSignedIn,
+               connections.gmailAccounts.contains(where: { !connections.gmailNeedsReauth.contains($0) }) {
+                stopClip(viewModel: viewModel)
+                onNext()
+            } else {
+                play("jo3", viewModel: viewModel)
+            }
+        }
+    }
+
+    func cancelGoogle(viewModel: OnboardingWelcomeViewModel) {
+        signIn.cancelGoogle()
     }
 
     func connectGoogle(viewModel: OnboardingWelcomeViewModel) {

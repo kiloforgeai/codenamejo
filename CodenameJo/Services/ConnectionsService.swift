@@ -86,6 +86,7 @@ final class ConnectionsService: ObservableObject {
     /// The code the user types at github.com/login/device while a sign-in waits on it.
     @Published var githubPendingCode: GitHubDeviceFlow.Code?
     private var githubSignIn: Task<Void, Never>?
+    private var googleSignIn: Task<Void, Never>?
     /// Which connector is mid-request (`"gmail"`, `"github"`, `"notion"` or `"slack"`) — nil when idle.
     @Published var busyConnector: String?
     @Published var errorMessage: String?
@@ -346,7 +347,15 @@ final class ConnectionsService: ObservableObject {
     /// - Parameter reconnecting: an already-connected address, preselected on Google's picker.
     ///   Omit to add a new account.
     func connectGmail(reconnecting email: String? = nil) {
-        Task { await connectGoogle(hint: email) }
+        guard googleSignIn == nil, busyConnector == nil else { return }
+        googleSignIn = Task {
+            defer { googleSignIn = nil }
+            await connectGoogle(hint: email)
+        }
+    }
+
+    func cancelGoogleConnect() {
+        googleSignIn?.cancel()
     }
 
     private func connectGoogle(hint: String?) async {

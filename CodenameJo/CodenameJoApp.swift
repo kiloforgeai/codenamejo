@@ -12,6 +12,7 @@ struct CodenameJoApp: App {
     @AppStorage(AppearanceSetting.storageKey) private var appearance = AppearanceSetting.system
 
     init() {
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
         // First line of our own code that runs, so this leg covers dyld, the Swift runtime and
         // framework loads. See `LaunchTiming`.
         LaunchTiming.mark("pre-main")
@@ -56,7 +57,9 @@ struct RootView<Interactor: ViewWithModelLifecycleObserver<RootViewModel> & Root
 
     var body: some View {
         Group {
-            if !hasCompletedOnboarding {
+            if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+                Color.clear
+            } else if !hasCompletedOnboarding {
                 OnboardingFlowComponent.make()
             } else if !backend.isSignedIn {
                 Step1SignInViewComponent.make(onComplete: {})

@@ -1,4 +1,7 @@
 import AVFoundation
+#if targetEnvironment(macCatalyst)
+import CoreAudio
+#endif
 import Combine
 import FactoryKit
 import Speech
@@ -18,26 +21,33 @@ struct OnboardingSayItView<Interactor: ViewWithModelLifecycleObserver<Onboarding
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 20) {
-                    VoiceOrb(state: viewModel.joSpeaking ? .responding : .listening, muted: false, holding: false, diameter: 66)
+                    VoiceOrb(state: viewModel.joSpeaking ? .responding : (viewModel.inputUnavailable ? .disconnected : .listening), muted: false, holding: false, diameter: 66)
                         .allowsHitTesting(false)
                     SpeechIndicator(metering: viewModel.clipMetering)
-                        .accessibilityLabel("Jo is speaking")
+                        .accessibilityLabel(viewModel.inputUnavailable ? "Microphone unavailable" : "Jo is speaking")
                 }
                 .padding(.top, 30)
 
-                Text("“Go ahead. Say below phrase out loud.”")
+                Text(viewModel.inputUnavailable ? "Continue with setup." : "“Go ahead. Say below phrase out loud.”")
                     .foregroundStyle(OnboardingTheme.textPrimary)
                     .font(.system(size: 22, weight: .semibold))
                     .padding(.top, 28)
 
-                sayThisBox
-                    .padding(.top, 28)
+                if !viewModel.inputUnavailable {
+                    sayThisBox.padding(.top, 28)
+                }
 
-                Text("Not alone? Hold it to your ear.")
+                Text(viewModel.inputUnavailable
+                     ? "No microphone is available. Connect one to use voice, or continue with setup."
+                     : Self.listeningTip)
                     .font(.system(size: 14))
                     .foregroundStyle(Theme.textTertiary)
                     .frame(maxWidth: .infinity)
                     .padding(.top, 12)
+
+                if let error = viewModel.audioError {
+                    Text(error).font(.caption).foregroundStyle(.secondary).padding(.top, 8)
+                }
 
                 Spacer()
 
@@ -46,7 +56,7 @@ struct OnboardingSayItView<Interactor: ViewWithModelLifecycleObserver<Onboarding
                         Button {
                             interactor.skip(viewModel: viewModel)
                         } label: {
-                            Text("Skip for now")
+                            Text(viewModel.inputUnavailable ? "Continue without microphone" : "Skip for now")
                                 .font(.system(size: 15, weight: .medium))
                                 .foregroundStyle(OnboardingTheme.textSecondary)
                                 .underline()
@@ -70,6 +80,14 @@ struct OnboardingSayItView<Interactor: ViewWithModelLifecycleObserver<Onboarding
         } message: {
             Text("Turn on or turn up your volume.")
         }
+    }
+
+    private static var listeningTip: String {
+        #if targetEnvironment(macCatalyst)
+        "Use headphones if other people are nearby."
+        #else
+        "Not alone? Hold it to your ear."
+        #endif
     }
 
     private var sayThisBox: some View {
@@ -122,6 +140,22 @@ enum OnboardingVolume {
 }
 
 enum OnboardingAudioSession {
+    static var hasInputDevice: Bool {
+        #if targetEnvironment(macCatalyst)
+        var device = AudioDeviceID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                               &address, 0, nil, &size, &device)
+        if status != noErr { RealtimeLog.log("onboarding: input device query failed (\(status))") }
+        return status == noErr && device != kAudioObjectUnknown
+        #else
+        return AVCaptureDevice.default(for: .audio) != nil
+        #endif
+    }
+
     static func activate() throws {
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(
@@ -162,6 +196,8 @@ final class OnboardingSayItViewModel: ViewModel {
     @Published var level: Double = 0
     @Published var joSpeaking = false
     @Published var showSkip = false
+    @Published var inputUnavailable = false
+    @Published var audioError: String?
     /// Raised when the output volume is near zero as Jo's clip starts.
     @Published var showVolumeAlert = false
     /// Level feed for the header thread while Jo's clip plays; see `JoClipMeter`.
@@ -173,7 +209,10 @@ final class OnboardingSayItViewModel: ViewModel {
 @MainActor
 final class OnboardingSayItViewInteractor: ViewModelInteractor<OnboardingSayItViewModel> {
     @Injected(\.onboardingAudioQueue) private var audioQueue
+    @Injected(\.localSpeech) private var localSpeech
+    private var speakingWithoutInput = false
     private let onNext: () -> Void
+    private let hasMicrophone: @Sendable () -> Bool
     private var player: AVAudioPlayer?
     private var joFeed: Task<Void, Never>?
     private var introStart: Task<Void, Never>?
@@ -184,7 +223,9 @@ final class OnboardingSayItViewInteractor: ViewModelInteractor<OnboardingSayItVi
     private var task: SFSpeechRecognitionTask?
     private var advanced = false
 
-    init(onNext: @escaping () -> Void) {
+    init(hasMicrophone: @escaping @Sendable () -> Bool = { OnboardingAudioSession.hasInputDevice },
+         onNext: @escaping () -> Void) {
+        self.hasMicrophone = hasMicrophone
         self.onNext = onNext
         super.init()
     }
@@ -195,12 +236,29 @@ final class OnboardingSayItViewInteractor: ViewModelInteractor<OnboardingSayItVi
         introStart = Task { [weak self, weak viewModel] in
             guard !Task.isCancelled, let self, let viewModel else { return }
             do {
+                #if targetEnvironment(macCatalyst)
+                let available = try await audioQueue.run("onboarding input availability", hasMicrophone)
+                guard !Task.isCancelled, !advanced else { return }
+                if !available {
+                    viewModel.showSkip = true
+                    viewModel.inputUnavailable = true
+                    speakingWithoutInput = true
+                    viewModel.joSpeaking = true
+                    defer { viewModel.joSpeaking = false }
+                    try await localSpeech.speakWithoutMicrophone(
+                        "I can speak through your speakers. Connect a microphone to talk with me, or continue with setup.")
+                    return
+                }
+                #endif
                 // Finish any preceding playback-only setup before opening the microphone.
                 try await audioQueue.run("onboarding microphone handoff") {}
                 guard !Task.isCancelled, !advanced else { return }
                 playIntroThenListen(viewModel: viewModel)
+            } catch is CancellationError {
+                return
             } catch {
                 RealtimeLog.log("onboarding: microphone handoff failed: \(error.localizedDescription)")
+                viewModel.audioError = "Jo couldn't play audio: \(error.localizedDescription)"
                 viewModel.showSkip = true
             }
         }
@@ -215,6 +273,7 @@ final class OnboardingSayItViewInteractor: ViewModelInteractor<OnboardingSayItVi
     override func onViewDisappear(viewModel: OnboardingSayItViewModel) {
         super.onViewDisappear(viewModel: viewModel)
         introStart?.cancel()
+        if speakingWithoutInput { localSpeech.stop() }
         joFeed?.cancel()
         skipTimer?.cancel()
         viewModel.joSpeaking = false
@@ -380,6 +439,7 @@ final class OnboardingSayItViewInteractor: ViewModelInteractor<OnboardingSayItVi
     private func finish() {
         guard !advanced else { return }
         advanced = true
+        if speakingWithoutInput { localSpeech.stop() }
         skipTimer?.cancel()
         introStart?.cancel()
         joFeed?.cancel()
