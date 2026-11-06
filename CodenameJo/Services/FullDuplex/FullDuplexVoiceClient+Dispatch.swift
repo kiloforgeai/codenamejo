@@ -235,7 +235,8 @@ extension FullDuplexVoiceClient {
         guard let step = interstitialPayload(in: output)?["slackStep"],
               let data = try? JSONSerialization.data(withJSONObject: step),
               let text = String(data: data, encoding: .utf8) else { return nil }
-        return slackStepBrief(text, lead: "Before the rest of your email, your Slack.")
+        return slackStepBrief(text, lead: interstitialPayload(in: output)?["configuredSection"] != nil
+            ? "Now, your Slack." : "Before the rest of your email, your Slack.")
     }
 
     static func interstitial(in output: String) -> String? {
@@ -347,6 +348,9 @@ extension FullDuplexVoiceClient {
                 + "still pending; do not claim its messages were archived or the inbox is clear. "
                 + "Do not wait, return to the previous email, or call triage_next again unless "
                 + "the interstitial instructs you to.\n" + stepOutput
+        }
+        if interstitialPayload(in: stepOutput)?["configuredSection"] != nil {
+            return "\n\nQueue: " + say + ". Continue with the configured section below. Follow its note without adding a tip, asking whether to start, or claiming all inboxes are empty.\n" + stepOutput
         }
         let sayLower = say.prefix(1).lowercased() + say.dropFirst()
         if isFeedInterstitial(stepOutput) {
@@ -945,6 +949,7 @@ extension FullDuplexVoiceClient {
                     if outcome.ok == false { self.onToolFailed?("dispatch") } else { self.onToolDone?("dispatch") }
                 }
             }
+            self.transport?.liveAdapter?.jobCompleted(id: jobId, result: outcome.text)
             self.transport?.sendContextItem("Background job \(jobId) has finished. It is no longer running. Result: \(outcome.text)", role: "system")
 
             if let reconciliation,
@@ -1049,7 +1054,7 @@ extension FullDuplexVoiceClient {
             // unspoken, which is the failure this whole change is about.
             self.pendingReports.append(DispatchReport(
                 kind: report.kind, jobId: report.jobId, task: report.task, text: report.text,
-                ok: report.ok, landedAt: .now, delivery: report.delivery, origin: report.origin,
+                ok: report.ok, landedAt: .now, finishedAt: report.finishedAt, delivery: report.delivery, origin: report.origin,
                 scope: report.scope))
             self.drainDispatchReports()
         }
@@ -1068,7 +1073,7 @@ extension FullDuplexVoiceClient {
             RealtimeLog.log("handoff: reclaimed \"\(outcome.report.task.prefix(40))\" before the switch")
             pendingReports.append(DispatchReport(
                 kind: outcome.report.kind, jobId: jobId, task: outcome.report.task,
-                text: outcome.report.text, ok: outcome.report.ok, landedAt: .now,
+                text: outcome.report.text, ok: outcome.report.ok, landedAt: .now, finishedAt: outcome.report.finishedAt,
                 delivery: outcome.report.delivery, origin: outcome.report.origin,
                 scope: outcome.report.scope))
         }
@@ -1295,17 +1300,37 @@ extension FullDuplexVoiceClient {
 
     /// Put one answer or outcome into the conversation, and ask for it to be spoken if
     /// it is still wanted.
+    func recordJobSpeechStarted() {
+        guard let pending = pendingJobSpeech else { return }
+        pendingJobSpeech = nil
+        diagnostics?.record(.jobSpeechStarted, ["job_id": pending.id.uuidString,
+            "turn_id": dispatchHistory[pending.id]?.id.uuidString ?? "unknown",
+            "phase": "output_started_after_result",
+            "duration_ms": String(Int(Self.seconds(since: pending.finishedAt) * 1000))])
+    }
+
+    func cancelJobSpeech(reason: String) {
+        guard let pending = pendingJobSpeech else { return }
+        pendingJobSpeech = nil
+        diagnostics?.record(.jobSpeechCancelled, ["job_id": pending.id.uuidString, "reason": reason])
+    }
+
     func injectDispatchReport(_ report: DispatchReport, speak: Bool) {
+        if case .shortcut(_, let userID) = report.kind,
+           Container.shared.backend().userId != userID { return }
         if speak {
+            checkpointHistory()
+            emitFinalTranscript(responseCompleted: false)
             isBackgroundHistory = true
             let origin = report.jobId.flatMap { dispatchHistory[$0] }
             historyTurnID = origin?.id ?? UUID()
             historyUserText = origin?.text ?? report.task
+            if let jobID = report.jobId {
+                pendingJobSpeech = .init(id: jobID, finishedAt: report.finishedAt)
+            }
         }
         diagnostics?.record(.jobInjected, ["job_id": report.jobId?.uuidString ?? "shortcut", "outcome": speak ? "speech_requested" : "context_only",
-            "duration_ms": String(Int(Self.seconds(since: report.landedAt) * 1000))])
-        if case .shortcut(_, let userID) = report.kind,
-           Container.shared.backend().userId != userID { return }
+            "duration_ms": String(Int(Self.seconds(since: report.finishedAt) * 1000))])
         // The framing lives in the prompt's addenda (`prompts/addenda/`), not here. The item
         // carries data and says where the data came from; how to say it is a prompt question.
         //

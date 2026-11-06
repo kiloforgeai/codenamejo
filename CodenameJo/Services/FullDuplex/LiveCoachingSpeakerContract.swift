@@ -68,10 +68,11 @@ enum LiveCoachingAnswer {
     private static let requestVerbs: Set<String> = ["tell", "teach", "show", "give", "hit"]
 
     static func parse(_ transcript: String) -> Self? {
-        var words = transcript.lowercased()
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .filter { !$0.isEmpty }
+        var words = SpokenAnswerText.words(transcript)
         while let first = words.first, fillers.contains(first) { words.removeFirst() }
+        if let first = words.first, affirmatives.contains(first),
+           words.suffix(2) != ["why", "not"],
+           words.contains(where: { ["not", "don", "dont", "no"].contains($0) }) { return .declined }
         if asksForTheTip(words) { return .accepted }
         // "Go ahead" is consent; "go" alone stays a command.
         if let index = words.firstIndex(of: "go"), words.dropFirst(index + 1).first == "ahead" {

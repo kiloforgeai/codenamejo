@@ -43,6 +43,29 @@ enum CalendarWriteTiming {
         return fields
     }
 
+    static func matches(request: [String: Any], event: [String: Any]) -> Bool {
+        for key in ["start", "end"] {
+            guard let expected = request[key] as? String else { continue }
+            let stored = event[key] as? [String: Any] ?? [:]
+            if CalendarTools.isDateOnly(expected) {
+                guard stored["date"] as? String == expected else { return false }
+            } else {
+                guard let actual = stored["dateTime"] as? String,
+                      let wanted = CalendarTools.instant(expected),
+                      let received = CalendarTools.instant(actual), wanted == received else { return false }
+            }
+        }
+        return true
+    }
+
+    static func verifyStored(request: [String: Any], event: [String: Any]) throws {
+        guard matches(request: request, event: event) else {
+            throw CalendarTools.Refusal(text: "The calendar returned an event, but its stored time does not match the requested time. "
+                + receipt(event) + " The event may already exist; do not create another or claim the requested time was saved. "
+                + "Inspect this event and ask before correcting its time.")
+        }
+    }
+
     static func receipt(_ event: [String: Any]) -> String {
         let start = event["start"] as? [String: Any] ?? [:]
         let end = event["end"] as? [String: Any] ?? [:]

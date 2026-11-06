@@ -76,7 +76,7 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
             try? store.database?.close()
             try? FileManager.default.removeItem(at: directory)
         }
-        let queue = LocalTriageQueue()
+        let queue = LocalTriageQueue(mailAccounts: { ["me@example.com"] }, unreadOpeningLoader: { _ in nil })
         await queue.adopt([message("first"), message("second"), message("third")], store: store)
         _ = await queue.step(.init(direction: "next"), store: store, dealtWith: false)
         var answer = LocalTriageQueue.Outcome(
@@ -104,7 +104,7 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
             try? store.database?.close()
             try? FileManager.default.removeItem(at: directory)
         }
-        let queue = LocalTriageQueue()
+        let queue = LocalTriageQueue(mailAccounts: { ["me@example.com"] }, unreadOpeningLoader: { _ in nil })
         await queue.adopt([message("first"), message("second")], store: store)
         var answer = LocalTriageQueue.Outcome(
             jobId: UUID(), task: "Weather in San Francisco?",
@@ -166,7 +166,7 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
             try? store.database?.close()
             try? FileManager.default.removeItem(at: directory)
         }
-        let queue = LocalTriageQueue()
+        let queue = LocalTriageQueue(mailAccounts: { ["me@example.com"] }, unreadOpeningLoader: { _ in nil })
         await queue.adopt([message("original"), message("current"), message("next")], store: store)
         _ = await queue.step(.init(direction: "next"), store: store, dealtWith: false)
         let failed = LocalTriageQueue.Outcome(
@@ -296,7 +296,7 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
             try? store.database?.close()
             try? FileManager.default.removeItem(at: directory)
         }
-        let queue = LocalTriageQueue()
+        let queue = LocalTriageQueue(mailAccounts: { ["me@example.com"] }, unreadOpeningLoader: { _ in nil })
         await queue.adopt([
             message("rejuvenation", thread: "rejuvenation-thread"),
             message("pottery"),
@@ -321,12 +321,12 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
         let followup = await queue.dispatchAnswerAbout
         XCTAssertEqual(followup?.id, "rejuvenation", "A follow-up must not capture Pottery's suspended cursor")
         let afterPresentation = await queue.currentId
-        XCTAssertEqual(afterPresentation, "pottery")
+        XCTAssertEqual(afterPresentation, "rejuvenation")
 
-        // A draft names only the thread. Resolving it returns the live cursor to advance.
+        // A draft names only the thread. The displayed result remains the compare-and-step token.
         let resolution = await queue.resolveActionOutcome(
             id: nil, threadId: "rejuvenation-thread", as: "create_draft")
-        XCTAssertEqual(resolution?.cursorId, "pottery")
+        XCTAssertEqual(resolution?.cursorId, "rejuvenation")
         XCTAssertEqual(resolution?.dealtWith, true)
         let resumed = await queue.step(
             .init(), store: store, dealtWith: resolution?.dealtWith ?? true)
@@ -347,7 +347,7 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
             try? store.database?.close()
             try? FileManager.default.removeItem(at: directory)
         }
-        let queue = LocalTriageQueue()
+        let queue = LocalTriageQueue(mailAccounts: { ["me@example.com"] }, unreadOpeningLoader: { _ in nil })
         await queue.adopt([message("original"), message("current"), message("next")], store: store)
         _ = await queue.step(.init(direction: "next"), store: store, dealtWith: false)
         let held = await queue.hold(outcome(.answer, about: referent(id: "original")))
@@ -355,7 +355,7 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
         let returned = await queue.step(.init(direction: "next"), store: store)
         XCTAssertNotNil(DispatchAnswerPresentation(step: returned.output))
         let whilePresented = await queue.currentId
-        XCTAssertEqual(whilePresented, "current")
+        XCTAssertEqual(whilePresented, "original")
         let resumed = await queue.step(.init(direction: "next"), store: store)
         XCTAssertNil(DispatchAnswerPresentation(step: resumed.output))
         let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(resumed.output.utf8)) as? [String: Any])
@@ -373,7 +373,7 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
             try? store.database?.close()
             try? FileManager.default.removeItem(at: directory)
         }
-        let queue = LocalTriageQueue()
+        let queue = LocalTriageQueue(mailAccounts: { ["me@example.com"] }, unreadOpeningLoader: { _ in nil })
         await queue.adopt([
             message("first", thread: "first-thread"),
             message("second"),
@@ -399,7 +399,7 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
             try? store.database?.close()
             try? FileManager.default.removeItem(at: directory)
         }
-        let queue = LocalTriageQueue()
+        let queue = LocalTriageQueue(mailAccounts: { ["me@example.com"] }, unreadOpeningLoader: { _ in nil })
         await queue.adopt([
             message("researched", thread: "researched-thread"),
             message("cursor"),
@@ -416,7 +416,7 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
         XCTAssertNil(unresolved, "A nameless unrelated draft must not move the queue")
         let resolved = await queue.resolveActionOutcome(
             id: nil, threadId: nil, allowUnscoped: true, as: "create_draft")
-        XCTAssertEqual(resolved?.cursorId, "cursor")
+        XCTAssertEqual(resolved?.cursorId, "researched")
     }
 
     func testOnlyReferentialDraftLanguageCanUsePresentedOutcomeFallback() {

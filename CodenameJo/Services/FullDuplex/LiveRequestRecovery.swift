@@ -8,21 +8,42 @@ enum LiveRequestRecovery {
 
     static func requiresQueueAction(_ text: String) -> Bool {
         let normalized = FullDuplexVoiceClient.normalize(text)
-        let tokens = normalized.split(separator: " ").map(String.init)
+        var tokens = normalized.split(separator: " ").map(String.init)
         let words = Set(tokens)
-        guard !isFeedback(text), words.isDisjoint(with: ["command", "commands"]),
+        guard !isFeedback(text), words.isDisjoint(with: ["command", "commands", "no", "not"]),
               !["don t", "do not", "never", "already", "did you"].contains(where: normalized.contains) else { return false }
-        let first = tokens.first { !questionFillers.contains($0) && $0 != "please" }
+        while let first = tokens.first, questionFillers.contains(first) || ["please", "just"].contains(first) {
+            tokens.removeFirst()
+        }
+        let requests = ["can you", "could you", "would you", "i want you to", "you can", "go ahead and", "let s"]
+        if let prefix = requests.map({ $0.split(separator: " ").map(String.init) }).first(where: { tokens.starts(with: $0) }) {
+            tokens.removeFirst(prefix.count)
+        }
+        while let first = tokens.first, ["please", "just"].contains(first) { tokens.removeFirst() }
         let verbs: Set<String> = ["archive", "delete", "trash", "spam", "skip", "next", "unsubscribe", "label", "snooze"]
-        guard !words.isDisjoint(with: verbs) else { return false }
-        if let first, verbs.contains(first) { return true }
-        return ["can you", "could you", "would you", "i want you to", "go to", "move on"].contains(where: normalized.contains)
+        return tokens.first.map(verbs.contains) == true || tokens.starts(with: ["go", "to", "next"])
+            || tokens.starts(with: ["move", "on"])
     }
 
     static func refersToCurrentMessage(_ text: String) -> Bool {
         let words = Set(FullDuplexVoiceClient.normalize(text).split(separator: " "))
         return !words.isDisjoint(with: ["this", "it", "that", "yes", "yeah", "yep"])
     }
+
+    static func isCorrection(_ text: String) -> Bool {
+        var words = FullDuplexVoiceClient.normalize(text).split(separator: " ").map(String.init)
+        while let first = words.first, first != "no", questionFillers.contains(first) { words.removeFirst() }
+        return words.first == "no" || words.first == "not" || words.starts(with: ["don", "t"])
+            || words.starts(with: ["do", "not"])
+    }
+    /// A caption pause cannot turn the verb completing a negation/reminder into authorization.
+    static func hasUnfinishedAuthorizationPrefix(_ text: String) -> Bool {
+        let words = FullDuplexVoiceClient.normalize(text).split(separator: " ").map(String.init)
+        if [["don", "t"], ["dont"], ["do", "not"], ["never"], ["remind", "me", "to"]].contains(words) { return true }
+        let verbs: Set<String> = ["archive", "delete", "trash", "send", "reply", "skip", "read", "label", "spam"]
+        return words.first == "if" && !words.contains(where: verbs.contains)
+    }
+
     enum Decision: String { case noAction = "no_action", clarification }
 
     struct Output {

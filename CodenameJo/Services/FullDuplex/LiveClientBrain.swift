@@ -10,11 +10,17 @@ final class LiveClientBrain {
     let failed: (String) -> Void
     private var history: [[String: Any]] = []
     private var context: [String] = []
+    private var completedJobs: [(id: UUID, result: String)] = []
+    private var jobRevision = 0
     private var input: [[String: Any]] = []
     private var task: Task<Void, Never>?
-    private var activeRequest: (responseID: String, delegation: String)?
+    private var activeRequest: (requestID: String, responseID: String, delegation: String)?
     private var requestWatchdog: Task<Void, Never>?
-    var requestBound: TimeInterval = 20
+    var requestBound: TimeInterval = 10
+    var onRequestTransition: ((String, String, String, Int) -> Void)?
+    var onPresentationInvalidated: ((String, String?) -> Void)?
+    private var rejectingAssistantPresentation = false
+    private var correctedEmptySelection = false
     private var delegation: String?
     private var liveDelegation: String?
     private var generation = UUID()
@@ -40,6 +46,7 @@ final class LiveClientBrain {
     private var scopeChanged = false
     private var questionState = ""
     private var actionRecords: [[String: Any]] = []
+    private var functionOrigins: [String: (turn: Int, selection: String)] = [:]
     private var functionItems: [String: [String: Any]] = [:]
     private var pendingQuestion = ""
     private var queuedDelegation: (id: String, live: Bool, turn: Int)?
@@ -63,6 +70,7 @@ final class LiveClientBrain {
     var busy: Bool { task != nil || !pendingCalls.isEmpty }
 
     func updateState(_ text: String, scope: String?) {
+        let previousSelection = LiveSelectionGrounding.selection(state)
         if self.scope != scope {
             // A pending switch call caused this change: its result still belongs to this
             // delegation, so the response is not cut short. Any other pending result is stale.
@@ -72,7 +80,10 @@ final class LiveClientBrain {
             self.scope = scope
             scopeRevision += 1
             actionRecords.removeAll()
+            completedJobs.removeAll()
+            jobRevision += 1
             functionItems.removeAll()
+            functionOrigins.removeAll()
             pendingCalls.removeAll()
             unclaimedCalls.removeAll()
             callWatchdog?.cancel()
@@ -93,9 +104,18 @@ final class LiveClientBrain {
             turnHistoryIndex = nil
         }
         state = LiveCompactContext.text(text)
+        let selected = LiveSelectionGrounding.selection(state)
+        if selected != previousSelection {
+            invalidatePresentation(reason: "selection_changed")
+            rejectingAssistantPresentation = false
+            if selected.identity != nil { correctedEmptySelection = false }
+        }
     }
 
     func user(_ text: String, turn: Int) {
+        if LiveRequestRecovery.isFeedback(text) {
+            invalidatePresentation(reason: "feedback")
+        }
         scopeChanged = false
         transcriptRevision += 1
         settledTurn = nil
@@ -104,6 +124,7 @@ final class LiveClientBrain {
                 history.append(["type": "message", "role": "assistant", "content": latestAssistant])
             }
             latestAssistant = ""
+            rejectingAssistantPresentation = false
             currentTurn = turn
             turnState = state
             history.append(["type": "message", "role": "user", "content": text])
@@ -117,11 +138,51 @@ final class LiveClientBrain {
     }
 
     func assistant(_ delta: String) {
+        guard !rejectingAssistantPresentation else { return }
         latestAssistant += delta
+        if LiveSelectionGrounding.unsupportedIntroduction(latestAssistant, state: state) {
+            rejectingAssistantPresentation = true
+            invalidatePresentation(reason: "unsupported_spoken_introduction")
+            return
+        }
         if latestAssistant.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?") {
             pendingQuestion = latestAssistant
             questionState = state
         }
+    }
+
+    private func invalidatePresentation(reason: String) {
+        latestAssistant = ""
+        pendingQuestion = ""
+        questionState = ""
+        let priorUserIndex = turnHistoryIndex
+        if let priorUserIndex {
+            turnHistoryIndex = history.prefix(priorUserIndex).filter { $0["role"] as? String != "assistant" }.count
+        }
+        history.removeAll { $0["role"] as? String == "assistant" }
+        if LiveSelectionGrounding.selection(state).isEmpty {
+            context.removeAll()
+            observe("No current email is selected. Earlier spoken descriptions and questions are not mailbox evidence. Never resume them. Continue only from an application-selected item.")
+        }
+        onPresentationInvalidated?(reason, LiveSelectionGrounding.selection(state).identity)
+    }
+
+    private func groundedReply(_ text: String) -> String {
+        guard LiveSelectionGrounding.unsupportedIntroduction(text, state: state) else { return text }
+        invalidatePresentation(reason: "unsupported_model_introduction")
+        defer { correctedEmptySelection = true }
+        return correctedEmptySelection ? LiveSelectionGrounding.noSelection : LiveSelectionGrounding.correction
+    }
+
+    func jobCompleted(id: UUID, result: String) {
+        let compact = LiveCompactContext.text(result, includeEmailContent: false)
+        let result = String(decoding: compact.utf8.prefix(2048), as: UTF8.self)
+            + (compact.utf8.count > 2048 ? " [Result shortened; consult the returned result before describing details.]" : "")
+        guard !completedJobs.contains(where: { $0.id == id && $0.result == result }) else { return }
+        completedJobs.removeAll { $0.id == id }
+        completedJobs.append((id, result))
+        if completedJobs.count > 12 { completedJobs.removeFirst() }
+        jobRevision += 1
     }
 
     func observe(_ text: String) {
@@ -154,7 +215,18 @@ final class LiveClientBrain {
         }
         if item["type"] as? String == "function_call_output", let id = item["call_id"] as? String,
            let call = functionItems[id] {
-            actionRecords.append(Self.actionRecord(call: call, output: item["output"] as? String ?? "No result"))
+            if LiveSelectionGrounding.selection(state).isEmpty,
+               let name = call["name"] as? String,
+               ["search_context", "gmail_search_messages", "search_messages"].contains(name),
+               LiveSelectionGrounding.emptySearch(item["output"] as? String ?? "") {
+                invalidatePresentation(reason: "negative_verification")
+            }
+            var record = Self.actionRecord(call: call, output: item["output"] as? String ?? "No result")
+            if let origin = functionOrigins.removeValue(forKey: id) {
+                record["origin_turn"] = origin.turn
+                record["origin_selection"] = origin.selection
+            }
+            actionRecords.append(record)
             functionItems.removeValue(forKey: id)
             while actionRecords.count > 12 { actionRecords.removeFirst() }
         }
@@ -276,10 +348,15 @@ final class LiveClientBrain {
         let requestRevision = transcriptRevision
         let requestScope = scopeRevision
         let requestPresentation = presentationOnly
+        let requestJobs = jobRevision
         let responseID = "jo-" + UUID().uuidString
-        var mandatory = ["requestSelection": requestState == state ? "Same as currentSelection" : requestState, "currentSelection": state,
+        var mandatory = ["current_turn": currentTurn, "selectionStatus": LiveSelectionGrounding.selection(state).isEmpty ? "none" : "application_state",
+                         "selectionRule": "Only currentSelection establishes the current email. Speech, prior questions, history and background findings cannot create one. Select a returned result explicitly before acting on it.",
+                         "requestSelection": requestState == state ? "Same as currentSelection" : requestState, "currentSelection": state,
                          "latestAssistant": latestAssistant, "pendingQuestion": pendingQuestion, "questionSelection": questionState == state ? "Same as currentSelection" : questionState,
-                         "recordedActions": Array(actionRecords.suffix(12)), "applicationUpdates": context] as [String: Any]
+                         "recordedActions": Array(actionRecords.suffix(12)), "completedJobs": completedJobs.map {
+                             ["job_id": $0.id.uuidString, "state": "finished", "result": $0.result]
+                         }, "applicationUpdates": context] as [String: Any]
         var optionalUpdates = context
         while !optionalUpdates.isEmpty,
               let data = try? JSONSerialization.data(withJSONObject: mandatory), data.count > 64_000 {
@@ -293,12 +370,13 @@ final class LiveClientBrain {
             fail("The current task context is too large to process safely."); return
         }
         let prior = history.enumerated().filter { $0.offset != turnHistoryIndex }.map(\.element)
-        let body: [String: Any] = ["requestId": UUID().uuidString, "delegationId": delegation, "turnIndex": currentTurn,
+        let requestID = UUID().uuidString
+        let body: [String: Any] = ["requestId": requestID, "delegationId": delegation, "turnIndex": currentTurn, "turnID": String(currentTurn),
             "context": String(decoding: stateData, as: UTF8.self), "history": Array(prior.suffix(12)), "input": input,
             "presentationOnly": presentationOnly]
         deliver(["type": "response.event", "delegation_id": delegation,
                  "event": ["type": "response.created", "response": ["id": responseID]]])
-        activeRequest = (responseID, delegation)
+        activeRequest = (requestID, responseID, delegation)
         let bound = requestBound
         requestWatchdog = Task { [weak self] in
             try? await Task.sleep(for: .seconds(bound))
@@ -322,7 +400,10 @@ final class LiveClientBrain {
                     || requestScope != scopeRevision || (!requestPresentation && completedTurns.contains(requestTurn)) {
                     let retry = requestTurn == currentTurn && requestScope == scopeRevision
                         && !completedTurns.contains(requestTurn)
-                    if retry { queuedDelegation = (delegation, liveDelegation != nil, currentTurn) }
+                    if retry {
+                        onRequestTransition?("request_transcript_revised", requestID, delegation, requestTurn)
+                        queuedDelegation = (delegation, liveDelegation != nil, currentTurn)
+                    }
                     // Preserve already returned tool outcomes when applying a same-turn correction.
                     if !retry { input.removeAll() }
                     self.delegation = nil
@@ -332,11 +413,20 @@ final class LiveClientBrain {
                     startSettledDelegation()
                     return
                 }
+                // A late acknowledgment must use job results that landed during its request.
+                if functions.isEmpty, requestJobs != jobRevision {
+                    finish(responseID: responseID, delegation: delegation, response: [:])
+                    run()
+                    return
+                }
                 input += output
                 let calls = Set(functions.compactMap { $0["call_id"] as? String })
                 pendingCalls.formUnion(calls)
                 for function in functions {
-                    if let id = function["call_id"] as? String { functionItems[id] = function }
+                    if let id = function["call_id"] as? String {
+                        functionItems[id] = function
+                        functionOrigins[id] = (requestTurn, LiveCompactContext.text(requestState, includeEmailContent: false))
+                    }
                 }
                 if !calls.isEmpty { armCallWatchdog(for: calls) }
                 for item in output {
@@ -346,7 +436,20 @@ final class LiveClientBrain {
                 if functions.isEmpty {
                     let text = output.flatMap { $0["content"] as? [[String: Any]] ?? [] }
                         .compactMap { $0["text"] as? String }.joined(separator: "\n")
-                    if !text.isEmpty { speak(text, liveDelegation) }
+                    // An earlier receipt is history, not proof that this turn's command ran.
+                    let hasCurrentAction = actionRecords.contains { record in
+                        guard record["origin_turn"] as? Int == requestTurn,
+                              let call = record["call"] as? [String: Any], let name = call["name"] as? String else { return false }
+                        return LiveWriteTarget.mailWrites.contains(ToolNarration.canonical(name)) || ["dispatch", "dispatch_command"].contains(name)
+                    }
+                    if !requestPresentation, LiveFastAction.parse(latestUser) == .archive,
+                       !hasCurrentAction, !Self.isActionClarification(text) {
+                        onRequestTransition?("request_no_action", requestID, delegation, requestTurn)
+                        finish(responseID: responseID, delegation: delegation, response: [:])
+                        fail("I haven't executed this new archive request. Please try again.")
+                        return
+                    }
+                    if !text.isEmpty { speak(groundedReply(text), liveDelegation) }
                     completedTurns.insert(requestTurn)
                     input.removeAll()
                     self.delegation = nil
@@ -375,6 +478,7 @@ final class LiveClientBrain {
                 }
                 deliver(["type": "response.event", "delegation_id": delegation,
                          "event": ["type": "response.failed", "response": ["id": responseID, "status": "failed", "client_task": true]]])
+                onRequestTransition?("request_provider_failed", requestID, delegation, requestTurn)
                 let detail = (error as? LiveBrainRequestError)?.diagnostic ?? "transport_or_response_failure"
                 RealtimeLog.log("liveBrain: request failed \(detail)")
                 fail("That task could not complete. The call is still connected; existing actions have not been repeated.")
@@ -382,8 +486,15 @@ final class LiveClientBrain {
         }
     }
 
+    private static func isActionClarification(_ text: String) -> Bool {
+        let question = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        return question.hasSuffix("?") && ["which email", "which message", "do you mean", "did you mean"]
+            .contains(where: question.hasPrefix)
+    }
+
     private func supersedeRequest() {
         guard let active = activeRequest else { return }
+        onRequestTransition?("request_superseded", active.requestID, active.delegation, requestTurn)
         cancelRequest()
         input.removeAll()
         delegation = nil
@@ -395,6 +506,7 @@ final class LiveClientBrain {
 
     private func expireRequest() {
         guard let active = activeRequest else { return }
+        onRequestTransition?("request_timed_out", active.requestID, active.delegation, requestTurn)
         cancelRequest()
         RealtimeLog.log("liveBrain: request exceeded \(Int(requestBound))s; releasing turn \(requestTurn)")
         deliver(["type": "response.event", "delegation_id": active.delegation,

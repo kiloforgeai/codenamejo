@@ -9,3 +9,14 @@ struct TurnTranscript {
         return order.compactMap { parts[$0] }.joined(separator: " ")
     }
 }
+
+struct LiveHistoryOrigin {
+    let id: UUID
+    let userText: String
+    let background: Bool
+}
+
+struct LiveHistoryReply {
+    let origin: LiveHistoryOrigin
+    let text: String
+}

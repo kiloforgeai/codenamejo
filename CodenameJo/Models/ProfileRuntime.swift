@@ -12,6 +12,7 @@ enum ProfileRuntime {
         var canSwitch = false
         var mailHeadersOnly: Bool? = nil
         var membershipRevision: Int? = nil
+        var feedSections: [FeedSection]? = nil
 
         func containsMailbox(_ account: String) -> Bool {
             emails?.contains { $0.caseInsensitiveCompare(account) == .orderedSame } == true

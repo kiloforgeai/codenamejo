@@ -1,5 +1,24 @@
 import AVFoundation
 
+private struct CueAudioGraph {
+    let generation: Int
+    let requestID: String
+    let phase: String
+    let diagnostics: VoiceDiagnostics.Session?
+    let engine: AVAudioEngine
+    let player: AVAudioPlayerNode
+
+    func release() {
+        player.stop()
+        engine.stop()
+        if player.engine != nil {
+            engine.disconnectNodeOutput(player)
+            engine.detach(player)
+        }
+        diagnostics?.record(.audioReleased, ["engine": "cue", "phase": phase, "request_id": requestID])
+    }
+}
+
 /// Two-note cue for "you may talk now", inverted for "the call is down". It plays while libwebrtc owns the
 /// session, so it never calls `setCategory`, `setActive(false)`, `engine.inputNode` or `RTCAudioSession`.
 /// The end cue must play before teardown in `FullDuplexVoiceClient.stop()`; after `audio.deactivate()` it is silent.
@@ -50,9 +69,10 @@ final class ConnectCue {
 
     /// Defaults to the connect cue, so the existing call site reads as it did.
     init(notes: [(frequency: Double, at: Double)] = ConnectCue.risingFifth,
-         label: String = "connect cue") {
+         label: String = "connect cue", queue: AudioQueue = AudioQueue()) {
         self.notes = notes
         self.label = label
+        self.queue = queue
     }
     /// Sized so the second note's decay ends exactly at `length` — the buffer is silent
     /// at its end rather than approximately silent.
@@ -74,15 +94,12 @@ final class ConnectCue {
 
     // MARK: - Graph
 
-    /// `nonisolated(unsafe)` because `engine.start()` and `stop()` block, so they run
-    /// on `AudioQueue` while the main thread keeps the orb animating.
-    private nonisolated(unsafe) let engine = AVAudioEngine()
-    private nonisolated(unsafe) let player = AVAudioPlayerNode()
-    private let queue = AudioQueue()
-
-    /// Bumped by every `play()` and `stop()` so an overtaken cue can recognise itself and do nothing.
+    // Accessed only on AudioQueue, including creation and destruction.
+    private nonisolated(unsafe) var graph: CueAudioGraph?
+    private let queue: AudioQueue
+    private let instanceID = UUID().uuidString
     private var generation = 0
-    private var audible = false
+    private var audibleGeneration: Int?
     var diagnostics: VoiceDiagnostics.Session?
 
     nonisolated static func validOutput(sampleRate: Double, channels: UInt32) -> Bool {
@@ -96,88 +113,99 @@ final class ConnectCue {
     func play() async {
         generation += 1
         let mine = generation
-
+        let requestID = "cue-\(instanceID)-\(mine)"
+        let trace = diagnostics, phase = label
         guard let buffer = cueBuffer() else {
-            RealtimeLog.log("\(label): skipped — could not build the cue")
+            trace?.record(.speechFailed, ["engine": "cue", "phase": phase, "request_id": requestID,
+                "reason": "buffer_unavailable"])
             return
         }
-
-        let format = buffer.format
-        let started = (try? await queue.run("\(label) start") { [engine, player] in
-            // No `setCategory` or `setActive`: libwebrtc owns the session.
-            let hardware = engine.outputNode.outputFormat(forBus: 0)
-            guard Self.validOutput(sampleRate: hardware.sampleRate, channels: hardware.channelCount) else { return false }
-            if player.engine == nil { engine.attach(player) }
-            engine.connect(player, to: engine.mainMixerNode, format: format)
-            engine.prepare()
-            try engine.start()
-            return true
-        }) ?? false
-
-        guard started else {
-            diagnostics?.record(.speechFailed, ["engine": "cue", "phase": label, "reason": "invalid_or_unavailable_output"])
-            await releaseGraph()
-            RealtimeLog.log("\(label): not playing — engine unavailable")
-            return
-        }
-
-        // The call can end while the engine is coming up.
-        guard generation == mine else {
-            await releaseGraph()
-            RealtimeLog.log("\(label): call ended during bring-up — graph released")
-            return
-        }
-
-        let playing = (try? await queue.run("\(label) play") { [player] in
-            player.volume = 1
-            player.scheduleBuffer(buffer, at: nil, options: [], completionHandler: nil)
-            player.play()
-            return true
-        }) ?? false
-        guard playing else {
-            diagnostics?.record(.speechFailed, ["engine": "cue", "phase": label, "reason": "play_failed"])
-            await releaseGraph()
-            return
-        }
-        audible = true
-        diagnostics?.record(.speechStarted, ["engine": "cue", "phase": label])
-        // "Earpiece" here means something reconfigured the session.
-        RealtimeLog.log("\(label): playing on \(AudioRoute.describeCurrentRoute())")
-
-        try? await Task.sleep(for: Self.micDeafWindow)
-        // `stop()` overtook us and has already released the graph.
-        guard generation == mine else { return }
-        audible = false
-        await releaseGraph()
-        diagnostics?.record(.speechFinished, ["engine": "cue", "phase": label])
-    }
-
-    /// Silence and release early — the call ended while the cue was still playing.
-    func stop() async {
-        generation += 1
-        guard audible else { return }
-        audible = false
-
-        // Ramp instead of cutting, to avoid a click.
-        let steps = 6
-        for step in (0..<steps).reversed() {
-            _ = try? await queue.run("\(label) fade") { [player] in player.volume = Float(step) / Float(steps) }
-            try? await Task.sleep(for: .milliseconds(8))
-        }
-
-        await releaseGraph()
-        RealtimeLog.log("\(label): stopped")
-    }
-
-    private func releaseGraph() async {
-        _ = try? await queue.run("\(label) release") { [engine, player] in
-            player.stop()
-            engine.stop()
-            if player.engine != nil {
-                engine.disconnectNodeOutput(player)
-                engine.detach(player)
+        do {
+            let started = try await queue.run("\(label) start and play") { [self] in
+                graph?.release()
+                let engine = AVAudioEngine(), player = AVAudioPlayerNode()
+                graph = CueAudioGraph(generation: mine, requestID: requestID, phase: phase,
+                    diagnostics: trace, engine: engine, player: player)
+                let hardware = engine.outputNode.outputFormat(forBus: 0)
+                trace?.record(.speechRequested, ["engine": "cue", "phase": phase, "request_id": requestID,
+                    "sample_rate": String(hardware.sampleRate), "output_channels": String(hardware.channelCount)])
+                guard Self.validOutput(sampleRate: hardware.sampleRate, channels: hardware.channelCount) else { return false }
+                engine.attach(player)
+                engine.connect(player, to: engine.mainMixerNode, format: buffer.format)
+                engine.prepare()
+                try engine.start()
+                player.volume = 1
+                player.scheduleBuffer(buffer, at: nil, options: [], completionHandler: nil)
+                player.play()
+                return true
             }
-            // No `setActive(false)`: this runs under a live call, and the ADM needs an active session.
+            guard started else {
+                trace?.record(.speechFailed, ["engine": "cue", "phase": phase, "request_id": requestID,
+                    "reason": "invalid_output_format"])
+                await releaseGraph(generation: mine)
+                return
+            }
+        } catch {
+            trace?.record(.speechFailed, VoiceDiagnostics.failure(error).merging([
+                "engine": "cue", "phase": phase, "request_id": requestID, "reason": "engine_start_failed"
+            ]) { _, new in new })
+            await releaseGraph(generation: mine)
+            return
+        }
+        guard generation == mine, !Task.isCancelled else {
+            await releaseGraph(generation: mine)
+            trace?.record(.speechCancelled, ["engine": "cue", "phase": phase, "request_id": requestID,
+                "reason": "superseded_during_start"])
+            return
+        }
+        audibleGeneration = mine
+        trace?.record(.speechStarted, ["engine": "cue", "phase": phase, "request_id": requestID])
+        do { try await Task.sleep(for: Self.micDeafWindow) }
+        catch {
+            if audibleGeneration == mine { audibleGeneration = nil }
+            await releaseGraph(generation: mine)
+            trace?.record(.speechCancelled, ["engine": "cue", "phase": phase, "request_id": requestID,
+                "reason": "task_cancelled"])
+            return
+        }
+        guard generation == mine else { return }
+        audibleGeneration = nil
+        await releaseGraph(generation: mine)
+        trace?.record(generation == mine ? .speechFinished : .speechCancelled,
+            ["engine": "cue", "phase": phase, "request_id": requestID])
+    }
+
+    func stop() async {
+        let mine = generation
+        generation += 1
+        if audibleGeneration == mine {
+            audibleGeneration = nil
+            for step in (0..<6).reversed() {
+                do {
+                    try await queue.run("\(label) fade") { [self] in
+                        guard let graph, graph.generation == mine else { return }
+                        graph.player.volume = Float(step) / 6
+                    }
+                    try await Task.sleep(for: .milliseconds(8))
+                } catch { break }
+            }
+            diagnostics?.record(.speechCancelled, ["engine": "cue", "phase": label,
+                "request_id": "cue-\(instanceID)-\(mine)", "reason": "stopped"])
+        }
+        await releaseGraph(generation: mine)
+    }
+
+    private func releaseGraph(generation: Int) async {
+        do {
+            try await queue.run("\(label) release") { [self] in
+                guard let graph, graph.generation == generation else { return }
+                graph.release()
+                self.graph = nil
+            }
+        } catch {
+            diagnostics?.record(.speechFailed, VoiceDiagnostics.failure(error).merging([
+                "engine": "cue", "phase": label, "reason": "release_failed"
+            ]) { _, new in new })
         }
     }
 

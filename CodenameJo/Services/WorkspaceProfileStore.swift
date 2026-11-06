@@ -11,6 +11,7 @@ class WorkspaceProfileStore: ObservableObject {
     @Published var profiles: [WorkspaceProfile] = []
     @Published var selected: WorkspaceProfile?
     @Published var connections: [WorkspaceProfileConnection] = []
+    @Published var feedSections: [FeedSection] = []
     @Published var capabilities = WorkspaceProfileCapabilities.unavailable
     @Published var isSwitching = false
     @Published var error: String?
@@ -38,7 +39,7 @@ class WorkspaceProfileStore: ObservableObject {
         openingPreparation = nil
         revision += 1
         selected = nil; owner = nil; loaded = false; connectionsProfileId = nil; knownAccounts = []
-        profiles = []; connections = []; capabilities = .unavailable; error = nil; needsConnection = false
+        profiles = []; connections = []; feedSections = []; capabilities = .unavailable; error = nil; needsConnection = false
         publishScope()
     }
 
@@ -47,7 +48,7 @@ class WorkspaceProfileStore: ObservableObject {
             profileId: $0.id, isDefault: $0.isDefault,
             emails: connectionsProfileId == $0.id ? connections.map { $0.email.lowercased() } : nil,
             canSwitch: capabilities.liveSwitch && profiles.count > 1,
-            membershipRevision: $0.revision) })
+            membershipRevision: $0.revision, feedSections: feedSections) })
     }
 
     /// One profile's mailboxes, spelled as connected, with the reconnect state Connections last read.
@@ -66,8 +67,10 @@ class WorkspaceProfileStore: ObservableObject {
         let version = revision
         do {
             let refreshed = try await connections(of: selected.id)
+            let sections = try await rows.feedSections(userId: owner, profileId: selected.id)
             guard version == revision, backend.userId == owner, self.selected?.id == selected.id else { return }
             connections = refreshed
+            feedSections = sections
             connectionsProfileId = selected.id
             publishScope()
         } catch {
@@ -80,6 +83,16 @@ class WorkspaceProfileStore: ObservableObject {
         try await rows.reorderMailboxes(emails, userId: owner, profileId: profileId)
         guard backend.userId == owner, selected?.id == profileId else { return }
         await refreshConnections()
+    }
+
+    func saveFeedSections(_ sections: [FeedSection], profileId: String) async throws {
+        guard let owner = backend.userId, selected?.id == profileId else { throw WorkspaceProfileError.notFound }
+        let resolved = FeedSection.resolved(sections, accounts: connections.map(\.email))
+        try await rows.saveFeedSections(resolved, userId: owner, profileId: profileId)
+        guard backend.userId == owner, selected?.id == profileId else { return }
+        feedSections = resolved
+        publishScope()
+        await Container.shared.localTriage().updateFeedSections(resolved, profileID: profileId, store: Container.shared.mailStore())
     }
 
     /// Every mailbox the account has connected. One that no profile holds yet joins the profile
@@ -130,6 +143,7 @@ class WorkspaceProfileStore: ObservableObject {
                 try await rows.saveSettings(UserProfile.capturingLocalSettings(), userId: owner, profileId: selected.id)
             }
             connections = try await connections(of: selected.id)
+            feedSections = try await rows.feedSections(userId: owner, profileId: selected.id)
             connectionsProfileId = selected.id
         }
         publishScope()
@@ -207,12 +221,14 @@ class WorkspaceProfileStore: ObservableObject {
                 try await rows.saveSettings(UserProfile.capturingLocalSettings(), userId: owner, profileId: outgoing.id)
             }
             let destination = try await connections(of: profile.id)
+            let destinationSections = try await rows.feedSections(userId: owner, profileId: profile.id)
             let settings = try await rows.settings(userId: owner, profileId: profile.id) ?? UserProfile()
             let dossier = await Container.shared.profileDossier().context(owner: owner, profileId: profile.id)
             mark("destination read")
             try Container.shared.userProfile().applyWorkspaceSettings(settings)
             selected = profile
             connections = destination
+            feedSections = destinationSections
             connectionsProfileId = profile.id
             needsConnection = destination.isEmpty
             publishScope()

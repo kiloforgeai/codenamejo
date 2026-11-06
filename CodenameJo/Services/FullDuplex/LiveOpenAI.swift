@@ -76,15 +76,15 @@ enum LiveOpenAI {
         request["prompt_cache_key"] = SHA256.hash(data: brain).prefix(16)
             .map { String(format: "%02x", $0) }.joined()
 
-        let started = Date()
+        let started = ProcessInfo.processInfo.systemUptime
         let requestID = body["requestId"] as? String ?? UUID().uuidString
         diagnostics?.record(.brainRequest, ["request_id": requestID, "turn_id": body["turnID"] as? String ?? "unknown", "delegation_id": body["delegationId"] as? String ?? "unknown", "model": LivePrompt.brainModel,
             "instructions_bytes": String(bytes(request["instructions"] ?? "")),
             "tools_bytes": String(bytes(request["tools"] ?? [])), "input_bytes": String(bytes(input))])
         var completed = false
         defer {
-            if !completed { diagnostics?.record(.brainResponse, ["request_id": requestID, "outcome": "failed",
-                "duration_ms": String(Int(Date().timeIntervalSince(started) * 1000))]) }
+            if !completed { diagnostics?.record(.brainResponse, ["request_id": requestID, "outcome": Task.isCancelled ? "cancelled" : "failed",
+                "duration_ms": String(Int((ProcessInfo.processInfo.systemUptime - started) * 1000))]) }
         }
         let (data, response) = try await URLSession.shared.data(
             for: try post("responses", body: JSONSerialization.data(withJSONObject: request), timeout: 45))
@@ -102,12 +102,12 @@ enum LiveOpenAI {
         let cached = (usage?["input_tokens_details"] as? [String: Any])?["cached_tokens"] as? Int
         completed = true
         var fields = ["request_id": requestID, "outcome": "success", "model": LivePrompt.brainModel,
-            "duration_ms": String(Int(Date().timeIntervalSince(started) * 1000)),
+            "duration_ms": String(Int((ProcessInfo.processInfo.systemUptime - started) * 1000)),
             "input_tokens": String(usage?["input_tokens"] as? Int ?? -1), "cached_tokens": String(cached ?? -1),
             "output_tokens": String(usage?["output_tokens"] as? Int ?? -1)]
         fields["provider_request_id"] = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "x-request-id")
         diagnostics?.record(.brainResponse, fields)
-        RealtimeLog.log("liveBrain: ms=\(Int(Date().timeIntervalSince(started) * 1000)) "
+        RealtimeLog.log("liveBrain: ms=\(Int((ProcessInfo.processInfo.systemUptime - started) * 1000)) "
             + "inputTokens=\(usage?["input_tokens"] as? Int ?? -1) cachedTokens=\(cached ?? -1)")
         var answer: [String: Any] = ["output": output]
         answer["id"] = result["id"]

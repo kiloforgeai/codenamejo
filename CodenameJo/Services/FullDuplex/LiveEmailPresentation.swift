@@ -52,8 +52,10 @@ struct LiveEmailPresentation: Codable, Sendable {
         static func step(_ output: String) -> Key? {
             guard let json = try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any],
                   json["done"] as? Bool == false,
-                  ["interstitial", "cleanup", "onboarding", "coaching", "dispatchOutcome",
-                   "presentedForOutcome"].allSatisfy({ json[$0] == nil }),
+                  ["interstitial", "cleanup", "onboarding", "coaching"].allSatisfy({ json[$0] == nil }),
+                  (json["dispatchOutcome"] == nil && json["presentedForOutcome"] == nil)
+                    || (json["presentedForOutcome"] as? Bool == true
+                        && (json["returnedWorkSelection"] as? String).flatMap(UUID.init(uuidString:)) != nil),
                   let item = json["item"] as? [String: Any], item["alreadyDone"] == nil,
                   item["hasDraft"] as? Bool != true,
                   let account = item["account"] as? String, let id = item["id"] as? String,

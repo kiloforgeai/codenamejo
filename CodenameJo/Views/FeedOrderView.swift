@@ -4,14 +4,15 @@ import SwiftUI
 
 @MainActor
 class FeedOrderViewModel: ViewModel {
-    @Published var inboxes: [WorkspaceProfileConnection] = []
+    @Published var sections: [FeedSection] = []
     @Published var profileName = ""
     @Published var saving = false
     @Published var error: String?
 }
 
 protocol FeedOrderHandler {
-    func move(_ email: String, before destination: String?, viewModel: FeedOrderViewModel)
+    func setEnabled(_ id: String, enabled: Bool, viewModel: FeedOrderViewModel)
+    func move(_ id: String, before destination: String?, viewModel: FeedOrderViewModel)
 }
 
 @MainActor
@@ -21,23 +22,35 @@ class FeedOrderInteractor: ViewModelInteractor<FeedOrderViewModel>, FeedOrderHan
     @CancellableBuilder
     override func onLoad(viewModel: FeedOrderViewModel) -> [AnyCancellable] {
         super.onLoad(viewModel: viewModel)
-        profiles.$connections.sink { [weak viewModel] in viewModel?.inboxes = $0 }
+        profiles.$feedSections.sink { [weak viewModel] in viewModel?.sections = $0 }
         profiles.$selected.sink { [weak viewModel] in viewModel?.profileName = $0?.name ?? "Your workspace" }
     }
 
-    func move(_ email: String, before destination: String?, viewModel: FeedOrderViewModel) {
-        guard !viewModel.saving, email != destination, let profile = profiles.selected,
-              let source = viewModel.inboxes.firstIndex(where: { $0.email == email }) else { return }
-        var ordered = viewModel.inboxes
+    func move(_ id: String, before destination: String?, viewModel: FeedOrderViewModel) {
+        guard !viewModel.saving, id != destination,
+              let source = viewModel.sections.firstIndex(where: { $0.id == id }) else { return }
+        var ordered = viewModel.sections
         let item = ordered.remove(at: source)
-        let target = destination.flatMap { address in ordered.firstIndex { $0.email == address } } ?? ordered.count
+        let target = destination.flatMap { id in ordered.firstIndex { $0.id == id } } ?? ordered.count
         ordered.insert(item, at: target)
+        save(ordered, viewModel: viewModel)
+    }
+
+    func setEnabled(_ id: String, enabled: Bool, viewModel: FeedOrderViewModel) {
+        guard !viewModel.saving, let index = viewModel.sections.firstIndex(where: { $0.id == id }) else { return }
+        var sections = viewModel.sections
+        sections[index].enabled = enabled
+        save(sections, viewModel: viewModel)
+    }
+
+    private func save(_ sections: [FeedSection], viewModel: FeedOrderViewModel) {
+        guard let profile = profiles.selected else { return }
         viewModel.saving = true
         viewModel.error = nil
         Task { [weak self, weak viewModel] in
             guard let self, let viewModel else { return }
             defer { viewModel.saving = false }
-            do { try await profiles.reorderMailboxes(ordered.map(\.email), profileId: profile.id) }
+            do { try await profiles.saveFeedSections(sections, profileId: profile.id) }
             catch { viewModel.error = error.localizedDescription }
         }
     }
@@ -53,63 +66,68 @@ struct FeedOrderView<Interactor: ViewWithModelLifecycleObserver<FeedOrderViewMod
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Feed order").font(.largeTitle.bold())
+                    Text("Feed sections").font(.largeTitle.bold())
                     Text(viewModel.profileName).font(.headline).foregroundStyle(.secondary)
-                    Text("Drag an inbox above another to choose what comes next. Jo keeps your current email in place.")
+                    Text("Choose what belongs in your feed, then drag sections into the order you want. Your current email stays in place.")
                         .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
-                if viewModel.inboxes.isEmpty {
-                    ContentUnavailableView("Connect an inbox first", systemImage: "envelope",
-                        description: Text("Your connected inboxes will appear here."))
-                }
                 VStack(spacing: 10) {
-                    ForEach(Array(viewModel.inboxes.enumerated()), id: \.element.id) { index, inbox in
+                    ForEach(Array(viewModel.sections.enumerated()), id: \.element.id) { index, section in
                         HStack(spacing: 16) {
                             Image(systemName: "line.3.horizontal").foregroundStyle(.secondary)
                                 .frame(width: 24, height: 32).contentShape(Rectangle())
                                 .gesture(DragGesture(minimumDistance: 6, coordinateSpace: .named("feedOrderRows"))
-                                    .onChanged { _ in if !viewModel.saving { dragging = inbox.email } }
+                                    .onChanged { _ in if !viewModel.saving { dragging = section.id } }
                                     .onEnded { value in
                                         defer { dragging = nil }
                                         guard !viewModel.saving else { return }
-                                        let destination = viewModel.inboxes.first { candidate in
-                                            candidate.email != inbox.email && (rowFrames[candidate.email]?.midY ?? .infinity) > value.location.y
-                                        }?.email
-                                        interactor.move(inbox.email, before: destination, viewModel: viewModel)
+                                        let destination = viewModel.sections.first { candidate in
+                                            candidate.id != section.id && (rowFrames[candidate.id]?.midY ?? .infinity) > value.location.y
+                                        }?.id
+                                        interactor.move(section.id, before: destination, viewModel: viewModel)
                                     })
                                 .accessibilityHidden(true)
                             Text("\(index + 1)").monospacedDigit().foregroundStyle(.secondary)
-                            Text(inbox.email).font(.body.weight(.medium))
-                                .fixedSize(horizontal: false, vertical: true)
+                            Image(systemName: section.symbol).frame(width: 24).foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(section.title).font(.body.weight(.semibold))
+                                Text(section.subtitle).font(.callout).foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                             Spacer(minLength: 8)
+                            Toggle("Include \(section.title), \(section.subtitle)", isOn: Binding(
+                                get: { section.enabled },
+                                set: { interactor.setEnabled(section.id, enabled: $0, viewModel: viewModel) }))
+                                .labelsHidden().disabled(viewModel.saving)
+                                .accessibilityIdentifier("feedSectionToggle_\(section.id)")
                             Button {
-                                interactor.move(inbox.email, before: viewModel.inboxes[index - 1].email, viewModel: viewModel)
+                                interactor.move(section.id, before: viewModel.sections[index - 1].id, viewModel: viewModel)
                             } label: { Image(systemName: "arrow.up") }
                                 .disabled(index == 0 || viewModel.saving)
-                                .accessibilityLabel("Move \(inbox.email) earlier")
+                                .accessibilityLabel("Move \(section.title), \(section.subtitle) earlier")
                             Button {
-                                let afterNext = index + 2 < viewModel.inboxes.count ? viewModel.inboxes[index + 2].email : nil
-                                interactor.move(inbox.email, before: afterNext, viewModel: viewModel)
+                                let afterNext = index + 2 < viewModel.sections.count ? viewModel.sections[index + 2].id : nil
+                                interactor.move(section.id, before: afterNext, viewModel: viewModel)
                             } label: { Image(systemName: "arrow.down") }
-                                .disabled(index == viewModel.inboxes.count - 1 || viewModel.saving)
-                                .accessibilityLabel("Move \(inbox.email) later")
+                                .disabled(index == viewModel.sections.count - 1 || viewModel.saving)
+                                .accessibilityLabel("Move \(section.title), \(section.subtitle) later")
                         }
                         .padding(18).background(Theme.surface, in: RoundedRectangle(cornerRadius: 12))
-                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(dragging == inbox.email ? Color.accentColor : .clear, lineWidth: 2))
+                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(dragging == section.id ? Color.accentColor : .clear, lineWidth: 2))
                         .background(GeometryReader { geometry in
                             Color.clear.preference(key: FeedOrderRowFrames.self,
-                                value: [inbox.email: geometry.frame(in: .named("feedOrderRows"))])
+                                value: [section.id: geometry.frame(in: .named("feedOrderRows"))])
                         })
                         .accessibilityIdentifier("feedOrderRow_\(index)")
                     }
                 }
                 .coordinateSpace(name: "feedOrderRows")
                 .onPreferenceChange(FeedOrderRowFrames.self) { rowFrames = $0 }
-                if viewModel.saving { ProgressView("Saving order…") }
+                if viewModel.saving { ProgressView("Saving feed…") }
                 if let error = viewModel.error {
                     Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.red)
                 }
-                Text("Order is saved for this profile. Newly connected inboxes are added at the end.")
+                Text("Saved for this profile. Important emails are Jo’s high-priority mail from the past week; Other emails includes everything else, including unranked mail. Changes apply to upcoming sections. New inbox sections are added at the end.")
                     .font(.footnote).foregroundStyle(.secondary)
             }.padding(32).frame(maxWidth: 760, alignment: .leading).frame(maxWidth: .infinity)
         }

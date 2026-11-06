@@ -123,8 +123,13 @@ class RealtimeService: ObservableObject {
     // files, and `SpokenCommand` still reads the finals to hang up. Nothing
     // reads the words as they arrive.
     @Published var responseText: String = "" {
-        didSet { syncLiveActivity() }
+        didSet {
+            if responseText.isEmpty { responseItemID = nil; responseTurnID = nil }
+            syncLiveActivity()
+        }
     }
+    var responseItemID: String?
+    var responseTurnID: String?
     /// The answer on screen belongs to a question that has already been superseded.
     ///
     /// Set when the user starts speaking, cleared by the next reply's first delta. It
@@ -379,23 +384,23 @@ class RealtimeService: ObservableObject {
     var renderedWorkspace: RenderedFeedState?
     private var renderRevision = 0
 
+    func selectReturnedResult(_ id: UUID) async -> String? {
+        guard isConversing, let client = fullDuplex else { return "Start a Live session to work on this email." }
+        return await client.selectReturnedResult(id)
+    }
+
+    func performFeedAction(_ action: LiveFastAction, context: FeedActionContext) -> String? {
+        guard isConversing, let client = fullDuplex else { return "Start a Live feed session to use these actions." }
+        return client.performFeedAction(action, context: context)
+    }
+
     func recordRenderedWorkspace(_ state: RenderedFeedState) {
         guard state.conversationID == activeConversationId, state.profileID == ProfileRuntime.snapshot?.profileId,
               state != renderedWorkspace else { return }
-        let queueChanged = state.queueOrder != renderedWorkspace?.queueOrder
         renderedWorkspace = state
         renderRevision += 1
         guard isConversing, let diagnostics else { return }
-        var fields = ["render_revision": String(renderRevision), "queue_revision": String(state.queueRevision),
-            "queue_scope": state.queueScope, "observation_phase": "layout_applied",
-            "window_id": "workspace", "profile_hash": diagnostics.target(state.profileID ?? "default"),
-            "response_hash": diagnostics.target(state.response), "response_role": state.previousResponse ? "previous" : "current",
-            "focus_mode": String(state.focusMode), "visible_count": String(state.queueOrder.count)]
-        if let focus = state.focus { fields["target_hash"] = diagnostics.target(focus.canonical) }
-        if let current = state.queueCurrent { fields["queue_target_hash"] = diagnostics.target(current.canonical) }
-        if queueChanged { fields["queue_order"] = state.queueOrder.map { diagnostics.target($0) }.joined(separator: ",") }
-        fields["mismatch"] = String(state.focus != nil && state.focus != state.queueCurrent)
-        diagnostics.record(.workspaceRendered, fields)
+        diagnostics.record(.workspaceRendered, state.diagnosticFields(session: diagnostics, revision: renderRevision))
     }
     var isLocalVoice: Bool { localVoiceEngine != nil }
 
@@ -583,32 +588,14 @@ class RealtimeService: ObservableObject {
             if self.commandStartTime == nil { self.commandStartTime = Date() }
             if !text.isEmpty { self.lastCommandText = text }
         }
-        client.onAssistantTranscript = { [weak self, weak client] text, isFinal in
-            // `stopWithEndCue` keeps the audio session alive briefly for the falling
-            // tone. Ignore any transcript frame already in flight during that window;
-            // otherwise End clears the answer and a late delta draws it again.
+        client.onAssistantTranscript = { [weak self, weak client] text, _ in
             guard let self, self.isConversing else { return }
+            self.responseItemID = client?.currentAssistantItem
+            self.responseTurnID = client?.currentAssistantTurnID
             self.responseText = SpokenAddress.written(text)
-            // The reply that replaces the stale one has arrived, so it is no longer
-            // stale — done on every delta rather than on a "response started" event
-            // because this is the first thing that puts *new* words on screen.
             self.answerIsStale = false
-            // A tool call ends a Realtime response without ending the turn, so
-            // "final" here means the model has actually stopped — the client
-            // withholds it while a continuation is in flight.
-            if isFinal {
-                self.lastCommandText = client?.historyUserText ?? self.lastCommandText
-                self.finalizeTurn(id: client?.historyTurnID)
-            }
         }
-        client.onUserTurnCommitted = { [weak self] in
-            // The step chips describe *one* wait and are cleared when the next one
-            // starts — the same contract as the turn-based path's `onUtteranceSent`.
-            // Without this they persisted across turns, so a turn that ran no tools
-            // at all still showed "search email ids ✓ / batch read email ✓" from
-            // two questions ago, which reads as work that never happened.
-            self?.turnSteps = []
-        }
+        bindLiveHistory(client)
         client.onResetRequested = { [weak self, weak client] in
             guard let self, let client, self.fullDuplex === client else { return }
             self.resetLiveConversation()
@@ -1527,6 +1514,8 @@ class RealtimeService: ObservableObject {
         // transport, and whichever reason lands first is the one kept — so recording the
         // user's intent here is what stops a hang-up being filed as a transport failure
         // it actually caused.
+        fullDuplex?.checkpointHistory()
+        fullDuplex?.emitFinalTranscript(responseCompleted: false)
         finishConversation(reason: reason)
         // Pause the durable queue on the same action that ends the call, not on the
         // next dial. The latter is too late: a queued continuation can advance and
@@ -1931,22 +1920,53 @@ class RealtimeService: ObservableObject {
     ///   stamping that would put the marker in front of the user.
     private var completedHistory: [UUID: CommandRecord] = [:]
 
-    private func finalizeTurn(interrupted: Bool = false, id: UUID? = nil) {
-        let id = id ?? fullDuplex?.historyTurnID ?? UUID()
-        let previous = completedHistory[id]
-        if fullDuplex?.isBackgroundHistory == true {
-            var record = previous ?? CommandRecord(id: id, commandText: lastCommandText, conversationId: activeConversationId)
-            record.responseText = responseText
-            record.status = fullDuplex?.historyJobOutcomes[id] ?? .unknown
+    func bindLiveHistory(_ client: FullDuplexVoiceClient) {
+        client.onHistoryCheckpoint = { [weak self] id, text in
+            self?.checkpointLiveTurn(id: id, text: text)
+        }
+        client.onHistoryReply = { [weak self, weak client] reply in
+            guard let self, let client else { return }
+            let origin = reply.origin
+            if origin.id == client.historyTurnID, !origin.background {
+                self.finalizeTurn(id: origin.id, command: origin.userText, response: reply.text)
+                return
+            }
+            var record = self.completedHistory[origin.id] ?? CommandRecord(
+                id: origin.id, commandText: origin.userText, conversationId: self.activeConversationId)
+            record.responseText = SpokenAddress.written(reply.text)
+            record.status = client.historyJobOutcomes[origin.id] ?? record.status
             record.toolSteps = record.toolSteps?.map { step in
                 var step = step
                 if step.tool == "dispatch" { step.outcome = record.status.rawValue }
                 return step
             }
-            completedHistory[id] = record
-            lastCompletedTurn = record
-            return
+            self.completedHistory[origin.id] = record
+            self.lastCompletedTurn = record
         }
+    }
+
+    private func checkpointLiveTurn(id: UUID, text: String) {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        var record = completedHistory[id] ?? CommandRecord(
+            id: id, commandText: text, conversationId: activeConversationId)
+        record.commandText = text
+        if !turnSteps.isEmpty {
+            record.status = CommandRecord.outcome(steps: turnSteps, interrupted: false)
+            record.toolSteps = turnSteps.map { .init(tool: $0.tool,
+                milliseconds: $0.serverMilliseconds.flatMap { $0 > 0 ? $0 : nil },
+                outcome: $0.failed ? "failed" : $0.isRunning ? "unknown" : "success") }
+        }
+        guard record != completedHistory[id] else { return }
+        completedHistory[id] = record
+        lastCompletedTurn = record
+    }
+
+    private func finalizeTurn(interrupted: Bool = false, id: UUID? = nil,
+                              command: String? = nil, response: String? = nil) {
+        let id = id ?? fullDuplex?.historyTurnID ?? UUID()
+        let previous = completedHistory[id]
+        let lastCommandText = command ?? self.lastCommandText
+        let responseText = response.map(SpokenAddress.written) ?? self.responseText
         let status = interrupted ? CommandRecord.CommandStatus.cancelled
             : fullDuplex?.historyJobOutcomes[id] ?? CommandRecord.outcome(steps: turnSteps, interrupted: false)
         lastResponseText = interrupted
@@ -1975,9 +1995,7 @@ class RealtimeService: ObservableObject {
         lastTurnLatency = nil
         commandStartTime = nil
 
-        // A turn with nothing said back isn't a turn worth filing — the old save
-        // guarded on this too, and it is the one place that can still decline.
-        guard !lastResponseText.isEmpty else { return }
+        guard !lastResponseText.isEmpty || !lastCommandText.isEmpty else { return }
         let brainSteps = (previous?.brainSteps ?? []) + pendingBrainSteps
         pendingBrainSteps = []
         let record = CommandRecord(
@@ -2090,6 +2108,8 @@ extension RealtimeService {
         }
         call.onAssistantTranscript = { [weak self] text, isFinal in
             guard let self, self.isConversing else { return }
+            self.responseItemID = nil
+            self.responseTurnID = nil
             self.responseText = SpokenAddress.written(text)
             self.answerIsStale = false
             if isFinal { self.finalizeTurn() }
