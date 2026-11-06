@@ -10,7 +10,7 @@ final class VoiceDiagnosticsTests: XCTestCase {
         first.record(.sessionEnded)
         let data = try await log.snapshot(userID: "first-user")
         let events = try rows(data)
-        XCTAssertEqual(events.count, 2)
+        XCTAssertEqual(events.count, 3, "The export includes two lifecycle events and their coverage manifest")
         XCTAssertTrue(events.allSatisfy { $0["user_id"] as? String == "first-user" })
         XCTAssertTrue(events.allSatisfy { $0["session_id"] as? String == first.id.uuidString })
     }
