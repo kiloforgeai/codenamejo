@@ -1,4 +1,4 @@
-#if targetEnvironment(macCatalyst) && JO_QA
+#if targetEnvironment(macCatalyst) && (JO_QA || JO_TESTING)
 import Foundation
 import Network
 

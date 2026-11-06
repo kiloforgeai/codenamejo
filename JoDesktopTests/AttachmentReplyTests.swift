@@ -10,7 +10,7 @@ final class AttachmentReplyTests: XCTestCase {
     private var context: LocalContextStore!
     private var folder: URL!
     private var saved: [String: Any] = [:]
-    private let keys = [DraftsOnly.storageKey, DraftsOnly.byAccountStorageKey, MailFooter.storageKey,
+    private let keys = [DraftsOnly.byAccountStorageKey, MailFooter.storageKey,
                         StandingRule.archiveAfterReply.storageKey, MailHeadersOnly.storageKey]
 
     override func setUp() async throws {
@@ -20,7 +20,6 @@ final class AttachmentReplyTests: XCTestCase {
             saved[key] = UserDefaults.standard.object(forKey: key)
             UserDefaults.standard.removeObject(forKey: key)
         }
-        UserDefaults.standard.set(false, forKey: DraftsOnly.storageKey)
         UserDefaults.standard.set(false, forKey: StandingRule.archiveAfterReply.storageKey)
         UserDefaults.standard.set(false, forKey: MailFooter.storageKey)
         ProfileRuntime.install(.init(profileId: "attachment-profile", isDefault: true,

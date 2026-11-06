@@ -1,4 +1,7 @@
-#if targetEnvironment(macCatalyst) && JO_QA
+#if targetEnvironment(macCatalyst) && (JO_QA || JO_TESTING)
+#if JO_TESTING
+@testable import CodenameJo
+#endif
 import Foundation
 
 @MainActor
