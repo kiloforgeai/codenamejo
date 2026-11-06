@@ -59,14 +59,14 @@ final class LiveClientBrainTests: XCTestCase {
         Container.shared.dispatchJobs.register { jobs }
         let h = Harness()
         defer { h.brain.close(); for reply in h.replies { reply.resume(throwing: CancellationError()) }; h.replies = [] }
-        let a = #"{"done":false,"item":{"id":"A","threadId":"thread-A","account":"owner@example.test","subject":"Same subject"}}"#
+        let a = #"{"done":false,"item":{"id":"A","threadId":"thread-A","account":"owner@example.test","subject":"Project check-in"}}"#
         let b = #"{"done":false,"item":{"id":"B","threadId":"thread-B","account":"other@example.test","subject":"Same subject"}}"#
         let body = String(repeating: "All dictated details must survive. ", count: 80)
         h.brain.updateState(a, scope: "work")
-        h.brain.user("Reply saying " + body, turn: 1)
+        h.brain.updateState(b, scope: "work")
+        h.brain.user("Reply to the Project check-in email: " + body, turn: 1)
         h.brain.begin("reply", live: true, turn: 1); h.brain.settle(turn: 1)
         await waitForRequest(1, in: h)
-        h.brain.updateState(b, scope: "work")
         h.reply([["type": "function_call", "call_id": "preflight", "name": "send_email",
             "arguments": GmailReadTools.json(["account": "owner@example.test", "thread_id": "thread-A", "reply_message_id": "A", "body": body])]])
         await waitForRequest(2, in: h)

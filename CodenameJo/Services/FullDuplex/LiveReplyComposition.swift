@@ -3,8 +3,8 @@ import Foundation
 /// Keeps dictated reply content separate from a question about its destination.
 struct LiveReplyComposition {
     let id = UUID()
-    let source: DispatchJob.MailOrigin
-    let selection: String
+    var source: DispatchJob.MailOrigin
+    var selection: String
     var request: String
     var turn: Int
     var revision = 1
@@ -14,6 +14,7 @@ struct LiveReplyComposition {
     var writeCall: String?
     var recoveredBody: String?
     var recoveryJobID: UUID?
+    var candidateSelections: [String] = []
 
     static func sameSource(_ lhs: DispatchJob.MailOrigin?, _ rhs: DispatchJob.MailOrigin) -> Bool {
         lhs?.account.lowercased() == rhs.account.lowercased() && lhs?.threadID == rhs.threadID && lhs?.messageID == rhs.messageID
@@ -49,6 +50,19 @@ struct LiveReplyComposition {
                    options: [.regularExpression, .caseInsensitive]) != nil
     }
 
+    static func namedSources(_ request: String, recent: [String]) -> [String] {
+        let words = " " + FullDuplexVoiceClient.normalize(request) + " "
+        return recent.filter { state in
+            guard let source = DispatchJob.MailOrigin.captured(in: state) else { return false }
+            let title = FullDuplexVoiceClient.normalize(source.subject)
+                .replacingOccurrences(of: #"^(?:re|fwd|fw)\s+"#, with: "", options: .regularExpression)
+            guard title.count >= 4, words.contains(" " + title + " ") else { return false }
+            let namedAccounts = recent.compactMap { DispatchJob.MailOrigin.captured(in: $0)?.account }
+                .filter { request.lowercased().contains($0.lowercased()) }
+            return namedAccounts.isEmpty || namedAccounts.contains(source.account)
+        }
+    }
+
     mutating func question(_ text: String) {
         guard writeCall == nil, !targetConfirmed, text.contains("?"), text.range(
             of: #"\b(?:(?:which|what) (?:email|message|recipient|person)|(?:do you|did you) mean|(?:is|was) (?:this|that) (?:the|who)|who (?:did you|do you|should))\b"#,
@@ -67,7 +81,14 @@ struct LiveReplyComposition {
             self.turn = turn
             return
         }
-        if Self.confirmsTarget(text) || (recoveryJobID != nil && Self.requestsRetry(text)) { targetConfirmed = Self.sameSource(DispatchJob.MailOrigin.captured(in: selection), source) }
+        if candidateSelections.count > 1, Self.confirmsTarget(text) || Self.requestsRetry(text),
+           let selected = DispatchJob.MailOrigin.captured(in: selection),
+           candidateSelections.contains(where: { Self.sameSource(DispatchJob.MailOrigin.captured(in: $0), selected) }) {
+            self.source = selected
+            self.selection = selection
+            candidateSelections = []
+        }
+        if Self.confirmsTarget(text) || ((recoveryJobID != nil || recoveredBody != nil) && Self.requestsRetry(text)) { targetConfirmed = Self.sameSource(DispatchJob.MailOrigin.captured(in: selection), source) }
         self.turn = turn
     }
 
@@ -81,12 +102,13 @@ struct LiveReplyComposition {
         ["composition_id": id.uuidString, "revision": revision, "original_request": request,
          "original_source": selection, "target_question": clarification ?? "", "target_confirmed": targetConfirmed,
          "clarifications": followups, "write_call": writeCall ?? "",
-         "preserved_body": recoveredBody ?? "", "recovery_activity_id": recoveryJobID?.uuidString ?? "",
+         "preserved_body": recoveredBody ?? "", "candidate_sources": candidateSelections, "recovery_activity_id": recoveryJobID?.uuidString ?? "",
          "rule": "Preserve this complete dictated reply and its supplied details. A target clarification resolves only the destination; it does not discard the body or request another email summary/disposition. Continue the original reply under the existing send/draft policy after confirmation. Apply explicit content corrections without losing earlier details. Never substitute the newly selected email. A recorded write call may be pending or uncertain: inspect its receipt and never send again merely because the user clarified the target."]
     }
 
     func refusal(name: String, arguments: String, selection: String) -> String? {
         guard active, ["send_email", "reply_email", "create_draft", "forward_email"].contains(ToolNarration.canonical(name)) else { return nil }
+        if candidateSelections.count > 1 { return "Which account’s email should receive the preserved reply? Select that exact email and explicitly retry; do not choose by subject alone." }
         if writeCall != nil { return "This composition already has a write attempt. Inspect its receipt; do not send or draft it again." }
         guard targetConfirmed, Self.sameSource(DispatchJob.MailOrigin.captured(in: selection), source) else {
             return "The reply text is preserved, but its original email target still needs confirmation. Do not send to the newly selected email."
