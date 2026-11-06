@@ -431,6 +431,10 @@ targets:
       - CodenameJoTests/LocalSlackQueueTests.swift
       - CodenameJoTests/FeedOfferAnswerTests.swift
       - CodenameJoTests/FeedFocusTests.swift
+      - CodenameJoTests/LivePromptTests.swift
+      - CodenameJoTests/GoogleSignInFlowTests.swift
+      - CodenameJoTests/GoogleCredentialFailureTests.swift
+      - CodenameJoTests/OpenAIKeyReinstallTests.swift
     configFiles:
       Debug: Config/Version.xcconfig
       Release: Config/Version.xcconfig

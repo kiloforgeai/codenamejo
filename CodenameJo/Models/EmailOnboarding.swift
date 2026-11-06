@@ -34,7 +34,8 @@ enum OnboardingResume {
 /// Builds onboarding on the phone: the bundled steps and the founder email.
 enum LocalOnboardingRun {
     static func config(bundle: Bundle = .main) -> EmailOnboardingConfig? {
-        let url = bundle.bundleURL.appendingPathComponent("prompts/onboarding/config.json")
+        guard let url = bundle.url(forResource: "config", withExtension: "json", subdirectory: "prompts/onboarding")
+        else { return nil }
         return (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(EmailOnboardingConfig.self, from: $0) }
     }
 
@@ -75,7 +76,8 @@ enum WelcomeEmail {
     }
 
     static let copy: Copy? = {
-        let url = Bundle.main.bundleURL.appendingPathComponent("prompts/onboarding/welcome-email.json")
+        guard let url = Bundle.main.url(forResource: "welcome-email", withExtension: "json", subdirectory: "prompts/onboarding")
+        else { return nil }
         return (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(Copy.self, from: $0) }
     }()
 

@@ -1,7 +1,6 @@
 import SwiftUI
 
 /// Where the user adds, replaces or removes their own OpenAI key, in onboarding (`onContinue`) and Settings.
-/// Calls cannot start without a key: the backend refuses them with 409.
 struct OpenAIKeyView: View {
     var onContinue: (() -> Void)?
 
@@ -17,7 +16,7 @@ struct OpenAIKeyView: View {
                 .foregroundStyle(OnboardingTheme.textPrimary)
             Text("Jo runs on your own OpenAI account, so calls are billed to you. "
                 + "Create a key at platform.openai.com/api-keys and paste it here. "
-                + "It stays in this phone's Keychain; Jo's server uses it for your requests and never stores it.")
+                + "It stays in this device's Keychain and is sent only to OpenAI for your requests.")
                 .font(.system(size: 16))
                 .foregroundStyle(OnboardingTheme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)

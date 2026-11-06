@@ -109,6 +109,11 @@ connector grants. The sandbox permits WebRTC's inbound UDP audio as well as outg
 CarPlay, Watch pairing, Live Activities, and the locked-phone Siri shortcut stay iPhone-only.
 Local fallback speech uses the installed macOS system voice; Live voice uses the shared transport.
 
+Use **Feedback** in the workspace, or ask Jo to save feedback during a call. Notes stay in local,
+account-scoped logs with their session reference; Jo does not upload them or open GitHub issues.
+The workspace's log export includes only the signed-in user's feedback and lifecycle records.
+Settings also offers a speaker sample, and onboarding can continue when no microphone is connected.
+
 ```bash
 xcodebuild test -project CodenameJo.xcodeproj -scheme JoDesktop \
   -destination 'platform=macOS,variant=Mac Catalyst' -allowProvisioningUpdates \

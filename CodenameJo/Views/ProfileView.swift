@@ -10,6 +10,7 @@ protocol ProfileViewHandler {
     func requestDeleteAccount(viewModel: ProfileViewModel)
     func confirmDeleteAccount(viewModel: ProfileViewModel)
     func voiceNotesSwitched(viewModel: ProfileViewModel)
+    func cancelGoogleConnect(viewModel: ProfileViewModel)
     func connectGoogle(viewModel: ProfileViewModel)
     func reconnectGoogle(_ email: String, viewModel: ProfileViewModel)
     func removeGoogle(_ email: String, viewModel: ProfileViewModel)
@@ -63,6 +64,7 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
     @AppStorage(VoiceSettings.Key.voiceNotes) private var voiceNotesChoice: Bool?
     @AppStorage(LocalVoice.storageKey) private var localVoice = LocalVoice.current.rawValue
     @ObservedObject private var localSpeech = Container.shared.localSpeech()
+    @ObservedObject private var voiceSession = Container.shared.realtimeService()
     @AppStorage(LocalVoiceSettings.allLocalKey) private var allLocal = false
     @AppStorage(JoTips.storageKey) private var joTips = true
     @AppStorage(VoiceNotesDefault.ownerKey) private var voiceNotesOwner: String?
@@ -102,6 +104,12 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
                         .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 0, trailing: 0))
 
                     accountHeaderSection
+                    #if targetEnvironment(macCatalyst)
+                    Section {
+                        NavigationLink("Connections") { ProfileConnectionsSummaryComponent.make() }
+                            .accessibilityIdentifier("settings_connections")
+                    }
+                    #endif
                     voiceSection
                     Section {
                         NavigationLink("OpenAI key") { OpenAIKeyView() }
@@ -272,11 +280,15 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
                 Text(localVoiceDetail)
                     .font(.system(size: 12))
                     .foregroundStyle(Theme.textTertiary)
-                Button("Hear a sample") {
+                Button(localSpeech.isPreviewing ? "Playing sample…" : "Hear a sample") {
                     localSpeech.preview(LocalVoice(rawValue: localVoice) ?? .paradee)
                 }
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(Theme.accent)
+                .disabled(localSpeech.isPreviewing || voiceSession.isConversing)
+                if let message = localSpeech.previewMessage {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
+                }
             }
             .accessibilityIdentifier("localVoicePicker")
             .listRowBackground(Theme.surface)
@@ -881,6 +893,10 @@ extension ProfileViewInteractor: ProfileViewHandler {
 
     func connectGoogle(viewModel: ProfileViewModel) {
         connections.connectGmail()
+    }
+
+    func cancelGoogleConnect(viewModel: ProfileViewModel) {
+        connections.cancelGoogleConnect()
     }
 
     func reconnectGoogle(_ email: String, viewModel: ProfileViewModel) {

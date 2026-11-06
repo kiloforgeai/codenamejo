@@ -36,9 +36,7 @@ struct JoDesktopApp: App {
         .commands {
             CommandGroup(after: .appInfo) {
                 Button("Start work session") {
-                    Container.shared.voiceCall().withMicPermission {
-                        Container.shared.voiceCall().beginVoice()
-                    }
+                    Container.shared.voiceLauncher().requestLaunch(source: "desktop shortcut")
                 }.keyboardShortcut("k", modifiers: [.command, .shift])
                     .disabled(!onboarded || !backend.isSignedIn || realtime.isConversing)
                 Button("Mute / unmute microphone") {

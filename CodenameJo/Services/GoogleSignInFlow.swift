@@ -166,12 +166,15 @@ enum GoogleSignInFlow {
         let callback: URL
         do {
             callback = try await present(url)
+        } catch is CancellationError {
+            return .failure(.cancelled)
         } catch let error as ASWebAuthenticationSessionError where error.code == .canceledLogin {
             return .failure(.cancelled)
         } catch {
             return .failure(.failed(error.localizedDescription))
         }
 
+        guard !Task.isCancelled else { return .failure(.cancelled) }
         let items = URLComponents(url: callback, resolvingAgainstBaseURL: false)?.queryItems ?? []
         func item(_ name: String) -> String? { items.first { $0.name == name }?.value }
         guard item("state") == state else {
@@ -186,7 +189,9 @@ enum GoogleSignInFlow {
         guard let code = item("code") else { return .failure(.failed("Google didn't return a code.")) }
 
         let tokens: GoogleTokenServer.Tokens
-        switch await GoogleTokenServer.exchange(code: code, verifier: pkce.verifier) {
+        let exchange = await GoogleTokenServer.exchange(code: code, verifier: pkce.verifier)
+        guard !Task.isCancelled else { return .failure(.cancelled) }
+        switch exchange {
         case .success(let value): tokens = value
         case .failure(let failure):
             RealtimeLog.log("google sign-in: exchange failed — \(failure)")
@@ -219,36 +224,8 @@ enum GoogleSignInFlow {
 
     // MARK: - Presenting
 
-    private static var active: ASWebAuthenticationSession?
-    private static let anchor = PresentationAnchor()
-
     private static func present(_ url: URL) async throws -> URL {
-        try await withCheckedThrowingContinuation { continuation in
-            let session = ASWebAuthenticationSession(url: url, callbackURLScheme: callbackScheme) { callback, error in
-                MainActor.assumeIsolated {
-                    active = nil
-                    if let callback { continuation.resume(returning: callback) }
-                    else { continuation.resume(throwing: error ?? URLError(.badServerResponse)) }
-                }
-            }
-            session.presentationContextProvider = anchor
-            session.prefersEphemeralWebBrowserSession = false
-            active = session
-            if !session.start() {
-                active = nil
-                continuation.resume(throwing: URLError(.cannotOpenFile))
-            }
-        }
-    }
-
-    private final class PresentationAnchor: NSObject, ASWebAuthenticationPresentationContextProviding {
-        func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-            MainActor.assumeIsolated {
-                UIApplication.shared.connectedScenes
-                    .compactMap { ($0 as? UIWindowScene)?.keyWindow }
-                    .first ?? ASPresentationAnchor()
-            }
-        }
+        try await WebAuthSheet.present(url, callbackScheme: callbackScheme)
     }
 
     // MARK: - Randomness

@@ -34,6 +34,9 @@ struct OnboardingNotificationsView<Interactor: ViewWithModelLifecycleObserver<On
                     .lineSpacing(3)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.top, 28)
+                if let error = viewModel.audioError {
+                    Text(error).font(.caption).foregroundStyle(.secondary).padding(.top, 8)
+                }
                 LockScreenMockup()
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .padding(.top, 24)
@@ -264,6 +267,8 @@ final class OnboardingNotificationsViewModel: ViewModel {
     @Published var isRequesting = false
 
     @Published var joSpeaking = false
+    @Published var inputUnavailable = false
+    @Published var audioError: String?
     /// Level feed for the header thread while Jo's clip plays; see `JoClipMeter`.
     let clipMetering = VoiceMetering()
 }
@@ -273,6 +278,9 @@ final class OnboardingNotificationsViewModel: ViewModel {
 @MainActor
 final class OnboardingNotificationsViewInteractor: ViewModelInteractor<OnboardingNotificationsViewModel> {
     @Injected(\.pushNotifications) private var push
+    @Injected(\.onboardingAudioQueue) private var audioQueue
+    private let hasMicrophone: @Sendable () -> Bool
+    private var audioStart: Task<Void, Never>?
 
     private let onNext: () -> Void
     private var player: AVAudioPlayer?
@@ -286,7 +294,9 @@ final class OnboardingNotificationsViewInteractor: ViewModelInteractor<Onboardin
     private var heardYes = false
     private weak var viewModel: OnboardingNotificationsViewModel?
 
-    init(onNext: @escaping () -> Void) {
+    init(hasMicrophone: @escaping @Sendable () -> Bool = { OnboardingAudioSession.hasInputDevice },
+         onNext: @escaping () -> Void) {
+        self.hasMicrophone = hasMicrophone
         self.onNext = onNext
         super.init()
     }
@@ -300,7 +310,20 @@ final class OnboardingNotificationsViewInteractor: ViewModelInteractor<Onboardin
             await self.push.refresh()
             if self.push.isEnabled { self.advanceOnce() }
         }
-        playClip(viewModel: viewModel)
+        audioStart = Task { [weak self, weak viewModel] in
+            guard let self, let viewModel else { return }
+            do {
+                let available = try await audioQueue.run("notification input availability", hasMicrophone)
+                guard !Task.isCancelled, !advanced else { return }
+                viewModel.inputUnavailable = !available
+                try await playClip(viewModel: viewModel, hasInput: available)
+            } catch is CancellationError {
+                return
+            } catch {
+                RealtimeLog.log("onboarding: notification audio unavailable: \(error.localizedDescription)")
+                viewModel.audioError = "Jo couldn't play audio: \(error.localizedDescription)"
+            }
+        }
     }
 
     override func onViewDisappear(viewModel: OnboardingNotificationsViewModel) {
@@ -309,20 +332,35 @@ final class OnboardingNotificationsViewInteractor: ViewModelInteractor<Onboardin
         player = nil
     }
 
-    private func playClip(viewModel: OnboardingNotificationsViewModel) {
-        guard let url = Bundle.main.url(forResource: "jo4", withExtension: "wav") else { return }
-        do {
-            try OnboardingAudioSession.activate()
-            let player = try AVAudioPlayer(contentsOf: url)
-            self.player = player
-            player.play()
-            self.viewModel = viewModel
-            startListening()
-            joFeed = JoClipMeter.feed(player, into: viewModel.clipMetering) { [weak viewModel] in
-                viewModel?.joSpeaking = $0
+    private func playClip(viewModel: OnboardingNotificationsViewModel, hasInput: Bool) async throws {
+        guard let url = Bundle.main.url(forResource: "jo4", withExtension: "wav") else {
+            viewModel.audioError = "Jo's introduction couldn't be loaded. You can continue using the buttons."
+            return
+        }
+        let player = try await audioQueue.run("notification voice playback") {
+            if hasInput {
+                try OnboardingAudioSession.activate()
+            } else {
+                let session = AVAudioSession.sharedInstance()
+                try session.setCategory(.playback, mode: .spokenAudio)
+                try session.setActive(true)
             }
-        } catch {
-            RealtimeLog.log("onboarding: notifications clip failed: \(error.localizedDescription)")
+            let player = try AVAudioPlayer(contentsOf: url)
+            guard player.prepareToPlay(), player.play() else {
+                throw NSError(domain: "JoAudioPlayback", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "The speaker could not start playback."])
+            }
+            return player
+        }
+        guard !Task.isCancelled, !advanced else {
+            audioQueue.detached("cancel notification playback") { player.stop() }
+            return
+        }
+        self.player = player
+        self.viewModel = viewModel
+        if hasInput { startListening() }
+        joFeed = JoClipMeter.feed(player, into: viewModel.clipMetering) { [weak viewModel] in
+            viewModel?.joSpeaking = $0
         }
     }
 
@@ -384,6 +422,7 @@ final class OnboardingNotificationsViewInteractor: ViewModelInteractor<Onboardin
     }
 
     private func stopClip(viewModel: OnboardingNotificationsViewModel) {
+        audioStart?.cancel()
         stopListening()
         joFeed?.cancel()
         player?.stop()

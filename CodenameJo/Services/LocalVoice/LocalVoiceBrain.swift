@@ -1,4 +1,5 @@
 import CryptoKit
+import FactoryKit
 import Foundation
 import FoundationModels
 
@@ -123,7 +124,7 @@ enum LocalVoiceBrain {
         let relay = FullDuplexBroker.workerTools(mail: ProfileRuntime.allowedMailAccounts(mail), calendar: calendar,
                                                  notion: notion)
         let relayNames = Set(relay.compactMap { $0["name"] as? String })
-        let tools = DispatchWorker.tools(mail: mail, calendar: calendar, relay: relay)
+        let tools = DispatchWorker.tools(mail: mail, calendar: calendar, relay: relay) + [LiveToolSchemas.logFeedback]
         let instructions = try instructions(mail: !mail.isEmpty, calendar: !calendar.isEmpty, notion: notion)
         let names = Set(tools.compactMap { $0["name"] as? String })
         let cacheKey = SHA256.hash(data: Data((instructions + names.sorted().joined()).utf8)).prefix(16)
@@ -159,8 +160,18 @@ enum LocalVoiceBrain {
                 let name = call["name"] as? String ?? ""
                 let callId = call["call_id"] as? String ?? ""
                 let arguments = call["arguments"] as? String ?? "{}"
-                let result = await DispatchWorker.execute(name, arguments, relayNames: relayNames, cursor: focus?.cursor,
+                let result: (output: String, failed: Bool, write: Bool)
+                if name == UserFeedbackTool.name {
+                    let feedback = Container.shared.userFeedback()
+                    let submission = feedback.capture()
+                    let receipt = await UserFeedbackTool.run(argumentsJSON: arguments) {
+                        try await feedback.save($0, source: .voice, submission: submission)
+                    }
+                    result = (receipt.output, receipt.failed, false)
+                } else {
+                    result = await DispatchWorker.execute(name, arguments, relayNames: relayNames, cursor: focus?.cursor,
                                                           standingOn: focus?.standingOn, profileId: profileId)
+                }
                 RealtimeLog.log("local-voice: tool \(name)\(result.failed ? " failed" : "")")
                 input.append(["type": "function_call_output", "call_id": callId, "output": result.output])
             }

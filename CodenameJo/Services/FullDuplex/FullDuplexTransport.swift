@@ -92,6 +92,7 @@ final class FullDuplexTransport: NSObject {
     /// The assistant's track, held so its renderer can be detached on close.
     private var remoteAudioTrack: RTCAudioTrack?
     private let assistantVolume: Double
+    private let diagnostics: VoiceDiagnostics.Session?
 
     @Injected(\.voiceTransportQueue) private var lifecycleQueue
     private var closed = false
@@ -102,7 +103,8 @@ final class FullDuplexTransport: NSObject {
     /// Events written before the data channel opened, flushed on open.
     private var outbox: [Data] = []
 
-    init(assistantVolume: Double = 1.0) {
+    init(assistantVolume: Double = 1.0, diagnostics: VoiceDiagnostics.Session? = nil) {
+        self.diagnostics = diagnostics
         self.assistantVolume = min(max(assistantVolume, 0), 1)
         (signals, emit) = AsyncStream.makeStream(of: RealtimeSignal.self)
         super.init()
@@ -231,6 +233,8 @@ final class FullDuplexTransport: NSObject {
         guard let sdp = peerConnection?.localDescription?.sdp ?? pendingOffer?.sdp else {
             throw URLError(.cannotConnectToHost)
         }
+        let candidates = sdp.components(separatedBy: "\n").filter { $0.hasPrefix("a=candidate:") }.count
+        diagnostics?.record(.livePreparing, ["phase": "offer_ready", "ice_candidates": String(candidates)])
         return sdp
     }
 
@@ -369,18 +373,23 @@ final class FullDuplexTransport: NSObject {
         }
     }
 
-    func close(reason: String = "ended") {
-        lifecycleQueue.detached("voice transport teardown") { [self] in
-            guard !closed else { return }
-            closed = true
-            closeResources(reason: reason)
+    func close(reason: String = "ended") async {
+        await MainActor.run { [self] in
+            inputDriver.stop()
+            liveAdapter?.close()
+        }
+        await withCheckedContinuation { continuation in
+            lifecycleQueue.detached("voice transport teardown") { [self] in
+                if !closed {
+                    closed = true
+                    closeResources(reason: reason)
+                }
+                continuation.resume()
+            }
         }
     }
 
     private func closeResources(reason: String) {
-        Task { @MainActor in inputDriver.stop() }
-
-        if let liveAdapter { Task { @MainActor in liveAdapter.close() } }
         RealtimeLog.log("webrtc: closing — \(reason)")
 
 #if DEBUG
@@ -413,6 +422,21 @@ final class FullDuplexTransport: NSObject {
     // MARK: - Inbound
 
     fileprivate func handle(frame: Data) {
+        if let event = try? JSONSerialization.jsonObject(with: frame) as? [String: Any],
+           let type = event["type"] as? String,
+           ["session.created", "session.updated", "error", "response.created", "response.done",
+            "input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped"].contains(type) {
+            var fields = ["event_type": type]
+            if let error = event["error"] as? [String: Any] { fields["provider_code"] = error["code"] as? String }
+            if let response = event["response"] as? [String: Any] {
+                fields["response_status"] = response["status"] as? String
+                if let details = response["status_details"] as? [String: Any],
+                   let error = details["error"] as? [String: Any] {
+                    fields["provider_code"] = error["code"] as? String
+                }
+            }
+            diagnostics?.record(.liveEvent, fields)
+        }
         validationEvidence.receive(frame)
         FullDuplexTrace.inbound(frame)
         guard let liveAdapter else { return }
@@ -513,6 +537,7 @@ extension FullDuplexTransport: RTCPeerConnectionDelegate {
     func peerConnection(_ pc: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {}
 
     func peerConnection(_ pc: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
+        diagnostics?.record(.liveEvent, ["event_type": "ice." + newState.readableName])
         RealtimeLog.log("webrtc: ICE \(newState.readableName)")
         switch newState {
         case .connected, .completed:

@@ -21,6 +21,8 @@ final class LocalVoiceCall {
     static let tick: Duration = .milliseconds(150)
     static let readyDeadline: Duration = .seconds(8)
 
+    private let diagnostics: VoiceDiagnostics.Session?
+
     var onState: ((SessionState) -> Void)?
     var onUserTranscript: ((String, Bool) -> Void)?
     var onAssistantTranscript: ((String, Bool) -> Void)?
@@ -72,9 +74,11 @@ final class LocalVoiceCall {
     init(microphone: LocalMicrophone, speech: LocalSpeech, transcriber: LocalTranscriber = LocalTranscriber(),
          detector: SemanticTurnDetector = Container.shared.localTurnDetector(),
          profileId: String? = ProfileRuntime.snapshot?.profileId, conversationId: String? = nil,
+         diagnostics: VoiceDiagnostics.Session? = nil,
          brain: @escaping Brain = {
              LocalVoiceBrain.reply(to: $0, history: $1, engine: $2, profileId: $3, focus: $4, conversationId: $5)
          }) {
+        self.diagnostics = diagnostics
         self.microphone = microphone
         self.speech = speech
         self.transcriber = transcriber
@@ -120,10 +124,12 @@ final class LocalVoiceCall {
             await teardown()
             return
         }
+        diagnostics?.record(.microphoneStarted, ["engine": "local"])
         RealtimeLog.log("local-voice: call open on \(engine.rawValue)")
         if engine == .onDevice { Task { try? await LocalModel.preload() } }
         guard let inbox else { listen(); return }
         phase = .thinking
+        diagnostics?.record(.turnStarted)
         onState?(.processing)
         let started = ContinuousClock.now
         inboxBusy = true
@@ -152,7 +158,7 @@ final class LocalVoiceCall {
         turnAudio = nil
         turnReader?.cancel()
         turnReader = nil
-        speech.stop()
+        await speech.stopAndWait()
         transcriber.onTranscript = nil
         transcriber.stop()
         await microphone.stop()
@@ -279,6 +285,7 @@ final class LocalVoiceCall {
         }
         guard let engine else { return }
         phase = .thinking
+        diagnostics?.record(.turnStarted)
         onState?(.processing)
         let started = ContinuousClock.now
         turn = Task { [weak self] in
@@ -340,11 +347,15 @@ final class LocalVoiceCall {
             if id == turnID, phase == .thinking || phase == .speaking { listen() }
         } catch {
             guard phase == .thinking || phase == .speaking else { return }
+            diagnostics?.record(.turnFailed, VoiceDiagnostics.failure(error))
             RealtimeLog.log("local-voice: turn failed — \(error.localizedDescription)")
             onTurnFailed?(error.localizedDescription)
             phase = .speaking
             onState?(.responding)
-            try? await speech.speak("Sorry, that didn't go through. Try again.")
+            if !(error is LocalSpeech.PlaybackFailure) {
+                do { try await speech.speak("Sorry, that didn't go through. Try again.", diagnostics: diagnostics) }
+                catch { onTurnFailed?(error.localizedDescription) }
+            }
             guard phase == .speaking else { return }
             listen()
         }
@@ -370,10 +381,10 @@ final class LocalVoiceCall {
         }
         defer { producer.cancel() }
         heardReply = ""
-        try await speech.speak(phrases) { [weak self] phrase in
+        try await speech.speak(phrases, diagnostics: diagnostics) { [weak self] phrase in
             guard let self, self.phase == .thinking || self.phase == .speaking else { return }
             if self.phase == .thinking {
-                RealtimeLog.log("local-voice: first audio \(ContinuousClock.now - started) after the turn ended")
+                RealtimeLog.log("local-voice: first phrase ready \(ContinuousClock.now - started) after the turn ended")
                 self.phase = .speaking
                 self.onState?(.responding)
             }

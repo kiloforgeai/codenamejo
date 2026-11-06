@@ -1,3 +1,4 @@
+import FactoryKit
 import Foundation
 
 /// The Live session's function tools, prompt facts and capability answers, decided on the phone
@@ -194,6 +195,15 @@ enum LiveSessionSetup {
                     (StandingRuleTool.run(argumentsJSON: call.arguments), false)
                 }
             },
+            PhoneTool(s.logFeedback) { client, call in
+                let feedback = Container.shared.userFeedback()
+                let submission = feedback.capture()
+                client.answerSettingsTool(callId: call.id, tool: call.name) {
+                    await UserFeedbackTool.run(argumentsJSON: call.arguments) {
+                        try await feedback.save($0, source: .voice, submission: submission)
+                    }
+                }
+            },
             PhoneTool(s.feedItems) { client, call in
                 client.answerSettingsTool(callId: call.id, tool: call.name) { (FeedItems.run(argumentsJSON: call.arguments), false) }
             },
@@ -279,6 +289,7 @@ enum LiveSessionSetup {
         // Dispatch owns web research in a permission-first coaching session.
         if !(interactiveCoaching && request.dispatch) { add("web_search") }
         add("set_rule")
+        add(UserFeedbackTool.name)
         add("feed_items")
         if localCoachingDelivery { add("coach_capability") }
         for name in ["list_profiles", "switch_profile", "create_profile", "rename_profile",

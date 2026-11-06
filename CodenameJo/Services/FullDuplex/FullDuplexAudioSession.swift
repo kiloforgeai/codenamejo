@@ -27,7 +27,7 @@ final class FullDuplexAudioSession {
         .allowBluetoothA2DP,
     ]
 
-    init(mode: FullDuplexTuning.VoiceMode) {
+    init(mode: FullDuplexTuning.VoiceMode, diagnostics: VoiceDiagnostics.Session? = nil) {
         self.mode = mode
         // Our own override emits a route change; reacting to it would loop and reset AEC convergence.
         routeObserver = AudioRoute.Observer(ignoringSelfInflicted: true) { [weak self] in
@@ -41,7 +41,7 @@ final class FullDuplexAudioSession {
                 guard let self, self.isActivated else { return }
                 self.onFailure?(message)
             }
-        })
+        }, diagnostics: diagnostics)
     }
 
     /// At the ear, the display turns off and output moves to the receiver; away, back to the loudspeaker.
@@ -171,13 +171,16 @@ final class WebRTCSessionObserver: NSObject, RTCAudioSessionDelegate {
 
     private let onSessionConfigured: () -> Void
     private let onFailure: (String) -> Void
+    private let diagnostics: VoiceDiagnostics.Session?
     /// The ADM starts play and record separately, so this fires more than once a call.
     private var hasLoggedStart = false
 
     /// Swift imports `addDelegate:`/`removeDelegate:` as `add`/`remove`.
-    init(onSessionConfigured: @escaping () -> Void, onFailure: @escaping (String) -> Void) {
+    init(onSessionConfigured: @escaping () -> Void, onFailure: @escaping (String) -> Void,
+         diagnostics: VoiceDiagnostics.Session? = nil) {
         self.onSessionConfigured = onSessionConfigured
         self.onFailure = onFailure
+        self.diagnostics = diagnostics
         super.init()
         RTCAudioSession.sharedInstance().add(self)
     }
@@ -217,6 +220,7 @@ final class WebRTCSessionObserver: NSObject, RTCAudioSessionDelegate {
 
     private func reportFailure(_ stage: String, error: Error) {
         let detail = error as NSError
+        diagnostics?.record(.liveFailed, ["phase": stage, "error_domain": detail.domain, "error_code": String(detail.code)])
         RealtimeLog.log("audio: \(stage) failed — \(detail.domain)/\(detail.code): \(detail.localizedDescription)")
         DispatchQueue.main.async { [onFailure] in
             onFailure("The microphone and speaker could not start. Please dial again.")

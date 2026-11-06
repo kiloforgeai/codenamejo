@@ -43,6 +43,13 @@ extension Container {
         self { MainActor.assumeIsolated { KeychainTokenProvider() } }.singleton
     }
     var voiceTransportQueue: Factory<AudioQueue> { self { AudioQueue() }.singleton }
+    var voiceDiagnostics: Factory<VoiceDiagnostics> { self { VoiceDiagnostics() }.singleton }
+    var userFeedback: Factory<UserFeedback> {
+        self { MainActor.assumeIsolated { UserFeedback() } }.singleton
+    }
+    @MainActor var voiceAudioHandoff: Factory<VoiceAudioHandoff> {
+        self { MainActor.assumeIsolated { VoiceAudioHandoff() } }.singleton
+    }
     var voiceAudioConfiguration: Factory<any VoiceAudioConfiguration> {
         self { Container.shared.watchAudioRouter().audioConfiguration() }
     }

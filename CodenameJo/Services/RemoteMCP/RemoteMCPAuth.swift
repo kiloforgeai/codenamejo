@@ -311,39 +311,3 @@ enum RemoteMCPAuth {
         }
     }
 }
-
-/// `ASWebAuthenticationSession`, presented over the key window and awaited.
-@MainActor
-enum WebAuthSheet {
-    private static var active: ASWebAuthenticationSession?
-    private static let anchor = Anchor()
-
-    static func present(_ url: URL, callbackScheme: String) async throws -> URL {
-        try await withCheckedThrowingContinuation { continuation in
-            let session = ASWebAuthenticationSession(url: url, callbackURLScheme: callbackScheme) { callback, error in
-                MainActor.assumeIsolated {
-                    active = nil
-                    if let callback { continuation.resume(returning: callback) }
-                    else { continuation.resume(throwing: error ?? URLError(.badServerResponse)) }
-                }
-            }
-            session.presentationContextProvider = anchor
-            session.prefersEphemeralWebBrowserSession = false
-            active = session
-            if !session.start() {
-                active = nil
-                continuation.resume(throwing: URLError(.cannotOpenFile))
-            }
-        }
-    }
-
-    private final class Anchor: NSObject, ASWebAuthenticationPresentationContextProviding {
-        func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-            MainActor.assumeIsolated {
-                UIApplication.shared.connectedScenes
-                    .compactMap { ($0 as? UIWindowScene)?.keyWindow }
-                    .first ?? ASPresentationAnchor()
-            }
-        }
-    }
-}

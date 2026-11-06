@@ -121,6 +121,7 @@ final class OnboardingFlowViewModel: ViewModel {
 
 @MainActor
 final class OnboardingFlowInteractor: ViewModelInteractor<OnboardingFlowViewModel> {
+    @Injected(\.onboardingAudioQueue) private var audioQueue
     @Injected(\.backend) private var backend
     @Injected(\.userProfile) private var userProfile
     @Injected(\.voiceLauncher) private var voiceLauncher
@@ -153,17 +154,26 @@ final class OnboardingFlowInteractor: ViewModelInteractor<OnboardingFlowViewMode
         finished = true
         // The flow is over, so an applied profile may decide this again.
         userProfile.completesOnboarding = true
-        // If the preparing screen's session is up, ask it to speak; otherwise arm the greeting flag
-        // for `CommandView`'s dial. Writing it after `speakOpening` fired would greet twice.
-        if realtimeService.isConversing {
-            realtimeService.speakOpening()
-        } else {
-            UserDefaults.standard.set(true, forKey: FullDuplexConfig.pendingGreetingKey)
+        Task {
+            do {
+                let available = try await audioQueue.run("onboarding completion input availability") {
+                    OnboardingAudioSession.hasInputDevice
+                }
+                if available {
+                    if realtimeService.isConversing {
+                        realtimeService.speakOpening()
+                    } else {
+                        UserDefaults.standard.set(true, forKey: FullDuplexConfig.pendingGreetingKey)
+                    }
+                    voiceLauncher.requestLaunch(source: "onboarding")
+                } else {
+                    UserDefaults.standard.removeObject(forKey: FullDuplexConfig.pendingGreetingKey)
+                }
+            } catch {
+                RealtimeLog.log("onboarding: completion audio unavailable: \(error.localizedDescription)")
+            }
+            OnboardingState.complete()
         }
-        voiceLauncher.requestLaunch(source: "onboarding")
-        // The flag `RootView` gates on, through `OnboardingState`; `RootView`'s `@AppStorage`
-        // observes it.
-        OnboardingState.complete()
     }
 }
 

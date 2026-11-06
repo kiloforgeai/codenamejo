@@ -382,35 +382,7 @@ enum SlackSignInFlow {
         return .success(grant)
     }
 
-    private static var active: ASWebAuthenticationSession?
-    private static let anchor = PresentationAnchor()
-
     private static func present(_ url: URL) async throws -> URL {
-        try await withCheckedThrowingContinuation { continuation in
-            let session = ASWebAuthenticationSession(url: url, callbackURLScheme: SlackConfig.callbackScheme) { callback, error in
-                MainActor.assumeIsolated {
-                    active = nil
-                    if let callback { continuation.resume(returning: callback) }
-                    else { continuation.resume(throwing: error ?? URLError(.badServerResponse)) }
-                }
-            }
-            session.presentationContextProvider = anchor
-            session.prefersEphemeralWebBrowserSession = false
-            active = session
-            if !session.start() {
-                active = nil
-                continuation.resume(throwing: URLError(.cannotOpenFile))
-            }
-        }
-    }
-
-    private final class PresentationAnchor: NSObject, ASWebAuthenticationPresentationContextProviding {
-        func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-            MainActor.assumeIsolated {
-                UIApplication.shared.connectedScenes
-                    .compactMap { ($0 as? UIWindowScene)?.keyWindow }
-                    .first ?? ASPresentationAnchor()
-            }
-        }
+        try await WebAuthSheet.present(url, callbackScheme: SlackConfig.callbackScheme)
     }
 }

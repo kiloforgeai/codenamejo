@@ -13,6 +13,7 @@ private enum Desk {
 struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWorkspaceModel> & DesktopWorkspaceHandler>: View {
     @StateObject var viewModel: DesktopWorkspaceModel
     @StateObject var interactor: Interactor
+    @ObservedObject private var localSpeech = Container.shared.localSpeech()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -35,6 +36,17 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
         .background(Desk.canvas)
         .tint(Desk.accent)
         .bind(observer: interactor, viewModel: viewModel)
+        .fileExporter(isPresented: $viewModel.exportingDiagnostics,
+                      document: viewModel.diagnosticsDocument, contentType: .plainText,
+                      defaultFilename: "Jo-session-logs.jsonl") { result in
+            if case .failure(let error) = result { viewModel.diagnosticsError = error.localizedDescription }
+        }
+        .alert("Couldn't export session logs", isPresented: Binding(
+            get: { viewModel.diagnosticsError != nil },
+            set: { if !$0 { viewModel.diagnosticsError = nil } })) {
+            Button("OK") { viewModel.diagnosticsError = nil }
+        } message: { Text(viewModel.diagnosticsError ?? "") }
+        .sheet(isPresented: $viewModel.showingFeedback) { feedbackSheet }
         .sheet(isPresented: $viewModel.showingSettings) {
             NavigationStack { ProfileViewComponent.make(onClose: { viewModel.showingSettings = false }) }
                 .frame(minWidth: 580, minHeight: 600)
@@ -59,6 +71,11 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { viewModel.selectedJob = nil } } }
             }.frame(minWidth: 600, minHeight: 440)
         }
+        .alert("No microphone available", isPresented: $viewModel.showMicUnavailable) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Connect a microphone or headset, then start a session. You can keep using the workspace meanwhile.")
+        }
         .alert("Allow microphone access", isPresented: $viewModel.showMicDenied) {
             Button("Open System Settings") {
                 if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
@@ -77,6 +94,10 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             Rectangle().fill(Desk.line).frame(width: 1, height: 22).padding(.horizontal, 6)
             Text("Your workspace").font(.system(size: 14, weight: .medium))
             Spacer()
+            if let receipt = viewModel.feedbackReceipt {
+                Label(receipt, systemImage: "checkmark.circle").font(.caption).foregroundStyle(.secondary)
+                    .accessibilityIdentifier("feedbackSaved")
+            }
             if let started = viewModel.startedAt {
                 Text(started, style: .timer).monospacedDigit().foregroundStyle(.secondary).font(.caption)
                 Text("IN SESSION").font(.system(size: 10, weight: .semibold)).tracking(1.3).foregroundStyle(.secondary)
@@ -87,7 +108,44 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             }.buttonStyle(.borderless).padding(.leading, 16)
             Button { viewModel.showingSettings = true } label: { Image(systemName: "gearshape").padding(8) }
                 .buttonStyle(.plain).accessibilityLabel("Settings and connections")
+            Button(action: interactor.showFeedback) { Label("Feedback", systemImage: "bubble.left.and.text.bubble.right") }
+                .buttonStyle(.borderless).accessibilityIdentifier("desktopFeedback")
+                .help("Leave feedback about Jo")
+            Button(action: interactor.exportDiagnostics) { Image(systemName: "doc.text.magnifyingglass").padding(8) }
+                .buttonStyle(.plain).accessibilityLabel("Export session logs")
         }.padding(.horizontal, 24).frame(height: 64)
+    }
+
+    private var feedbackSheet: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Feedback").font(.title2.weight(.semibold))
+            Text("What should Jo do better?").foregroundStyle(.secondary)
+            TextEditor(text: $viewModel.feedbackText)
+                .font(.body).frame(minHeight: 150)
+                .padding(8).background(Desk.inset, in: RoundedRectangle(cornerRadius: 8))
+                .accessibilityLabel("Your feedback").accessibilityIdentifier("feedbackMessage")
+                .disabled(viewModel.savingFeedback)
+            HStack {
+                Text("Saved on this Mac. Included when you export session logs.")
+                Spacer()
+                Text("\(viewModel.feedbackText.count)/\(FeedbackText.maximumCharacters)")
+                    .foregroundStyle(viewModel.feedbackText.count > FeedbackText.maximumCharacters ? Color.red : .secondary)
+            }.font(.caption).foregroundStyle(.secondary)
+            if let error = viewModel.feedbackError {
+                Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.red)
+                    .accessibilityIdentifier("feedbackError")
+            }
+            HStack {
+                Button("Cancel") { viewModel.showingFeedback = false }
+                    .keyboardShortcut(.cancelAction).disabled(viewModel.savingFeedback)
+                Spacer()
+                Button(viewModel.savingFeedback ? "Saving…" : "Save feedback", action: interactor.saveFeedback)
+                    .buttonStyle(.borderedProminent).disabled(!viewModel.canSaveFeedback)
+                    .keyboardShortcut(.return, modifiers: .command).accessibilityIdentifier("saveFeedback")
+            }
+        }
+        .padding(24).frame(width: 560, height: 360)
+        .interactiveDismissDisabled(viewModel.savingFeedback)
     }
 
     private var sidebar: some View {
@@ -328,8 +386,11 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                         .frame(width: 6, height: 6)
                     Text(viewModel.status).font(.system(size: 14, weight: .medium))
                 }
-                Text(viewModel.inSession ? "Say “next”, ask a question, or talk Jo through the task." : "Your microphone turns on when you start a session.")
+                Text(viewModel.inSession ? "Say “next”, ask a question, or talk Jo through the task." : (localSpeech.previewMessage ?? "Your microphone turns on when you start a session."))
                     .font(.system(size: 12)).foregroundStyle(.secondary)
+                if let notice = viewModel.voiceNotice {
+                    Text(notice).font(.caption).foregroundStyle(.orange)
+                }
             }
             Spacer()
             if viewModel.inSession {
@@ -338,6 +399,14 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                 }.buttonStyle(.bordered)
                 Button("End session", action: interactor.toggleSession).buttonStyle(.bordered)
             } else {
+                Button {
+                    localSpeech.preview(.current)
+                } label: {
+                    Label(localSpeech.isPreviewing ? "Playing…" : "Test speaker", systemImage: "speaker.wave.2")
+                }
+                .buttonStyle(.bordered)
+                .disabled(localSpeech.isPreviewing)
+                .accessibilityIdentifier("desktopTestSpeaker")
                 Button(action: interactor.toggleSession) { Label("Start session", systemImage: "play.fill") }
                     .buttonStyle(.borderedProminent)
             }

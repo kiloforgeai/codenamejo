@@ -565,6 +565,10 @@ final class FullDuplexVoiceClient {
                 NSLocalizedDescriptionKey: "A call is already up.",
             ])
         }
+        try await Container.shared.voiceAudioHandoff().wait()
+        try Task.checkCancellation()
+        diagnostics?.record(.livePreparing, ["model": LivePrompt.speakerModel, "brain_model": LivePrompt.brainModel])
+        observedRemoteAudio = false
         FullDuplexTrace.begin()
         // Before any work, so the breakdown accounts for the whole wait rather
         // than for the parts we already suspected. See `DialTiming`.
@@ -649,7 +653,7 @@ final class FullDuplexVoiceClient {
         let opening = SessionOpening.afterReconnect(
             requested: requestedOpening, wasAudible: openingWasAudible)
 
-        let audio = FullDuplexAudioSession(mode: FullDuplexTuning.voiceMode)
+        let audio = FullDuplexAudioSession(mode: FullDuplexTuning.voiceMode, diagnostics: diagnostics)
         audio.onFailure = { [weak self] message in
             guard let self, self.isActive else { return }
             self.handle(.failed(message))
@@ -665,7 +669,7 @@ final class FullDuplexVoiceClient {
         // is what the rest of this path was assumed to be too.
         DialTiming.mark("audio session")
 
-        let transport = FullDuplexTransport()
+        let transport = FullDuplexTransport(diagnostics: diagnostics)
         transport.enableLive()
         liveConfiguration = nil
         liveAnchors.removeAll()
@@ -701,6 +705,7 @@ final class FullDuplexVoiceClient {
                         self.didObserveCapture = true
                         DialTiming.micLive()
                         RealtimeLog.log("audio: first capture buffer received")
+                        self.diagnostics?.record(.microphoneStarted, ["engine": "live"])
                         self.handle(.micLive)
                     }
                 } else if let connectedAt = self.connectedAt,
@@ -720,6 +725,10 @@ final class FullDuplexVoiceClient {
                 // this and the wait would read as ~0 on every barge-in-adjacent turn.
                 if !self.assistantAudible, sample.capture > Self.micSpeechFloor {
                     self.lastMicLoudAt = .now
+                }
+                if sample.assistant > 0.001, !self.observedRemoteAudio {
+                    self.observedRemoteAudio = true
+                    self.diagnostics?.record(.remoteAudioObserved)
                 }
                 transport.liveAdapter?.observePlayback(sample.assistant)
                 self.ingest(sample)
@@ -782,7 +791,7 @@ final class FullDuplexVoiceClient {
                 session = try await FullDuplexBroker.mint(opening: opening, onboardingFlow: flow)
                 DialTiming.mark("session setup")
                 live = session.live
-                live.answerSDP = try await LiveOpenAI.createSession(session: live.session, sdp: liveSDP)
+                live.answerSDP = try await LiveOpenAI.createSession(session: live.session, sdp: liveSDP, diagnostics: diagnostics)
             } catch {
                 // The mic is already open by now. `teardown` in the outer catch
                 // closes it, but the task holds the transport until it finishes, so
@@ -889,6 +898,7 @@ final class FullDuplexVoiceClient {
             // a deadline on the rest. See `armConnectWatchdog`.
             armConnectWatchdog()
         } catch {
+            diagnostics?.record(.liveFailed, VoiceDiagnostics.failure(error))
             RealtimeLog.log("fullduplex: start failed — \(error.localizedDescription)")
             DialTiming.abandoned(error.localizedDescription)
             teardown(reason: "start failed")
@@ -926,6 +936,9 @@ final class FullDuplexVoiceClient {
             self.onError?(message)
         }
     }
+
+    var diagnostics: VoiceDiagnostics.Session?
+    private var observedRemoteAudio = false
 
     func stop() {
         if let runId = onboardingFlow?.runId {
@@ -1188,18 +1201,24 @@ final class FullDuplexVoiceClient {
         levelPoll = nil
         pump?.cancel()
         pump = nil
-        transport?.close(reason: reason)
+        let closingTransport = transport
         transport = nil
-        // Covers End tapped while the cue is still sounding. Cancel first so the
-        // task's own gain restore can't land after the transport is gone, then
-        // silence. Detached because teardown is synchronous and nothing is waiting.
         cueTask?.cancel()
         cueTask = nil
-        Task { await connectCue.stop() }
-        // Stop a cue still playing when transport failure triggers teardown.
-        Task { await endCue.stop() }
-        audio?.deactivate()
+        let closingAudio = audio
         audio = nil
+        let trace = diagnostics
+        Container.shared.voiceAudioHandoff().release { [connectCue, endCue] in
+            await connectCue.stop()
+            await endCue.stop()
+            await closingTransport?.close(reason: reason)
+            if let closingAudio {
+                await withCheckedContinuation { continuation in
+                    closingAudio.deactivate { continuation.resume() }
+                }
+            }
+            trace?.record(.audioReleased, ["engine": "live"])
+        }
         // Clear a failed dial's flow hold, retaining first-call identity until the introduction
         // is audible unless the opening watchdog already abandoned it.
         if openingWasAudible || openingAbandoned {
@@ -1267,6 +1286,7 @@ final class FullDuplexVoiceClient {
             guard isActive, endCueTask == nil else { return }
             onResetRequested?()
         case .connected:
+            diagnostics?.record(.liveConnected)
             // The one thing the watchdog was waiting for. First, so nothing below it
             // can suspend with a deadline still armed against a call that is up.
             connectWatchdog?.cancel()
@@ -1316,6 +1336,7 @@ final class FullDuplexVoiceClient {
             onEnded?(ConversationRecord.Reason.closedByServer)
 
         case .failed(let message):
+            diagnostics?.record(.liveFailed, ["reason": "transport_failure"])
             teardown(reason: "transport failure")
             onEnded?(ConversationRecord.Reason.transportFailure)
             onError?(message)

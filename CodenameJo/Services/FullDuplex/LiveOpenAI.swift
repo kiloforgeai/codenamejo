@@ -33,15 +33,20 @@ enum LiveOpenAI {
 
     /// Creates the Live session from the `session` config `LivePrompt` built and returns
     /// OpenAI's SDP answer.
-    static func createSession(session: Data, sdp: String) async throws -> String {
+    static func createSession(session: Data, sdp: String, diagnostics: VoiceDiagnostics.Session? = nil) async throws -> String {
         let config = try JSONSerialization.jsonObject(with: session)
         let body = try JSONSerialization.data(withJSONObject: [
             "session": config, "transport": ["type": "webrtc", "sdp": sdp],
         ])
+        diagnostics?.record(.liveRequest, ["model": LivePrompt.speakerModel])
         let (data, response) = try await URLSession.shared.data(
             for: try post("live/sessions", body: body, timeout: 15))
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         let result = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        var fields = ["http_status": String(status)]
+        fields["request_id"] = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "x-request-id")
+        fields["provider_code"] = (result?["error"] as? [String: Any])?["code"] as? String
+        diagnostics?.record(.liveResponse, fields)
         guard (200..<300).contains(status), let answer = (result?["transport"] as? [String: Any])?["sdp"] as? String,
               (result?["session"] as? [String: Any])?["id"] is String else {
             let detail = String(decoding: data, as: UTF8.self).prefix(300)

@@ -6,11 +6,14 @@ import os
 
 // MARK: - Logging
 
-/// Lightweight console logger for the realtime connection flow. Prints to
-/// stdout (visible in the Xcode console) with a grep-able prefix.
+/// Private debug messages in the system log; content-free session diagnostics use VoiceDiagnostics.
 enum RealtimeLog {
+    private static let logger = Logger(subsystem: "com.kiloforge.jo.desktop", category: "realtime")
     static func log(_ message: String) {
+        logger.debug("\(message, privacy: .private)")
+        #if DEBUG
         print("🎙️[Realtime] \(message)")
+        #endif
     }
 }
 
@@ -371,7 +374,26 @@ class RealtimeService: ObservableObject {
     private var localVoice: LocalVoiceCall?
     /// Which brain the local call is on, published so the screen can say which mode this is.
     @Published private(set) var localVoiceEngine: LocalVoiceBrain.Engine?
+    @Published var voiceNotice: String?
+    private var diagnostics: VoiceDiagnostics.Session?
     var isLocalVoice: Bool { localVoiceEngine != nil }
+
+    var feedbackContext: FeedbackContext {
+        let state: String
+        switch sessionState {
+        case .disconnected: state = "disconnected"
+        case .connecting: state = "connecting"
+        case .ready: state = "ready"
+        case .listening: state = "listening"
+        case .processing: state = "processing"
+        case .responding: state = "responding"
+        case .error: state = "error"
+        }
+        return FeedbackContext(sessionID: isConversing ? diagnostics?.id : nil,
+            conversationID: activeConversationId, profileID: ProfileRuntime.snapshot?.profileId,
+            engine: isConversing ? (localVoiceEngine.map { "local_\($0.rawValue)" } ?? "live") : "idle",
+            state: state)
+    }
 
     func installProfileDossier(_ dossier: ProfileDossierContext?, profileId: String) {
         guard ProfileRuntime.snapshot?.profileId == profileId else { return }
@@ -1366,6 +1388,10 @@ class RealtimeService: ObservableObject {
     ) {
         guard let client = fullDuplex, !isConversing else { return }
         activeConversationId = conversationId
+        diagnostics = Container.shared.voiceDiagnostics().begin(conversationID: conversationId,
+            engine: LocalVoiceSettings.allLocal ? "on_device" : "live", userID: Container.shared.backend().userId)
+        client.diagnostics = diagnostics
+        voiceNotice = nil
         isConversing = true
         isMuted = false
         clearMuteSettling()
@@ -1421,7 +1447,7 @@ class RealtimeService: ObservableObject {
             } catch {
                 guard let self, self.fullDuplex === client, self.isConversing else { return }
                 RealtimeLog.log("fullduplex: start failed \(error.localizedDescription)")
-                if let engine = self.localVoiceEngine(after: error.localizedDescription) {
+                if !(error is LivePrompt.MissingText), let engine = self.localVoiceEngine(after: error.localizedDescription) {
                     self.beginLocalVoice(engine: engine, reason: "dial failed: \(error.localizedDescription)")
                     return
                 }
@@ -1433,6 +1459,7 @@ class RealtimeService: ObservableObject {
                 // network: `drain()` returns at its own `isOnline` guard.
                 self.resumeMemoQueue()
                 self.sessionState = .error(error.localizedDescription)
+                self.diagnostics?.record(.sessionEnded, ["reason": "live_start_failed"])
             }
         }
     }
@@ -1486,6 +1513,8 @@ class RealtimeService: ObservableObject {
         // three callers of `stop()` must not move.
         fullDuplex?.stopWithEndCue()
         stopLocalVoice()
+        voiceNotice = nil
+        diagnostics?.record(.sessionEnded, ["reason": reason])
         isConversing = false
         // See `clearCard()`: this path does not reach `disconnect()`, so without it the
         // next dial opens on the last call's card.
@@ -1977,9 +2006,13 @@ extension RealtimeService {
     /// Opens the local call on the conversation that is already in progress.
     func beginLocalVoice(engine: LocalVoiceBrain.Engine, reason: String) {
         RealtimeLog.log("local-voice: standing in for Live on \(engine.rawValue) — \(reason)")
+        let trace = diagnostics
+        trace?.record(.fallbackSelected, ["engine": engine.rawValue,
+            "reason": reason == "fully local mode" ? "user_selected_local" : "live_unavailable"])
+        voiceNotice = reason == "fully local mode" ? "Using on-device voice." : "Live is unavailable. Using the system voice."
         let call = LocalVoiceCall(microphone: LocalMicrophone(queue: Container.shared.localVoiceQueue()),
                                   speech: Container.shared.localSpeech(),
-                                  conversationId: activeConversationId?.uuidString)
+                                  conversationId: activeConversationId?.uuidString, diagnostics: trace)
         if LocalInbox.isAvailable {
             let inbox = LocalInbox(engine: engine, conversationId: activeConversationId?.uuidString)
             inbox.onFocus = { [weak self] focus in
@@ -2006,8 +2039,9 @@ extension RealtimeService {
             self.answerIsStale = false
             if isFinal { self.finalizeTurn() }
         }
-        call.onTurnFailed = { [weak self] _ in
+        call.onTurnFailed = { [weak self] message in
             self?.turnSteps = []
+            self?.voiceNotice = message
         }
         call.onEndRequested = { [weak self] in
             guard let self, self.isConversing else { return }
@@ -2015,15 +2049,20 @@ extension RealtimeService {
         }
         Task { [weak self] in
             do {
+                try await Container.shared.voiceAudioHandoff().wait()
+                guard let self, self.isConversing, self.localVoice === call else { return }
                 try await call.start(engine: engine)
-                guard let self, self.isConversing, self.localVoice === call else {
+                guard self.isConversing, self.localVoice === call else {
                     await call.stop()
                     return
                 }
+                trace?.record(.fallbackReady, ["engine": engine.rawValue])
                 self.micIsLive = true
                 self.startLiveActivity("local voice connected")
             } catch {
                 guard let self, self.localVoice === call else { return }
+                trace?.record(.fallbackFailed, VoiceDiagnostics.failure(error))
+                trace?.record(.sessionEnded, ["reason": "fallback_start_failed"])
                 RealtimeLog.log("local-voice: start failed \(error.localizedDescription)")
                 self.stopLocalVoice()
                 self.isConversing = false
@@ -2038,7 +2077,7 @@ extension RealtimeService {
         guard let call = localVoice else { return }
         localVoice = nil
         localVoiceEngine = nil
-        Task { await call.stop() }
+        Container.shared.voiceAudioHandoff().release { await call.stop() }
     }
 
     /// The orb, tapped while the local call is speaking: stop and listen.
