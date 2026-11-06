@@ -545,6 +545,7 @@ extension FullDuplexVoiceClient {
         guard let retry = failedCommandRetry, CommandRetryText.matches(text, keyword: retry.keyword),
               let adapter = transport?.liveAdapter,
               adapter.beginFastAction(callId: callID, action: nil, routed: true) else { return false }
+        beginDispatchAttempt(callID: callID, tool: "dispatch_command")
         adapter.resolveLocalInput(applicationResult: "The application owns this explicit saved-command retry. Wait for its actual result; do not reintroduce a stale email, dispatch, write or advance.", allowPresentation: false)
         let dial = dialGeneration, turn = liveUserTurn
         let historyID = historyTurnID
@@ -558,7 +559,7 @@ extension FullDuplexVoiceClient {
                 if historyTurnID == historyID { onToolFailed?("commands") }
                 diagnostics?.record(.turnTransition, ["transition": "command_retry_refused", "job_id": retry.id.uuidString,
                     "turn_id": historyID.uuidString])
-                postDispatchOutput(callId: callID, startedWork: false, output: "Not started. " + message)
+                postDispatchOutput(callId: callID, startedWork: false, reason: "command_retry_unavailable", output: "Not started. " + message)
             }
             guard let job = dispatchJobs.latestCommandAttempt(from: retry.id),
                   let saved = customCommands.commands.first(where: { $0.keyword == retry.keyword }) else {
@@ -595,13 +596,49 @@ extension FullDuplexVoiceClient {
         return true
     }
 
+    struct DispatchAttempt {
+        var origin: LiveHistoryOrigin
+        let tool: String
+        let started: TimeInterval
+        var outcome: String?
+        var submitted = false
+    }
+
+    func beginDispatchAttempt(callID: String, tool: String = "dispatch") {
+        guard dispatchAttempts[callID] == nil else { return }
+        dispatchAttempts[callID] = DispatchAttempt(origin: .init(id: historyTurnID,
+            userText: historyUserText, background: false), tool: tool,
+            started: ProcessInfo.processInfo.systemUptime)
+    }
+
+    func recordDispatchAttempt(callID: String, status: CommandRecord.CommandStatus, reason: String,
+                               accepted: Bool = false) {
+        beginDispatchAttempt(callID: callID)
+        guard var attempt = dispatchAttempts[callID], attempt.outcome == nil || attempt.outcome == "accepted" else { return }
+        let outcome = accepted ? "accepted" : status == .failed && !reason.hasPrefix("worker_") ? "refused" : status.rawValue
+        guard attempt.outcome != outcome else { return }
+        attempt.outcome = outcome
+        dispatchAttempts[callID] = attempt
+        let ms = max(0, Int((ProcessInfo.processInfo.systemUptime - attempt.started) * 1000))
+        let step = CommandRecord.ToolStep(tool: attempt.tool, milliseconds: ms, outcome: outcome,
+            callID: callID, reason: reason)
+        historyJobOutcomes[attempt.origin.id] = status
+        onDispatchAttempt?(attempt.origin, step, status)
+        diagnostics?.record(.toolFinished, ["call_id": callID, "turn_id": attempt.origin.id.uuidString,
+            "tool": attempt.tool, "outcome": outcome, "reason": reason, "duration_ms": String(ms)])
+    }
+
     func startDispatch(callId: String, argumentsJSON: String,
                        requestedBackground: Bool = false, commandRetry: DispatchJob.CommandRun? = nil) {
+        let tool = Self.stringArgument("command", in: argumentsJSON)?.isEmpty == false ? "dispatch_command" : "dispatch"
+        beginDispatchAttempt(callID: callId, tool: tool)
+        guard dispatchAttempts[callId]?.submitted == false else { return }
+        dispatchAttempts[callId]?.submitted = true
         if let reason = LiveRequestRecovery.dispatchRefusal(latestCompletedUserUtterance)
             ?? (transport?.liveAdapter.map { $0.allowsNewDispatch ? nil : "stale_or_unsettled_request" } ?? nil) {
             diagnostics?.record(.turnTransition, ["transition": "dispatch_request_refused", "reason": reason,
                 "call_id": callId, "turn_id": historyTurnID.uuidString, "input_source": "current_user_request"])
-            postDispatchOutput(callId: callId, startedWork: false, output:
+            postDispatchOutput(callId: callId, startedWork: false, reason: reason, output:
                 "Not started: the current input does not authorize a new task. Never copy a completed request onto another email. " +
                 (reason == "continuation_requires_existing_task" ? "Continue only an explicitly identified unfinished task with manage_task." :
                     "Wait for a complete user request; nonverbal input requires no response or action."))
@@ -638,7 +675,7 @@ extension FullDuplexVoiceClient {
                 "outcome": savedCommand.map { $0.enabled ? "enabled" : "disabled" } ?? "missing_or_ambiguous"])
             guard let savedCommand else {
                 RealtimeLog.log("dispatch: refused — no exact saved command")
-                postDispatchOutput(callId: callId, startedWork: false, output:
+                postDispatchOutput(callId: callId, startedWork: false, reason: "command_not_found", output:
                     "Not started — I could not match that to exactly one saved command. "
                     + "Tell the user I could not dispatch that command. Do not guess, "
                     + "do not improvise its instructions, and do not start any work.")
@@ -646,20 +683,20 @@ extension FullDuplexVoiceClient {
             }
             guard savedCommand.enabled else {
                 RealtimeLog.log("dispatch: refused — command \(savedCommand.keyword) is off")
-                postDispatchOutput(callId: callId, startedWork: false, output:
+                postDispatchOutput(callId: callId, startedWork: false, reason: "command_disabled", output:
                     "Not started — the saved command \"\(savedCommand.title)\" is switched "
                     + "off. Tell the user that plainly and do not run its steps.")
                 return
             }
             guard !savedCommand.actions.isEmpty else {
                 RealtimeLog.log("dispatch: refused — command \(savedCommand.keyword) has no steps")
-                postDispatchOutput(callId: callId, startedWork: false, output:
+                postDispatchOutput(callId: callId, startedWork: false, reason: "command_empty", output:
                     "Not started — the saved command \"\(savedCommand.title)\" has no steps. "
                     + "Tell the user that plainly and do not invent any.")
                 return
             }
             if let commandRetry, commandRetry.actions.map(\.definition) != savedCommand.actions.map(\.definition) || commandRetry.keyword != savedCommand.keyword {
-                postDispatchOutput(callId: callId, startedWork: false, output: "Not started. The saved command changed during recovery. Retry with its current definition.")
+                postDispatchOutput(callId: callId, startedWork: false, reason: "command_changed", output: "Not started. The saved command changed during recovery. Retry with its current definition.")
                 return
             }
         }
@@ -680,7 +717,7 @@ extension FullDuplexVoiceClient {
             } catch {
                 historyJobOutcomes[historyTurnID] = .failed
                 onToolFailed?("commands")
-                postDispatchOutput(callId: callId, startedWork: false, output: "Not started. " + error.localizedDescription)
+                postDispatchOutput(callId: callId, startedWork: false, reason: "command_retry_invalid", output: "Not started. " + error.localizedDescription)
             }
             return
         }
@@ -690,7 +727,7 @@ extension FullDuplexVoiceClient {
             guard let retrySource, let selected = standingStep.flatMap(LiveEmailPresentation.Key.selection),
                   selected.account.caseInsensitiveCompare(retrySource.account) == .orderedSame,
                   selected.selectedIDs == [retrySource.messageID] else {
-                postDispatchOutput(callId: callId, startedWork: false, output: "Not started. The restored command source changed before dispatch. Select its original result and retry.")
+                postDispatchOutput(callId: callId, startedWork: false, reason: "source_changed", output: "Not started. The restored command source changed before dispatch. Select its original result and retry.")
                 return
             }
         }
@@ -704,17 +741,17 @@ extension FullDuplexVoiceClient {
             dispatchJobs.decisionDependencies.first { $0.id == id }
         }
         if dependencyReference != nil, dependency == nil {
-            postDispatchOutput(callId: callId, startedWork: false, output: "Not started. That source task is unavailable in this profile. Select the original task before continuing.")
+            postDispatchOutput(callId: callId, startedWork: false, reason: "dependency_unavailable", output: "Not started. That source task is unavailable in this profile. Select the original task before continuing.")
             return
         }
         if let dependency, !dependency.isDone || dependency.result?.isEmpty != false {
-            postDispatchOutput(callId: callId, startedWork: false, output: "Not started. The related lookup has no confirmed answer yet. Keep its original email and wait for the result or resolve the task's error before using its destination.")
+            postDispatchOutput(callId: callId, startedWork: false, reason: "dependency_unfinished", output: "Not started. The related lookup has no confirmed answer yet. Keep its original email and wait for the result or resolve the task's error before using its destination.")
             return
         }
         if dependency != nil || (standingStep.flatMap(LiveEmailPresentation.Key.selection) != nil
             && DispatchScope.refersToSelectedEmail(latestCompletedUserUtterance)) { scope = .currentEmail }
         if !isSavedCommand, scope == nil, dispatchScopeRequired || arguments?["scope"] != nil {
-            postDispatchOutput(callId: callId, startedWork: false, output:
+            postDispatchOutput(callId: callId, startedWork: false, reason: "scope_required", output:
                 "Not started. Set scope to current_email only when the task concerns the email "
                     + "being reviewed; otherwise use independent. Retry with that explicit intent.")
             return
@@ -722,12 +759,12 @@ extension FullDuplexVoiceClient {
         let relatesToEmail = isSavedCommand || scope != .independent
         if let savedCommand, let reason = CustomCommandRules.accountRefusal(savedCommand.actions,
             account: (liveQueueActionAnchor?.step ?? standingStep).flatMap(LiveEmailPresentation.Key.selection)?.account) {
-            postDispatchOutput(callId: callId, startedWork: false, output: reason)
+            postDispatchOutput(callId: callId, startedWork: false, reason: "account_unavailable", output: reason)
             return
         }
         #if targetEnvironment(macCatalyst)
         if relatesToEmail, dependency == nil, let refusal = renderedSelectionRefusal() {
-            postDispatchOutput(callId: callId, startedWork: false, output: refusal)
+            postDispatchOutput(callId: callId, startedWork: false, reason: "rendered_selection_unavailable", output: refusal)
             return
         }
         #endif
@@ -747,12 +784,12 @@ extension FullDuplexVoiceClient {
         let capturedSource = DispatchJob.MailOrigin.captured(in: backgroundSource)
         if scope == .currentEmail, capturedSource == nil {
             diagnostics?.record(.turnTransition, ["transition": "dispatch_source_refused", "reason": "missing_committed_source"])
-            postDispatchOutput(callId: callId, startedWork: false, output: "Not started: this task needs its original selected email. Select that email before retrying. No task or external action was started.")
+            postDispatchOutput(callId: callId, startedWork: false, reason: "source_missing", output: "Not started: this task needs its original selected email. Select that email before retrying. No task or external action was started.")
             return
         }
         if let capturedSource, let supplied = arguments?["account"] as? String, !supplied.isEmpty,
            supplied.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(capturedSource.account) != .orderedSame {
-            postDispatchOutput(callId: callId, startedWork: false, output: "Not started: the task account does not match the captured source email. Use its original account; do not substitute another inbox.")
+            postDispatchOutput(callId: callId, startedWork: false, reason: "account_mismatch", output: "Not started: the task account does not match the captured source email. Use its original account; do not substitute another inbox.")
             return
         }
         // The two pinning fields, passed through untouched. **Nothing here validates
@@ -796,7 +833,7 @@ extension FullDuplexVoiceClient {
         // what happened instead of the turn ending in silence.
         guard !task.isEmpty else {
             RealtimeLog.log("dispatch: refused — no task in \(argumentsJSON.prefix(120))")
-            postDispatchOutput(callId: callId, startedWork: false, output:
+            postDispatchOutput(callId: callId, startedWork: false, reason: "task_empty", output:
                 "That dispatch had no task in it, so nothing was started. Say what you "
                 + "were trying to find out, or just answer directly.")
             return
@@ -835,7 +872,7 @@ extension FullDuplexVoiceClient {
             // is trying to keep out of the turn. Telling it to reword and dispatch again is
             // the recovery; the marker list stays narrow, for the reason on
             // `mailWorkMarkers`.
-            postDispatchOutput(callId: callId, startedWork: false, output:
+            postDispatchOutput(callId: callId, startedWork: false, reason: "mail_read_inline", output:
                 "Not started — a question about the mailbox is answered in this turn, not "
                 + "handed off. For the selected conversation, use its supplied summary and "
                 + "retrieve needed selected members with get_message; use gmail_search_messages "
@@ -851,7 +888,7 @@ extension FullDuplexVoiceClient {
             RealtimeLog.log(
                 "dispatch: refused \"\(task.prefix(60))\" — an RSVP is answered inline")
             FullDuplexTrace.note("!! dispatch refused — calendar RSVP")
-            postDispatchOutput(callId: callId, startedWork: false, output:
+            postDispatchOutput(callId: callId, startedWork: false, reason: "calendar_rsvp_inline", output:
                 "Not started — answering a calendar invitation is one call, not a handoff. "
                 + "Call respond_to_calendar_event directly for each invite and say what "
                 + "happened once they're all answered.")
@@ -860,7 +897,7 @@ extension FullDuplexVoiceClient {
         guard dispatchTasks.count < Self.maxLiveDispatches else {
             RealtimeLog.log("dispatch: refused \"\(task.prefix(60))\" — "
                 + "\(dispatchTasks.count) already running")
-            postDispatchOutput(callId: callId, startedWork: false, output:
+            postDispatchOutput(callId: callId, startedWork: false, reason: "capacity_limit", output:
                 "Too many background jobs are already running (\(dispatchTasks.count)). "
                 + "Tell the user that, and either wait for one to come back or answer "
                 + "this directly.")
@@ -869,7 +906,7 @@ extension FullDuplexVoiceClient {
         // Before any acknowledgement or live dispatch, so a repeat gets this one output.
         if onboardingFlow != nil, !onboardingDispatches.insert(task).inserted {
             RealtimeLog.log("dispatch: refused \"\(task.prefix(60))\" — onboarding repeat")
-            postDispatchOutput(callId: callId, startedWork: false,
+            postDispatchOutput(callId: callId, startedWork: false, reason: "onboarding_duplicate",
                 output: "That onboarding task is already queued. Do not dispatch it again or advance the stage again.")
             return
         }
@@ -1116,7 +1153,7 @@ extension FullDuplexVoiceClient {
             if parksSource, dispatchUsesQueue, let self, self.isActive, dial == self.dialGeneration {
                 guard Container.shared.dispatchJobs().existing(accepted)?.context != nil else {
                     let refusal = await tasks.result(accepted)
-                    self.postDispatchOutput(callId: callId, startedWork: false, output: refusal.text)
+                    self.postDispatchOutput(callId: callId, startedWork: false, reason: "task_submission_refused", output: refusal.text)
                     return
                 }
                 let step = await self.parkAcceptedTask(accepted)
@@ -1126,6 +1163,8 @@ extension FullDuplexVoiceClient {
                         ?? "The source is retained with its task in Activities. Do not ask what to do with it again or repeat the operation. Continue with the current feed selection.")
             }
             guard case .task(let outcome) = await tasks.result(accepted) else { return }
+            let status = outcome.status ?? (outcome.ok == false ? .failed : outcome.ok == true ? .success : .unknown)
+            self?.recordDispatchAttempt(callID: callId, status: status, reason: "worker_" + status.rawValue)
             // A job that outlived its call has already written its row; the next call reads it.
             guard let self, self.isActive, dial == self.dialGeneration, !Task.isCancelled else { return }
             // Cannot race the assignment above: the body always suspends at the
@@ -1326,8 +1365,11 @@ extension FullDuplexVoiceClient {
         return matches.count == 1 ? matches[0] : nil
     }
 
-    func postDispatchOutput(callId: String, startedWork: Bool = true, output: String,
+    func postDispatchOutput(callId: String, startedWork: Bool = true, reason: String = "accepted", output: String,
                                     queueAdvance: String? = nil) {
+        recordDispatchAttempt(callID: callId, status: startedWork ? .pending : .failed,
+            reason: reason, accepted: startedWork)
+        let output = startedWork ? output : output + " This task did not start. Report the local refusal and its recovery step; do not claim the provider was contacted or that work is running."
         // Set before the continuation, not after: `continueAfterFunctionResult` can
         // issue the response synchronously, and the acknowledgement it produces is
         // exactly what the stall backstop must not see as a stall.

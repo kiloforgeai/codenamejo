@@ -80,6 +80,12 @@ struct CommandRecord: Codable, Identifiable, Hashable {
         var record = self
         var steps = record.toolSteps ?? []
         for prior in previous.toolSteps ?? [] {
+            if prior.outcome == "accepted", let id = prior.callID {
+                if let index = steps.firstIndex(where: { $0.callID == id }) {
+                    if !["success", "refused", "failed", "cancelled", "partial", "unknown"].contains(steps[index].outcome ?? "") { steps[index] = prior }
+                } else { steps.append(prior) }
+                continue
+            }
             guard let id = prior.callID,
                   ["success", "refused", "failed", "cancelled", "partial", "unknown"].contains(prior.outcome ?? "") else { continue }
             if let index = steps.firstIndex(where: { $0.callID == id }) { steps[index] = prior }
@@ -89,6 +95,12 @@ struct CommandRecord: Codable, Identifiable, Hashable {
         record.feedbackID = record.feedbackID ?? previous.feedbackID
         if steps.contains(where: { $0.outcome == "refused" }) {
             record.status = steps.contains(where: { $0.outcome == "success" }) ? .partial : .failed
+        } else if record.status == .conversational, let terminal = steps.last(where: {
+            $0.callID != nil && ["success", "failed", "cancelled", "partial", "unknown"].contains($0.outcome ?? "")
+        }), let status = CommandStatus(rawValue: terminal.outcome ?? "") {
+            record.status = status
+        } else if steps.contains(where: { $0.outcome == "accepted" }), record.status == .conversational {
+            record.status = .pending
         } else if record.feedbackID != nil, record.status == .pending || record.status == .conversational {
             record.status = .success
         }

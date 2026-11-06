@@ -69,6 +69,8 @@ final class FullDuplexVoiceClient {
     var onHistoryCheckpoint: ((UUID, String) -> Void)?
     var onHistoryInterrupted: ((UUID) -> Void)?
     var onHistoryReply: ((LiveHistoryReply) -> Void)?
+    var onDispatchAttempt: ((LiveHistoryOrigin, CommandRecord.ToolStep, CommandRecord.CommandStatus) -> Void)?
+    var dispatchAttempts: [String: DispatchAttempt] = [:]
     var onToolRefused: ((LiveHistoryOrigin, CommandRecord.ToolStep) -> Void)?
     var onFeedbackSettled: (([String], UUID?, CommandRecord.CommandStatus) -> Void)?
     private var refusedLiveCalls = Set<String>()
@@ -924,6 +926,11 @@ final class FullDuplexVoiceClient {
                     guard let self else { return ("No active call.", nil) }
                     return (self.standingStep.map { self.preparedEmailStep($0) } ?? "No email selected.",
                             ProfileRuntime.snapshot?.profileId)
+                }
+                adapter.onDispatchRefused = { [weak self, weak adapter] call, reason in
+                    guard let self else { return }
+                    let turn = adapter?.turn(for: call.delegation) ?? self.liveUserTurn
+                    self.recordAdapterDispatchRefusal(call, turn: turn, reason: reason)
                 }
                 adapter.diagnostics = diagnostics
                 adapter.onPlaybackBoundary = { [weak self] id, item, phase in
@@ -3085,6 +3092,16 @@ final class FullDuplexVoiceClient {
         toolCalledThisResponse = true
         let arguments = action == .next ? [:] : ["message_id": key.messageId, "account": key.account]
         runFunctionTool(callId: id, name: action.rawValue, argumentsJSON: GmailReadTools.json(arguments))
+    }
+
+    func recordAdapterDispatchRefusal(_ call: LiveSessionAdapter.Call, turn: Int, reason: String) {
+        let id = historyIDsByInput[turn] ?? historyTurnID
+        beginDispatchAttempt(callID: call.id, tool: call.name)
+        if var attempt = dispatchAttempts[call.id] {
+            attempt.origin = .init(id: id, userText: id == historyTurnID ? historyUserText : "", background: false)
+            dispatchAttempts[call.id] = attempt
+        }
+        recordDispatchAttempt(callID: call.id, status: .failed, reason: reason)
     }
 
     func refuseLiveFunction(_ call: LiveSessionAdapter.Call, reason: String, output: String, fields: [String: String] = [:]) {

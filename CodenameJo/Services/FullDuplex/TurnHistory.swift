@@ -4,6 +4,19 @@ struct TurnHistory {
     private var records: [UUID: CommandRecord] = [:]
     private var failedTurns = Set<UUID>()
 
+    mutating func dispatchAttempt(_ origin: LiveHistoryOrigin, step: CommandRecord.ToolStep,
+                                  status: CommandRecord.CommandStatus, conversationID: UUID?) -> CommandRecord {
+        var record = records[origin.id] ?? CommandRecord(id: origin.id, commandText: origin.userText, conversationId: conversationID)
+        var steps = record.toolSteps ?? []
+        if let index = steps.firstIndex(where: { $0.callID == step.callID }) { steps[index] = step }
+        else { steps.append(step) }
+        record.toolSteps = steps
+        record.status = status
+        if status == .failed { failedTurns.insert(origin.id) }
+        records[origin.id] = record
+        return record
+    }
+
     mutating func refused(_ origin: LiveHistoryOrigin, attempt: CommandRecord.ToolStep,
                           conversationID: UUID?) -> CommandRecord {
         var record = records[origin.id] ?? CommandRecord(id: origin.id, commandText: origin.userText, conversationId: conversationID)
@@ -70,7 +83,7 @@ struct TurnHistory {
         record.status = status ?? record.status
         record.toolSteps = record.toolSteps?.map { step in
             var step = step
-            if step.tool == "dispatch" { step.outcome = record.status.rawValue }
+            if step.tool == "dispatch", step.callID == nil { step.outcome = record.status.rawValue }
             return step
         }
         record = record.preservingTerminalAttempts(from: records[record.id])

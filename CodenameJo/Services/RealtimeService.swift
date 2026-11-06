@@ -1997,6 +1997,11 @@ class RealtimeService: ObservableObject {
     private var turnHistory = TurnHistory()
 
     func bindLiveHistory(_ client: FullDuplexVoiceClient) {
+        client.onDispatchAttempt = { [weak self] origin, step, status in
+            guard let self else { return }
+            self.lastCompletedTurn = self.turnHistory.dispatchAttempt(origin, step: step,
+                status: status, conversationID: self.activeConversationId)
+        }
         client.onToolRefused = { [weak self] origin, attempt in
             guard let self else { return }
             self.lastCompletedTurn = self.turnHistory.refused(origin, attempt: attempt, conversationID: self.activeConversationId)
