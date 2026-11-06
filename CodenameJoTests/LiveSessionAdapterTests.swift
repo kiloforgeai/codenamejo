@@ -163,7 +163,7 @@ final class LiveSessionAdapterTests: XCTestCase {
         h.adapter.toolCallBound = 0.2
         try await finalizedCommand(h, start: 1)
         try h.function("archive-a")
-        try h.function("second-call")
+        try h.function("second-call", name: "gmail_get_message")
         XCTAssertEqual(h.calls.map(\.id), ["archive-a"], "Local calls stay serial")
         var waited = 0
         while h.calls.count < 2, waited < 100 { try await Task.sleep(for: .milliseconds(20)); waited += 1 }
@@ -185,7 +185,7 @@ final class LiveSessionAdapterTests: XCTestCase {
         // A call answered in time is never answered for.
         try h.receive(["type": "session.delegation.created", "delegation": ["id": "d2", "response_id": "r2"]])
         try h.lifecycle("response.created", response: "r2")
-        try h.function("third-call", response: "r2")
+        try h.function("third-call", response: "r2", name: "gmail_get_message")
         XCTAssertEqual(h.calls.map(\.id), ["archive-a", "second-call", "third-call"])
         h.result("third-call")
         try await Task.sleep(for: .milliseconds(500))
@@ -198,7 +198,7 @@ final class LiveSessionAdapterTests: XCTestCase {
         try await finalizedCommand(h, start: 1)
         try h.function("archive-a")
         try h.function("archive-a")
-        try h.function("second-call")
+        try h.function("second-call", name: "gmail_get_message")
         XCTAssertEqual(h.calls.map(\.id), ["archive-a"])
         h.result("archive-a")
         XCTAssertEqual(h.calls.map(\.id), ["archive-a", "second-call"])
@@ -1000,7 +1000,7 @@ final class LiveSessionAdapterTests: XCTestCase {
         try await finalizedCommand(h, start: 2000)
         XCTAssertFalse(h.adapter.beginFastAction(callId: "local", action: .archive))
         try h.function("normal-brain", response: "r2000")
-        XCTAssertEqual(h.calls.map(\.id), ["normal-brain"])
+        XCTAssertTrue(h.calls.isEmpty, "A model call cannot override the complete negative request")
     }
 
     @MainActor

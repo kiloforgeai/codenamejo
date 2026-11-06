@@ -48,6 +48,15 @@ final class LiveMailAuthorizationTests: XCTestCase {
         }
     }
 
+    func testDictatedNegationDoesNotCancelReplyOrAuthorizeBodyInstructions() {
+        let operations = LiveMailAuthorization("Reply saying please do not cancel the meeting, and archive the attached copy when done.").operations
+        XCTAssertEqual(operations, [.send, .draft])
+        XCTAssertEqual(LiveMailAuthorization.proposedOperations("Would you like me to archive this email?"), [.archive])
+        XCTAssertTrue(LiveMailAuthorization.proposedOperations("Should I archive or delete it?").isEmpty)
+        XCTAssertTrue(LiveMailAuthorization("Do not reply saying yes").operations.isEmpty)
+        XCTAssertTrue(LiveMailAuthorization("Actually don't send that email").operations.isEmpty)
+    }
+
     func testCalendarQuestionAfterArchiveButtonCannotMutateOrAdvance() async throws {
         let h = Harness(); defer { h.adapter.close() }
         try await h.start("Which proposed meeting times work with my calendar?", afterButton: true)

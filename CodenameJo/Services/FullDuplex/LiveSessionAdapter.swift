@@ -168,6 +168,25 @@ final class LiveSessionAdapter {
         guard let state = clientBrainState?(), let key = LiveEmailPresentation.Key.selection(state.text) else { return nil }
         return MailSelection(account: key.account, messageID: key.messageId)
     }
+    private struct MailProposal {
+        let turn: Int
+        let operations: Set<LiveMailAuthorization.Operation>
+        let selection: MailSelection
+        let profile: String?
+        let scope: String?
+    }
+    private var spokenMailProposal: MailProposal?
+    private var confirmedMailProposal: MailProposal?
+
+    private func confirmsMailProposal(_ call: Call) -> Bool {
+        guard let proposal = confirmedMailProposal, proposal.turn + 1 == inputTurn,
+              proposal.selection == currentMailRequestSelection,
+              proposal.profile == ProfileRuntime.snapshot?.profileId, proposal.scope == clientBrainState?().scope,
+              let operation = LiveMailAuthorization.Operation(tool: call.name), proposal.operations.contains(operation) else { return false }
+        return ["yes", "correct", "go ahead", "yes go ahead", "correct go ahead", "do it", "yes please", "yes do it"]
+            .contains(FullDuplexVoiceClient.normalize(inputText))
+    }
+
     private var mailOperations: [LiveMailAuthorization.Operation: String] = [:]
 
     func mailRequestRefusal(for call: Call) -> String? {
@@ -182,7 +201,8 @@ final class LiveSessionAdapter {
             return "mail_request_selection_changed"
         }
         guard LiveMailAuthorization(inputText).operations.contains(operation)
-                || clientBrain?.authorizesPreservedReply(call.id, name: call.name) == true else { return "mail_operation_not_requested" }
+                || clientBrain?.authorizesPreservedReply(call.id, name: call.name) == true
+                || confirmsMailProposal(call) else { return "mail_operation_not_requested" }
         if let executed = mailOperations[operation], executed != call.id { return "mail_operation_already_attempted" }
         return nil
     }
@@ -1243,7 +1263,13 @@ final class LiveSessionAdapter {
             }
             if let inputStart = inputTurns.last?.start, start >= inputStart {
                 recoverySpeech += delta
-                if start >= inputEnd { speechAfterInput += delta }
+                if start >= inputEnd {
+                    speechAfterInput += delta
+                    if Self.endsOnQuestion(speechAfterInput), let selection = currentMailRequestSelection {
+                        spokenMailProposal = .init(turn: inputTurn, operations: LiveMailAuthorization.proposedOperations(speechAfterInput),
+                            selection: selection, profile: ProfileRuntime.snapshot?.profileId, scope: clientBrainState?().scope)
+                    } else { spokenMailProposal = nil }
+                }
                 lastTranscriptAt = ProcessInfo.processInfo.systemUptime
                 if completedDelegation != nil { idlePending = true }
                 if !delegationTurns.values.contains(inputTurn) { unworkedPending = true }
@@ -1314,6 +1340,8 @@ final class LiveSessionAdapter {
                 sourceInquiryTurn = nil
                 completedDelegation = nil
                 recoverySpeech = ""
+                confirmedMailProposal = spokenMailProposal
+                spokenMailProposal = nil
                 speechAfterInput = ""
                 lastTranscriptAt = nil
                 idlePending = false
@@ -1467,7 +1495,7 @@ final class LiveSessionAdapter {
         activeCall = call
         if LiveWriteTarget.requiresCurrentRequest(call.name),
            delegationTurns[call.delegation] != inputTurn || LiveRequestRecovery.isFeedback(inputText)
-            || (LiveRequestRecovery.isBackchannel(inputText) && clientBrain?.authorizesPreservedReply(call.id, name: call.name) != true)
+            || (LiveRequestRecovery.isBackchannel(inputText) && clientBrain?.authorizesPreservedReply(call.id, name: call.name) != true && !confirmsMailProposal(call))
             || LiveRequestRecovery.incompleteAction(inputText) || !finalizedInput {
             trace("write_request_superseded", call: call.id, delegation: call.delegation)
             outbound(["type": "conversation.item.create", "item": ["type": "function_call_output",

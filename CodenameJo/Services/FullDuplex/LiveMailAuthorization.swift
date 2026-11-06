@@ -29,9 +29,13 @@ struct LiveMailAuthorization {
     init(_ request: String) {
         var allowed = Set<Operation>()
         let text = request.lowercased().replacingOccurrences(of: "’", with: "'")
+        // Negation inside dictated reply content does not cancel the requested composition.
+        let authorization = text.replacingOccurrences(
+            of: #"^((?:(?:please|can you|could you|would you|just)\s+)*(?:reply|respond|draft|compose|write back|send|forward)\b.*?(?:\b(?:saying|with|that)\b|:))[\s\S]*$"#,
+            with: "$1", options: .regularExpression)
         guard !LiveRequestRecovery.isFeedback(text),
               !Self.matches(text, #"^(?:what|why|which|when|where|who|how|should|did|does|do i|can i|could i|have you|is |are )\b"#),
-              !Self.matches(text, #"\b(?:don't|dont|do not|never|instead|actually|unless|if|stop|cancel)\b"#) else {
+              !Self.matches(authorization, #"\b(?:don't|dont|do not|never|instead|actually|unless|if|stop|cancel)\b"#) else {
             operations = []; return
         }
         // Quoted/dictated content cannot grant an additional operation.
@@ -50,7 +54,7 @@ struct LiveMailAuthorization {
                 allowed.insert(operation)
             }
             let actionPatterns: [(Operation, String)] = [
-                (.archive, #"^(?:archive|file away|file (?:it|this|that)|get rid of|toss)\b"#),
+                (.archive, #"^(?:archive|file away|file (?:it|this|that)|get rid of|toss|(?:get|take|move|remove) (?:this|that|it|this email|that email) out of (?:my|the) inbox)\b"#),
                 (.trash, #"^(?:trash|delete|move (?:it|this|that|the email) to (?:the )?trash)\b"#),
                 (.delete, #"^permanently delete\b"#),
                 (.spam, #"^(?:mark|report).{0,60}\b(?:spam|junk)\b"#),
@@ -61,12 +65,21 @@ struct LiveMailAuthorization {
                 (.send, #"^(?:reply|respond|write back|send (?:it|this|that|(?:the|a|an) (?:reply|email|message|draft)))\b"#),
                 (.draft, #"^(?:draft|compose|write (?:a |the )?(?:reply|email)|create (?:a |the )?draft|reply|respond)\b"#),
                 (.forward, #"^forward\b"#),
-                (.next, #"^(?:skip|next|move on|continue (?:the )?feed|go to (?:the )?next)\b"#)
+                (.next, #"^(?:skip|next|move on|continue (?:the )?feed|(?:go|move) to (?:the )?next)\b"#)
             ]
             for (operation, pattern) in actionPatterns where Self.matches(clause, pattern) { allowed.insert(operation) }
             if Self.matches(clause, #"^(?:send|reply|respond|write|draft|compose|forward|create (?:a |the )?draft)\b"#) { break }
         }
         operations = allowed
+    }
+
+    static func proposedOperations(_ question: String) -> Set<Operation> {
+        let text = question.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.hasSuffix("?"), !matches(text, #"\bor\b"#) else { return [] }
+        let action = text.replacingOccurrences(
+            of: #"^(?:would you like me to|do you want me to|want me to|should i|shall i|can i)\s+"#,
+            with: "", options: .regularExpression)
+        return Self(action).operations
     }
 
     private static func matches(_ text: String, _ pattern: String) -> Bool {
