@@ -925,6 +925,14 @@ final class FullDuplexVoiceClient {
                     return (self.standingStep.map { self.preparedEmailStep($0) } ?? "No email selected.",
                             ProfileRuntime.snapshot?.profileId)
                 }
+                adapter.mailRequestSelection = { [weak self] in
+                    let realtime = Container.shared.realtimeService()
+                    if let id = realtime.renderedWorkspace?.activityID {
+                        return Container.shared.dispatchJobs().existing(id)?.sourceSelection
+                    }
+                    guard let key = self?.standingStep.flatMap(LiveEmailPresentation.Key.selection) else { return nil }
+                    return MailSelection(account: key.account, messageID: key.messageId)
+                }
                 adapter.diagnostics = diagnostics
                 adapter.onPlaybackBoundary = { [weak self] id, item, phase in
                     self?.recordPlaybackBoundary(id: id, item: item, phase: phase)
@@ -3143,6 +3151,11 @@ final class FullDuplexVoiceClient {
     }
 
     private func runLiveFunction(_ call: LiveSessionAdapter.Call) {
+        if let reason = transport?.liveAdapter?.mailRequestRefusal(for: call) {
+            refuseLiveFunction(call, reason: reason, output:
+                "Not executed: this mail operation was not authorized for the current request and original selection. No mailbox change was made. Answer the user's question or ask which action they want.")
+            return
+        }
         #if targetEnvironment(macCatalyst)
         let currentWrite = LiveWriteTarget.mailWrites.contains(ToolNarration.canonical(call.name))
             || ["send_email", "forward_email", "create_draft", "reply_email", "dispatch", "dispatch_command"].contains(ToolNarration.canonical(call.name))
