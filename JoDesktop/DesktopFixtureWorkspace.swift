@@ -91,7 +91,7 @@ struct DesktopFixtureView: View {
                     Button("Export evidence") { interactor.exportEvidence() }
                     Button("Save bundle…") { interactor.saveEvidenceBundle() }
                     Button("Browser fixture") {
-                        let browser = SupervisedBrowserExperiment(context: .init(jobID: UUID(), profileID: nil,
+                        let browser = SupervisedBrowserExperiment(context: .init(jobID: UUID(), profileID: ProfileRuntime.snapshot?.profileId,
                             origin: .init(account: "qa@example.test", messageID: "fixture-1", threadID: "thread-1",
                                 sender: "Same Sender", subject: "Same Subject"),
                             request: "Inspect workshop availability and request a place only after my approval."))
@@ -127,7 +127,7 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
                 attachments: [.init(filename: "Project notes.txt", mimeType: "text/plain", bytes: Data("Synthetic project notes".utf8))])
             let action = MailActionReceipt(kind: .draft, account: "qa@example.test", message: message, replyMessageID: "fixture-1")
             do {
-                _ = try await LocalDraftReview.stage(action: action, message: message, owner: "fixture-user", profile: nil,
+                _ = try await LocalDraftReview.stage(action: action, message: message, owner: "fixture-user", profile: ProfileRuntime.snapshot?.profileId,
                     conversation: nil, origin: .init(account: "qa@example.test", messageID: "fixture-1", threadID: "thread-1", sender: "Alex", subject: message.subject),
                     archiveAfterSave: false, attachmentAccounts: ["qa@example.test"])
                 model?.applyJobs(await Container.shared.dispatchJobs().history())
@@ -147,7 +147,7 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
                 let origin = DispatchJob.MailOrigin(account: "qa@example.test", messageID: "fixture-1",
                     threadID: "thread-1", sender: "Alex", subject: "Project review request")
                 guard let (job, _) = try? await store.beginCalendarAction(action, ownerID: "fixture-user",
-                    profileID: nil, conversationID: nil, origin: origin) else { continue }
+                    profileID: ProfileRuntime.snapshot?.profileId, conversationID: nil, origin: origin) else { continue }
                 action.state = state; action.attempted = true
                 action.providerID = "synthetic-event-\(index)"
                 action.providerLink = "https://calendar.google.com/calendar/event?eid=synthetic-event-\(index)"
@@ -433,7 +433,7 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
                 let origin = DispatchJob.MailOrigin(account: "qa@example.test", messageID: "fixture-1",
                     threadID: "thread-1", sender: "Synthetic sender", subject: "Workshop")
                 let job = try tasks.job(request: form ? "browser form fixture: request a place after approval"
-                    : "browser fixture: bring back the workshop times", commandID: nil, origin: origin, profile: nil)
+                    : "browser fixture: bring back the workshop times", commandID: nil, origin: origin, profile: ProfileRuntime.snapshot?.profileId)
                 await tasks.submit(job)
                 model.jobs = await Container.shared.dispatchJobs().history()
                 model.showingActivity = true
@@ -575,7 +575,7 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
         Task {
             let outcome = LocalTriageQueue.Outcome(jobId: id, task: job.task, text: job.result ?? "",
                 ok: job.isDone, expects: .answer, about: origin.about)
-            if let step = await queue.selectReturnedResult(outcome, profileID: nil) {
+            if let step = await queue.selectReturnedResult(outcome, profileID: ProfileRuntime.snapshot?.profileId) {
                 await present(step, delayProjection: false)
                 model?.selectedJob = nil
             }
@@ -612,7 +612,7 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
                     }
                     let origin = DispatchJob.MailOrigin(account: action.account, messageID: action.replyMessageID!,
                         threadID: message.threadId!, sender: "Dana", subject: message.subject)
-                    let (job, _) = try await jobs.beginMailAction(action, ownerID: "fixture-user", profileID: nil,
+                    let (job, _) = try await jobs.beginMailAction(action, ownerID: "fixture-user", profileID: ProfileRuntime.snapshot?.profileId,
                         conversationID: nil, origin: origin)
                     _ = try await MailActionAudit.write(job, receipt: "Synthetic provider confirmed this message. No external request was made.") {
                         let sent: [String: Any] = ["id": "fixture-sent-\(index)", "threadId": message.threadId!]
@@ -642,7 +642,7 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
                 let id = UUID(), subject = index == 2 ? "Project update — a deliberately long subject with café ☕ and extensive release details" : "Project update"
                 let origin = DispatchJob.MailOrigin(account: index == 1 ? "personal@example.test" : "qa@example.test",
                     messageID: "activity-\(index)", threadID: "thread-\(index)", sender: "Dana", subject: subject)
-                await jobs.begin(id: id, task: "Archive only the original email from Dana about \(subject). Keep its account and thread unchanged. Do not archive any other email.", profileId: nil, origin: origin)
+                await jobs.begin(id: id, task: "Archive only the original email from Dana about \(subject). Keep its account and thread unchanged. Do not archive any other email.", profileId: ProfileRuntime.snapshot?.profileId, origin: origin)
                 if state != "unknown" { await jobs.receipt(id, callId: "fixture", tool: index == 1 ? "send_email" : "archive_message", failed: state == "partial") }
                 await jobs.finish(id, state: state, result: state == "done"
                     ? "Confirmed synthetic action on \(subject). Complete original receipt retained here for inspection. No provider request was made."

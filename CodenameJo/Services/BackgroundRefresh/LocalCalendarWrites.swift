@@ -1,8 +1,7 @@
 import Foundation
 import FactoryKit
 
-/// `respond_to_calendar_event` and `cancel_calendar_event` on the phone's Calendar grant. Only the PATCH or DELETE
-/// lands after the receipt; the sentences are load-bearing (`CalendarRSVPQueuePolicy` and the queue read them).
+/// Calendar writes on the device's grant, with provider-confirmed receipts and cache updates.
 enum LocalCalendarWrites {
     static let respond = "respond_to_calendar_event"
     static let cancel = "cancel_calendar_event"
@@ -113,7 +112,6 @@ enum LocalCalendarWrites {
             prefix: "NOT ANSWERED", claim: "answered it",
             unchanged: "your answer wasn't sent and the organizer wasn't told",
             deferred: false, conversationId: conversationId)
-        _ = await landed()
         return await InvitationArchive.finish(result, args: args, event: event, account: target)
     }
 
@@ -161,13 +159,14 @@ enum LocalCalendarWrites {
     // MARK: - Shared
 
     /// Run the write now, or hand it to a detached task whose failure is told on the conversation's next output.
-    /// A deferred write updates the calendar cache when it lands; a synchronous one leaves that to its caller.
+    /// Update the calendar cache only after the provider confirms the write.
     private static func finish(_ write: @escaping @Sendable () async throws -> Void,
                                landed: @escaping @Sendable () async -> Int, receipt: String, target: String,
                                capability: String, prefix: String, claim: String, unchanged: String,
                                deferred: Bool, conversationId: String?) async throws -> FullDuplexBroker.ToolResult {
         guard deferred else {
             try await translating(target, capability, prefix, claim, write)
+            _ = await landed()
             return .init(text: receipt, ok: true)
         }
         let accepted = Date()

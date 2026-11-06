@@ -43,7 +43,7 @@ final class MailBodyTextTests: XCTestCase {
 
     func testHTMLIsOnlyUsedWhenThereIsNoPlainPart() {
         let tree = branch("multipart/alternative", [leaf("text/html", "<p>Hi<br>there</p>")])
-        XCTAssertEqual(MailBodyText.plainText(tree), "Hi\nthere\n")
+        XCTAssertEqual(MailBodyText.plainText(tree), "Hi\nthere")
     }
 
     func testNestedPartsAreCollectedInOrderAcrossTheWholeTree() {
@@ -97,6 +97,6 @@ final class MailBodyTextTests: XCTestCase {
     func testStrippingHTMLTurnsBlockEndsIntoLineBreaksAndDecodesEntities() {
         XCTAssertEqual(
             MailBodyText.stripHTML("<div>Tom &amp; Jerry</div><div>&lt;draft&gt;&nbsp;ok</div>"),
-            "Tom & Jerry\n<draft> ok\n")
+            "Tom & Jerry\n<draft> ok")
     }
 }

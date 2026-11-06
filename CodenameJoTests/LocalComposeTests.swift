@@ -23,12 +23,25 @@ final class LocalComposeTests: XCTestCase {
     private var settled: ComposeSettled!
     private var clock: ComposeClock!
     private var paths: [String] = []
+    private var pools: [DatabasePool] = []
 
     private static let defaultsKeys = [StandingRule.archiveAfterReply.storageKey, MailFooter.storageKey,
                                        DraftsOnly.byAccountStorageKey]
 
+    private var previousProfile: ProfileRuntime.Scope?
+
     override func setUp() async throws {
         try await super.setUp()
+        Container.shared.manager.push()
+        previousProfile = ProfileRuntime.snapshot
+        ProfileRuntime.install(nil)
+        let backend = BackendService(restoringSession: false)
+        backend.userId = "compose-tests"
+        Container.shared.backend.register { backend }
+        let jobPath = NSTemporaryDirectory() + "compose-jobs-\(UUID().uuidString).json"
+        paths.append(jobPath)
+        let jobs = DispatchJobStore(url: URL(fileURLWithPath: jobPath))
+        Container.shared.dispatchJobs.register { MainActor.assumeIsolated { jobs } }
         grants = ComposeGrantStorage()
         let grants = grants!
         Container.shared.googleGrantStorage.register { grants }
@@ -59,6 +72,8 @@ final class LocalComposeTests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        try await writePool.write { db in _ = try PendingMailWrite.deleteAll(db) }
+        await writes.drain(userId: "compose-tests")
         Container.shared.googleGrantStorage.reset()
         Container.shared.googleTokenProvider.reset()
         Container.shared.mailStore.reset()
@@ -67,14 +82,21 @@ final class LocalComposeTests: XCTestCase {
         Container.shared.pendingMailWrites.reset()
         Container.shared.localWriteNotices.reset()
         Self.defaultsKeys.forEach { UserDefaults.standard.removeObject(forKey: $0) }
+        for pool in pools { try pool.close() }
+        pools.removeAll()
         paths.forEach { try? FileManager.default.removeItem(atPath: $0) }
+        Scope.singleton.reset()
+        Container.shared.manager.pop()
+        ProfileRuntime.install(previousProfile)
         try await super.tearDown()
     }
 
     private func pool() throws -> DatabasePool {
         let path = NSTemporaryDirectory() + "compose-\(UUID().uuidString).sqlite"
         paths.append(path)
-        return try DatabasePool(path: path)
+        let pool = try DatabasePool(path: path)
+        pools.append(pool)
+        return pool
     }
 
     private func connect(_ email: String) {
@@ -123,13 +145,17 @@ final class LocalComposeTests: XCTestCase {
             case ("GET", "threads/T1"):
                 return holders.contains(call.bearerToken.replacingOccurrences(of: "access-", with: ""))
                     ? (200, "application/json", threadBody) : (404, "application/json", "{}")
-            case ("POST", "drafts"): return (200, "application/json", #"{"id":"d1"}"#)
+            case ("POST", "drafts"): return (200, "application/json", #"{"id":"d1","message":{"id":"draft-message","threadId":"T1"}}"#)
             case ("POST", "messages/send"): return (200, "application/json", #"{"id":"s1","threadId":"T1"}"#)
             case ("POST", "threads/T1/modify"): return (200, "application/json", #"{"id":"T1","messages":[{"id":"m1"}]}"#)
             case ("GET", "settings/sendAs"):
                 return (200, "application/json", #"{"sendAs":[{"sendAsEmail":"\#(owner)","isPrimary":true},\#(sendAs)]}"#)
             case ("GET", "messages"): return (200, "application/json", ScriptedGmail.messageList(searchHits.map(\.0)))
             default:
+                if call.method == "GET", let selected = thread.first(where: { call.path == "messages/\($0.id)" }),
+                   let data = try? JSONSerialization.data(withJSONObject: selected.json) {
+                    return (200, "application/json", String(decoding: data, as: UTF8.self))
+                }
                 if call.method == "GET", call.path.hasPrefix("messages/"),
                    let hit = searchHits.first(where: { call.path == "messages/\($0.0)" }),
                    let message = (try? JSONSerialization.jsonObject(with: Data(hit.1.utf8)) as? [String: Any])?["messages"]
@@ -262,8 +288,8 @@ final class LocalComposeTests: XCTestCase {
 
         gmail(thread)
         let missing = await run("create_draft", ["thread_id": "T1", "reply_message_id": "nope", "body": "x"])
-        XCTAssertEqual(missing.text, "NOT SENT — that selected message is not available in this thread and mailbox. "
-            + "Nothing has gone yet.")
+        XCTAssertEqual(missing.text, "NOT SENT — Gmail could not find the exact selected message in this account. "
+            + "Refresh the feed and check that original message before retrying.")
     }
 
     func testAThreadWhoseOnlyReplyAddressIsTheUserIsRefusedUntilAnAddressIsGiven() async throws {
@@ -304,8 +330,8 @@ final class LocalComposeTests: XCTestCase {
 
         gmail(dealt(Mail(id: "m1", from: dana, to: owner), draft))
         let selected = await run("create_draft", ["thread_id": "T1", "reply_message_id": "d1", "body": "x"])
-        XCTAssertEqual(selected.text, "NOT SENT — that selected message is not available in this thread and mailbox. "
-            + "Nothing has gone yet.", "a draft is not a message that can be followed up")
+        XCTAssertEqual(selected.text, "NOT SENT — the selected source is an unsent draft, not a delivered message "
+            + "to reply to.", "a draft is not a message that can be followed up")
     }
 
     func testANamedSendersInboundMessageBeatsANewerSentOneAndItsCopiesComeWithIt() async throws {
@@ -520,26 +546,31 @@ final class LocalComposeTests: XCTestCase {
         await contacts.recordSent(account: owner, email: "dana@acme.co")
         let scripted = gmail { $0.path == "messages/send" ? (500, "application/json", "{}") : nil }
         let result = await run("send_email", ["to": "dana@acme.co", "subject": "Hi", "body": "x"], defer: true)
-        XCTAssertEqual(result.text, "Sent to dana@acme.co from \(owner).")
+        XCTAssertEqual(result.text, "Sending to dana@acme.co. Gmail has not confirmed it yet; its receipt will appear in activity.")
         XCTAssertTrue(result.deferred)
         let told = try await notice()
-        XCTAssertEqual(told, "\n\nthat didn't send (gmail 500) — nothing went out, so it needs asking for again.")
+        let unknown = "Gmail did not confirm this send. Its outcome is unknown. Check Gmail before trying again; "
+            + "Jo will not repeat it automatically."
+        XCTAssertEqual(told, "\n\n" + unknown)
         XCTAssertEqual(scripted.calls.filter { $0.path == "messages/send" }.count, 1)
-        let queued = await writes.pending(userId: "")
+        let queued = await writes.pending(userId: "compose-tests")
         XCTAssertTrue(queued.isEmpty)
 
-        gmail { _ in (429, "application/json", "{}") }
-        let throttled = await run("send_email", ["to": "dana@acme.co", "subject": "Hi", "body": "x"])
-        XCTAssertEqual(throttled.text, "Gmail is rate-limiting this account right now. Nothing went out.")
-        XCTAssertEqual(throttled.ok, false)
+        let duplicate = await run("send_email", ["to": "dana@acme.co", "subject": "Hi", "body": "x"])
+        XCTAssertEqual(duplicate.text, unknown + " No duplicate write was attempted.")
+        XCTAssertEqual(duplicate.ok, false)
+        XCTAssertTrue(duplicate.outcomeUnknown)
+        XCTAssertEqual(scripted.calls.filter { $0.path == "messages/send" }.count, 1)
     }
 
-    func testADraftThatFailsForAnotherReasonSaysThereIsNothingInDrafts() async {
-        gmail { $0.path == "drafts" ? (500, "application/json", "{}") : nil }
+    func testADraftWithAnUnconfirmedProviderResponseReportsAnUnknownOutcome() async {
+        let scripted = gmail { $0.path == "drafts" ? (500, "application/json", "{}") : nil }
         let result = await run("create_draft", ["to": "dana@acme.co", "subject": "Hi", "body": "x"])
-        XCTAssertEqual(result.text, "that draft didn't save (gmail 500) — there is nothing in \(owner)'s drafts, so it "
-            + "needs asking for again.")
+        XCTAssertEqual(result.text, "Gmail did not confirm this draft. Its outcome is unknown. Check Gmail before trying again; "
+            + "Jo will not repeat it automatically.")
         XCTAssertEqual(result.ok, false)
+        XCTAssertTrue(result.outcomeUnknown)
+        XCTAssertEqual(scripted.calls.filter { $0.path == "drafts" }.count, 1)
     }
 
     func testAThrottledDraftIsQueuedAndTheDrainSavesTheSameMessageWithoutFilingTheThread() async throws {
@@ -557,17 +588,18 @@ final class LocalComposeTests: XCTestCase {
         XCTAssertEqual(pending.account, owner)
         XCTAssertEqual(pending.to, dana)
         XCTAssertEqual(pending.threadId, "T1")
-        let archives = await writes.pending(userId: "")
+        let archives = await writes.pending(userId: "compose-tests")
         XCTAssertTrue(archives.isEmpty, "a queued draft is not an archive the queue reports")
 
         clock.advance(60)
         // The accept's own drain may still be running, and it found nothing due; drain until the row lands.
         for _ in 0..<50 where settled.succeeded == 0 {
-            await writes.drain(userId: "")
+            await writes.drain(userId: "compose-tests")
             try await Task.sleep(for: .milliseconds(20))
         }
         let drafts = scripted.calls.filter { $0.path == "drafts" }
         XCTAssertEqual(drafts.count, 2)
+        guard drafts.count == 2 else { return }
         let raws = drafts.map { call -> String? in
             let json = (try? JSONSerialization.jsonObject(with: Data(call.body.utf8))) as? [String: Any]
             return (json?["message"] as? [String: Any])?["raw"] as? String
@@ -582,14 +614,14 @@ final class LocalComposeTests: XCTestCase {
     func testADeferredDraftThatIsThrottledIsQueuedWithoutTellingAnyone() async throws {
         gmail { $0.path == "drafts" ? (429, "application/json", "{}") : nil }
         let result = await run("create_draft", ["to": "dana@acme.co", "subject": "Hi", "body": "x"], defer: true)
-        XCTAssertEqual(result.text, "Draft to dana@acme.co saved in \(owner).")
+        XCTAssertEqual(result.text, "Saving a draft to dana@acme.co. Gmail has not confirmed it yet; its receipt will appear in activity.")
         XCTAssertTrue(result.deferred)
         for _ in 0..<100 where try await queuedDrafts() == 0 {
             try await Task.sleep(for: .milliseconds(20))
         }
         let rows = try await queuedDrafts()
         XCTAssertEqual(rows, 1)
-        XCTAssertEqual(notices.appending(to: "", conversation: "call"), "", "the receipt already said it was saved, and it will be")
+        XCTAssertEqual(notices.appending(to: "", conversation: "call"), "", "a retry remains pending without announcing success")
     }
 
     // MARK: - Helpers

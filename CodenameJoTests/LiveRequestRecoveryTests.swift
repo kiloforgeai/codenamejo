@@ -20,7 +20,7 @@ final class LiveRequestRecoveryTests: XCTestCase {
     }
 
     @MainActor
-    func testInformationAndFeedbackNeverArmTheLiveMailWatchdog() async throws {
+    func testQuestionRecoveryFollowsPlatformPolicyAndFeedbackNeverArmsIt() async throws {
         for question in ["How can you archive this?", "Uh, so what w- what's his email?",
                          "Can I create a new command?", "Feedback: archive did not work"] {
             let adapter = LiveSessionAdapter(wire: { _ in }, emit: { _ in })
@@ -28,9 +28,14 @@ final class LiveRequestRecoveryTests: XCTestCase {
             adapter.receive(try JSONSerialization.data(withJSONObject: ["type": "session.input_transcript.delta",
                 "delta": question, "start_ms": 100, "end_ms": 500]))
             try await Task.sleep(for: .milliseconds(1100))
-            XCTAssertFalse(adapter.hasUnresolvedQueueAction, question)
+            #if targetEnvironment(macCatalyst)
+            let expectsRecovery = false
+            #else
+            let expectsRecovery = !LiveRequestRecovery.isFeedback(question)
+            #endif
+            XCTAssertEqual(adapter.hasUnresolvedQueueAction, expectsRecovery, question)
             adapter.observePlayback(0)
-            XCTAssertFalse(adapter.hasUnresolvedQueueAction, question)
+            XCTAssertEqual(adapter.hasUnresolvedQueueAction, expectsRecovery, question)
             adapter.close()
         }
         let adapter = LiveSessionAdapter(wire: { _ in }, emit: { _ in })
