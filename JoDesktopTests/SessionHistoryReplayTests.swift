@@ -5,6 +5,33 @@ import XCTest
 
 @MainActor
 final class SessionHistoryReplayTests: XCTestCase {
+    func testBrainFailureKeepsReadReceiptAndCannotBecomeConversationalAfterApology() throws {
+        let service = RealtimeService()
+        let client = FullDuplexVoiceClient()
+        service.bindLiveHistory(client)
+        client.handle(.liveUserActivity)
+        client.handle(.liveInputText("Find a time on my calendar"))
+        var read = TurnStep(tool: "gmail_get_message")
+        read.endedAt = Date()
+        service.turnSteps = [read]
+        client.handle(.event(.error(message: "Context limit", code: "live_client_brain_failed")))
+        XCTAssertEqual(service.lastCompletedTurn?.status, .failed)
+        XCTAssertEqual(service.lastCompletedTurn?.toolSteps?.first?.outcome, "success")
+        client.historyUserText += " during those dates"
+        client.checkpointHistory()
+        XCTAssertEqual(service.lastCompletedTurn?.status, .failed)
+        client.handle(.event(.assistantTranscriptDelta(itemId: "failed-reply", delta: "I couldn't finish that.", spoken: true)))
+        client.emitFinalTranscript()
+        XCTAssertEqual(service.lastCompletedTurn?.status, .failed)
+        XCTAssertEqual(service.lastCompletedTurn?.toolSteps?.first?.tool, "gmail_get_message")
+        client.handle(.liveUserActivity)
+        service.turnSteps = []
+        client.handle(.liveInputText("Hello"))
+        client.handle(.event(.assistantTranscriptDelta(itemId: "next-reply", delta: "Hello.", spoken: true)))
+        client.emitFinalTranscript()
+        XCTAssertEqual(service.lastCompletedTurn?.status, .conversational)
+    }
+
     func testUnansweredFeedbackAndPartialTranscriptPersistBeforeReply() async throws {
         let service = RealtimeService()
         let client = FullDuplexVoiceClient()

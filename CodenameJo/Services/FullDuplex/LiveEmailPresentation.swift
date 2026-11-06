@@ -82,7 +82,7 @@ struct LiveEmailPresentation: Codable, Sendable {
             }
             let context = (item[exchange == "read-thread" ? "summaryMessages" : "exchangeContext"] as? [[String: Any]]) ?? []
             let ids = Set(selected + context.compactMap { $0["id"] as? String }).sorted()
-            guard !selected.isEmpty, ids.count <= 12 else { return nil }
+            guard !selected.isEmpty else { return nil }
             return Key(account: account.lowercased(), threadId: thread, messageId: id,
                        exchangeId: exchange, messageIDs: ids, selectedIDs: selected.sorted())
         }
@@ -195,7 +195,9 @@ struct LiveEmailPreparationCache {
     static func candidates(current: String?, readAhead: [LiveEmailPresentation.Key]) -> [LiveEmailPresentation.Key] {
         let selected = current.flatMap(LiveEmailPresentation.Key.step)
         var seen: Set<LiveEmailPresentation.Key.Identity> = []
-        return ([selected].compactMap { $0 } + readAhead).filter { seen.insert($0.identity).inserted }
+        return ([selected].compactMap { $0 } + readAhead).filter {
+            $0.messageIDs.count <= 12 && seen.insert($0.identity).inserted
+        }
     }
 
     func ready(for step: String, profileId: String?, now: Date = Date()) -> LiveEmailPresentation? {

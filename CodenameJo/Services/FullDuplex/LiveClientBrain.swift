@@ -18,6 +18,12 @@ final class LiveClientBrain {
     private var requestWatchdog: Task<Void, Never>?
     var requestBound: TimeInterval = 10
     var onRequestTransition: ((String, String, String, Int) -> Void)?
+    var onAttemptOutcome: ((Int, [String: String]) -> Void)?
+    var encodeContext: ([String: Any]) throws -> Data = { try JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys]) }
+    var contextByteLimit = 96_000
+    var stepLimit = 12
+    private var attempt: (id: String, turn: Int)?
+    private var attemptFields: [String: String] = [:]
     var onPresentationInvalidated: ((String, String?) -> Void)?
     private var rejectingAssistantPresentation = false
     private var correctedEmptySelection = false
@@ -46,6 +52,7 @@ final class LiveClientBrain {
     private var scopeChanged = false
     private var questionState = ""
     private var actionRecords: [[String: Any]] = []
+    private var retainedResults: [(id: String, text: String)] = []
     private var functionOrigins: [String: (turn: Int, selection: String)] = [:]
     private var functionItems: [String: [String: Any]] = [:]
     private var pendingQuestion = ""
@@ -69,6 +76,11 @@ final class LiveClientBrain {
 
     var busy: Bool { task != nil || !pendingCalls.isEmpty }
 
+    func requestWasSent(_ id: String) {
+        guard activeRequest?.requestID == id else { return }
+        attemptFields["request_sent"] = "true"
+    }
+
     func updateState(_ text: String, scope: String?) {
         let previousSelection = LiveSelectionGrounding.selection(state)
         if self.scope != scope {
@@ -80,6 +92,7 @@ final class LiveClientBrain {
             self.scope = scope
             scopeRevision += 1
             actionRecords.removeAll()
+            retainedResults.removeAll()
             completedJobs.removeAll()
             jobRevision += 1
             functionItems.removeAll()
@@ -94,6 +107,7 @@ final class LiveClientBrain {
             pendingQuestion = ""
             questionState = ""
             requestState = ""
+            finishQueuedAttempt(reason: "scope_changed")
             queuedDelegation = nil
             pendingPresentation = nil
             presentationOnly = false
@@ -103,7 +117,7 @@ final class LiveClientBrain {
             turnState = ""
             turnHistoryIndex = nil
         }
-        state = LiveCompactContext.text(text)
+        state = LiveCompactContext.bounded(text, bytes: 24_000)
         let selected = LiveSelectionGrounding.selection(state)
         if selected != previousSelection {
             invalidatePresentation(reason: "selection_changed")
@@ -147,7 +161,7 @@ final class LiveClientBrain {
         }
         if latestAssistant.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?") {
             pendingQuestion = latestAssistant
-            questionState = state
+            questionState = LiveCompactContext.selectionReference(state)
         }
     }
 
@@ -195,8 +209,23 @@ final class LiveClientBrain {
 
     func item(_ item: [String: Any]) {
         var item = item
+        if item["type"] as? String == "function_call_output", let output = item["output"] as? String,
+           let id = item["call_id"] as? String, pendingCalls.contains(id) || scopeSwitchCalls.contains(id) {
+            attemptFields["tool_result_bytes"] = String(max(Int(attemptFields["tool_result_bytes"] ?? "0") ?? 0, output.utf8.count))
+        }
         if let text = item["content"] as? String { item["content"] = LiveCompactContext.text(text) }
-        if let output = item["output"] as? String { item["output"] = LiveCompactContext.text(output) }
+        if let output = item["output"] as? String, let id = item["call_id"] as? String,
+           pendingCalls.contains(id) || scopeSwitchCalls.contains(id), !results.contains(id) {
+            if functionItems[id]?["name"] as? String != "read_tool_result",
+               LiveOpenAI.bytes(output) > 24_000 {
+                retainedResults.removeAll { $0.id == id }
+                retainedResults.append((id, output))
+                while retainedResults.count > 12 || retainedResults.reduce(0, { $0 + $1.text.utf8.count }) > 8_000_000 {
+                    retainedResults.removeFirst()
+                }
+                item["output"] = resultPage(id: id, offset: 0)
+            } else { item["output"] = LiveCompactContext.text(output) }
+        }
         if item["type"] as? String == "function_call_output", let id = item["call_id"] as? String {
             if scopeSwitchCalls.remove(id) != nil {
                 guard results.insert(id).inserted else { return }
@@ -224,7 +253,7 @@ final class LiveClientBrain {
             var record = Self.actionRecord(call: call, output: item["output"] as? String ?? "No result")
             if let origin = functionOrigins.removeValue(forKey: id) {
                 record["origin_turn"] = origin.turn
-                record["origin_selection"] = origin.selection
+                record["origin_selection"] = LiveCompactContext.selectionReference(origin.selection)
             }
             actionRecords.append(record)
             functionItems.removeValue(forKey: id)
@@ -239,7 +268,7 @@ final class LiveClientBrain {
     /// Keep command definitions in the active exchange, not a second copy in every later turn.
     private static func actionRecord(call: [String: Any], output: String) -> [String: Any] {
         var call = call
-        var result = LiveCompactContext.text(output, includeEmailContent: false)
+        var result = LiveCompactContext.bounded(output, bytes: 2_000, includeEmailContent: false)
         if call["name"] as? String == "commands",
            let raw = call["arguments"] as? String,
            let arguments = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [String: Any] {
@@ -254,12 +283,42 @@ final class LiveClientBrain {
                     + "Individual action records report what ran. Fetch the command again for a new run."
             }
         }
+        if let arguments = call["arguments"] as? String {
+            call["arguments"] = LiveCompactContext.bounded(arguments, bytes: 2_000, includeEmailContent: false)
+        }
         return ["call": call, "result": result]
+    }
+
+    private func resultPage(id: String, offset: Int) -> String {
+        guard let source = retainedResults.first(where: { $0.id == id })?.text else {
+            return "Retained result is unavailable. Retrieve the source with a read-only tool if needed; never repeat a write to recover its receipt."
+        }
+        let bytes = Array(source.utf8)
+        guard offset >= 0, offset <= bytes.count,
+              offset == bytes.count || bytes[offset] & 0xC0 != 0x80 else {
+            return "Invalid result offset. Start at 0 or use the previous next_offset."
+        }
+        let remaining = String(decoding: bytes.dropFirst(offset), as: UTF8.self)
+        var chunk = FeedEmailContent.prefix(remaining, bytes: 12_000)
+        while LiveOpenAI.bytes(chunk) > 16_000 { chunk = FeedEmailContent.prefix(chunk, bytes: chunk.utf8.count / 2) }
+        let next = offset + chunk.utf8.count
+        let value: [String: Any] = ["source_call_id": id, "total_bytes": bytes.count, "offset": offset,
+            "next_offset": next, "complete": next == bytes.count, "text": chunk,
+            "contentAccess": "This is a page of an already returned tool result, not a retrieval failure. Use read_tool_result with source_call_id and next_offset for more. Do not repeat the original action. Do not claim a full read from a partial page."]
+        do { return String(decoding: try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), as: UTF8.self) }
+        catch { return "The saved result could not be encoded for presentation. The original operation has not been repeated." }
     }
 
     func begin(_ id: String, live: Bool, turn: Int) {
         guard !completedTurns.contains(turn), queuedDelegation?.id != id, delegation != id else { return }
+        finishQueuedAttempt(reason: "superseded")
         queuedDelegation = (id, live, turn)
+    }
+
+    private func finishQueuedAttempt(reason: String) {
+        guard let queued = queuedDelegation else { return }
+        onAttemptOutcome?(queued.turn, ["delegation_id": queued.id, "request_sent": "false", "stage": "queued",
+            "reason": reason, "outcome": "stopped", "recovery": "none", "byte_limit": String(contextByteLimit)])
     }
 
     func settle(turn: Int) {
@@ -278,6 +337,7 @@ final class LiveClientBrain {
         presentationOnly = false
         requestTurn = turn
         requestState = turnState
+        startAttempt()
         input.append(["type": "message", "role": "user", "content": latestUser])
         run()
     }
@@ -285,6 +345,7 @@ final class LiveClientBrain {
     func continueResponse(delegation id: String?) {
         guard !busy else { return }
         if delegation != nil, requestTurn != currentTurn {
+            endAttempt(reason: "superseded", stage: "continuation", recovery: "new_turn")
             input.removeAll()
             delegation = nil
             liveDelegation = nil
@@ -298,6 +359,7 @@ final class LiveClientBrain {
             requestTurn = currentTurn
             requestState = turnState
             steps = 0
+            startAttempt()
         }
         run()
     }
@@ -305,7 +367,7 @@ final class LiveClientBrain {
     func recordFastResult(_ output: String, turn: Int) {
         completedTurns.insert(turn)
         observe("Application already handled user turn \(turn). Verified result: " + output)
-        if queuedDelegation?.turn == turn { queuedDelegation = nil }
+        if queuedDelegation?.turn == turn { finishQueuedAttempt(reason: "locally_resolved"); queuedDelegation = nil }
         if task != nil, requestTurn == turn, !presentationOnly { supersedeRequest() }
     }
 
@@ -327,12 +389,32 @@ final class LiveClientBrain {
         requestTurn = pending.turn
         requestState = state
         steps = 0
+        startAttempt()
         run()
+    }
+
+    private func startAttempt() {
+        endAttempt(reason: "superseded", stage: "handoff", recovery: "new_attempt")
+        attempt = (delegation ?? "application-" + UUID().uuidString, requestTurn)
+        attemptFields = ["request_sent": "false", "byte_limit": String(contextByteLimit), "tool_result_bytes": "0"]
+    }
+
+    private func endAttempt(reason: String, stage: String, recovery: String) {
+        guard let attempt else { return }
+        self.attempt = nil
+        var fields = attemptFields
+        fields["delegation_id"] = attempt.id
+        fields["reason"] = reason
+        fields["stage"] = stage
+        fields["recovery"] = recovery
+        fields["outcome"] = reason == "completed" ? "completed" : "stopped"
+        onAttemptOutcome?(attempt.turn, fields)
     }
 
     private func run() {
         guard task == nil, pendingCalls.isEmpty, let delegation else { return }
         if scopeChanged {
+            endAttempt(reason: "scope_changed", stage: "continuation", recovery: "select_current_profile")
             let responseID = "jo-" + UUID().uuidString
             deliver(["type": "response.event", "delegation_id": delegation,
                      "event": ["type": "response.created", "response": ["id": responseID]]])
@@ -342,7 +424,7 @@ final class LiveClientBrain {
             return
         }
         steps += 1
-        guard steps <= 12 else { fail("This task reached its step limit. No further actions were attempted."); return }
+        guard steps <= stepLimit else { fail("This task reached its step limit. No further actions were attempted.", reason: "step_limit", stage: "continuation"); return }
         let requestGeneration = generation
         let requestTurn = self.requestTurn
         let requestRevision = transcriptRevision
@@ -352,8 +434,8 @@ final class LiveClientBrain {
         let responseID = "jo-" + UUID().uuidString
         var mandatory = ["current_turn": currentTurn, "selectionStatus": LiveSelectionGrounding.selection(state).isEmpty ? "none" : "application_state",
                          "selectionRule": "Only currentSelection establishes the current email. Speech, prior questions, history and background findings cannot create one. Select a returned result explicitly before acting on it.",
-                         "requestSelection": requestState == state ? "Same as currentSelection" : requestState, "currentSelection": state,
-                         "latestAssistant": latestAssistant, "pendingQuestion": pendingQuestion, "questionSelection": questionState == state ? "Same as currentSelection" : questionState,
+                         "requestSelection": requestState == state ? "Same as currentSelection" : LiveCompactContext.selectionReference(requestState), "currentSelection": state,
+                         "latestAssistant": LiveCompactContext.bounded(latestAssistant, bytes: 2_000), "pendingQuestion": LiveCompactContext.bounded(pendingQuestion, bytes: 2_000), "questionSelection": questionState == state ? "Same as currentSelection" : questionState,
                          "recordedActions": Array(actionRecords.suffix(12)), "completedJobs": completedJobs.map {
                              ["job_id": $0.id.uuidString, "state": "finished", "result": $0.result]
                          }, "applicationUpdates": context] as [String: Any]
@@ -363,11 +445,35 @@ final class LiveClientBrain {
             optionalUpdates.removeFirst()
             mandatory["applicationUpdates"] = optionalUpdates
         }
-        guard let stateData = try? JSONSerialization.data(withJSONObject: mandatory, options: [.sortedKeys]),
-              stateData.count <= 96_000 else {
+        if LiveOpenAI.bytes(mandatory) > 80_000 {
+            mandatory["currentSelection"] = LiveCompactContext.bounded(state, bytes: 12_000)
+            mandatory["completedJobs"] = completedJobs.suffix(4).map {
+                ["job_id": $0.id.uuidString, "state": "finished", "result": LiveCompactContext.bounded($0.result, bytes: 800)]
+            }
+            mandatory["recordedActions"] = actionRecords.suffix(12).map { record in
+                var record = record
+                for key in ["result", "origin_selection"] {
+                    if let text = record[key] as? String { record[key] = LiveCompactContext.bounded(text, bytes: 1_000, includeEmailContent: false) }
+                }
+                return record
+            }
+        }
+        for (key, value) in mandatory { attemptFields[key + "_bytes"] = String(LiveOpenAI.bytes(value)) }
+        let stateData: Data
+        do { stateData = try encodeContext(mandatory) }
+        catch {
+            fail("Jo couldn't prepare this answer. Your selected email and previous actions are unchanged.", reason: "context_encoding_failed", stage: "pre_request")
+            return
+        }
+        attemptFields["total_bytes"] = String(stateData.count)
+        guard stateData.count <= contextByteLimit else {
             let sizes = mandatory.keys.sorted().map { "\($0)=\(LiveOpenAI.bytes(mandatory[$0]!))" }.joined(separator: " ")
             RealtimeLog.log("liveBrain: context limit exceeded bytes by field: " + sizes)
-            fail("The current task context is too large to process safely."); return
+            context.removeAll()
+            latestAssistant = ""
+            pendingQuestion = ""
+            questionState = ""
+            fail("Jo couldn't fit this task's context into an answer. Your mailbox isn't full. The selected email and previous actions are unchanged; select a single message or skip this item.", reason: "context_limit", stage: "pre_request"); return
         }
         let prior = history.enumerated().filter { $0.offset != turnHistoryIndex }.map(\.element)
         let requestID = UUID().uuidString
@@ -377,6 +483,7 @@ final class LiveClientBrain {
         deliver(["type": "response.event", "delegation_id": delegation,
                  "event": ["type": "response.created", "response": ["id": responseID]]])
         activeRequest = (requestID, responseID, delegation)
+        attemptFields["request_id"] = requestID
         let bound = requestBound
         requestWatchdog = Task { [weak self] in
             try? await Task.sleep(for: .seconds(bound))
@@ -400,6 +507,7 @@ final class LiveClientBrain {
                     || requestScope != scopeRevision || (!requestPresentation && completedTurns.contains(requestTurn)) {
                     let retry = requestTurn == currentTurn && requestScope == scopeRevision
                         && !completedTurns.contains(requestTurn)
+                    endAttempt(reason: "superseded", stage: "provider_response", recovery: retry ? "revised_transcript" : "new_turn")
                     if retry {
                         onRequestTransition?("request_transcript_revised", requestID, delegation, requestTurn)
                         queuedDelegation = (delegation, liveDelegation != nil, currentTurn)
@@ -429,7 +537,15 @@ final class LiveClientBrain {
                     }
                 }
                 if !calls.isEmpty { armCallWatchdog(for: calls) }
+                var localResultCalls = false
                 for item in output {
+                    if item["name"] as? String == "read_tool_result", let id = item["call_id"] as? String {
+                        let args = (item["arguments"] as? String).flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+                        self.item(["type": "function_call_output", "call_id": id,
+                                   "output": resultPage(id: args?["source_call_id"] as? String ?? "", offset: args?["offset"] as? Int ?? 0)])
+                        localResultCalls = true
+                        continue
+                    }
                     deliver(["type": "response.event", "delegation_id": delegation,
                              "event": ["type": "response.output_item.done", "response_id": responseID, "item": item]])
                 }
@@ -446,16 +562,18 @@ final class LiveClientBrain {
                        !hasCurrentAction, !Self.isActionClarification(text) {
                         onRequestTransition?("request_no_action", requestID, delegation, requestTurn)
                         finish(responseID: responseID, delegation: delegation, response: [:])
-                        fail("I haven't executed this new archive request. Please try again.")
+                        fail("I haven't executed this new archive request. Please try again.", reason: "no_action", stage: "presentation")
                         return
                     }
                     if !text.isEmpty { speak(groundedReply(text), liveDelegation) }
+                    endAttempt(reason: "completed", stage: "presentation_queued", recovery: "none")
                     completedTurns.insert(requestTurn)
                     input.removeAll()
                     self.delegation = nil
                     liveDelegation = nil
                 }
                 finish(responseID: responseID, delegation: delegation, response: response)
+                if localResultCalls, pendingCalls.isEmpty { run() }
                 if functions.isEmpty {
                     presentationOnly = false
                     startPresentationIfReady()
@@ -469,6 +587,7 @@ final class LiveClientBrain {
                 activeRequest = nil
                 input.removeAll()
                 if !requestPresentation && completedTurns.contains(requestTurn) {
+                    endAttempt(reason: "locally_resolved", stage: "provider_response", recovery: "application_result")
                     self.delegation = nil
                     liveDelegation = nil
                     finish(responseID: responseID, delegation: delegation, response: [:])
@@ -478,10 +597,13 @@ final class LiveClientBrain {
                 }
                 deliver(["type": "response.event", "delegation_id": delegation,
                          "event": ["type": "response.failed", "response": ["id": responseID, "status": "failed", "client_task": true]]])
-                onRequestTransition?("request_provider_failed", requestID, delegation, requestTurn)
+                let sent = attemptFields["request_sent"] == "true"
+                onRequestTransition?(sent ? "request_provider_failed" : "request_preparation_failed", requestID, delegation, requestTurn)
                 let detail = (error as? LiveBrainRequestError)?.diagnostic ?? "transport_or_response_failure"
                 RealtimeLog.log("liveBrain: request failed \(detail)")
-                fail("That task could not complete. The call is still connected; existing actions have not been repeated.")
+                attemptFields.merge(VoiceDiagnostics.failure(error)) { _, new in new }
+                if let error = error as? LiveBrainRequestError { attemptFields["http_status"] = String(error.status) }
+                fail("That task could not complete. The call is still connected; existing actions have not been repeated.", reason: sent ? "provider_failure" : "request_preparation_failed", stage: sent ? "provider_request" : "pre_request")
             }
         }
     }
@@ -494,6 +616,7 @@ final class LiveClientBrain {
 
     private func supersedeRequest() {
         guard let active = activeRequest else { return }
+        endAttempt(reason: "superseded", stage: "provider_request", recovery: "new_turn")
         onRequestTransition?("request_superseded", active.requestID, active.delegation, requestTurn)
         cancelRequest()
         input.removeAll()
@@ -512,7 +635,7 @@ final class LiveClientBrain {
         deliver(["type": "response.event", "delegation_id": active.delegation,
                  "event": ["type": "response.failed", "response": ["id": active.responseID,
                     "status": "failed", "client_task": true]]])
-        fail("I couldn't finish that answer in time. You can ask again; I haven't repeated any email actions.")
+        fail("I couldn't finish that answer in time. You can ask again; I haven't repeated any email actions.", reason: "timeout", stage: "provider_request")
     }
 
     private func finish(responseID: String, delegation: String, response: [String: Any]) {
@@ -521,7 +644,8 @@ final class LiveClientBrain {
                     "output": response["output"] ?? [], "usage": response["usage"] ?? [:]]]])
     }
 
-    private func fail(_ message: String) {
+    private func fail(_ message: String, reason: String, stage: String) {
+        endAttempt(reason: reason, stage: stage, recovery: "retain_selection_and_receipts")
         let live = liveDelegation
         input.removeAll()
         delegation = nil
@@ -576,5 +700,9 @@ final class LiveClientBrain {
         callWatchdog = nil
     }
 
-    func close() { cancelRequest(); queuedDelegation = nil }
+    func close() {
+        endAttempt(reason: "cancelled", stage: "session_close", recovery: "none")
+        finishQueuedAttempt(reason: "cancelled")
+        cancelRequest(); queuedDelegation = nil
+    }
 }

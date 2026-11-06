@@ -68,9 +68,9 @@ enum SessionExport {
         return data
     }
 
-    private static let diagnosticKeys: Set<String> = ["event", "timestamp", "elapsed_ms", "sequence",
+    private static let diagnosticKeys: Set<String> = ["event", "timestamp", "elapsed_ms", "sequence", "session_sequence", "core_sequence",
         "session_id", "conversation_id", "app_version", "schema_version", "source_revision", "fields",
-        "feedback_id", "source", "engine", "session_state", "render_revision", "user_id", "profile_id"]
+        "feedback_id", "source", "engine", "session_state", "render_revision", "turn_id", "user_id", "profile_id"]
     private static let historyKeys: Set<String> = ["id", "serviceName", "serviceIcon", "status", "durationSeconds",
         "issuedAt", "profile_id", "conversationId", "toolSteps", "latency", "brainSteps"]
     private static let jobKeys: Set<String> = ["id", "state", "receipts", "user_id", "conversation_id", "turn_id",

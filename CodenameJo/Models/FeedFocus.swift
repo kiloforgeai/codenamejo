@@ -3,6 +3,7 @@ import Foundation
 /// The in-app-only representation of the Feed stage Jo is speaking about. It contains no
 /// actions and is never sent to the broker or Live Activity.
 enum FeedFocus: Hashable, Sendable {
+    case overview(FeedOverview)
     case email(Email)
     case emailStatus(EmailStatus)
     case slack(Slack)
@@ -23,9 +24,10 @@ enum FeedFocus: Hashable, Sendable {
         var messageId: String? = nil
         var threadId: String? = nil
         var isBackgroundResult = false
+        var isFeedSelection = false
 
-        var displayedPosition: Int? { isBackgroundResult ? nil : position }
-        var displayedTotal: Int? { isBackgroundResult ? nil : total }
+        var displayedPosition: Int? { isBackgroundResult || isFeedSelection ? nil : position }
+        var displayedTotal: Int? { isBackgroundResult || isFeedSelection ? nil : total }
 
         var pageTotal: Int? {
             guard let total, total > 0 else { return nil }
@@ -136,7 +138,7 @@ enum FeedFocus: Hashable, Sendable {
     /// or the summary is up.
     var isSettled: Bool {
         switch self {
-        case .email, .slack, .about, .calendar(.loading): return false
+        case .overview, .email, .slack, .about, .calendar(.loading): return false
         case .emailStatus, .slackStatus, .tip, .calendar, .complete: return true
         }
     }
@@ -192,9 +194,31 @@ struct FeedFocusTracker: Sendable {
             return focus
         }
 
+        if let kind = object["desktopSelection"] as? String,
+           let selected = object["selection"] as? [String: Any] {
+            terminalResponsePending = false
+            if kind == "Slack" {
+                applySlack(step: ["item": selected, "position": 1])
+            } else if kind == "Calendar", let id = selected["event_id"] as? String,
+                      let account = selected["account"] as? String {
+                let parser = ISO8601DateFormatter()
+                focus = .calendar(.agenda(events: [.init(id: id, account: account,
+                    title: selected["title"] as? String ?? "Untitled event", location: selected["location"] as? String,
+                    start: (selected["start"] as? String).flatMap(parser.date),
+                    end: (selected["end"] as? String).flatMap(parser.date),
+                    allDay: (selected["start"] as? String)?.count == 10)], partial: false))
+            }
+            return focus
+        }
+
         if Self.bool(object["stopped"]) == true {
             focus = nil
             terminalResponsePending = false
+            return focus
+        }
+        if let payload = object["overview"] as? [String: Any], let overview = FeedOverview(payload: payload) {
+            terminalResponsePending = false
+            focus = .overview(overview)
             return focus
         }
         if let items = (object["about"] as? [String: Any])?["items"] as? [String], !items.isEmpty {
@@ -213,6 +237,7 @@ struct FeedFocusTracker: Sendable {
                 messageId: item["id"] as? String,
                 threadId: item["threadId"] as? String,
                 isBackgroundResult: Self.bool(object["presentedForOutcome"]) == true,
+                isFeedSelection: Self.bool(object["selectedFromFeed"]) == true,
                 received: Self.date(item["date"]),
                 threadIndex: (object["thread"] as? [String: Any]).flatMap { Self.int($0["index"]) },
                 threadCount: (object["thread"] as? [String: Any]).flatMap { Self.int($0["queued"]) },

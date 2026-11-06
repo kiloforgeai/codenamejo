@@ -37,32 +37,43 @@ struct DesktopFixtureView: View {
         let browser: SupervisedBrowserExperiment
     }
     @State private var browserPresentation: BrowserPresentation?
+    @AppStorage(AppearanceSetting.storageKey) private var appearance = AppearanceSetting.system
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("ISOLATED QA · synthetic mail · no audio or provider writes").font(.caption)
+                Label("Isolated preview · synthetic data · no audio or provider writes", systemImage: "testtube.2")
+                    .font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("Next") { interactor.next(delayProjection: false) }
-                Button("Archive fixture") { interactor.archive() }
-                Button("Delay projection") { interactor.next(delayProjection: true) }
-                Button("Apply projection") { interactor.applyProjection() }
-                Button("Section feed") { interactor.sectionFeed() }
-                Button("Finish fixture") { interactor.finish() }
-                Button("Export evidence") { interactor.exportEvidence() }
-                Button("Save bundle…") { interactor.saveEvidenceBundle() }
-                Button("Browser fixture") {
-                    let browser = SupervisedBrowserExperiment(context: .init(jobID: UUID(), profileID: nil,
-                        origin: .init(account: "qa@example.test", messageID: "fixture-1", threadID: "thread-1",
-                            sender: "Same Sender", subject: "Same Subject"),
-                        request: "Inspect workshop availability and request a place only after my approval."))
-                    browserPresentation = BrowserPresentation(browser: browser)
+                Picker("Appearance", selection: $appearance) {
+                    Text("System").tag(AppearanceSetting.system)
+                    Text("Light").tag(AppearanceSetting.light)
+                    Text("Dark").tag(AppearanceSetting.dark)
+                }.pickerStyle(.menu).fixedSize()
+                Button("Snapshot") { interactor.exportEvidence() }
+                Menu("Fixtures") {
+                    Button("Next") { interactor.next(delayProjection: false) }
+                    Button("Archive fixture") { interactor.archive() }
+                    Button("Delay projection") { interactor.next(delayProjection: true) }
+                    Button("Apply projection") { interactor.applyProjection() }
+                    Button("Section feed") { interactor.sectionFeed() }
+                    Button("Finish fixture") { interactor.finish() }
+                    Button("Export evidence") { interactor.exportEvidence() }
+                    Button("Save bundle…") { interactor.saveEvidenceBundle() }
+                    Button("Browser fixture") {
+                        let browser = SupervisedBrowserExperiment(context: .init(jobID: UUID(), profileID: nil,
+                            origin: .init(account: "qa@example.test", messageID: "fixture-1", threadID: "thread-1",
+                                sender: "Same Sender", subject: "Same Subject"),
+                            request: "Inspect workshop availability and request a place only after my approval."))
+                        browserPresentation = BrowserPresentation(browser: browser)
+                    }
                 }
-            }.padding(12)
+            }.padding(.horizontal, 16).padding(.vertical, 8)
             DesktopWorkspaceView(viewModel: viewModel, interactor: interactor)
-            Text(interactor.renderLabel).font(.caption.monospaced()).padding(8)
-                .accessibilityIdentifier("fixtureRenderIdentity")
-            Text(interactor.evidenceStatus).font(.caption).textSelection(.enabled)
-                .accessibilityIdentifier("fixtureEvidenceStatus")
+            HStack {
+                Text(interactor.renderLabel).accessibilityIdentifier("fixtureRenderIdentity")
+                Spacer()
+                Text(interactor.evidenceStatus).textSelection(.enabled).accessibilityIdentifier("fixtureEvidenceStatus")
+            }.font(.system(size: 10)).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 6)
         }.frame(minWidth: 1040, minHeight: 760)
             .sheet(item: $browserPresentation) { presentation in
                 SupervisedBrowserExperimentView(browser: presentation.browser) { context, result, state in
@@ -161,6 +172,7 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
                 feedSections: profiles.feedSections)
             let step = await queue.openingStep(store: mail)
             await queue.awaitFeedSectionPreparation()
+            model?.profileID = ProfileRuntime.snapshot?.profileId
             await present(step.output, delayProjection: false)
         }
     }
@@ -195,7 +207,27 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
     func applyProjection() {
         guard let model, let snapshot = pendingProjection else { return }
         model.sessionFeed = .init(mail: snapshot)
+        updateFixtureEmailReader()
         pendingProjection = nil
+    }
+
+    private func updateFixtureEmailReader() {
+        guard let model else { return }
+        if case .email(let email) = model.displayedFocus, let id = email.messageId {
+            let request = DesktopEmailReader.Request(selection: .init(account: email.account, messageID: id),
+                threadID: email.threadId, ownerID: "fixture-user", profileID: model.profileID,
+                conversationID: model.conversationID, headersOnly: false)
+            let text = "FIRST MARKER · Complete synthetic email \(id).\n\n"
+                + (1...30).map { "Paragraph \($0). This complete email remains readable while the conversation scrolls independently below it." }
+                    .joined(separator: "\n\n")
+                + "\n\nOn Monday, the earlier sender wrote:\n> The original quoted reply stays visible.\n\nFINAL MARKER"
+            model.emailReader = .ready(request, .init(selectedID: id, messages: [
+                .init(id: "earlier-\(id)", from: "Earlier sender", to: email.account, cc: "", subject: email.subject,
+                      date: "Monday", text: "The complete earlier message in this synthetic thread.", attachments: [], error: nil),
+                .init(id: id, from: email.sender, to: email.account, cc: "", subject: email.subject,
+                      date: "Tuesday", text: text, attachments: ["Example.pdf"], error: nil)
+            ]))
+        } else { model.emailReader = .idle }
     }
     func finish() {
         Task {
@@ -324,10 +356,49 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
             model?.jobs = await jobs.history()
         }
     }
-    func toggleSession() {}
+    func selectFeedItem(_ row: DesktopFeedRow) {
+        guard !busy else { return }
+        model?.feedSelectionError = nil
+        if model?.inSession == false {
+            model?.previewSelection = row
+            updateFixtureEmailReader()
+            return
+        }
+        busy = true
+        Task {
+            defer { busy = false }
+            let output: String?
+            if let selection = row.selection {
+                output = await queue.selectPreparedEmail(selection, profileID: model?.profileID)
+            } else {
+                output = await queue.selectPreparedSupplement(row, profileID: model?.profileID)?.selectionStep
+            }
+            if let output { await present(output, delayProjection: false) }
+            else { model?.feedSelectionError = "This item is no longer in the prepared feed." }
+        }
+    }
+
+    func toggleSession() {
+        guard let model else { return }
+        if model.inSession {
+            model.feedPreview = .init(mail: .init(rows: model.sessionFeed.rows, count: model.sessionFeed.rows.count), slack: .init())
+            model.inSession = false
+            model.focus = nil
+            model.response = ""
+            model.userWords = ""
+            model.micLive = false
+            model.startedAt = nil
+        } else {
+            model.inSession = true
+            model.micLive = true
+            model.startedAt = Date()
+            Task { if let step = client.standingStep { await present(step, delayProjection: false) } }
+        }
+    }
     func quickAction() {}
-    func toggleMute() {}
+    func toggleMute() { model?.muted.toggle() }
     func stopSpeaking() {}
+    func retryEmailReader() {}
     func exportDiagnostics() {}
     func exportHistory() {}
     func showFeedback() { model?.showingFeedback = true }

@@ -23,6 +23,7 @@ struct JoDesktopApp: App {
         WindowGroup {
             #if JO_QA
             DesktopFixtureComponent.make()
+                .preferredColorScheme(appearance.colorScheme)
             #else
             if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil { Color.clear } else {
             RootViewComponent.make()

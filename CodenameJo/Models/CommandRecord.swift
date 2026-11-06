@@ -123,3 +123,23 @@ extension CommandRecord {
         knownServices.first { $0.name == service }?.icon ?? "waveform"
     }
 }
+
+extension CommandRecord {
+    /// The display category for a turn or background job; it does not route tools.
+    static func inferService(from text: String) -> String {
+        let lower = text.lowercased()
+        if lower.contains("email") || lower.contains("gmail") || lower.contains("inbox")
+            || lower.contains("mail") { return "Gmail" }
+        if lower.contains("granola") { return "Granola" }
+        if lower.contains("slack") { return "Slack" }
+        if lower.contains("github") || lower.contains("pull request") || lower.contains("pr ")
+            || lower.contains("issue") || lower.contains("repo") || lower.contains("merge")
+            || lower.contains("workflow") { return "GitHub" }
+        if lower.contains("notion") || lower.contains("page") || lower.contains("doc")
+            || lower.contains("note") || lower.contains("database") { return "Notion" }
+        if lower.contains("calendar") || lower.contains("meeting") || lower.contains("schedule")
+            || lower.contains("invite") || lower.contains("invitation")
+            || lower.contains("event") { return "Calendar" }
+        return "General"
+    }
+}

@@ -74,6 +74,9 @@ extension Container {
     var desktopFeedPreview: Factory<DesktopFeedPreview> {
         self { MainActor.assumeIsolated { DesktopFeedPreview() } }.singleton
     }
+    var desktopEmailReader: Factory<DesktopEmailReader> {
+        self { MainActor.assumeIsolated { DesktopEmailReader() } }.singleton
+    }
     #endif
 
     var contactStore: Factory<ContactStore> {

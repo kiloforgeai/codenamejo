@@ -389,6 +389,15 @@ class RealtimeService: ObservableObject {
         return await client.selectReturnedResult(id)
     }
 
+    #if targetEnvironment(macCatalyst)
+    func selectFeedItem(_ row: DesktopFeedRow) async -> String? {
+        guard isConversing, let client = fullDuplex else { return "Start a Live session to work on this item." }
+        let error = await client.selectFeedItem(row)
+        if error == nil { answerIsStale = !responseText.isEmpty }
+        return error
+    }
+    #endif
+
     func performFeedAction(_ action: LiveFastAction, context: FeedActionContext) -> String? {
         guard isConversing, let client = fullDuplex else { return "Start a Live feed session to use these actions." }
         return client.performFeedAction(action, context: context)
@@ -418,7 +427,7 @@ class RealtimeService: ObservableObject {
         return FeedbackContext(sessionID: isConversing ? diagnostics?.id : nil,
             conversationID: activeConversationId, profileID: ProfileRuntime.snapshot?.profileId,
             engine: isConversing ? (localVoiceEngine.map { "local_\($0.rawValue)" } ?? "live") : "idle",
-            state: state, renderRevision: renderRevision)
+            state: state, renderRevision: renderRevision, turnID: responseTurnID)
     }
 
     func installProfileDossier(_ dossier: ProfileDossierContext?, profileId: String) {
@@ -710,9 +719,6 @@ class RealtimeService: ObservableObject {
         }
         client.onLevels = { [weak self] levels in
             self?.metering.levels = levels
-        }
-        client.onTurnFailed = { [weak self] _ in
-            self?.turnSteps = []
         }
         client.onDispatchStarted = { [weak self] jobId, task in
             self?.addLiveDispatch(id: jobId, task: task)
@@ -1915,12 +1921,14 @@ class RealtimeService: ObservableObject {
 
     // MARK: - Turn finalize
 
-    /// - Parameter interrupted: the user cut this reply off. Only the *stored*
-    ///   copy is marked — `responseText` is what the screen is showing, and
-    ///   stamping that would put the marker in front of the user.
-    private var completedHistory: [UUID: CommandRecord] = [:]
+    private var turnHistory = TurnHistory()
 
     func bindLiveHistory(_ client: FullDuplexVoiceClient) {
+        client.onTurnFailed = { [weak self, weak client] _ in
+            guard let self, let client else { return }
+            self.lastCompletedTurn = self.turnHistory.fail(id: client.historyTurnID, text: client.historyUserText,
+                conversationID: self.activeConversationId, steps: self.turnSteps)
+        }
         client.onHistoryCheckpoint = { [weak self] id, text in
             self?.checkpointLiveTurn(id: id, text: text)
         }
@@ -1931,40 +1939,21 @@ class RealtimeService: ObservableObject {
                 self.finalizeTurn(id: origin.id, command: origin.userText, response: reply.text)
                 return
             }
-            var record = self.completedHistory[origin.id] ?? CommandRecord(
-                id: origin.id, commandText: origin.userText, conversationId: self.activeConversationId)
-            record.responseText = SpokenAddress.written(reply.text)
-            record.status = client.historyJobOutcomes[origin.id] ?? record.status
-            record.toolSteps = record.toolSteps?.map { step in
-                var step = step
-                if step.tool == "dispatch" { step.outcome = record.status.rawValue }
-                return step
-            }
-            self.completedHistory[origin.id] = record
-            self.lastCompletedTurn = record
+            self.lastCompletedTurn = self.turnHistory.reply(reply, conversationID: self.activeConversationId,
+                                                          status: client.historyJobOutcomes[origin.id])
         }
     }
 
     private func checkpointLiveTurn(id: UUID, text: String) {
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        var record = completedHistory[id] ?? CommandRecord(
-            id: id, commandText: text, conversationId: activeConversationId)
-        record.commandText = text
-        if !turnSteps.isEmpty {
-            record.status = CommandRecord.outcome(steps: turnSteps, interrupted: false)
-            record.toolSteps = turnSteps.map { .init(tool: $0.tool,
-                milliseconds: $0.serverMilliseconds.flatMap { $0 > 0 ? $0 : nil },
-                outcome: $0.failed ? "failed" : $0.isRunning ? "unknown" : "success") }
+        if let record = turnHistory.checkpoint(id: id, text: text, conversationID: activeConversationId, steps: turnSteps) {
+            lastCompletedTurn = record
         }
-        guard record != completedHistory[id] else { return }
-        completedHistory[id] = record
-        lastCompletedTurn = record
     }
 
+    /// Interruption marks the stored record without changing the response currently on screen.
     private func finalizeTurn(interrupted: Bool = false, id: UUID? = nil,
                               command: String? = nil, response: String? = nil) {
         let id = id ?? fullDuplex?.historyTurnID ?? UUID()
-        let previous = completedHistory[id]
         let lastCommandText = command ?? self.lastCommandText
         let responseText = response.map(SpokenAddress.written) ?? self.responseText
         let status = interrupted ? CommandRecord.CommandStatus.cancelled
@@ -1976,16 +1965,8 @@ class RealtimeService: ObservableObject {
         // step behind, and a step with no end reads as a tool that never returned.
         let recordedSteps = turnSteps
         closeOpenSteps()
-        lastTurnSteps = recordedSteps.map { step in
-            CommandRecord.ToolStep(
-                tool: step.tool,
-                // 0 is the "we don't know" the hosted-MCP path reports, not a
-                // measurement — see `CommandRecord.ToolStep.milliseconds`.
-                milliseconds: step.serverMilliseconds.flatMap { $0 > 0 ? $0 : nil },
-                outcome: step.failed ? "failed" : step.isRunning ? "unknown" : "success"
-            )
-        }
-        lastServiceName = Self.inferService(from: lastCommandText)
+        lastTurnSteps = recordedSteps.map(CommandRecord.ToolStep.init)
+        lastServiceName = CommandRecord.inferService(from: lastCommandText)
         let duration = commandStartTime.map { Date().timeIntervalSince($0) } ?? 0
         lastDuration = duration
         // Read and cleared together with the rest of the turn's fields, for the
@@ -1996,7 +1977,7 @@ class RealtimeService: ObservableObject {
         commandStartTime = nil
 
         guard !lastResponseText.isEmpty || !lastCommandText.isEmpty else { return }
-        let brainSteps = (previous?.brainSteps ?? []) + pendingBrainSteps
+        let brainSteps = pendingBrainSteps
         pendingBrainSteps = []
         let record = CommandRecord(
             id: id, commandText: lastCommandText.isEmpty ? "Voice command" : lastCommandText,
@@ -2004,60 +1985,13 @@ class RealtimeService: ObservableObject {
             serviceName: lastServiceName,
             serviceIcon: CommandRecord.icon(for: lastServiceName),
             status: status,
-            durationSeconds: (previous?.durationSeconds ?? 0) + duration,
-            issuedAt: previous?.issuedAt ?? Date(),
+            durationSeconds: duration,
             conversationId: activeConversationId,
-            toolSteps: lastTurnSteps.isEmpty ? previous?.toolSteps : lastTurnSteps,
-            latency: latency ?? previous?.latency,
+            toolSteps: lastTurnSteps.isEmpty ? nil : lastTurnSteps,
+            latency: latency,
             brainSteps: brainSteps.isEmpty ? nil : brainSteps
         )
-        completedHistory[id] = record
-        lastCompletedTurn = record
-    }
-
-    // MARK: - Service inference
-
-    /// Which service a turn gets filed under in History.
-    ///
-    /// **Only the services the assistant can actually reach.** It used to guess
-    /// between eleven, five of which have never been connectable — "what are my
-    /// open issues" filed as Linear, "post that" as Typefully, "which file" as
-    /// Drive — and every one of those labels became a filter chip on the History
-    /// screen offering to narrow a list by a service that does not exist here.
-    /// Adding a service to this ladder is only correct once there is a connector
-    /// behind it; `ConnectionsService.connectedServices` is what then decides
-    /// whether its chip appears.
-    ///
-    /// Still a keyword guess on the user's words, and still rough — it labels a
-    /// row, it does not route anything. Two keywords went with the services that
-    /// owned them rather than being dropped: "issue" and "pr" are GitHub's. `pr` is matched with a trailing space because bare
-    /// `contains("pr")` hits "approve", "print" and "surprise"; `app` and `ci`
-    /// are gone for the same reason ("happening", "decide") and were never worth
-    /// the false positives.
-    /// `static` and internal rather than private: History's Dispatch panel files
-    /// each job under the same ladder (a dispatch row carries no service of its
-    /// own, only the task's words), and two keyword ladders would drift.
-    static func inferService(from text: String) -> String {
-        let lower = text.lowercased()
-        if lower.contains("email") || lower.contains("gmail") || lower.contains("inbox")
-            || lower.contains("mail") { return "Gmail" }
-        if lower.contains("granola") { return "Granola" }
-        if lower.contains("slack") { return "Slack" }
-        if lower.contains("github") || lower.contains("pull request") || lower.contains("pr ")
-            || lower.contains("issue") || lower.contains("repo") || lower.contains("merge")
-            || lower.contains("workflow") { return "GitHub" }
-        if lower.contains("notion") || lower.contains("page") || lower.contains("doc")
-            || lower.contains("note") || lower.contains("database") { return "Notion" }
-        if lower.contains("calendar") || lower.contains("meeting") || lower.contains("schedule")
-            || lower.contains("invite") || lower.contains("invitation")
-            || lower.contains("event") { return "Calendar" }
-        // No `Kiloforge` branch since 2026-08-19: the operator-only MCP that made
-        // "build" and "testflight" mean something came off the mint, so a turn
-        // labelled that way would name a service nothing can reach. Unlike GitHub
-        // and Notion — kept here because a question about a pull request is still
-        // about a pull request — there is no user-facing subject left to label.
-        // `CommandRecord.knownServices` keeps the row so stored turns still draw.
-        return "General"
+        lastCompletedTurn = turnHistory.complete(record)
     }
 }
 

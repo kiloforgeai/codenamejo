@@ -63,6 +63,8 @@ final class LiveSessionAdapter {
     private var turnsWithTools: Set<Int> = []
     private var activeFastCall: (id: String, turn: Int, delegation: String)?
     private var fastResults: [Int: String] = [:]
+    private var locallyAcceptedInputs: [Int: String] = [:]
+    private var locallyPresentedTurns = Set<Int>()
     private var outbox: [[String: Any]] = []
     private var calls: [Call] = []
     private var seenCalls: Set<String> = []
@@ -86,6 +88,10 @@ final class LiveSessionAdapter {
     var canSelectReturnedWork: Bool {
         started && !closed && !backendRunning && !continuationOwed && activeCall == nil
             && activeFastCall == nil && calls.isEmpty
+    }
+    func canRestoreReturnedWork(_ callID: String) -> Bool {
+        started && !closed && activeFastCall?.id == callID && activeFastCall?.turn == inputTurn
+            && activeCall == nil && calls.isEmpty
     }
     private var backendRunning: Bool { backendStarting || !runningResponses.isEmpty }
     var isWorkSettled: Bool {
@@ -178,6 +184,8 @@ final class LiveSessionAdapter {
         self.emit = emit
     }
 
+    func brainRequestWasSent(_ id: String) { clientBrain?.requestWasSent(id) }
+
     func enableClientDelegation(request: @escaping LiveClientBrain.Request) {
         clientBrain = LiveClientBrain(request: request, deliver: { [weak self] event in
             guard let data = try? JSONSerialization.data(withJSONObject: event) else { return }
@@ -205,11 +213,18 @@ final class LiveSessionAdapter {
             self?.diagnostics?.record(.turnTransition, ["transition": reason, "request_id": request,
                 "delegation_id": delegation, "input_turn": String(turn)])
         }
+        clientBrain?.onAttemptOutcome = { [weak self] turn, fields in
+            guard let self else { return }
+            var fields = fields
+            fields["input_turn"] = String(turn)
+            fields["turn_id"] = historyIDForTurn?(turn) ?? String(turn)
+            diagnostics?.record(.brainAttemptEnded, fields)
+        }
         clientBrain?.onPresentationInvalidated = { [weak self] reason, selection in
             guard let self else { return }
             diagnostics?.record(.turnTransition, ["transition": "presentation_invalidated",
                 "reason": reason, "input_turn": String(inputTurn),
-                "selection": selection.map { self.diagnostics?.target($0) ?? "unknown" } ?? "none"])
+                "target_hash": selection.map { self.diagnostics?.target($0) ?? "unknown" } ?? "none"])
             guard reason == "unsupported_spoken_introduction" else { return }
             cancelPreparedEmail()
             recoverySpeech = ""
@@ -376,10 +391,15 @@ final class LiveSessionAdapter {
         return true
     }
 
-    func resolveLocalInput() {
+    func resolveLocalInput(applicationResult: String? = nil, allowPresentation: Bool = true) {
         resolvedInputTurns.insert(inputTurn)
         authorizationText = ""
         stopQueueActionRecovery()
+        if let applicationResult {
+            locallyAcceptedInputs[inputTurn] = applicationResult
+            if !allowPresentation { locallyPresentedTurns.insert(inputTurn) }
+            clientBrain?.recordFastResult(applicationResult, turn: inputTurn)
+        }
     }
 
     func allowsFastFollowup(_ call: Call) -> Bool {
@@ -753,8 +773,15 @@ final class LiveSessionAdapter {
                 emit(.liveDelegation(id, userTurn: turn))
                 if delegation["target"] as? String == "client", let clientBrain {
                     refreshBrainState()
-                    clientBrain.begin(id, live: true, turn: turn)
-                    if finalizedInput { clientBrain.settle(turn: inputTurn) }
+                    if let result = locallyAcceptedInputs[turn], turn == inputTurn {
+                        if locallyPresentedTurns.insert(turn).inserted {
+                            presentationDelegations.insert(id)
+                            clientBrain.presentResult(result + "\n" + (clientBrainState?().text ?? ""), delegation: id, turn: turn)
+                        }
+                    } else {
+                        clientBrain.begin(id, live: true, turn: turn)
+                        if finalizedInput { clientBrain.settle(turn: inputTurn) }
+                    }
                 }
             }
         case "response.event":
@@ -955,6 +982,13 @@ final class LiveSessionAdapter {
                 if SpokenCommand.match(self.inputText) == .resetCall {
                     self.close()
                     self.emit(.liveResetRequested)
+                    return
+                }
+                if SpokenCommand.explicitlyEndsSession(self.inputText) {
+                    let text = self.inputText
+                    self.trace("explicit_session_exit")
+                    self.close()
+                    self.emit(.liveEndRequested(text))
                     return
                 }
                 self.finalizedInput = true

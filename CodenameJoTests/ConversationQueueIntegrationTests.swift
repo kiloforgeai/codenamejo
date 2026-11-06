@@ -1262,7 +1262,8 @@ final class ConversationQueueIntegrationTests: XCTestCase {
             forceOnboardingFeedLesson: false, sequentialFeed: false,
             calendarFeedDue: false, localCalendar: false)
         let opening = await queue.step(.init(scope: .important), store: fixture.store)
-        XCTAssertEqual(try current(opening.output)["id"] as? String, "second")
+        let first = await emailAfterOverview(opening.output, queue: queue, store: fixture.store)
+        XCTAssertEqual(try current(first)["id"] as? String, "second")
         await queue.end()
     }
 
@@ -2614,7 +2615,8 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         let queue = makeQueue()
 
         let opening = await queue.step(.init(), store: fixture.store)
-        XCTAssertEqual(try current(opening.output)["id"] as? String, "important")
+        let first = await emailAfterOverview(opening.output, queue: queue, store: fixture.store)
+        XCTAssertEqual(try current(first)["id"] as? String, "important")
         let crossed = await queue.step(.init(), store: fixture.store)
         XCTAssertEqual(try current(crossed.output)["id"] as? String, "unread")
         let back = await queue.step(.init(direction: "back"), store: fixture.store)
@@ -2662,7 +2664,8 @@ final class ConversationQueueIntegrationTests: XCTestCase {
                                scopePlan: ["important", "unread", "all"], band: "high")
         let queue = makeQueue()
 
-        _ = await queue.step(.init(), store: fixture.store)
+        let opening = await queue.step(.init(), store: fixture.store)
+        _ = await emailAfterOverview(opening.output, queue: queue, store: fixture.store)
         let crossed = await queue.step(.init(), store: fixture.store)
         XCTAssertEqual(try current(crossed.output)["id"] as? String, "unread")
         let back = await queue.step(.init(direction: "back"), store: fixture.store)
@@ -2693,12 +2696,42 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         let queue = makeQueue()
 
         let opening = await queue.step(.init(scope: .important), store: fixture.store)
+#if targetEnvironment(macCatalyst)
+        let overviewPayload = try XCTUnwrap(try object(opening.output)["overview"] as? [String: Any])
+        let ranked = try XCTUnwrap(overviewPayload["entries"] as? [[String: Any]])
+        let overview = try XCTUnwrap(FeedOverview(payload: overviewPayload))
+        XCTAssertNil(try object(opening.output)["item"])
+        XCTAssertEqual(FullDuplexVoiceClient.stepScript(opening.output), overview.speech)
+        XCTAssertFalse(overview.speech.contains("First up"))
+        let before = await queue.desktopSnapshot()
+        XCTAssertNil(before.currentID)
+        XCTAssertEqual(before.overview, overview)
+        let referent = await queue.standingOnAbout
+        let jsonReferent = await queue.standingOnJSON
+        let selected = await queue.standingOn(messageId: "newest", account: account)
+        let selectedThread = await queue.standingOn(threadId: "t1", account: account)
+        XCTAssertNil(referent)
+        XCTAssertNil(jsonReferent)
+        XCTAssertFalse(selected)
+        XCTAssertFalse(selectedThread)
+        let back = await queue.step(.init(direction: "back"), store: fixture.store)
+        XCTAssertEqual(back.output, opening.output, "Back cannot step behind the opening overview")
+        let first = await queue.step(.init(scope: .important), store: fixture.store)
+        XCTAssertEqual(try current(first.output)["id"] as? String, "newest",
+                       "Asking to begin the same scope must not skip email one")
+        let after = await queue.desktopSnapshot()
+        XCTAssertNil(after.overview)
+        XCTAssertEqual(after.currentID, "newest")
+        let stillUnread = await fixture.store.unreadPage(before: nil, limit: 12, account: account)
+        XCTAssertTrue(stillUnread.contains { $0.id == "newest" }, "Leaving an overview must not mark email one read")
+#else
         let ranked = try XCTUnwrap(try object(opening.output)["ranked"] as? [[String: Any]])
+        XCTAssertNotNil(try object(opening.output)["rankedIsForSaying"])
+        XCTAssertEqual(try current(opening.output)["id"] as? String, "newest")
+#endif
         XCTAssertEqual(ranked.compactMap { $0["subject"] as? String },
                        ["Subject newest", "Subject middle", "Subject oldest"],
                        "read mail from the week is in the list, in the order it will be walked")
-        XCTAssertNotNil(try object(opening.output)["rankedIsForSaying"])
-        XCTAssertEqual(try current(opening.output)["id"] as? String, "newest")
 
         let second = await queue.step(.init(), store: fixture.store)
         XCTAssertEqual(try current(second.output)["id"] as? String, "middle")
@@ -2722,8 +2755,14 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         let queue = makeQueue()
 
         let opening = await queue.openingStep(store: fixture.store)
+#if targetEnvironment(macCatalyst)
+        XCTAssertNotNil(try object(opening.output)["overview"])
+        let first = await queue.step(.init(), store: fixture.store)
+        XCTAssertEqual(try current(first.output)["id"] as? String, "invite")
+#else
         XCTAssertEqual(try current(opening.output)["id"] as? String, "invite")
         XCTAssertNotNil(try object(opening.output)["ranked"], "the week opens with its list")
+#endif
         await queue.end()
     }
 
@@ -2746,8 +2785,14 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         let queue = makeQueue()
 
         let opening = await queue.openingStep(store: fixture.store)
+#if targetEnvironment(macCatalyst)
+        XCTAssertNotNil(try object(opening.output)["overview"])
+        let first = await queue.step(.init(), store: fixture.store)
+        XCTAssertEqual(try current(first.output)["id"] as? String, "arrived")
+#else
         XCTAssertEqual(try current(opening.output)["id"] as? String, "arrived")
         XCTAssertNotNil(try object(opening.output)["ranked"], "the week opens with its list")
+#endif
         await queue.end()
     }
 
@@ -2811,12 +2856,48 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         let queue = makeQueue()
 
         let opening = await queue.step(.init(), store: fixture.store)
+#if targetEnvironment(macCatalyst)
+        let overview = try XCTUnwrap(try object(opening.output)["overview"] as? [String: Any])
+        let ranked = try XCTUnwrap(overview["entries"] as? [[String: Any]])
+        let first = await queue.step(.init(), store: fixture.store)
+        XCTAssertEqual(try current(first.output)["id"] as? String, "urgent")
+#else
         XCTAssertEqual(try current(opening.output)["id"] as? String, "urgent",
                        "the opening item is the week's most important, not the newest")
         let ranked = try XCTUnwrap(try object(opening.output)["ranked"] as? [[String: Any]])
+#endif
         XCTAssertEqual(ranked.count, 2, "the list is the week; older unread waits for the next stage")
         await queue.end()
     }
+
+    private func emailAfterOverview(_ output: String, queue: LocalTriageQueue, store: MailStore) async -> String {
+        guard (try? object(output)["overview"]) != nil else { return output }
+        return await queue.step(.init(), store: store).output
+    }
+
+#if targetEnvironment(macCatalyst)
+    func testStoppingOnOverviewKeepsFirstEmailUnreadAndResumable() async throws {
+        let fixture = try StoreFixture()
+        defer { fixture.close() }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let first = row("first", thread: "t1", date: now, sender: "Priya")
+        try await fixture.seed([first], unread: ["first"])
+        await fixture.store.applyBands(["first": ("high", "Needs a reply", 8)], account: account)
+        let queue = makeQueue()
+        let opening = await queue.step(.init(scope: .important), store: fixture.store)
+        XCTAssertNotNil(try object(opening.output)["overview"])
+        _ = await queue.step(.init(direction: "back", stop: true), store: fixture.store)
+        let stopped = await queue.desktopSnapshot()
+        XCTAssertNil(stopped.overview)
+        XCTAssertNil(stopped.currentID)
+        let unread = await fixture.store.unreadPage(before: nil, limit: 12, account: account)
+        XCTAssertEqual(unread.map(\.id), ["first"])
+        let reopened = await queue.step(.init(scope: .important), store: fixture.store)
+        let resumed = await emailAfterOverview(reopened.output, queue: queue, store: fixture.store)
+        XCTAssertEqual(try current(resumed)["id"] as? String, "first")
+        await queue.end()
+    }
+#endif
 
     private struct StoreFixture {
         let directory: URL

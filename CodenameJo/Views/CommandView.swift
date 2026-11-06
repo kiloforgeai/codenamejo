@@ -1044,6 +1044,13 @@ struct FeedFocusCard: View {
     @ViewBuilder
     private var content: some View {
         switch focus {
+        case .overview(let overview):
+            VStack(alignment: .leading, spacing: 8) {
+                Text(overview.title).font(.headline)
+                ForEach(Array(overview.entries.enumerated()), id: \.offset) { index, entry in
+                    Text("\(index + 1). \(entry.sender): \(entry.reason ?? entry.subject)")
+                }
+            }
         case .email(let email):
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -1284,6 +1291,7 @@ struct FeedFocusCard: View {
 
     private var stageLabel: String {
         switch focus {
+        case .overview: return "PRIORITIES"
         case .email(let email):
             if let total = email.pageTotal {
                 return "EMAIL \(email.position) OF \(total)"
@@ -1305,6 +1313,7 @@ struct FeedFocusCard: View {
 
     private var stageIcon: String {
         switch focus {
+        case .overview: return "list.number"
         case .email, .emailStatus: return "envelope.fill"
         case .slack, .slackStatus: return "number.square.fill"
         case .tip: return "lightbulb.fill"
@@ -1316,6 +1325,7 @@ struct FeedFocusCard: View {
 
     private var stageColor: Color {
         switch focus {
+        case .overview: return Theme.amethyst
         case .email, .emailStatus: return Theme.serviceColor(for: "Gmail")
         case .slack, .slackStatus: return Theme.serviceColor(for: "Slack")
         case .tip: return Theme.amethyst
@@ -1372,6 +1382,7 @@ struct FeedFocusCard: View {
 
     private var accessibilityText: String {
         switch focus {
+        case .overview(let overview): return overview.speech
         case .email(let email):
             var parts = [stageLabel, "From \(displaySender(email.sender))", email.subject]
             if !email.snippet.isEmpty { parts.append(email.snippet) }

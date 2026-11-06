@@ -16,6 +16,7 @@ enum RealtimeSignal {
     case liveInputText(String)
     case liveInputFinished(String)
     case liveResetRequested
+    case liveEndRequested(String)
     /// The user's last word to Jo's first, on Live's timeline.
     case liveFirstSpeech(afterInputMs: Int)
     case liveBackendUsage(ResponseUsage, ms: Int)

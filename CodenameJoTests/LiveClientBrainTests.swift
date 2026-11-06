@@ -9,21 +9,27 @@ final class LiveClientBrainTests: XCTestCase {
         var speech: [String] = []
         var spokenDelegations: [String?] = []
         var failures: [String] = []
-        lazy var brain = LiveClientBrain(request: { [unowned self] body in
+        var sendsRequest = true
+        lazy var brain: LiveClientBrain = LiveClientBrain(request: { [weak self] body in
+            guard let self else { throw CancellationError() }
+            if sendsRequest { brain.requestWasSent(body["requestId"] as? String ?? "") }
             requests.append(body)
-            return try await withCheckedThrowingContinuation { replies.append($0) }
-        }, deliver: { [unowned self] in events.append($0) },
-           speak: { [unowned self] text, delegation in
-               speech.append(text); spokenDelegations.append(delegation)
+            return try await withCheckedThrowingContinuation { self.replies.append($0) }
+        }, deliver: { [weak self] in self?.events.append($0) },
+           speak: { [weak self] text, delegation in
+               self?.speech.append(text); self?.spokenDelegations.append(delegation)
            },
-           failed: { [unowned self] in failures.append($0) })
+           failed: { [weak self] in self?.failures.append($0) })
         func start() {
             brain.updateState("email A", scope: "personal")
             brain.user("archive it", turn: 1)
             brain.begin("d1", live: true, turn: 1)
             brain.settle(turn: 1)
         }
-        func reply(_ output: [[String: Any]]) { replies.removeFirst().resume(returning: ["output": output]) }
+        func reply(_ output: [[String: Any]], file: StaticString = #filePath, line: UInt = #line) {
+            guard !replies.isEmpty else { return XCTFail("No provider request is waiting for this reply", file: file, line: line) }
+            replies.removeFirst().resume(returning: ["output": output])
+        }
         var calls: [[String: Any]] {
             events.compactMap { $0["event"] as? [String: Any] }
                 .compactMap { $0["item"] as? [String: Any] }.filter { $0["type"] as? String == "function_call" }
@@ -32,6 +38,87 @@ final class LiveClientBrainTests: XCTestCase {
     private static let call: [String: Any] = ["type": "function_call", "call_id": "c1",
         "name": "archive_message", "arguments": "{\"message_id\":\"a\"}"]
     @MainActor private func drain() async { for _ in 0..<20 { await Task.yield() } }
+
+    @MainActor func testPreRequestFailuresHaveOneTerminalReasonWithoutAProviderRequest() async throws {
+        for reason in ["context_limit", "context_encoding_failed", "step_limit"] {
+            let h = Harness()
+            var outcomes: [[String: String]] = []
+            h.brain.onAttemptOutcome = { turn, fields in
+                XCTAssertEqual(turn, 1); outcomes.append(fields)
+            }
+            if reason == "context_limit" { h.brain.contextByteLimit = 1 }
+            if reason == "context_encoding_failed" { h.brain.encodeContext = { _ in throw CocoaError(.fileWriteInapplicableStringEncoding) } }
+            if reason == "step_limit" { h.brain.stepLimit = 0 }
+            h.start(); await drain(); h.brain.close()
+            XCTAssertTrue(h.requests.isEmpty)
+            XCTAssertEqual(outcomes.count, 1)
+            XCTAssertEqual(outcomes.first?["reason"], reason)
+            XCTAssertEqual(outcomes.first?["delegation_id"], "d1")
+            XCTAssertEqual(outcomes.first?["request_sent"], "false")
+            XCTAssertNil(outcomes.first?["request_id"])
+            if reason == "context_limit" {
+                XCTAssertGreaterThan(Int(outcomes[0]["total_bytes"] ?? "0") ?? 0, 1)
+                XCTAssertNotNil(outcomes[0]["currentSelection_bytes"])
+            }
+        }
+    }
+
+    @MainActor func testQueuedDelegationsReportCancellationWithoutInventingARequest() {
+        let h = Harness()
+        var outcomes: [[String: String]] = []
+        h.brain.onAttemptOutcome = { _, fields in outcomes.append(fields) }
+        h.brain.begin("d1", live: true, turn: 1)
+        h.brain.begin("d2", live: true, turn: 2)
+        h.brain.close(); h.brain.close()
+        XCTAssertEqual(outcomes.map { $0["reason"] }, ["superseded", "cancelled"])
+        XCTAssertTrue(outcomes.allSatisfy { $0["stage"] == "queued" && $0["request_sent"] == "false" && $0["request_id"] == nil })
+        XCTAssertTrue(h.requests.isEmpty)
+    }
+
+    @MainActor func testReadReceiptThenRejectedPresentationAndRetryHaveDistinctOutcomes() async throws {
+        let h = Harness()
+        var outcomes: [[String: String]] = []
+        h.brain.onAttemptOutcome = { _, fields in outcomes.append(fields) }
+        h.start(); await waitForRequest(1, in: h)
+        h.reply([["type": "function_call", "call_id": "read", "name": "gmail_get_message", "arguments": "{}"]])
+        await drain()
+        h.brain.item(["type": "function_call_output", "call_id": "read", "output": "verified source é 😀"])
+        h.brain.contextByteLimit = 1
+        h.brain.continueResponse(delegation: "d1")
+        h.brain.user("retry", turn: 2); h.brain.begin("d2", live: true, turn: 2); h.brain.settle(turn: 2)
+        XCTAssertEqual(outcomes.count, 2)
+        XCTAssertEqual(outcomes.map { $0["reason"] }, ["context_limit", "context_limit"])
+        XCTAssertEqual(outcomes[0]["request_sent"], "true")
+        XCTAssertEqual(outcomes[0]["tool_result_bytes"], String("verified source é 😀".utf8.count))
+        XCTAssertEqual(outcomes[1]["request_sent"], "false")
+        XCTAssertEqual(h.requests.count, 1)
+        XCTAssertEqual(h.calls.count, 1)
+        h.brain.close()
+    }
+
+    @MainActor func testCompletedFailedAndCancelledRequestsTerminateOnlyOnce() async throws {
+        for reason in ["completed", "provider_failure", "request_preparation_failed", "cancelled", "timeout", "superseded"] {
+            let h = Harness()
+            h.sendsRequest = reason != "request_preparation_failed"
+            var outcomes: [[String: String]] = []
+            h.brain.onAttemptOutcome = { _, fields in outcomes.append(fields) }
+            h.brain.requestBound = reason == "timeout" ? 0.03 : 10
+            h.brain.user("read the current email", turn: 1)
+            h.brain.begin("d1", live: true, turn: 1); h.brain.settle(turn: 1)
+            await waitForRequest(1, in: h)
+            switch reason {
+            case "completed": h.reply([])
+            case "provider_failure", "request_preparation_failed": h.replies.removeFirst().resume(throwing: URLError(.badServerResponse))
+            case "timeout": try await Task.sleep(for: .milliseconds(80)); h.reply([])
+            case "superseded": h.brain.user("another request", turn: 2); h.reply([])
+            default: h.brain.close(); h.reply([])
+            }
+            await drain(); h.brain.close()
+            XCTAssertEqual(outcomes.count, 1, reason)
+            XCTAssertEqual(outcomes.first?["reason"], reason)
+            XCTAssertEqual(outcomes.first?["request_sent"], String(h.sendsRequest))
+        }
+    }
 
     @MainActor func testLargeCommandLookupDoesNotPoisonContinuationOrNextTurn() async throws {
         let h = Harness(); h.start(); await drain()
@@ -45,7 +132,9 @@ final class LiveClientBrainTests: XCTestCase {
         guard h.requests.count == 2 else { return XCTFail("Command continuation was rejected before reaching the model") }
         let body = try XCTUnwrap(h.requests.last)
         let input = try LiveOpenAI.boundedInput(body)
-        XCTAssertEqual(input.first { $0["call_id"] as? String == "cmd" && $0["type"] as? String == "function_call_output" }?["output"] as? String, instructions)
+        let result = try XCTUnwrap(input.first { $0["call_id"] as? String == "cmd" && $0["type"] as? String == "function_call_output" }?["output"] as? String)
+        XCTAssertTrue(result.contains("source_call_id"))
+        XCTAssertTrue(result.contains("read_tool_result"))
         XCTAssertFalse((body["context"] as? String ?? "").contains("command instruction"))
         h.reply([Self.call]); await drain()
         h.brain.item(["type": "function_call_output", "call_id": "c1", "output": "Archive queued for email A"])
@@ -83,7 +172,7 @@ final class LiveClientBrainTests: XCTestCase {
 
     @MainActor func testPreviousReceiptCannotSatisfyNewArchiveOnNextSelection() async throws {
         let h = Harness(); h.start(); await waitForRequest(1, in: h)
-        h.reply([Self.call]); await drain()
+        h.reply([Self.call]); await waitForCalls(1, in: h)
         h.brain.item(["type": "function_call_output", "call_id": "c1", "output": "Archived A"])
         h.brain.continueResponse(delegation: "d1"); await waitForRequest(2, in: h)
         h.reply([]); await drain()
@@ -141,6 +230,14 @@ final class LiveClientBrainTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(1))
         }
         XCTAssertEqual(harness.requests.count, count)
+    }
+
+    @MainActor private func waitForCalls(_ count: Int, in harness: Harness) async {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while harness.calls.count < count, .now < deadline {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertEqual(harness.calls.count, count)
     }
 
     @MainActor func testCompletedJobInvalidatesAnInflightRunningAnnouncement() async throws {
@@ -211,13 +308,15 @@ final class LiveClientBrainTests: XCTestCase {
     }
 
     @MainActor func testCompletedToolExchangeIsWholeAndRepeatedResultsAreIgnored() async throws {
-        let h = Harness(); h.start(); await drain()
-        h.reply([Self.call]); await drain()
+        let h = Harness(); h.start(); await waitForRequest(1, in: h)
+        h.reply([Self.call])
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while h.calls.isEmpty, .now < deadline { try await Task.sleep(for: .milliseconds(1)) }
         XCTAssertEqual(h.calls.count, 1)
         let result: [String: Any] = ["type": "function_call_output", "call_id": "c1", "output": "Queued for email a, not completed"]
         h.brain.item(result); h.brain.item(result)
         h.brain.updateState("email B", scope: "personal")
-        h.brain.continueResponse(delegation: "d1"); await drain()
+        h.brain.continueResponse(delegation: "d1"); await waitForRequest(2, in: h)
         let input = try XCTUnwrap(h.requests.last?["input"] as? [[String: Any]])
         XCTAssertEqual(input.filter { $0["type"] as? String == "function_call" }.count, 1)
         XCTAssertEqual(input.filter { $0["type"] as? String == "function_call_output" }.count, 1)
@@ -278,19 +377,23 @@ final class LiveClientBrainTests: XCTestCase {
     }
 
     @MainActor func testTimedOutRequestReleasesTurnAndRejectsLateWriteProposal() async throws {
-        let h = Harness(); h.brain.requestBound = 0.05; h.start(); await drain()
-        try await Task.sleep(for: .milliseconds(150)); await drain()
+        let h = Harness(); h.brain.requestBound = 0.05; h.start(); await waitForRequest(1, in: h)
+        defer { h.brain.close() }
+        let timeoutDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while h.failures.isEmpty, .now < timeoutDeadline { try await Task.sleep(for: .milliseconds(1)) }
         XCTAssertFalse(h.brain.busy)
         XCTAssertEqual(h.failures.count, 1)
-        XCTAssertEqual(h.spokenDelegations.first!, "d1")
+        XCTAssertEqual(try XCTUnwrap(h.spokenDelegations.first), "d1")
         h.brain.requestBound = 20
         h.brain.user("what is this email about?", turn: 2)
-        h.brain.begin("d2", live: true, turn: 2); h.brain.settle(turn: 2); await drain()
+        h.brain.begin("d2", live: true, turn: 2); h.brain.settle(turn: 2); await waitForRequest(2, in: h)
         XCTAssertEqual(h.requests.count, 2)
         h.reply([Self.call]); await drain()
         XCTAssertTrue(h.calls.isEmpty, "A late request must never execute its write proposal")
         XCTAssertTrue(h.brain.busy)
-        h.reply([["type": "message", "content": [["text": "It is a meeting invitation."]]]]); await drain()
+        h.reply([["type": "message", "content": [["text": "It is a meeting invitation."]]]])
+        let responseDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while h.brain.busy, .now < responseDeadline { try await Task.sleep(for: .milliseconds(1)) }
         XCTAssertEqual(h.speech.last, "It is a meeting invitation.")
         XCTAssertEqual(h.failures.count, 1)
         let events = h.events.compactMap { $0["event"] as? [String: Any] }
@@ -298,18 +401,24 @@ final class LiveClientBrainTests: XCTestCase {
     }
 
     @MainActor func testNewQuestionPreservesAcceptedActionWhileDroppingItsSlowPresentation() async throws {
-        let h = Harness(); h.start(); await drain()
-        h.reply([Self.call]); await drain()
+        let h = Harness(); h.start(); await waitForRequest(1, in: h)
+        defer { h.brain.close() }
+        h.reply([Self.call])
+        let callDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while h.calls.isEmpty, .now < callDeadline { try await Task.sleep(for: .milliseconds(1)) }
+        guard h.calls.count == 1 else { return XCTFail("The initial archive proposal was not delivered") }
         h.brain.acceptToolCall("c1")
         h.brain.item(["type": "function_call_output", "call_id": "c1", "output": "Archive queued for email A"])
-        h.brain.continueResponse(delegation: "d1"); await drain()
+        h.brain.continueResponse(delegation: "d1"); await waitForRequest(2, in: h)
         h.brain.user("what did you do with that email?", turn: 2)
-        h.brain.begin("d2", live: true, turn: 2); h.brain.settle(turn: 2); await drain()
+        h.brain.begin("d2", live: true, turn: 2); h.brain.settle(turn: 2); await waitForRequest(3, in: h)
         XCTAssertEqual(h.requests.count, 3)
         XCTAssertTrue((h.requests.last?["context"] as? String)?.contains("Archive queued for email A") == true)
         h.reply([Self.call]); await drain()
         XCTAssertEqual(h.calls.count, 1, "Do not repeat the accepted archive")
-        h.reply([["type": "message", "content": [["text": "The archive is queued."]]]]); await drain()
+        h.reply([["type": "message", "content": [["text": "The archive is queued."]]]])
+        let speechDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while h.speech.isEmpty, .now < speechDeadline { try await Task.sleep(for: .milliseconds(1)) }
         XCTAssertEqual(h.speech, ["The archive is queued."])
     }
 
@@ -400,20 +509,25 @@ final class LiveClientBrainTests: XCTestCase {
     }
 
     @MainActor func testSwitchToolsOwnResultSurvivesTheScopeChangeItCaused() async throws {
-        let h = Harness(); h.start(); await drain()
+        let h = Harness(); h.start(); await waitForRequest(1, in: h)
+        defer { h.brain.close() }
         let switchCall: [String: Any] = ["type": "function_call", "call_id": "s1",
             "name": LiveClientBrain.scopeSwitchTool, "arguments": "{\"name\":\"Work\"}"]
-        h.reply([switchCall]); await drain()
+        h.reply([switchCall])
+        let callDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while h.calls.isEmpty, .now < callDeadline { try await Task.sleep(for: .milliseconds(1)) }
         XCTAssertEqual(h.calls.count, 1)
         // The switch lands: the state refresh sees the new scope before the tool's result arrives.
         h.brain.updateState("work email", scope: "work")
         h.brain.item(["type": "function_call_output", "call_id": "s1", "output": "Switched to Work. First email: work email."])
-        h.brain.continueResponse(delegation: "d1"); await drain()
+        h.brain.continueResponse(delegation: "d1"); await waitForRequest(2, in: h)
         XCTAssertEqual(h.requests.count, 2, "The response is not cut short by the scope change")
         let body = String(decoding: try JSONSerialization.data(withJSONObject: try XCTUnwrap(h.requests.last)), as: UTF8.self)
         XCTAssertTrue(body.contains("Switched to Work"))
         XCTAssertFalse(body.contains("email A"), "The old scope's private state still goes")
-        h.reply([["type": "message", "content": [["type": "output_text", "text": "Switched to Work. First up, work email."]]]]); await drain()
+        h.reply([["type": "message", "content": [["type": "output_text", "text": "Switched to Work. First up, work email."]]]])
+        let speechDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while h.speech.isEmpty, .now < speechDeadline { try await Task.sleep(for: .milliseconds(1)) }
         XCTAssertEqual(h.speech, ["Switched to Work. First up, work email."])
     }
 
@@ -459,6 +573,154 @@ final class LiveClientBrainTests: XCTestCase {
         let text = #"prefix {"item":{"id":"a","account":"owner","messages":[{"body":"needed but no id"}]}} suffix"#
         XCTAssertTrue(LiveCompactContext.text(text).contains("needed but no id"))
         XCTAssertEqual(LiveCompactContext.text("broken {\"body\":"), "broken {\"body\":")
+    }
+}
+
+extension LiveClientBrainTests {
+    private func longThreadStep() throws -> String {
+        let members = (0..<27).map { index -> [String: Any] in
+            ["id": "message-\(index)", "threadId": "long-thread", "from": "Person \(index) <person@example.test>",
+             "recipient": "Recipient <recipient@example.test>", "subject": "A project meeting and its requirements",
+             "date": "Sat, 24 Oct 2026 09:06:01 -0700", "unread": false, "fromMe": false,
+             "ancestryCached": true, "internalDate": 1_793_000_000_000,
+             "rfcMessageID": "<message-\(index)@example.test>", "inReplyTo": "<previous@example.test>",
+             "references": String(repeating: "<previous-message@example.test> ", count: 40),
+             "exchangeID": String(repeating: "exchange", count: 20), "snippet": "Some source text"]
+        }
+        return GmailReadTools.json(["done": false, "item": ["id": "selected", "threadId": "long-thread",
+            "account": "owner@example.test", "subject": "Current email", "exchangeId": "reply-chain",
+            "summaryMessages": members, "exchangeContext": members]])
+    }
+
+    func testLongThreadCompactionDoesNotExpandSmallFieldsOrRestoreOriginalPayload() throws {
+        let source = try longThreadStep()
+        let bounded = LiveCompactContext.bounded(source, bytes: 24_000)
+        XCTAssertLessThanOrEqual(LiveOpenAI.bytes(bounded), 24_000)
+        XCTAssertEqual(LiveSelectionGrounding.selection(bounded), LiveSelectionGrounding.selection(source))
+        let reference = LiveCompactContext.selectionReference(source)
+        XCTAssertLessThan(LiveOpenAI.bytes(reference), 1_000)
+        XCTAssertEqual(LiveSelectionGrounding.selection(reference), LiveSelectionGrounding.selection(source))
+        XCTAssertFalse(reference.contains("previous-message"))
+        XCTAssertFalse(reference.contains("summaryMessages"))
+        let floor = LiveCompactContext.bounded(source, bytes: 1_000)
+        XCTAssertLessThan(LiveOpenAI.bytes(floor), LiveOpenAI.bytes(LiveCompactContext.text(source)))
+        XCTAssertEqual(LiveSelectionGrounding.selection(floor), LiveSelectionGrounding.selection(source))
+    }
+
+    func testShortenedArrayResultsCarryAContentNotice() throws {
+        let source = GmailReadTools.json([String(repeating: "details ", count: 5_000)])
+        let result = LiveCompactContext.bounded(source, bytes: 2_000)
+        let fields = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(result.utf8)) as? [String: Any])
+        XCTAssertLessThanOrEqual(LiveOpenAI.bytes(result), 2_000)
+        XCTAssertEqual(fields["contextShortened"] as? Bool, true)
+        XCTAssertNotNil(fields["contextNotice"])
+        XCTAssertEqual((fields["value"] as? [String])?.count, 1)
+    }
+
+    @MainActor func testLongThreadReadContinuesToCalendarAndDoesNotPoisonNextTurn() async throws {
+        let h = Harness()
+        defer { h.brain.close() }
+        let source = try longThreadStep()
+        h.brain.updateState(source, scope: "work")
+        h.brain.user("Find calendar availability during the dates in this email", turn: 1)
+        h.brain.begin("d1", live: true, turn: 1); h.brain.settle(turn: 1)
+        await waitForRequest(1, in: h)
+        h.reply([["type": "function_call", "call_id": "read", "name": "gmail_get_message",
+                  "arguments": #"{"message_id":"selected","account":"owner@example.test"}"#]])
+        await waitForCalls(1, in: h)
+        h.brain.item(["type": "function_call_output", "call_id": "read",
+                      "output": GmailReadTools.json(["id": "selected", "text": "Meet November 4–13. " + String(repeating: "body ", count: 4_000)])])
+        h.brain.continueResponse(delegation: "d1"); await waitForRequest(2, in: h)
+        h.reply([["type": "function_call", "call_id": "calendar", "name": "list_calendar_events", "arguments": "{}"]])
+        await waitForCalls(2, in: h)
+        h.brain.item(["type": "function_call_output", "call_id": "calendar", "output": "No conflicting fixture events."])
+        h.brain.continueResponse(delegation: "d1"); await waitForRequest(3, in: h)
+        h.reply([]); await drain()
+        h.brain.user("Try another time", turn: 2)
+        h.brain.begin("d2", live: true, turn: 2); h.brain.settle(turn: 2)
+        await waitForRequest(4, in: h)
+        for request in h.requests {
+            XCTAssertNoThrow(try LiveOpenAI.boundedInput(request))
+            let context = try XCTUnwrap(request["context"] as? String)
+            XCTAssertLessThanOrEqual(context.utf8.count, 96_000)
+        }
+        XCTAssertEqual(h.calls.compactMap { $0["name"] as? String }, ["gmail_get_message", "list_calendar_events"])
+        XCTAssertTrue(h.failures.isEmpty)
+        h.reply([]); await drain()
+    }
+
+    @MainActor func testLargeSelectedMetadataKeepsIdentityAndAllowsRetry() async throws {
+        let h = Harness()
+        let item: [String: Any] = ["id": "a", "account": "owner", "threadId": "thread-a",
+            "from": String(repeating: "🦊 long header ", count: 15_000), "unknownMetadata": String(repeating: "large ", count: 20_000),
+            "emailContent": ["messages": [["id": "a", "text": String(repeating: "source ", count: 20_000), "textComplete": true]]]]
+        let source = String(decoding: try JSONSerialization.data(withJSONObject: ["item": item]), as: UTF8.self)
+        h.brain.updateState(source, scope: "work")
+        for turn in 1...2 {
+            h.brain.user(turn == 1 ? "What does this email say?" : "Try again", turn: turn)
+            h.brain.begin("d\(turn)", live: true, turn: turn); h.brain.settle(turn: turn)
+            await waitForRequest(turn, in: h)
+            let body = try XCTUnwrap(h.requests.last)
+            let context = try XCTUnwrap(body["context"] as? String)
+            XCTAssertLessThanOrEqual(context.utf8.count, LiveOpenAI.contextBytes)
+            let fields = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(context.utf8)) as? [String: Any])
+            let selected = try XCTUnwrap(fields["currentSelection"] as? String)
+            XCTAssertEqual(LiveSelectionGrounding.selection(selected), LiveSelectionGrounding.selection(source))
+            XCTAssertTrue(selected.contains("contextShortened"))
+            XCTAssertFalse(selected.contains(#""textComplete":true"#))
+            XCTAssertNoThrow(try LiveOpenAI.boundedInput(body))
+            h.reply([]); await drain()
+        }
+        XCTAssertTrue(h.failures.isEmpty)
+    }
+
+    @MainActor func testLargeSuccessfulReadIsPagedWithoutRepeatingReadOrPoisoningRetry() async throws {
+        let h = Harness()
+        h.brain.updateState(#"{"item":{"id":"a","account":"owner"}}"#, scope: "work")
+        h.brain.user("Read the selected message", turn: 1)
+        h.brain.begin("d1", live: true, turn: 1); h.brain.settle(turn: 1)
+        await waitForRequest(1, in: h)
+        h.reply([["type": "function_call", "call_id": "read", "name": "gmail_get_message", "arguments": #"{"id":"a","account":"owner"}"#]])
+        await drain()
+        let original = "FIRST\n" + String(repeating: "quoted \"body\" 🦊\n", count: 5_000) + "\nFINAL"
+        h.brain.item(["type": "function_call_output", "call_id": "read", "output": original])
+        h.brain.continueResponse(delegation: "d1"); await waitForRequest(2, in: h)
+        var reconstructed = ""
+        var pages = 0
+        while pages < 12 {
+            let body = try XCTUnwrap(h.requests.last)
+            XCTAssertNoThrow(try LiveOpenAI.boundedInput(body))
+            let input = try XCTUnwrap(body["input"] as? [[String: Any]])
+            let output = try XCTUnwrap(input.last { $0["type"] as? String == "function_call_output" }?["output"] as? String)
+            let page = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any])
+            XCTAssertEqual(page["offset"] as? Int, reconstructed.utf8.count)
+            reconstructed += try XCTUnwrap(page["text"] as? String)
+            pages += 1
+            if page["complete"] as? Bool == true { break }
+            let args = String(decoding: try JSONSerialization.data(withJSONObject: ["source_call_id": "read", "offset": page["next_offset"]!]), as: UTF8.self)
+            h.reply([["type": "function_call", "call_id": "page-\(pages)", "name": "read_tool_result", "arguments": args]])
+            await waitForRequest(pages + 2, in: h)
+        }
+        XCTAssertEqual(reconstructed, original)
+        XCTAssertEqual(h.calls.count, 1, "Chunk reads stay local and do not repeat provider calls or writes")
+        h.replies.removeFirst().resume(throwing: NSError(domain: "network", code: 1)); await drain()
+        h.brain.user("Try again", turn: 2)
+        h.brain.begin("d2", live: true, turn: 2); h.brain.settle(turn: 2)
+        await waitForRequest(pages + 2, in: h)
+        XCTAssertNoThrow(try LiveOpenAI.boundedInput(try XCTUnwrap(h.requests.last)))
+        XCTAssertEqual(h.failures.count, 1, "Only the injected presentation failure should fail")
+        h.reply([]); await drain()
+    }
+
+    func testBoundedSelectionPreservesLargeGroupMembershipAndMultibyteBoundaries() throws {
+        for size in [23_999, 24_000, 24_001, 100_000] {
+            let source: [String: Any] = ["item": ["id": "a", "account": "owner", "messages": (0..<40).map { ["id": "m\($0)", "from": String(repeating: "é", count: size / 2)] }]]
+            let raw = String(decoding: try JSONSerialization.data(withJSONObject: source), as: UTF8.self)
+            let result = LiveCompactContext.bounded(raw, bytes: 24_000)
+            XCTAssertLessThanOrEqual(LiveOpenAI.bytes(result), 24_000)
+            XCTAssertEqual(LiveSelectionGrounding.selection(result), LiveSelectionGrounding.selection(raw))
+            XCTAssertFalse(result.contains("�"))
+        }
     }
 }
 
