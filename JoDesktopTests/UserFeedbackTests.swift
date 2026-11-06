@@ -7,11 +7,22 @@ final class UserFeedbackTests: XCTestCase {
         var owner = Submission(userID: "user", context: .init(sessionID: UUID(), profileID: "work"))
         var saved: [(String, Submission)] = []
         var failSave = false
+        var log: VoiceDiagnostics?
+        var gate: CheckedContinuation<Void, Never>?
+        var delayNextSave = false
         override func capture() -> Submission { owner }
         override func save(_ message: String, source: FeedbackSource, submission: Submission) async throws -> UUID {
             if failSave { throw URLError(.cannotWriteToFile) }
+            if delayNextSave {
+                delayNextSave = false
+                await withCheckedContinuation { gate = $0 }
+            }
             saved.append((message, submission))
-            return UUID()
+            if let log {
+                return try await log.saveFeedback(message, source: source, userID: submission.userID!, context: submission.context,
+                    id: submission.noteID ?? UUID(), revision: submission.revision, persistence: submission.persistence)
+            }
+            return submission.noteID ?? UUID()
         }
     }
 
@@ -142,9 +153,126 @@ final class UserFeedbackTests: XCTestCase {
         input("cancel feedback", "b")
         XCTAssertNil(feedback.pendingVoiceText)
         try await Task.sleep(for: .milliseconds(50))
-        XCTAssertTrue(feedback.saved.isEmpty)
+        XCTAssertTrue(feedback.saved.allSatisfy { $0.1.persistence == .cancelled })
         XCTAssertNil(VoiceFeedbackText.request("don't log feedback"))
         XCTAssertNil(VoiceFeedbackText.request("read the feedback email"))
+    }
+
+    func testPausesPersistOneEvolvingDraftUntilExplicitCompletion() async throws {
+        let folder = try directory()
+        let feedback = CaptureHarness()
+        feedback.log = VoiceDiagnostics(directory: folder)
+        feedback.voiceSaveDelay = .milliseconds(20)
+        var replies: [String] = [], receipts: [UUID] = []
+        func input(_ text: String, _ turn: String) {
+            XCTAssertTrue(feedback.voiceInput(text, turnID: turn, reply: { replies.append($0) }, transition: { _ in },
+                settled: { _, id, _ in if let id { receipts.append(id) } }))
+        }
+        input("File feedback that in the completed work", "note")
+        try await Task.sleep(for: .milliseconds(70))
+        XCTAssertEqual(feedback.pendingVoiceText, "that in the completed work")
+        XCTAssertTrue(receipts.isEmpty)
+        XCTAssertFalse(replies.contains(FeedbackText.savedAcknowledgment))
+        input("File feedback that in the completed work section I cannot inspect a completed forward.", "note")
+        try await Task.sleep(for: .milliseconds(70))
+        input("Also show the original recipients.", "continuation")
+        try await Task.sleep(for: .milliseconds(70))
+        let interrupted = try rows(await VoiceDiagnostics(directory: folder).snapshot(userID: "user"))
+        XCTAssertEqual(interrupted.count, 1, "A restart/export has one durable evolving draft")
+        XCTAssertEqual(interrupted.first?["feedback_state"] as? String, "draft")
+        XCTAssertTrue((interrupted.first?["message"] as? String)?.contains("cannot inspect a completed forward") == true)
+        input("Save it", "finish")
+        try await Task.sleep(for: .milliseconds(70))
+        let exported = try rows(await VoiceDiagnostics(directory: folder).snapshot(userID: "user"))
+        XCTAssertEqual(exported.count, 1)
+        XCTAssertEqual(exported.first?["feedback_state"] as? String, "saved")
+        XCTAssertEqual(exported.first?["message"] as? String,
+            "that in the completed work section I cannot inspect a completed forward.\nAlso show the original recipients.")
+        XCTAssertEqual(exported.first?["fragment_turn_ids"] as? [String], ["continuation", "finish", "note"])
+        XCTAssertEqual(Set(feedback.saved.compactMap { $0.1.noteID }).count, 1)
+        XCTAssertEqual(receipts.count, 1)
+        XCTAssertNil(feedback.pendingVoiceText)
+    }
+
+    func testLateSameTurnCorrectionAmendsReceiptWithoutDuplicateAcknowledgment() async throws {
+        let feedback = CaptureHarness()
+        feedback.voiceSaveDelay = .seconds(5)
+        var replies: [String] = []
+        func input(_ text: String, _ turn: String) {
+            XCTAssertTrue(feedback.voiceInput(text, turnID: turn, reply: { replies.append($0) }, transition: { _ in }))
+        }
+        input("Log feedback: selected text", "note")
+        input("save it", "finish")
+        try await Task.sleep(for: .milliseconds(60))
+        input("Log feedback: selected text cannot be copied", "note")
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(feedback.saved.map(\.0), ["selected text", "selected text cannot be copied"])
+        XCTAssertEqual(feedback.saved.first?.1.noteID, feedback.saved.last?.1.noteID)
+        XCTAssertEqual(replies.filter { $0 == FeedbackText.savedAcknowledgment }.count, 1)
+        input("Log feedback: selected text cannot be copied", "note")
+        input("Log feedback: another issue", "new-note")
+        input("save it", "finish-new")
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(feedback.saved.count, 3)
+        XCTAssertNotEqual(feedback.saved.first?.1.noteID, feedback.saved.last?.1.noteID)
+    }
+
+    func testSlowObsoleteWriteCannotAcknowledgeOrReplaceNewerText() async throws {
+        let folder = try directory()
+        let feedback = CaptureHarness()
+        feedback.log = VoiceDiagnostics(directory: folder)
+        feedback.voiceSaveDelay = .milliseconds(10)
+        feedback.delayNextSave = true
+        var replies: [String] = []
+        func input(_ text: String, _ turn: String) {
+            XCTAssertTrue(feedback.voiceInput(text, turnID: turn, reply: { replies.append($0) }, transition: { _ in }))
+        }
+        input("File feedback: first fragment", "note")
+        for _ in 0..<100 where feedback.gate == nil { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertNotNil(feedback.gate)
+        input("File feedback: first fragment plus the complete complaint", "note")
+        input("save it", "finish")
+        try await Task.sleep(for: .milliseconds(60))
+        feedback.gate?.resume(); feedback.gate = nil
+        try await Task.sleep(for: .milliseconds(60))
+        let exported = try rows(await VoiceDiagnostics(directory: folder).snapshot(userID: "user"))
+        XCTAssertEqual(exported.count, 1)
+        XCTAssertEqual(exported.first?["message"] as? String, "first fragment plus the complete complaint")
+        XCTAssertEqual(exported.first?["feedback_state"] as? String, "saved")
+        XCTAssertEqual(replies, [FeedbackText.savedAcknowledgment])
+    }
+
+    func testCancellingPersistedDraftRemovesItFromExportWithoutAFalseSaveReceipt() async throws {
+        let folder = try directory()
+        let feedback = CaptureHarness()
+        feedback.log = VoiceDiagnostics(directory: folder)
+        feedback.voiceSaveDelay = .milliseconds(10)
+        var replies: [String] = []
+        _ = feedback.voiceInput("File feedback: a draft", turnID: "note", reply: { replies.append($0) }, transition: { _ in })
+        try await Task.sleep(for: .milliseconds(50))
+        _ = feedback.voiceInput("cancel feedback", turnID: "cancel", reply: { replies.append($0) }, transition: { _ in })
+        try await Task.sleep(for: .milliseconds(50))
+        let exported = try await VoiceDiagnostics(directory: folder).snapshot(userID: "user")
+        XCTAssertTrue(try rows(exported).isEmpty)
+        XCTAssertFalse(replies.contains(FeedbackText.savedAcknowledgment))
+        XCTAssertNil(feedback.pendingVoiceText)
+    }
+
+    func testButtonCompletesTheSameDurableVoiceDraft() async throws {
+        let folder = try directory()
+        let feedback = CaptureHarness()
+        feedback.log = VoiceDiagnostics(directory: folder)
+        feedback.voiceSaveDelay = .milliseconds(10)
+        _ = feedback.voiceInput("File feedback: original voice draft", turnID: "note", reply: { _ in }, transition: { _ in })
+        try await Task.sleep(for: .milliseconds(50))
+        let draft = try XCTUnwrap(feedback.takeVoiceDraftSubmission())
+        XCTAssertEqual(draft.text, "original voice draft")
+        _ = try await feedback.save("Corrected in the button editor", source: .button, submission: draft.submission)
+        let exported = try rows(await VoiceDiagnostics(directory: folder).snapshot(userID: "user"))
+        XCTAssertEqual(exported.count, 1)
+        XCTAssertEqual(exported.first?["message"] as? String, "Corrected in the button editor")
+        XCTAssertEqual(exported.first?["feedback_state"] as? String, "saved")
+        XCTAssertEqual(exported.first?["fragment_turn_ids"] as? [String], ["note"])
     }
 
     private func directory() throws -> URL {

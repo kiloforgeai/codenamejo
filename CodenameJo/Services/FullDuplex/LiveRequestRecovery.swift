@@ -99,7 +99,36 @@ enum LiveRequestRecovery {
 
     static func isBackchannel(_ text: String) -> Bool {
         let words = text.lowercased().split(whereSeparator: { !$0.isLetter }).joined(separator: " ")
-        return words.isEmpty || ["mm", "mm hmm", "mhm", "hmm", "uh", "um"].contains(words)
+        return words.isEmpty || isNonverbal(text) || ["mm", "mm hmm", "mmhmm", "mhm", "hmm", "uh", "um",
+            "thanks", "thank you", "chuckle", "chuckles", "laughs", "laughter"].contains(words)
+    }
+
+    private static let nonverbalWords: Set<String> = ["sniff", "sniffs", "sniffing", "sigh", "sighs", "sighing",
+        "breath", "breaths", "breathing", "inhale", "inhales", "inhaling", "exhale", "exhales", "exhaling",
+        "cough", "coughs", "coughing", "sneeze", "sneezes", "sneezing", "throat", "clearing",
+        "chuckle", "chuckles", "laugh", "laughs", "laughing", "laughter", "um", "uh", "hmm", "mm"]
+
+    static func isNonverbal(_ text: String) -> Bool {
+        let words = text.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
+        return !words.isEmpty && words.allSatisfy(nonverbalWords.contains)
+    }
+
+    static func incompleteAction(_ text: String) -> Bool {
+        var words = SpokenAnswerText.words(text).filter { !nonverbalWords.contains($0) }
+        while let first = words.first, ["please", "okay", "ok", "yeah", "just"].contains(first) { words.removeFirst() }
+        for prefix in [["can", "you"], ["could", "you"], ["you", "can"], ["go", "ahead", "and"]] where words.starts(with: prefix) {
+            words.removeFirst(prefix.count)
+        }
+        guard let first = words.first, ["forward", "send", "reply", "respond", "draft", "email", "create", "book"].contains(first) else { return false }
+        return words.dropFirst().allSatisfy { ["a", "an", "the", "to", "for", "with", "and", "back"].contains($0) }
+    }
+
+    static func dispatchRefusal(_ text: String) -> String? {
+        if isBackchannel(text) { return "non_request" }
+        if incompleteAction(text) || hasUnfinishedAuthorizationPrefix(text) { return "incomplete_request" }
+        if ["yes", "yeah", "yep", "okay", "ok", "go ahead", "do it", "continue", "proceed"]
+            .contains(SpokenAnswerText.words(text).joined(separator: " ")) { return "continuation_requires_existing_task" }
+        return nil
     }
 
     /// A question that names no mail action. Live answers it itself, so assessing it again repeats the answer.

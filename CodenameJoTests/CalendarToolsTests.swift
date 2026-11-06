@@ -150,4 +150,14 @@ final class CalendarToolsTests: XCTestCase {
         XCTAssertEqual(summary["responseStatus"] as? String, "tentative")
         XCTAssertNil(summary["moreAttendees"])
     }
+
+    func testTransparentAllDayLocationDoesNotInventAnAfternoonConflict() {
+        let zone = TimeZone(identifier: "America/Los_Angeles")!
+        let from = Int64(CalendarTools.instant("2026-11-09T00:00:00-08:00")!)
+        let to = Int64(CalendarTools.instant("2026-11-10T00:00:00-08:00")!)
+        let location = cached("location", start: from, end: to, allDay: true, transparency: "transparent", startRaw: "2026-11-09", endRaw: "2026-11-10")
+        let prior = cached("prior", start: Int64(CalendarTools.instant("2026-11-09T12:00:00-08:00")!), end: Int64(CalendarTools.instant("2026-11-09T13:00:00-08:00")!))
+        XCTAssertEqual(CalendarTools.busy([location, prior], attendees: [], account: "me@example.test", window: (from, to), offset: "-08:00", zone: zone),
+            [["start": "2026-11-09T12:00:00-08:00", "end": "2026-11-09T13:00:00-08:00"]])
+    }
 }

@@ -68,10 +68,15 @@ extension LiveToolSchemas {
 
     static func createDraft(_ accounts: LiveSessionSetup.Accounts) -> [String: Any] {
         let inboxes = accounts.inboxes.joined(separator: ", ")
+        #if targetEnvironment(macCatalyst)
+        let review = " Prepare a local preview in Jo’s center pane. The user must click Save to Gmail after reviewing it. Preparing a preview does not create a Gmail draft, send mail, archive the source or finish the feed item."
+        #else
+        let review = ""
+        #endif
         return [
             "type": "function",
             "name": "create_draft",
-            "description": "Save outgoing mail when the user explicitly asks for a draft. For ordinary write, reply or send requests, use send_email when available: it checks the current inbox mode even if an earlier turn said drafts. An email in context is not enough. For calendar time use create_calendar_event. Never sends. Pass thread_id for a reply.",
+            "description": "Save outgoing mail when the user explicitly asks for a draft. For ordinary write, reply or send requests, use send_email when available: it checks the current inbox mode even if an earlier turn said drafts. An email in context is not enough. For calendar time use create_calendar_event. Never sends. Pass thread_id for a reply." + review,
             "parameters": [
                 "type": "object",
                 "properties": [
@@ -195,7 +200,7 @@ extension LiveToolSchemas {
         return [
             "type": "function",
             "name": "forward_email",
-            "description": "Forward a real message to someone: the original goes on verbatim — its formatting and attachments included — under a \"Forwarded message\" block, and the subject becomes Fwd: automatically. In drafts-only mode this saves a complete draft forward without sending. ALWAYS use this tool for forwards, including draft forwards. NEVER rebuild one with create_draft or send_email: retyping a message loses its formatting and attachments, and what arrives is your copy of it, not the mail itself. Forwarding is routine like sending. `to` is an email address, never a person's name. The one exception: a `to` this account has never mailed before comes back NOT SENT with what to ask, same as send_email.",
+            "description": "Forward a real message to someone: the original goes on verbatim — its formatting and attachments included — under a \"Forwarded message\" block, and the subject becomes Fwd: automatically. In drafts-only mode this saves a complete draft forward without sending. ALWAYS use this tool for forwards, including draft forwards. NEVER rebuild one with create_draft or send_email: retyping a message loses its formatting and attachments, and what arrives is your copy of it, not the mail itself. Forwarding is routine like sending. `to` is an email address, never a person's name. The one exception: a `to` this account has never mailed before comes back NOT SENT with what to ask, same as send_email. For a named person whose address is in the source, read get_message and distinguish From, replyTo and body contact evidence; use find_person if needed. Notification display names do not prove mailbox ownership, and prior correspondence does not resolve conflicting identities. Ask when evidence conflicts. Preserve an explicitly requested destination; do not automatically substitute Reply-To.",
             "parameters": [
                 "type": "object",
                 "properties": [

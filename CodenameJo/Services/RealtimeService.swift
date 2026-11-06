@@ -169,8 +169,9 @@ class RealtimeService: ObservableObject {
     /// that produced no measurement — an echo, or a reply cut off before it made a
     /// sound — cannot inherit the previous turn's number.
     @Published private(set) var lastTurnLatency: TurnLatency?
-    /// Live backend responses since the last stored row; they finish after the acknowledgement, so they land on the receipt.
-    private var pendingBrainSteps: [CommandRecord.BrainStep] = []
+    private var turnTelemetry = TurnTelemetry()
+    private var telemetrySessionStarted: Date?
+    var telemetryNow: () -> Date = Date.init
 
     /// The turn that just finished — one immutable value, every field belonging to
     /// the same exchange.
@@ -383,7 +384,12 @@ class RealtimeService: ObservableObject {
     private var diagnostics: VoiceDiagnostics.Session?
     var renderedWorkspace: RenderedFeedState?
     private var renderRevision = 0
+    private var recentFeedbackContext: RecentFeedbackContext?
     var renderedRevision: Int { renderRevision }
+
+    func actionDiagnostics(conversationID: UUID?) -> VoiceDiagnostics.Session? {
+        isConversing && conversationID == activeConversationId ? diagnostics : nil
+    }
 
     func selectReturnedResult(_ id: UUID) async -> String? {
         guard isConversing, let client = fullDuplex else { return "Start a Live session to work on this email." }
@@ -397,6 +403,8 @@ class RealtimeService: ObservableObject {
     }
 
     #if targetEnvironment(macCatalyst)
+    func setNarrationMode(_ mode: WorkSessionMode) { fullDuplex?.setNarrationMode(mode) }
+
     func beginDesktopInteraction() {
         fullDuplex?.beginDesktopInteraction()
         answerIsStale = !responseText.isEmpty
@@ -437,6 +445,9 @@ class RealtimeService: ObservableObject {
         renderRevision += 1
         guard isConversing, let diagnostics else { return }
         diagnostics.record(.workspaceRendered, state.diagnosticFields(session: diagnostics, revision: renderRevision))
+        recentFeedbackContext = .init(context: FeedbackContext(sessionID: diagnostics.id,
+            conversationID: activeConversationId, profileID: state.profileID,
+            renderRevision: renderRevision, turnID: responseTurnID), userID: diagnostics.userID, observedAt: Date())
     }
     var isLocalVoice: Bool { localVoiceEngine != nil }
 
@@ -450,6 +461,11 @@ class RealtimeService: ObservableObject {
         case .processing: state = "processing"
         case .responding: state = "responding"
         case .error: state = "error"
+        }
+        if !isConversing, var recent = recentFeedbackContext?.afterSession(
+            userID: backend.userId, profileID: ProfileRuntime.snapshot?.profileId) {
+            recent.engine = "idle"; recent.state = state
+            return recent
         }
         return FeedbackContext(sessionID: isConversing ? diagnostics?.id : nil,
             conversationID: activeConversationId, profileID: ProfileRuntime.snapshot?.profileId,
@@ -526,6 +542,9 @@ class RealtimeService: ObservableObject {
         fullDuplex = nil
         metering.levels = AudioLevels()
         commandStartTime = nil
+        turnTelemetry = TurnTelemetry()
+        telemetrySessionStarted = nil
+        lastTurnLatency = nil
         isMuted = false
         clearMuteSettling()
         turnSteps = []
@@ -612,8 +631,8 @@ class RealtimeService: ObservableObject {
             // which is also what makes `CommandView` file the turn in History.
             self.sessionState = state
         }
-        client.onUserTranscript = { [weak self] text, isFinal in
-            guard let self else { return }
+        client.onUserTranscript = { [weak self, weak client] text, isFinal in
+            guard let self, let client, self.fullDuplex === client, self.isConversing else { return }
             if !text.isEmpty, self.feedFocus?.isSettled == true {
                 self.fullDuplex?.dismissSettledFeedFocus()
             }
@@ -621,7 +640,8 @@ class RealtimeService: ObservableObject {
             // from the completed transcript — transcription lands after the user
             // has stopped talking, so timing from there would report every turn as
             // faster than it was.
-            if self.commandStartTime == nil { self.commandStartTime = Date() }
+            self.turnTelemetry.begin(client.historyTurnID, at: self.telemetryNow())
+            self.commandStartTime = self.turnTelemetry.entries[client.historyTurnID]?.started
             if !text.isEmpty { self.lastCommandText = text }
         }
         client.onAssistantTranscript = { [weak self, weak client] text, _ in
@@ -727,6 +747,8 @@ class RealtimeService: ObservableObject {
             // built from and neither this nor `onBargeIn` touches it.
             self.answerIsStale = true
             self.turnSteps = []
+            self.commandStartTime = nil
+            self.lastTurnLatency = nil
         }
         // **There was an `onUserSpeechOnset` here and it has gone with the line it
         // served.** It fired off the capture tap's energy — earlier than Apple's
@@ -738,11 +760,20 @@ class RealtimeService: ObservableObject {
         client.onMicLive = { [weak self] in
             self?.micIsLive = true
         }
-        client.onTurnLatency = { [weak self] latency in
-            self?.lastTurnLatency = latency
+        client.onTurnLatency = { [weak self, weak client] id, latency in
+            guard let self, let client, self.fullDuplex === client, self.isConversing else { return }
+            self.turnTelemetry.record(latency, for: id)
+            if id == client.historyTurnID { self.lastTurnLatency = latency }
         }
         client.onBrainStep = { [weak self] step in
-            self?.pendingBrainSteps.append(step)
+            guard let self, self.isConversing, let id = step.turnID.flatMap(UUID.init(uuidString:)),
+                  let started = self.telemetrySessionStarted,
+                  step.requestStartedAt.map({ $0 >= started }) == true else { return }
+            self.turnTelemetry.record(step, for: id)
+            if let entry = self.turnTelemetry.entries[id],
+               let updated = self.turnHistory.telemetry(entry, id: id, at: self.telemetryNow()) {
+                self.lastCompletedTurn = updated
+            }
         }
         client.onLevels = { [weak self] levels in
             self?.metering.levels = levels
@@ -1440,6 +1471,11 @@ class RealtimeService: ObservableObject {
     ) {
         guard let client = fullDuplex, !isConversing else { return }
         activeConversationId = conversationId
+        turnTelemetry = TurnTelemetry()
+        telemetrySessionStarted = telemetryNow()
+        commandStartTime = nil
+        lastTurnLatency = nil
+        lastCommandText = ""
         diagnostics = Container.shared.voiceDiagnostics().begin(conversationID: conversationId,
             engine: LocalVoiceSettings.allLocal ? "on_device" : "live", userID: Container.shared.backend().userId)
         client.diagnostics = diagnostics
@@ -1524,7 +1560,8 @@ class RealtimeService: ObservableObject {
         fullDuplex = nil
         isConversing = false
         commandStartTime = nil
-        pendingBrainSteps = []
+        turnTelemetry = TurnTelemetry()
+        telemetrySessionStarted = nil
         lastCommandText = ""
         clearCard()
         connectFullDuplex()
@@ -1748,7 +1785,11 @@ class RealtimeService: ObservableObject {
     /// Optional rather than a sentinel because `nil` is the state the callers have to
     /// handle anyway: no conversation means no queue to refresh and no thread to file
     /// against, and both of those are answers, not edge cases.
-    @Published private(set) var activeConversationId: UUID?
+    @Published private(set) var activeConversationId: UUID? {
+        didSet {
+            if let activeConversationId, activeConversationId != oldValue { recentFeedbackContext = nil }
+        }
+    }
 
     /// Set only by History's Resume action. A leftover active id after a failed call is
     /// conversation identity, not evidence that the user asked to continue it.
@@ -1923,7 +1964,10 @@ class RealtimeService: ObservableObject {
             conversation: \(Int(backgroundSeconds))s off-screen, \(Int(lockedSeconds))s locked, \
             surface \(backgroundSurface ?? "none — on screen throughout"), carplay \(sawCarPlay)
             """)
-        pendingBrainSteps = []
+        commandStartTime = nil
+        lastTurnLatency = nil
+        turnTelemetry = TurnTelemetry()
+        telemetrySessionStarted = nil
         backgroundSeconds = 0
         backgroundSurface = nil
         lockedSeconds = 0
@@ -1964,8 +2008,14 @@ class RealtimeService: ObservableObject {
             }
         }
         client.onHistoryInterrupted = { [weak self] id in
-            guard let self, let record = self.turnHistory.cancelUnanswered(id: id) else { return }
-            self.lastCompletedTurn = record
+            guard let self else { return }
+            self.turnTelemetry.end(id, at: self.telemetryNow())
+            self.commandStartTime = nil
+            self.lastTurnLatency = nil
+            if let record = self.turnHistory.cancelUnanswered(id: id) { self.lastCompletedTurn = record }
+            if let entry = self.turnTelemetry.entries[id], let record = self.turnHistory.telemetry(entry, id: id, at: self.telemetryNow()) {
+                self.lastCompletedTurn = record
+            }
         }
         client.onTurnFailed = { [weak self, weak client] _ in
             guard let self, let client else { return }
@@ -1984,10 +2034,15 @@ class RealtimeService: ObservableObject {
             }
             self.lastCompletedTurn = self.turnHistory.reply(reply, conversationID: self.activeConversationId,
                                                           status: client.historyJobOutcomes[origin.id])
+            if let entry = self.turnTelemetry.entries[origin.id],
+               let record = self.turnHistory.telemetry(entry, id: origin.id, at: self.telemetryNow()) {
+                self.lastCompletedTurn = record
+            }
         }
     }
 
     private func checkpointLiveTurn(id: UUID, text: String) {
+        if !text.isEmpty { turnTelemetry.begin(id, at: telemetryNow()) }
         if let record = turnHistory.checkpoint(id: id, text: text, conversationID: activeConversationId, steps: turnSteps) {
             lastCompletedTurn = record
         }
@@ -2010,18 +2065,22 @@ class RealtimeService: ObservableObject {
         closeOpenSteps()
         lastTurnSteps = recordedSteps.map(CommandRecord.ToolStep.init)
         lastServiceName = CommandRecord.inferService(from: lastCommandText)
-        let duration = commandStartTime.map { Date().timeIntervalSince($0) } ?? 0
+        if localVoice == nil, turnTelemetry.entries[id]?.started == nil, lastCommandText.isEmpty,
+           let started = telemetrySessionStarted { turnTelemetry.begin(id, at: started) }
+        if localVoice == nil { turnTelemetry.finish(id, reply: lastResponseText, at: telemetryNow()) }
+        let telemetry = turnTelemetry.entries[id]
+        let duration = localVoice == nil ? telemetry?.duration(at: telemetryNow()) ?? 0
+            : commandStartTime.map { max(0, telemetryNow().timeIntervalSince($0)) } ?? 0
         lastDuration = duration
         // Read and cleared together with the rest of the turn's fields, for the
         // reason `lastCompletedTurn` exists at all: a value left standing outlives
         // the exchange it belongs to and gets filed against the next one.
-        let latency = lastTurnLatency
+        let latency = localVoice == nil ? telemetry?.latency : lastTurnLatency
         lastTurnLatency = nil
         commandStartTime = nil
 
         guard !lastResponseText.isEmpty || !lastCommandText.isEmpty else { return }
-        let brainSteps = pendingBrainSteps
-        pendingBrainSteps = []
+        let brainSteps = telemetry?.brainSteps ?? []
         let record = CommandRecord(
             id: id, commandText: lastCommandText.isEmpty ? "Voice command" : lastCommandText,
             responseText: lastResponseText,
@@ -2080,7 +2139,7 @@ extension RealtimeService {
         }
         call.onUserTranscript = { [weak self] text, _ in
             guard let self else { return }
-            if self.commandStartTime == nil { self.commandStartTime = Date() }
+            if self.commandStartTime == nil { self.commandStartTime = self.telemetryNow() }
             if !text.isEmpty { self.lastCommandText = text }
         }
         call.onAssistantTranscript = { [weak self] text, isFinal in

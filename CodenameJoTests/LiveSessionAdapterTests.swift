@@ -73,11 +73,12 @@ final class LiveSessionAdapterTests: XCTestCase {
     func testSpokenResetClosesAStalledToolSessionWithoutWaitingOrReplaying() async throws {
         let h = Harness()
         h.adapter.toolCallBound = 60
-        try h.start()
+        try await finalizedCommand(h, start: 1)
+        h.completedInputs.removeAll()
         try h.function("stuck-write")
         try h.function("queued-write")
         try h.receive(["type": "session.input_transcript.delta", "delta": "Jo, reset.",
-                       "start_ms": 1000, "end_ms": 1500])
+                       "start_ms": 3000, "end_ms": 3500])
         try await Task.sleep(for: .milliseconds(1200))
         XCTAssertEqual(h.resets, 1)
         XCTAssertTrue(h.completedInputs.isEmpty, "Reset must bypass normal input and tool routing")
@@ -87,7 +88,7 @@ final class LiveSessionAdapterTests: XCTestCase {
         h.result("stuck-write")
         try h.lifecycle("response.completed")
         try h.receive(["type": "session.input_transcript.delta", "delta": "Jo reset",
-                       "start_ms": 4000, "end_ms": 4500])
+                       "start_ms": 6000, "end_ms": 6500])
         XCTAssertEqual(h.sent.count, before, "Late results cannot revive the closed session")
         XCTAssertEqual(h.resets, 1)
         XCTAssertEqual(h.calls.map(\.id), ["stuck-write"])
@@ -144,7 +145,7 @@ final class LiveSessionAdapterTests: XCTestCase {
     @MainActor
     func testStartsCompleteCallBeforeResponseEndsAndCorrelatesMissingEnvelopeDelegation() async throws {
         let h = Harness()
-        try h.start()
+        try await finalizedCommand(h, start: 1)
         try h.function("archive-a")
         XCTAssertEqual(h.calls.map(\.id), ["archive-a"])
         XCTAssertEqual(h.calls.first?.delegation, "d1")
@@ -160,7 +161,7 @@ final class LiveSessionAdapterTests: XCTestCase {
     func testUnansweredToolIsReleasedAndTheNextCallRuns() async throws {
         let h = Harness()
         h.adapter.toolCallBound = 0.2
-        try h.start()
+        try await finalizedCommand(h, start: 1)
         try h.function("archive-a")
         try h.function("second-call")
         XCTAssertEqual(h.calls.map(\.id), ["archive-a"], "Local calls stay serial")
@@ -194,7 +195,7 @@ final class LiveSessionAdapterTests: XCTestCase {
     @MainActor
     func testRepeatedCallCannotExecuteTwiceAndLocalCallsStaySerial() async throws {
         let h = Harness()
-        try h.start()
+        try await finalizedCommand(h, start: 1)
         try h.function("archive-a")
         try h.function("archive-a")
         try h.function("second-call")
@@ -1176,7 +1177,7 @@ final class LiveSessionAdapterTests: XCTestCase {
     func testFailedBackendStillDeliversAcceptedToolResultAndContinuesOnce() async throws {
         let h = Harness()
         try h.start()
-        try h.function("accepted")
+        try h.function("accepted", name: "gmail_get_message")
         h.result("accepted")
         try h.lifecycle("response.failed")
         XCTAssertEqual(h.sent.compactMap { $0["type"] as? String },
@@ -1246,11 +1247,11 @@ final class LiveSessionAdapterTests: XCTestCase {
     }
 
     @MainActor
-    func testCleanupOfferSpeaksBeforeBackendFinishesAndPreservesFullApprovalContext() throws {
+    func testCleanupOfferSpeaksBeforeBackendFinishesAndPreservesFullApprovalContext() async throws {
         let step = try LiveEmailPresentationTests.encode(LiveEmailPresentationTests.cleanupStep(action: .unsubscribe))
         let line = try XCTUnwrap(LiveEmailPresentation.cleanupSpeakerLine(for: step))
         let h = Harness()
-        try h.start()
+        try await finalizedCommand(h, start: 1)
         try h.function("archive-a")
         h.adapter.outbound(["type": "conversation.item.create", "item": [
             "type": "function_call_output", "call_id": "archive-a", "output": step]])
@@ -1435,14 +1436,18 @@ final class LiveSessionAdapterTests: XCTestCase {
     }
 
     @MainActor
-    func testArchiveBeforeInputSettlesCannotRearmRecovery() async throws {
+    func testUnsettledArchiveIsRefusedAndSettledRetryResolvesRecovery() async throws {
         let h = Harness()
         try h.receive(["type": "session.started"])
         try h.receive(["type": "session.input_transcript.delta", "start_ms": 100,
                        "end_ms": 200, "delta": "Archive this one for me, please"])
         try h.start()
         try h.function("archive")
+        XCTAssertTrue(h.calls.isEmpty, "An unfinished utterance cannot authorize a write")
         try await Task.sleep(for: .milliseconds(1050))
+        XCTAssertTrue(h.adapter.hasUnresolvedQueueAction)
+        try h.function("settled-archive")
+        XCTAssertEqual(h.calls.map(\.id), ["settled-archive"])
         XCTAssertFalse(h.adapter.hasUnresolvedQueueAction)
         h.adapter.close()
     }
@@ -1459,7 +1464,8 @@ final class LiveSessionAdapterTests: XCTestCase {
                            "end_ms": 2100, "delta": "You can archive"])
             try await Task.sleep(for: .milliseconds(1050))
             XCTAssertTrue(h.adapter.beginFastAction(callId: "local", action: .archive), filler)
-            XCTAssertTrue(h.sent.isEmpty, "The shortcut must require no backend request")
+            XCTAssertFalse(h.sent.contains { ["response.create", "response.item.create"].contains($0["type"] as? String ?? "") },
+                           "The shortcut must require no backend request")
             XCTAssertFalse(h.adapter.hasUnresolvedQueueAction)
             h.adapter.close()
         }

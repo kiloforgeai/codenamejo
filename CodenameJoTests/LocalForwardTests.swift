@@ -16,14 +16,25 @@ final class LocalForwardTests: XCTestCase {
     private let work = "work@example.test"
     private var grants: ForwardGrantStorage!
     private var contacts: ContactStore!
+    private var database: DatabasePool!
     private var notices: LocalWriteNotices!
     private var paths: [String] = []
+    private var savedDefaults: [String: Any] = [:]
 
     private static let defaultsKeys = [StandingRule.archiveAfterForward.storageKey, MailFooter.storageKey,
                                        DraftsOnly.byAccountStorageKey]
 
     override func setUp() async throws {
         try await super.setUp()
+        Container.shared.manager.push()
+        ProfileRuntime.install(nil)
+        let backend = BackendService(restoringSession: false)
+        backend.userId = "forward-tests"
+        Container.shared.backend.register { backend }
+        let jobsPath = NSTemporaryDirectory() + "forward-\(UUID().uuidString).json"
+        paths.append(jobsPath)
+        let jobs = DispatchJobStore(url: URL(fileURLWithPath: jobsPath))
+        Container.shared.dispatchJobs.register { MainActor.assumeIsolated { jobs } }
         grants = ForwardGrantStorage()
         let grants = grants!
         Container.shared.googleGrantStorage.register { grants }
@@ -33,6 +44,7 @@ final class LocalForwardTests: XCTestCase {
         let path = NSTemporaryDirectory() + "forward-\(UUID().uuidString).sqlite"
         paths.append(path)
         let pool = try DatabasePool(path: path)
+        database = pool
         try await pool.write { try ContactStore.createSchema($0); try ContactStore.addSource($0) }
         contacts = ContactStore(database: pool)
         let contacts = contacts!
@@ -40,18 +52,28 @@ final class LocalForwardTests: XCTestCase {
         notices = LocalWriteNotices()
         let notices = notices!
         Container.shared.localWriteNotices.register { notices }
-        Self.defaultsKeys.forEach { UserDefaults.standard.removeObject(forKey: $0) }
+        Self.defaultsKeys.forEach {
+            savedDefaults[$0] = UserDefaults.standard.object(forKey: $0)
+            UserDefaults.standard.removeObject(forKey: $0)
+        }
+        UserDefaults.standard.set(false, forKey: StandingRule.archiveAfterForward.storageKey)
         await contacts.recordSent(account: owner, email: "sam@acme.test")
     }
 
     override func tearDown() async throws {
+        try database?.close()
         Container.shared.googleGrantStorage.reset()
         Container.shared.googleTokenProvider.reset()
         Container.shared.mailStore.reset()
         Container.shared.providerHTTP.reset()
         Container.shared.contactStore.reset()
         Container.shared.localWriteNotices.reset()
-        Self.defaultsKeys.forEach { UserDefaults.standard.removeObject(forKey: $0) }
+        Self.defaultsKeys.forEach {
+            if let value = savedDefaults[$0] { UserDefaults.standard.set(value, forKey: $0) }
+            else { UserDefaults.standard.removeObject(forKey: $0) }
+        }
+        Scope.singleton.reset()
+        Container.shared.manager.pop()
         paths.forEach { try? FileManager.default.removeItem(atPath: $0) }
         try await super.tearDown()
     }
@@ -124,6 +146,15 @@ final class LocalForwardTests: XCTestCase {
         return await LocalForward.run(argumentsJSON: String(decoding: data, as: UTF8.self), defer: deferred,
                                       conversationId: "call")
     }
+
+    #if targetEnvironment(macCatalyst)
+    private func approveDraft(_ result: FullDuplexBroker.ToolResult) async throws -> DispatchJob {
+        let id = try XCTUnwrap(result.localDraftID)
+        let preview = try XCTUnwrap(Container.shared.dispatchJobs().existing(id)?.draftReview)
+        return try await LocalDraftReview.save(id, revision: preview.revision,
+            subject: preview.message.subject, body: preview.message.body)
+    }
+    #endif
 
     private func posts(_ scripted: ScriptedGmail) -> [String] { scripted.calls.filter { $0.method == "POST" }.map(\.path) }
 
@@ -201,8 +232,13 @@ final class LocalForwardTests: XCTestCase {
         DraftsOnly.set(true, for: owner)
         let scripted = gmail(parts: [Part(filename: "invoice.pdf", size: 1_000, attachmentId: "a1")])
         let result = await run(["message_id": "m1", "to": "new@acme.test", "note": "FYI"])
+        #if targetEnvironment(macCatalyst)
+        XCTAssertTrue(posts(scripted).isEmpty)
+        _ = try await approveDraft(result)
+        #else
         XCTAssertEqual(result.text, "Draft forward to new@acme.test saved in \(owner) — nothing was sent, because Drafts "
             + "only is on for this inbox.")
+        #endif
         XCTAssertEqual(result.ok, true)
         XCTAssertEqual(posts(scripted), ["drafts"])
         XCTAssertFalse(scripted.calls.contains { $0.path == "messages" }, "a draft is not asked the first-time question")
@@ -235,7 +271,7 @@ final class LocalForwardTests: XCTestCase {
 
     // MARK: - Failures
 
-    func testFailuresSayNothingWentOutAndADeferredOneIsToldWithoutARetry() async throws {
+    func testPreWriteFailureIsKnownButProviderFailureIsUnknownWithoutRetry() async throws {
         gmail(parts: [Part(filename: "invoice.pdf", size: 1_000, attachmentId: "a1")]) {
             $0.path.contains("/attachments/") ? (429, "application/json", "{}") : nil
         }
@@ -245,28 +281,34 @@ final class LocalForwardTests: XCTestCase {
 
         let scripted = gmail { $0.path == "messages/send" ? (500, "application/json", "{}") : nil }
         let deferred = await run(["message_id": "m1", "to": "sam@acme.test"], defer: true)
-        XCTAssertEqual(deferred.text, "Forwarded to sam@acme.test from \(owner).")
-        XCTAssertTrue(deferred.deferred)
-        var told = ""
-        for _ in 0..<100 where told.isEmpty {
-            try await Task.sleep(for: .milliseconds(20))
-            told = notices.appending(to: "", conversation: "call")
-        }
-        XCTAssertEqual(told, "\n\nthat didn't forward (gmail 500) — nothing went out, so it needs asking for again.")
+        XCTAssertEqual(deferred.ok, false)
+        XCTAssertTrue(deferred.outcomeUnknown)
+        XCTAssertFalse(deferred.deferred)
+        XCTAssertTrue(deferred.text.contains("outcome is unknown"))
+        XCTAssertTrue(notices.appending(to: "", conversation: "call").isEmpty)
         XCTAssertEqual(scripted.calls.filter { $0.path == "messages/send" }.count, 1)
 
         DraftsOnly.set(true, for: owner)
         gmail { $0.path == "drafts" ? (500, "application/json", "{}") : nil }
         let draft = await run(["message_id": "m1", "to": "sam@acme.test"])
-        XCTAssertEqual(draft.text, "that draft forward didn't save (gmail 500) — there is nothing in \(owner)'s drafts, "
-            + "so it needs asking for again.")
+        #if targetEnvironment(macCatalyst)
+        XCTAssertEqual(draft.ok, true)
+        do { _ = try await approveDraft(draft); XCTFail("Provider failure must be surfaced") }
+        catch { XCTAssertTrue(GmailManageTools.detail(error).contains("unknown")) }
+        XCTAssertEqual(Container.shared.dispatchJobs().mailAction(try XCTUnwrap(draft.localDraftID))?.mailAction?.state, .unknown)
+        #else
+        XCTAssertEqual(draft.ok, false)
+        XCTAssertTrue(draft.outcomeUnknown)
+        XCTAssertTrue(draft.text.contains("outcome is unknown"))
+        #endif
     }
 
-    func testRunToolSendsForwardsHereAndDefersOnlyInsideACall() async {
+    func testRunToolWaitsForProviderConfirmationEvenInsideACall() async {
         gmail()
         let inCall = await FullDuplexBroker.runTool(name: "forward_email",
             argumentsJSON: #"{"message_id":"m1","to":"sam@acme.test"}"#, conversationId: "call", deferSend: true)
-        XCTAssertTrue(inCall.deferred)
+        XCTAssertFalse(inCall.deferred)
+        XCTAssertEqual(inCall.ok, true)
         let noCall = await FullDuplexBroker.runTool(name: "forward_email",
             argumentsJSON: #"{"message_id":"m1","to":"sam@acme.test"}"#, deferSend: true)
         XCTAssertFalse(noCall.deferred)

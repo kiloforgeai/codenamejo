@@ -93,6 +93,10 @@ enum CustomCommandRules {
         // Granola
         "granola_list_meetings": true, "granola_get_meeting": true, "granola_action_items": true,
 
+        // Notion: resolve the destination anew from the captured source on each run.
+        "notion-search": true, "notion-fetch": true, "notion-list-recent-pages": true,
+        "notion-query-data-sources": true, "notion-create-pages": true, "notion-update-page": true,
+
         // GitHub
         "github_get_me": true, "github_search_repositories": true, "github_list_pull_requests": true,
         "github_pull_request_read": true, "github_search_pull_requests": true, "github_list_issues": true,

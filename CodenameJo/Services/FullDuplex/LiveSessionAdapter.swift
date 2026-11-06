@@ -14,6 +14,7 @@ final class LiveSessionAdapter {
     let emit: (RealtimeSignal) -> Void
     private var clientBrain: LiveClientBrain?
     var calendarWindow: CalendarRequestWindow? { clientBrain?.calendarWindow }
+    func calendarSource(for call: Call) -> String? { clientBrain?.calendarSource(for: call) }
     private var presentationDelegations = Set<String>()
     private var abandonedPresentations = Set<String>()
     private var resultPresentationState: (turn: Int, scope: String?, selection: LiveSelectionGrounding.Selection)?
@@ -59,12 +60,78 @@ final class LiveSessionAdapter {
     }
     private var inputTurn = 0
     private(set) var desktopQuiet = false
+    private(set) var narrationMode: WorkSessionMode = .away
+    private var automaticSpeech = false
+    private var automaticOutputBlocked = false
+    private var awayIntroduction: (() -> EmailOpeningResolution?)?
+
+    func setNarrationMode(_ mode: WorkSessionMode) {
+        narrationMode = mode
+        clientBrain?.automaticNarration = mode.automaticNarration
+        awayIntroduction = nil
+        if !mode.automaticNarration {
+            let stopAutomatic = automaticSpeech || (inputTurn == 0 && !backendRunning)
+            cancelEmailOpening(reason: "at_computer")
+            cancelPreparedEmail()
+            if stopAutomatic {
+                speechRequest = nil; speechRequestedAt = nil
+                idlePending = false; unworkedPending = false
+                automaticOutputBlocked = true
+                onOutputSuppressed?(true)
+                finishObservedPlayback(phase: "cancelled")
+                audible = false; finishTranscript()
+                emit(.event(.outputAudioStopped))
+            }
+            append("At computer mode is selected. Stop automatic feed narration. Keep listening and answer explicit requests, including read-aloud. A spoken question does not change this mode. Do not introduce the next email or ask for its disposition. Accepted work and background reporting continue normally.", type: stopAutomatic ? "session.instructions.append" : "session.thinking.append")
+        } else {
+            desktopQuiet = false
+            automaticOutputBlocked = false
+            onOutputSuppressed?(false)
+            append("Away mode is selected. Hands-free feed narration is enabled. Wait for the application to supply the current item; never replay previously skipped items.", type: "session.thinking.append")
+        }
+        diagnostics?.record(.turnTransition, ["transition": "narration_mode_changed", "narration_mode": mode.rawValue,
+            "reason": "explicit_preference", "outcome": mode.automaticNarration ? "automatic_enabled" : "requests_only"])
+    }
+
+    func introduceCurrentWhenSettled(_ resolve: @escaping () -> EmailOpeningResolution?) {
+        guard narrationMode.automaticNarration else { return }
+        awayIntroduction = resolve
+        introduceAwayIfSettled()
+    }
+
+    private func introduceAwayIfSettled() {
+        guard narrationMode.automaticNarration, canSelectReturnedWork,
+              pendingContext.isEmpty, pendingFunctionOutputs.isEmpty, !speechRequested, !audible,
+              !hasUnresolvedQueueAction, clientBrain?.holdsFeedDecision != true,
+              inputTurn == 0 || finalizedInput, let resolve = awayIntroduction else { return }
+        awayIntroduction = nil
+        guard let latest = resolve() else { return }
+        stageEmailOpening(resolve)
+        presentPreparedEmail(latest.line)
+    }
+
+    private func speechAllowed(automatic: Bool) -> Bool {
+        let allowed = !automatic || narrationMode.automaticNarration
+        diagnostics?.record(.turnTransition, ["transition": "narration_policy", "narration_mode": narrationMode.rawValue,
+            "reason": automatic ? "automatic_feed" : "requested_or_reported_result", "outcome": allowed ? "allowed" : "suppressed"])
+        return allowed
+    }
+
+    private func allowRequestedSpeech() {
+        automaticSpeech = false
+        automaticOutputBlocked = false
+        if !desktopQuiet { onOutputSuppressed?(false) }
+        _ = speechAllowed(automatic: false)
+    }
+    private var quietInput: (text: String, end: Double)?
     private var desktopDismissedThroughTurn = -1
     var onOutputSuppressed: ((Bool) -> Void)?
 
     func beginDesktopInteraction(origin: String, revision: Int) {
         guard !closed else { return }
+        cancelEmailOpening(reason: "desktop_action")
         desktopQuiet = true
+        quietInput = nil
         desktopDismissedThroughTurn = inputTurn
         inputFinalizer?.cancel()
         silentInputWatchdog?.cancel()
@@ -94,6 +161,10 @@ final class LiveSessionAdapter {
     private var backgroundStartedTurns: Set<Int> = []
     private var finalizedInput = false
     private var authorizationText = ""
+    var allowsNewDispatch: Bool {
+        finalizedInput && !closed && !desktopQuiet && inputTurn > desktopDismissedThroughTurn
+            && LiveRequestRecovery.dispatchRefusal(authorizationText) == nil
+    }
     private var sourceInquiryTurn: Int?
     private var questionTurn: Int?
     private var speechAfterInput = ""
@@ -147,6 +218,63 @@ final class LiveSessionAdapter {
     private var speechRequest: String? { didSet { speechIsCurrent = nil } }
     private var speechIsCurrent: (() -> Bool)?
     private var preparedSpeechPending = false
+    struct EmailOpeningResolution: Equatable {
+        let line: String
+        let summary: String?
+        let revision: Int
+        let reason: String
+        let targetHash: String
+    }
+    private var emailOpeningResolver: (() -> EmailOpeningResolution?)?
+    private var emailOpeningSelected: EmailOpeningResolution?
+    private var emailOpeningCommitted = false
+    private var emailOpeningPlayed = false
+
+    /// Resolve at the speech boundary, not when the queue first selected its item.
+    func stageEmailOpening(_ resolve: @escaping () -> EmailOpeningResolution?) {
+        guard speechAllowed(automatic: true) else { return }
+        emailOpeningResolver = resolve
+        emailOpeningSelected = nil
+        emailOpeningCommitted = false
+        emailOpeningPlayed = false
+    }
+
+    private func logEmailOpening(_ phase: String, _ resolution: EmailOpeningResolution?, reason: String? = nil) {
+        diagnostics?.record(.turnTransition, ["transition": "email_opening_presentation", "phase": phase,
+            "reason": reason ?? resolution?.reason ?? "selection_changed",
+            "target_hash": resolution?.targetHash ?? "none",
+            "task_revision": String(resolution?.revision ?? -1),
+            "complete": String(resolution?.summary != nil)])
+    }
+
+    func cancelEmailOpening(reason: String) {
+        guard emailOpeningResolver != nil else { return }
+        logEmailOpening("dropped", emailOpeningSelected, reason: reason)
+        emailOpeningResolver = nil
+        if !emailOpeningCommitted { speechRequest = nil }
+    }
+
+    /// A prepared summary supersedes an unsaid fallback. Once speech has started, only
+    /// the missing summary is recovered at silence; never another greeting or question.
+    func refreshEmailOpening() {
+        guard narrationMode.automaticNarration, !closed, !desktopQuiet, farewell == nil, let resolve = emailOpeningResolver else { return }
+        guard let latest = resolve() else { cancelEmailOpening(reason: "selection_or_profile_changed"); return }
+        guard emailOpeningCommitted else { flushSpeech(); return }
+        guard emailOpeningSelected?.summary == nil, let summary = latest.summary else { return }
+        if audible { return }
+        if emailOpeningPlayed {
+            guard !backendRunning, activeCall == nil, !hasUnresolvedQueueAction else { return }
+            emailOpeningResolver = nil
+            logEmailOpening("recovered_at_boundary", latest)
+            speakExactly(summary, automatic: true)
+        } else {
+            logEmailOpening("coalesced_before_playback", latest)
+            append("Cancel the queued email fallback before speaking it. Use only the latest application-supplied summary; give one introduction and one closing question.", type: "session.instructions.append")
+            emailOpeningCommitted = false
+            speechRequest = "Follow the latest application-supplied opening line exactly, then stop."
+            flushSpeech()
+        }
+    }
     private var speechRequestedAt: Double?
     /// Live takes a few seconds to turn a speech request into audio; nothing is audible yet.
     static let speechStartGrace: Double = 5
@@ -182,7 +310,10 @@ final class LiveSessionAdapter {
     private var lastOutputAt = Date.distantPast
     private var delegationStartedAt: [String: Date] = [:]
     private var delegationHandoffMs: [String: Int] = [:]
-    private var delegationStepTools: [String: [String]] = [:]
+    private var responseStepTools: [String: [String]] = [:]
+    private var responseStartedAt: [String: Date] = [:]
+    private var completedResponseIDs = Set<String>()
+    var telemetryNow: () -> Date = Date.init
     private var clockAppendedAt: Date?
     private var clockZone: String?
     /// Presence lines for a quiet tool turn; none names a tool or matches a stall phrase in `announcesLookup`.
@@ -237,6 +368,7 @@ final class LiveSessionAdapter {
         }, speak: { [weak self] text, delegation in
             guard let self, !closed else { return }
             guard !desktopQuiet, (delegation.flatMap { self.delegationTurns[$0] } ?? inputTurn) > desktopDismissedThroughTurn else { return }
+            allowRequestedSpeech()
             // Recovery decisions are structured backend output, not words for the speaker.
             var spoken = text
             if let id = recoveryRequests[inputTurn] {
@@ -245,7 +377,7 @@ final class LiveSessionAdapter {
                       value["request_id"] as? String == id, let message = value["message"] as? String else { return }
                 spoken = message
             }
-            if calendarWindow != nil || clientBrain?.needsSelectedSource == true { speakExactly(spoken) }
+            if clientBrain?.needsExactCalendarSpeech == true || clientBrain?.needsSelectedSource == true { speakExactly(spoken) }
             else { append(spoken, type: "session.commentary.append", delegation: delegation) }
         }, failed: { [weak self] message in
             guard let self, !closed else { return }
@@ -260,9 +392,16 @@ final class LiveSessionAdapter {
                 emit(.event(.error(message: message, code: "live_client_brain_failed")))
             }
         })
+        clientBrain?.automaticNarration = narrationMode.automaticNarration
         clientBrain?.onRequestTransition = { [weak self] reason, request, delegation, turn in
-            self?.diagnostics?.record(.turnTransition, ["transition": reason, "request_id": request,
-                "delegation_id": delegation, "input_turn": String(turn)])
+            guard let self else { return }
+            var fields = ["transition": reason, "request_id": request,
+                "delegation_id": delegation, "input_turn": String(turn)]
+            if reason.hasPrefix("selected_source_"), let key = (clientBrainState?().text).flatMap(LiveEmailPresentation.Key.selection) {
+                fields["target_hash"] = diagnostics?.target(MailSelection(account: key.account, messageID: key.messageId).canonical)
+                fields["phase"] = "source_evidence_answer"
+            }
+            diagnostics?.record(.turnTransition, fields)
         }
         clientBrain?.present = { [weak self] text in
             guard let self, !closed else { return }
@@ -277,6 +416,12 @@ final class LiveSessionAdapter {
             fields["input_turn"] = String(turn)
             fields["turn_id"] = historyIDForTurn?(turn) ?? String(turn)
             diagnostics?.record(.brainAttemptEnded, fields)
+        }
+        clientBrain?.onCalendarIntent = { [weak self] fields in
+            self?.diagnostics?.record(.turnTransition, fields)
+        }
+        clientBrain?.onReplyComposition = { [weak self] fields in
+            self?.diagnostics?.record(.turnTransition, fields)
         }
         clientBrain?.onPresentationInvalidated = { [weak self] reason, selection in
             guard let self else { return }
@@ -434,6 +579,7 @@ final class LiveSessionAdapter {
         }
         guard started, !closed, farewell == nil else { return decline("session") }
         guard finalizedInput, inputTurn > 0 else { return decline("input_pending") }
+        guard !LiveRequestRecovery.isBackchannel(inputText) else { return decline("acknowledgment") }
         guard !backgroundRequestTurns.contains(inputTurn) else { return decline("background_request") }
         guard routed || LiveFastAction.parse(authorizationText) == action else { return decline("authorization") }
         guard activeCall == nil, activeFastCall == nil, calls.isEmpty, !continuationOwed
@@ -524,6 +670,14 @@ final class LiveSessionAdapter {
         continuationDelegation = fast.delegation
         activeFastCall = nil
         trace("fast_result", call: id, delegation: fast.delegation)
+        guard fast.turn == inputTurn else {
+            // A late provider receipt belongs to its original action. Do not promote it into
+            // a new request or bind it to the newly selected email during an acknowledgment.
+            trace("fast_result_retained_for_original_turn", call: id, delegation: fast.delegation)
+            flushFunctionOutputs()
+            runNextCall()
+            return true
+        }
         watchButtonPresentation(turn: fast.turn)
         if let clientBrain {
             let preamble = output.prefix { $0 != "{" }
@@ -624,6 +778,7 @@ final class LiveSessionAdapter {
     ///   False only when the speech request follows immediately on this channel (`presentPreparedEmail`).
     private func append(_ text: String, type: String, awaitingAcknowledgement: Bool = true, delegation: String? = nil) {
         guard type != "session.commentary.append" || !desktopQuiet else { return }
+        if type == "session.commentary.append" { speechRequestedAt = ProcessInfo.processInfo.systemUptime }
         let text = clientBrain == nil ? text : LiveCompactContext.text(text)
         if type != "session.commentary.append" { clientBrain?.observe(text) }
         // UTF-8 byte bounds also bound tokens; never truncate email context to fit an append.
@@ -689,6 +844,8 @@ final class LiveSessionAdapter {
 
     /// Greeting directions are trusted app instructions, separate from email context.
     func prepareOpening(instructions: String) {
+        guard speechAllowed(automatic: true) else { return }
+        automaticSpeech = true
         guard !openingPrepared else { return }
         openingPrepared = true
         append("For the opening response only, speak in English now without waiting for the caller. "
@@ -700,6 +857,8 @@ final class LiveSessionAdapter {
     /// - Parameter phoneAnswersYes: the phone presents the first email itself on a plain yes, so
     ///   the speaker's own reply to it is kept to a word that the presentation can follow.
     func prepareFeedOffer(instructions: String, phoneAnswersYes: Bool = false) {
+        guard speechAllowed(automatic: true) else { return }
+        automaticSpeech = true
         guard !openingPrepared else { return }
         openingPrepared = true
         append("For the opening response only, speak in English now without waiting for the caller. "
@@ -718,6 +877,8 @@ final class LiveSessionAdapter {
     ///   rather than an earlier email, so the speaker finishes it instead of being cut off.
     func presentPreparedEmail(_ line: String, interruptsSpeech: Bool = true,
                               request: String = emailPresentationRequest) {
+        guard speechAllowed(automatic: true) else { return }
+        automaticSpeech = true
         guard !desktopQuiet else { return }
         refreshBrainState()
         guard clientBrain?.holdsFeedDecision != true else { return }
@@ -738,6 +899,8 @@ final class LiveSessionAdapter {
     /// A scripted step too long for `presentPreparedEmail`'s single chunk: speech waits for
     /// every chunk to be acknowledged, then the speaker presents it without a backend turn.
     func presentScript(_ text: String) {
+        guard speechAllowed(automatic: true) else { return }
+        automaticSpeech = true
         guard !desktopQuiet else { return }
         guard !closed, farewell == nil, !text.isEmpty else { return }
         append(text, type: "session.thinking.append")
@@ -764,8 +927,10 @@ final class LiveSessionAdapter {
 
     /// Recite one supplied line and stop. The model composes from thinking appends; it recites
     /// only from the commentary channel.
-    func speakExactly(_ line: String, ifCurrent: (() -> Bool)? = nil) {
+    func speakExactly(_ line: String, automatic: Bool = false, ifCurrent: (() -> Bool)? = nil) {
         guard !desktopQuiet else { return }
+        guard speechAllowed(automatic: automatic) else { return }
+        if automatic { automaticSpeech = true } else { allowRequestedSpeech() }
         guard !closed, farewell == nil, !line.isEmpty else { return }
         guard ifCurrent?() != false else { return }
         speechRequest = "Say exactly: \(line) Then stop speaking. Say nothing else and call no tool."
@@ -833,6 +998,11 @@ final class LiveSessionAdapter {
                        awaitingAcknowledgement: payload["await_context_ack"] as? Bool ?? true)
             }
         case "response.create":
+            if !narrationMode.automaticNarration, inputTurn == 0 {
+                _ = speechAllowed(automatic: true)
+                continueBackendIfReady()
+                return
+            }
             guard !desktopQuiet, inputTurn > desktopDismissedThroughTurn else {
                 continueBackendIfReady()
                 return
@@ -886,13 +1056,14 @@ final class LiveSessionAdapter {
             emit(.event(.mcpToolsListed))
         case "session.delegation.created":
             if let delegation = event["delegation"] as? [String: Any], let id = delegation["id"] as? String {
-                delegationStartedAt[id] = Date()
+                delegationStartedAt[id] = telemetryNow()
                 if lastInputAt != nil { delegationHandoffMs[id] = elapsed(since: lastInputAt) }
                 let offset = event["offset_ms"] as? Double
                 let turn = offset.flatMap { offset in inputTurns.last { $0.start <= offset }?.turn } ?? inputTurn
                 delegationTurns[id] = turn
                 if turn == inputTurn { unworkedPending = false }
                 if let responseID = delegation["response_id"] as? String {
+                    responseStartedAt[responseID] = responseStartedAt[responseID] ?? telemetryNow()
                     responseDelegations[responseID] = id
                     runningResponses.insert(responseID)
                 }
@@ -921,6 +1092,7 @@ final class LiveSessionAdapter {
                 responseDelegations[responseID] = delegation
             }
             if kind == "response.created", let responseID {
+                responseStartedAt[responseID] = responseStartedAt[responseID] ?? telemetryNow()
                 if responseDelegations[responseID] == nil {
                     responseDelegations[responseID] = continuationDelegation
                 }
@@ -950,36 +1122,41 @@ final class LiveSessionAdapter {
                 clientBrain?.acceptToolCall(id)
                 calls.append(Call(id: id, name: name, arguments: arguments, delegation: delegation,
                                   recoveryAnchor: delegationTurns[delegation].flatMap { recoveryAnchors[$0] }))
-                delegationStepTools[delegation, default: []].append(name)
+                if let outputResponseID { responseStepTools[outputResponseID, default: []].append(name) }
                 RealtimeLog.log("live: \(name) ready \(elapsed(since: delegationStartedAt[delegation]))ms after delegation")
                 runNextCall()
             }
             if kind == "response.completed" {
+                guard let responseID, completedResponseIDs.insert(responseID).inserted else { return }
                 let usageJSON = (nested["response"] as? [String: Any])?["usage"] as? [String: Any]
-                if let delegation = responseID.flatMap({ responseDelegations[$0] }),
+                let requestStart = responseStartedAt.removeValue(forKey: responseID)
+                let requestMS = requestStart.map { max(0, Int(telemetryNow().timeIntervalSince($0) * 1000)) } ?? -1
+                if let delegation = responseDelegations[responseID],
                    let started = delegationStartedAt[delegation] {
                     let usage = usageJSON.map(Self.backendUsage)
-                    let spoke = lastInputAt.map { Int($0.timeIntervalSince(started) * 1000) } ?? 0
+                    let originTurn = delegationTurns[delegation]
+                    let spoke = originTurn == inputTurn ? lastInputAt.map { Int($0.timeIntervalSince(started) * 1000) } ?? 0 : 0
                     emit(.liveBrainStep(CommandRecord.BrainStep(
-                        ms: elapsed(since: started),
-                        tools: delegationStepTools.removeValue(forKey: delegation),
+                        ms: requestMS,
+                        tools: responseStepTools.removeValue(forKey: responseID),
                         inputTokens: usage?.inputTokens, cachedTokens: usage?.cachedTokens,
                         outputTokens: (usageJSON?["output_tokens"] as? NSNumber)?.intValue,
                         handoffMs: delegationHandoffMs.removeValue(forKey: delegation),
-                        userSpokeMs: spoke > 0 ? spoke : nil)))
+                        userSpokeMs: spoke > 0 ? spoke : nil,
+                        responseID: responseID, delegationID: delegation,
+                        turnID: originTurn.flatMap { historyIDForTurn?($0) }, inputTurn: originTurn,
+                        requestStartedAt: requestStart, requestFinishedAt: telemetryNow())))
                 }
                 if let usage = usageJSON {
-                    let delegation = responseID.flatMap { responseDelegations[$0] }
-                    emit(.liveBackendUsage(Self.backendUsage(usage),
-                                           ms: elapsed(since: delegation.flatMap { delegationStartedAt[$0] })))
+                    emit(.liveBackendUsage(Self.backendUsage(usage), ms: requestMS))
                 }
-                let streamedOutput = responseID.flatMap { recoveryOutput.removeValue(forKey: $0) }
+                let streamedOutput = recoveryOutput.removeValue(forKey: responseID)
                 trace("backend_completed", call: responseID)
-                if let responseID { runningResponses.remove(responseID) }
+                runningResponses.remove(responseID)
                 flushFunctionOutputs()
                 runNextCall()
                 continueBackendIfReady()
-                if let delegation = responseID.flatMap({ responseDelegations[$0] }),
+                if let delegation = responseDelegations[responseID],
                    delegationTurns[delegation] == inputTurn {
                     completedDelegation = delegation
                     idlePending = true
@@ -1019,7 +1196,7 @@ final class LiveSessionAdapter {
                 }
             }
         case "session.output_transcript.delta":
-            guard !desktopQuiet else { return }
+            guard !desktopQuiet, !automaticOutputBlocked else { return }
             guard let fragment = event["delta"] as? String else { return }
             let start = event["start_ms"] as? Double ?? outputEnd
             // Both stamps are on Live's session timeline, so this is the user's wait without clock skew.
@@ -1055,11 +1232,29 @@ final class LiveSessionAdapter {
         case "session.input_transcript.delta":
             guard event["client_event_id"] == nil,
                   (event["end_ms"] as? Double) != (event["start_ms"] as? Double) else { return }
-            guard let delta = event["delta"] as? String else { return }
+            guard var delta = event["delta"] as? String else { return }
+            if desktopQuiet {
+                let start = event["start_ms"] as? Double ?? inputEnd
+                if let previous = quietInput, start - previous.end <= 1500,
+                   LiveRequestRecovery.incompleteAction(previous.text)
+                    || (LiveRequestRecovery.isNonverbal(previous.text)
+                        && (delta.hasPrefix("ing") || delta.hasPrefix("s]") || delta == "]")) {
+                    let separator = previous.text.last?.isLetter == true && delta.first?.isLetter == true
+                        && !delta.hasPrefix("ing") && !delta.hasPrefix("s]") ? " " : ""
+                    delta = previous.text + separator + delta
+                }
+                quietInput = (delta, event["end_ms"] as? Double ?? start)
+                if Self.desktopBackchannel(delta) || LiveRequestRecovery.incompleteAction(delta) {
+                    trace("desktop_input_non_request")
+                    return
+                }
+                quietInput = nil
+            }
+            if !Self.desktopBackchannel(delta) { cancelEmailOpening(reason: "user_request") }
             if desktopQuiet, Self.desktopBackchannel(delta) { return }
             let resumesDesktopVoice = desktopQuiet
             silentInputWatchdog?.cancel()
-            lastInputAt = Date()
+            lastInputAt = telemetryNow()
             let start = event["start_ms"] as? Double ?? inputEnd
             let suffix = delta.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
                 .trimmingCharacters(in: .punctuationCharacters)
@@ -1072,10 +1267,14 @@ final class LiveSessionAdapter {
                 || LiveRequestRecovery.isQuestion(delta) || LiveRequestRecovery.isCorrection(delta)
             let answered = !speechAfterInput.isEmpty || turnsWithTools.contains(inputTurn) || resolvedInputTurns.contains(inputTurn)
             let unfinishedPrefix = LiveRequestRecovery.hasUnfinishedAuthorizationPrefix(authorizationText)
-            let backchannel = finalizedInput && !authorizationText.isEmpty && LiveRequestRecovery.isBackchannel(delta)
-            let startsTurn = resumesDesktopVoice || inputText.isEmpty || (!finishesAssent && !unfinishedPrefix && !backchannel
-                && ((finalizedInput && (newIntent || (answered && start - inputEnd > 1000) || start - inputEnd > 5000))
-                    || (newIntent && start - inputEnd > 1000)))
+            let acknowledgment = LiveRequestRecovery.isBackchannel(delta)
+            let backchannel = finalizedInput && !authorizationText.isEmpty && !inputText.isEmpty
+                && !answered && acknowledgment
+            let startsTurn = resumesDesktopVoice || inputText.isEmpty || (finalizedInput && acknowledgment && !backchannel)
+                || (!finishesAssent && !unfinishedPrefix && !backchannel
+                    && ((finalizedInput && (newIntent || (answered && start - inputEnd > 1000)
+                        || (start - inputEnd > 5000 && !Self.unfinishedReplyDictation(authorizationText))))
+                        || (newIntent && start - inputEnd > 1000)))
             if startsTurn {
                 releaseResultPresentation(turn: inputTurn, reason: "new_user_request")
                 if speechIsCurrent != nil {
@@ -1100,7 +1299,6 @@ final class LiveSessionAdapter {
                 inputTurn += 1
                 if resumesDesktopVoice {
                     desktopQuiet = false
-                    onOutputSuppressed?(false)
                     append("A new spoken request begins now. Answer only this request using the current selected item; do not resume earlier presentations or desktop action receipts.", type: "session.instructions.append")
                     trace("desktop_voice_resumed")
                 }
@@ -1112,16 +1310,20 @@ final class LiveSessionAdapter {
                 emit(.liveUserActivity)
                 trace("input_started")
             }
-            if finalizedInput, !startsTurn, inputText.last?.isLetter == true, delta.first?.isLetter == true {
+            if finalizedInput, !startsTurn, inputText.last?.isWhitespace == false,
+               delta.first.map({ $0.isLetter || $0.isNumber }) == true {
                 inputText += " "
             }
             finalizedInput = false
             inputEnd = event["end_ms"] as? Double ?? start
             inputText += delta
+            if !Self.desktopBackchannel(inputText), !LiveRequestRecovery.incompleteAction(inputText) {
+                allowRequestedSpeech()
+            }
             if !backchannel {
                 authorizationText = inputText
                 refreshBrainState()
-                clientBrain?.user(authorizationText, turn: inputTurn)
+                clientBrain?.user(authorizationText, turn: inputTurn, finalized: false)
                 if clientBrain?.holdsFeedDecision == true { cancelPreparedEmail() }
                 if clientBrain?.needsSelectedSource == true, sourceInquiryTurn != inputTurn {
                     sourceInquiryTurn = inputTurn
@@ -1148,12 +1350,19 @@ final class LiveSessionAdapter {
                     return
                 }
                 self.finalizedInput = true
+                self.clientBrain?.finalizeUser(turn: self.inputTurn)
+                self.diagnostics?.record(.turnTransition, ["transition": "calendar_input_settled",
+                    "input_turn": String(self.inputTurn), "input_finalized": "true"])
                 if Self.explicitlyRequestsBackground(self.inputText) {
                     self.backgroundRequestTurns.insert(self.inputTurn)
                 }
                 if !self.turnsWithTools.contains(self.inputTurn),
                    LiveRequestRecovery.isBackchannel(self.authorizationText) {
                     self.resolvedInputTurns.insert(self.inputTurn)
+                    if !self.backendRunning, !self.preparedSpeechPending {
+                        self.append("The latest sound is a backchannel, not a request. Stay quiet. Do not recap, paraphrase, circle back to an email, ask for disposition, or revive earlier content. A later explicit recap must be delegated to read the current source.", type: "session.instructions.append")
+                        self.trace("backchannel_recap_not_requested")
+                    }
                 }
                 #if targetEnvironment(macCatalyst)
                 let needsRecovery = LiveRequestRecovery.requiresQueueAction(self.authorizationText)
@@ -1193,7 +1402,9 @@ final class LiveSessionAdapter {
                     brain.begin(id, live: false, turn: self.inputTurn)
                     self.trace("selected_source_delegated", delegation: id)
                 }
-                self.clientBrain?.settle(turn: self.inputTurn)
+                if !LiveRequestRecovery.isBackchannel(self.authorizationText), !LiveRequestRecovery.incompleteAction(self.authorizationText) {
+                    self.clientBrain?.settle(turn: self.inputTurn)
+                }
                 self.watchSilentInput()
                 self.emitIdleIfSettled()
                 self.emitUnworkedTurnIfSettled()
@@ -1226,7 +1437,8 @@ final class LiveSessionAdapter {
         let call = calls.removeFirst()
         activeCall = call
         if LiveWriteTarget.requiresCurrentRequest(call.name),
-           delegationTurns[call.delegation] != inputTurn || LiveRequestRecovery.isFeedback(inputText) {
+           delegationTurns[call.delegation] != inputTurn || LiveRequestRecovery.isFeedback(inputText)
+            || LiveRequestRecovery.isBackchannel(inputText) || LiveRequestRecovery.incompleteAction(inputText) || !finalizedInput {
             trace("write_request_superseded", call: call.id, delegation: call.delegation)
             outbound(["type": "conversation.item.create", "item": ["type": "function_call_output",
                 "call_id": call.id, "output": "Not executed: this action belongs to an earlier request or the current request is feedback. Do not revive it, retry it, or advance the feed. Handle only the user's latest request."]])
@@ -1322,23 +1534,39 @@ final class LiveSessionAdapter {
     }
 
     private func elapsed(since date: Date?) -> Int {
-        date.map { Int(Date().timeIntervalSince($0) * 1000) } ?? -1
+        date.map { max(0, Int(telemetryNow().timeIntervalSince($0) * 1000)) } ?? -1
+    }
+
+    private static func unfinishedReplyDictation(_ text: String) -> Bool {
+        text.range(of: #"(?i)\b(?:reply|respond|draft|write back)\b.{0,50}\b(?:saying|say|with|that|tell)\b"#, options: .regularExpression) != nil
     }
 
     private func flushSpeech() {
         guard !desktopQuiet else { speechRequest = nil; return }
+        guard !automaticSpeech || narrationMode.automaticNarration else { speechRequest = nil; return }
         guard pendingContext.isEmpty, let request = speechRequest else { return }
+        if !emailOpeningCommitted, let resolve = emailOpeningResolver {
+            guard let latest = resolve() else { cancelEmailOpening(reason: "selection_or_profile_changed"); return }
+            if latest != emailOpeningSelected {
+                emailOpeningSelected = latest
+                logEmailOpening("selected_at_commit", latest)
+                append(latest.line, type: "session.thinking.append")
+                return
+            }
+            emailOpeningCommitted = true
+            logEmailOpening("speech_requested", latest)
+        }
         let current = speechIsCurrent?() != false
         speechRequest = nil
         preparedSpeechPending = false
         guard current else { return }
         speechRequestedAt = ProcessInfo.processInfo.systemUptime
-        diagnostics?.record(.speechRequested, ["engine": "live", "turn_id": historyIDForTurn?(inputTurn) ?? String(inputTurn), "phase": "scheduled"])
+        diagnostics?.record(.speechRequested, ["engine": "live", "turn_id": historyIDForTurn?(inputTurn) ?? String(inputTurn), "phase": "scheduled", "narration_mode": narrationMode.rawValue])
         append(request, type: "session.commentary.append")
     }
 
     func observePlayback(_ level: Double) {
-        guard !closed, !desktopQuiet else { return }
+        guard !closed, !desktopQuiet, !automaticOutputBlocked else { introduceAwayIfSettled(); return }
         let farewellFinished = farewell?.observePlayback(
             level, at: ProcessInfo.processInfo.systemUptime) == true
         if level > 0.003 {
@@ -1346,6 +1574,10 @@ final class LiveSessionAdapter {
             if !audible {
                 audible = true
                 speechRequestedAt = nil
+                if emailOpeningResolver != nil {
+                    emailOpeningPlayed = true
+                    logEmailOpening("playback_started", emailOpeningResolver?())
+                }
                 let playback = (UUID().uuidString, assistantText.isEmpty ? nil : assistantID)
                 observedPlayback = playback
                 onPlaybackBoundary?(playback.0, playback.1, "started")
@@ -1356,12 +1588,14 @@ final class LiveSessionAdapter {
             finishObservedPlayback(phase: "stopped")
             finishTranscript()
             emit(.event(.outputAudioStopped))
+            refreshEmailOpening()
         }
         emitQueueActionRecoveryIfSettled()
         emitIdleIfSettled()
         emitUnworkedTurnIfSettled()
         speakWaitBeatIfOverdue()
         if farewellFinished { emit(.liveFarewellFinished) }
+        introduceAwayIfSettled()
     }
 
     private func finishObservedPlayback(phase: String) {
@@ -1372,7 +1606,7 @@ final class LiveSessionAdapter {
 
     /// Live says nothing while delegated work runs, so after a quiet stretch the user hears one presence line.
     private func speakWaitBeatIfOverdue() {
-        guard !desktopQuiet else { return }
+        guard !desktopQuiet, narrationMode.automaticNarration else { return }
         let working = backendRunning || activeCall != nil || activeFastCall != nil || !calls.isEmpty
             || continuationOwed || !pendingFunctionOutputs.isEmpty
         guard started, !closed, farewell == nil, working, finalizedInput, inputTurn > 0,
@@ -1463,6 +1697,7 @@ final class LiveSessionAdapter {
 
     private var inputNeedsResponse: Bool {
         finalizedInput && !closed && farewell == nil && !authorizationText.isEmpty
+            && !LiveRequestRecovery.isBackchannel(authorizationText) && !LiveRequestRecovery.incompleteAction(authorizationText)
             && !resolvedInputTurns.contains(inputTurn) && !turnsWithTools.contains(inputTurn)
             && locallyAcceptedInputs[inputTurn] == nil
             && (!Self.hasSubstantiveSpeech(speechAfterInput)
@@ -1628,6 +1863,7 @@ final class LiveSessionAdapter {
     }
 
     func close() {
+        cancelEmailOpening(reason: "session_closed")
         silentInputWatchdog?.cancel()
         buttonPresentationWatchdog?.cancel()
         guard !closed else { return }

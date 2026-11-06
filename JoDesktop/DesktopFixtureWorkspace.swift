@@ -81,13 +81,17 @@ struct DesktopFixtureView: View {
                     Button("Section feed") { interactor.sectionFeed() }
                     Button("Finish fixture") { interactor.finish() }
                     Button("Completed actions fixture") { interactor.completedActions() }
+                    Button("Draft review fixture") { interactor.draftReview() }
                     Button("Sent receipts fixture") { interactor.sentReceipts() }
+                    Button("Calendar receipts fixture") { interactor.calendarReceipts() }
+                    Button("Selection stability fixture") { interactor.selectionStability() }
                     Button("Background browser fixture") { interactor.backgroundBrowser(form: false) }
                     Button("Background form fixture") { interactor.backgroundBrowser(form: true) }
+                    Button("Expire task browsers") { Container.shared.backgroundBrowsers().purge() }
                     Button("Export evidence") { interactor.exportEvidence() }
                     Button("Save bundle…") { interactor.saveEvidenceBundle() }
                     Button("Browser fixture") {
-                        let browser = SupervisedBrowserExperiment(context: .init(jobID: UUID(), profileID: nil,
+                        let browser = SupervisedBrowserExperiment(context: .init(jobID: UUID(), profileID: ProfileRuntime.snapshot?.profileId,
                             origin: .init(account: "qa@example.test", messageID: "fixture-1", threadID: "thread-1",
                                 sender: "Same Sender", subject: "Same Subject"),
                             request: "Inspect workshop availability and request a place only after my approval."))
@@ -114,6 +118,48 @@ struct DesktopFixtureView: View {
 class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, DesktopWorkspaceHandler {
     @Published var renderLabel = "Waiting for the workspace to render"
     @Published var evidenceStatus = "No evidence exported"
+
+    func draftReview() {
+        Task {
+            let message = MailMIME.Outgoing(to: "Alex <alex@example.test>", cc: ["team@example.test"],
+                subject: "Re: Project review", body: "Hi Alex,\n\nThursday at 10 works for me. I’ve attached the project notes for our review.\n\nCould we spend the first few minutes on the rollout schedule?\n\nThanks,\nNate",
+                threadId: "thread-1", inReplyTo: "<fixture-1@example.test>",
+                attachments: [.init(filename: "Project notes.txt", mimeType: "text/plain", bytes: Data("Synthetic project notes".utf8))])
+            let action = MailActionReceipt(kind: .draft, account: "qa@example.test", message: message, replyMessageID: "fixture-1")
+            do {
+                _ = try await LocalDraftReview.stage(action: action, message: message, owner: "fixture-user", profile: ProfileRuntime.snapshot?.profileId,
+                    conversation: nil, origin: .init(account: "qa@example.test", messageID: "fixture-1", threadID: "thread-1", sender: "Alex", subject: message.subject),
+                    archiveAfterSave: false, attachmentAccounts: ["qa@example.test"])
+                model?.applyJobs(await Container.shared.dispatchJobs().history())
+            } catch { model?.resultSelectionError = GmailManageTools.detail(error) }
+        }
+    }
+
+    func calendarReceipts() {
+        Task {
+            let store = Container.shared.dispatchJobs()
+            for (index, state) in [CalendarActionReceipt.State.unknown, .failed, .confirmed].enumerated() {
+                var action = CalendarActionReceipt(tool: CalendarTools.create,
+                    arguments: ["summary": state == .confirmed ? "Project review" : "Project review · \(state.rawValue)", "start": "2026-11-04T10:00:00-08:00",
+                        "end": "2026-11-04T10:30:00-08:00", "time_zone": "America/Los_Angeles",
+                        "attendees": ["alex@example.test"]], account: "qa@example.test",
+                    requestKey: "calendar-fixture-\(index)-\(UUID())", parentJobID: nil)
+                let origin = DispatchJob.MailOrigin(account: "qa@example.test", messageID: "fixture-1",
+                    threadID: "thread-1", sender: "Alex", subject: "Project review request")
+                guard let (job, _) = try? await store.beginCalendarAction(action, ownerID: "fixture-user",
+                    profileID: ProfileRuntime.snapshot?.profileId, conversationID: nil, origin: origin) else { continue }
+                action.state = state; action.attempted = true
+                action.providerID = "synthetic-event-\(index)"
+                action.providerLink = "https://calendar.google.com/calendar/event?eid=synthetic-event-\(index)"
+                action.start = action.requestedStart; action.end = action.requestedEnd
+                action.invitationOutcome = state == .confirmed ? "Google confirmed the event. Notifications requested; delivery not verified." : "No provider confirmation."
+                action.archiveState = state == .confirmed ? "unconfirmed — source email kept" : nil
+                await store.recordCalendarAction(job.id, action: action,
+                    result: state == .confirmed ? "Calendar event created. The source email was kept because archiving failed." : "Synthetic \(state.rawValue) calendar operation.")
+            }
+            model?.jobs = await store.history()
+        }
+    }
     private let context: LocalContextStore
     private let queue = LocalTriageQueue(mailAccounts: { ["qa@example.test", "second@example.test"] },
         feedSectionLoader: { section in
@@ -149,6 +195,9 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
         super.onLoad(viewModel: viewModel)
         model = viewModel
         Container.shared.backgroundBrowsers().$sessions.sink { [weak viewModel] in viewModel?.browserTasks = $0 }
+        Container.shared.applicationTasks().$selectedTaskID.removeDuplicates().sink { [weak viewModel] id in
+            viewModel?.applyTaskSelection(id.flatMap { Container.shared.dispatchJobs().existing($0) })
+        }
         Container.shared.applicationTasks().$revision.dropFirst().sink { [weak viewModel] _ in
             Task { @MainActor in
                 guard let viewModel else { return }
@@ -310,7 +359,7 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
             let request = DesktopEmailReader.Request(selection: .init(account: email.account, messageID: id),
                 threadID: email.threadId, ownerID: "fixture-user", profileID: model.profileID,
                 conversationID: model.conversationID, headersOnly: false)
-            let text = "FIRST MARKER · Complete synthetic email \(id).\n\n"
+            let text = "FIRST MARKER · Complete synthetic email \(id). Café 🙂\n\n"
                 + "Email link: https://example.com/?jo-link-test=email\n\n"
                 + (1...30).map { "Paragraph \($0). This complete email remains readable while the conversation scrolls independently below it." }
                     .joined(separator: "\n\n")
@@ -384,7 +433,7 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
                 let origin = DispatchJob.MailOrigin(account: "qa@example.test", messageID: "fixture-1",
                     threadID: "thread-1", sender: "Synthetic sender", subject: "Workshop")
                 let job = try tasks.job(request: form ? "browser form fixture: request a place after approval"
-                    : "browser fixture: bring back the workshop times", commandID: nil, origin: origin, profile: nil)
+                    : "browser fixture: bring back the workshop times", commandID: nil, origin: origin, profile: ProfileRuntime.snapshot?.profileId)
                 await tasks.submit(job)
                 model.jobs = await Container.shared.dispatchJobs().history()
                 model.showingActivity = true
@@ -526,7 +575,7 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
         Task {
             let outcome = LocalTriageQueue.Outcome(jobId: id, task: job.task, text: job.result ?? "",
                 ok: job.isDone, expects: .answer, about: origin.about)
-            if let step = await queue.selectReturnedResult(outcome, profileID: nil) {
+            if let step = await queue.selectReturnedResult(outcome, profileID: ProfileRuntime.snapshot?.profileId) {
                 await present(step, delayProjection: false)
                 model?.selectedJob = nil
             }
@@ -546,22 +595,43 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
             do {
                 let jobs = Container.shared.dispatchJobs()
                 for index in 0..<17 {
-                    let message = MailMIME.Outgoing(to: "Dana <dana@example.test>", cc: ["team@example.test"],
+                    var message = MailMIME.Outgoing(to: "Dana <dana@example.test>", cc: ["team@example.test"],
                         subject: "Fixture reply \(index + 1)", body: "Thanks, Dana.\n\nThe synthetic review is ready.\nNate",
                         threadId: "fixture-thread-\(index)", inReplyTo: "<fixture-\(index)@example.test>")
-                    let action = MailActionReceipt(kind: index == 15 ? .draft : .send, account: "qa@example.test",
+                    if index == 16 {
+                        message.subject = "Fwd: Synthetic invoice"
+                        message.body = "Please review this invoice.\n\n---------- Forwarded message ----------\nFrom: Vendor <notifications@billing.example>\nSubject: Synthetic invoice\n\nTotal: $100. No real transaction."
+                    }
+                    var action = MailActionReceipt(kind: index == 15 ? .draft : index == 16 ? .forward : .send, account: "qa@example.test",
                         message: message, replyMessageID: "fixture-source-\(index)")
+                    if index == 16 {
+                        action.forwardNote = "Please review this invoice."
+                        action.archiveState = "unconfirmed"
+                        action.omittedAttachments = [.init(filename: "large-scan.pdf", mimeType: "application/pdf",
+                            size: 24_000_000, reason: "Exceeds attachment limit")]
+                    }
                     let origin = DispatchJob.MailOrigin(account: action.account, messageID: action.replyMessageID!,
                         threadID: message.threadId!, sender: "Dana", subject: message.subject)
-                    let (job, _) = try await jobs.beginMailAction(action, ownerID: "fixture-user", profileID: nil,
+                    let (job, _) = try await jobs.beginMailAction(action, ownerID: "fixture-user", profileID: ProfileRuntime.snapshot?.profileId,
                         conversationID: nil, origin: origin)
                     _ = try await MailActionAudit.write(job, receipt: "Synthetic provider confirmed this message. No external request was made.") {
                         let sent: [String: Any] = ["id": "fixture-sent-\(index)", "threadId": message.threadId!]
-                        return action.kind == .draft ? ["id": "fixture-draft-\(index)", "message": sent] : sent
+                        return action.kind.isDraft ? ["id": "fixture-draft-\(index)", "message": sent] : sent
                     }
                 }
                 model?.jobs = await jobs.history()
             } catch { model?.resultSelectionError = "Receipt fixture failed: \(error.localizedDescription)" }
+        }
+    }
+
+    func selectionStability() {
+        Task {
+            for index in 1...30 {
+                try? await Task.sleep(for: .milliseconds(300))
+                model?.response = "Synthetic transcript update \(index). No audio or provider writes."
+                updateFixtureEmailReader()
+                if index == 15 { completedActions() }
+            }
         }
     }
 
@@ -572,7 +642,7 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
                 let id = UUID(), subject = index == 2 ? "Project update — a deliberately long subject with café ☕ and extensive release details" : "Project update"
                 let origin = DispatchJob.MailOrigin(account: index == 1 ? "personal@example.test" : "qa@example.test",
                     messageID: "activity-\(index)", threadID: "thread-\(index)", sender: "Dana", subject: subject)
-                await jobs.begin(id: id, task: "Archive only the original email from Dana about \(subject). Keep its account and thread unchanged. Do not archive any other email.", profileId: nil, origin: origin)
+                await jobs.begin(id: id, task: "Archive only the original email from Dana about \(subject). Keep its account and thread unchanged. Do not archive any other email.", profileId: ProfileRuntime.snapshot?.profileId, origin: origin)
                 if state != "unknown" { await jobs.receipt(id, callId: "fixture", tool: index == 1 ? "send_email" : "archive_message", failed: state == "partial") }
                 await jobs.finish(id, state: state, result: state == "done"
                     ? "Confirmed synthetic action on \(subject). Complete original receipt retained here for inspection. No provider request was made."
@@ -657,6 +727,11 @@ private final class FixtureGrants: GoogleGrantStorage, @unchecked Sendable {
 }
 private struct FixtureNoNetwork: HTTPDataTransport {
     func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        if let url = request.url, url.host == "gmail.googleapis.com", url.path.hasSuffix("/drafts"), request.httpMethod == "POST" {
+            let body: [String: Any] = ["id": "fixture-draft-" + UUID().uuidString,
+                "message": ["id": "fixture-message", "threadId": "thread-1"]]
+            return (try JSONSerialization.data(withJSONObject: body), HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
         guard let url = request.url, url.host == "gmail.googleapis.com", url.path.contains("fixture-") || url.path.contains("thread-") else {
             throw URLError(.notConnectedToInternet)
         }

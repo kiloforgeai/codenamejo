@@ -50,6 +50,148 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
         await LocalCalendarWrites.run(name: LocalCalendarWrites.respond, argumentsJSON: GmailReadTools.json(args), defer: true)
     }
 
+    func testCalendarReceiptIsPendingBeforeWriteThenDurableAndDuplicateCallbackDoesNotWrite() async throws {
+        provider.emptyCalendar = true
+        var pendingWasSaved = false
+        provider.onCalendarWrite = {
+            let data = try? Data(contentsOf: self.folder.appendingPathComponent("jobs.json"))
+            pendingWasSaved = data.map { String(decoding: $0, as: UTF8.self).contains("calendarAction") } == true
+        }
+        let call = "create-durable"
+        let origin = DispatchJob.MailOrigin(account: "owner@example.test", messageID: "invite-a", threadID: "thread-a", sender: "Alex", subject: "Review request")
+        let result = await CalendarTools.run(name: CalendarTools.create, argumentsJSON: GmailReadTools.json(create),
+            callID: call, origin: origin)
+        XCTAssertFalse(result.failed, result.output)
+        XCTAssertTrue(pendingWasSaved, "Persist the pending operation before contacting Google")
+        _ = await CalendarTools.run(name: CalendarTools.create, argumentsJSON: GmailReadTools.json(create), callID: call, origin: origin)
+        XCTAssertEqual(provider.creates, 1)
+        let restarted = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        let history = await restarted.history()
+        XCTAssertEqual(history.count, 1)
+        let row = try XCTUnwrap(history.first)
+        let action = try XCTUnwrap(row.calendarAction)
+        XCTAssertEqual(action.state, .confirmed)
+        XCTAssertEqual(action.title, "Project Review")
+        XCTAssertEqual(action.start, create["start"] as? String)
+        XCTAssertEqual(action.timeZone, "America/Los_Angeles")
+        XCTAssertNotNil(action.providerID)
+        XCTAssertEqual(row.origin, origin)
+        XCTAssertTrue(action.invitationOutcome.contains("delivery is not verified"))
+        XCTAssertTrue(row.activityTitle.hasPrefix("Created"))
+        let model = DesktopWorkspaceModel(); model.jobs = history
+        XCTAssertEqual(model.activityJobs.map(\.id), [row.id])
+    }
+
+    func testUnknownCalendarWriteSurvivesRestartAndNewCallIDCannotDuplicateEvent() async throws {
+        provider.emptyCalendar = true
+        provider.failAfterCreate = true
+        let first = await CalendarTools.run(name: CalendarTools.create, argumentsJSON: GmailReadTools.json(create), callID: "unknown-1")
+        XCTAssertTrue(first.failed)
+        let restarted = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        Container.shared.dispatchJobs.register { restarted }
+        let before = provider.calls.count
+        let retry = await CalendarTools.run(name: CalendarTools.create, argumentsJSON: GmailReadTools.json(create), callID: "unknown-2")
+        XCTAssertTrue(retry.failed)
+        XCTAssertEqual(provider.creates, 1)
+        XCTAssertEqual(provider.calls.count, before, "Do not repeat an unresolved operation")
+        let rows = await restarted.history()
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows.first?.calendarAction?.state, .unknown)
+        XCTAssertTrue(rows.first?.activityNeedsAttention == true)
+        let model = DesktopWorkspaceModel(); model.jobs = rows
+        XCTAssertEqual(model.activityJobs.count, 1)
+        XCTAssertEqual(model.activityReviewCount, 1, "Unknown calendar outcomes must appear in the activity review count")
+    }
+
+    func testRSVPReceiptKeepsConfirmedCalendarAndFailedArchiveSeparate() async throws {
+        provider.archiveFailure = true
+        let result = await LocalCalendarWrites.run(name: LocalCalendarWrites.respond,
+            argumentsJSON: GmailReadTools.json(accept), defer: true, callID: "rsvp-receipt")
+        XCTAssertEqual(result.ok, false)
+        let rows = await Container.shared.dispatchJobs().history()
+        let row = try XCTUnwrap(rows.first)
+        XCTAssertEqual(row.calendarAction?.state, .confirmed)
+        XCTAssertEqual(row.calendarAction?.response, "accepted")
+        XCTAssertTrue(row.calendarAction?.archiveState?.hasPrefix("unconfirmed") == true)
+        XCTAssertTrue(row.activityTitle.hasPrefix("RSVP recorded"))
+        XCTAssertTrue(row.activityNeedsAttention)
+        XCTAssertEqual(row.origin?.messageID, "invite-a")
+        let model = DesktopWorkspaceModel(); model.jobs = rows
+        XCTAssertEqual(model.activityReviewCount, 1, "A failed archive still needs attention after a confirmed RSVP")
+    }
+
+    func testUpdatedEventAndParentArchiveHaveIndependentReceipts() async throws {
+        let store = Container.shared.dispatchJobs(), parent = UUID()
+        await store.begin(id: parent, task: "Move review and archive", profileId: nil)
+        let result = await CalendarTools.run(name: CalendarTools.update,
+            argumentsJSON: GmailReadTools.json(["account": "owner@example.test", "event_id": "event-a", "summary": "Renamed review"]),
+            callID: "update-receipt", parentJobID: parent)
+        XCTAssertFalse(result.failed, result.output)
+        await store.receipt(parent, callId: "archive-failed", tool: "archive_message", failed: true)
+        let rows = await store.history()
+        let row = try XCTUnwrap(rows.first { $0.calendarAction != nil })
+        XCTAssertEqual(row.calendarAction?.title, "Renamed review")
+        XCTAssertEqual(row.calendarAction?.state, .confirmed)
+        XCTAssertEqual(row.calendarAction?.parentJobID, parent)
+        XCTAssertTrue(row.calendarAction?.archiveState?.hasPrefix("unconfirmed") == true)
+        XCTAssertTrue(row.activityTitle.hasPrefix("Updated"))
+        await store.receipt(parent, callId: "archive-success", tool: "archive_message", failed: false)
+        let updated = await store.history()
+        XCTAssertEqual(updated.first { $0.id == row.id }?.calendarAction?.archiveState, "confirmed")
+    }
+
+
+
+    func testMissingProviderConfirmationCannotSaveASuccessSentence() async throws {
+        provider.emptyCalendar = true; provider.omitCreateConfirmation = true
+        let result = await CalendarTools.run(name: CalendarTools.create, argumentsJSON: GmailReadTools.json(create), callID: "missing-id")
+        XCTAssertTrue(result.failed)
+        XCTAssertFalse(result.output.hasPrefix("Created"))
+        let rows = await Container.shared.dispatchJobs().history()
+        XCTAssertEqual(rows.first?.calendarAction?.state, .unknown)
+        XCTAssertFalse(rows.first?.result?.hasPrefix("Created") == true)
+        XCTAssertNotNil(rows.first?.calendarAction?.providerID, "Keep the requested stable event ID for inspection")
+    }
+
+    func testForegroundCreateThenFailedArchiveRetainsCalendarSuccess() async throws {
+        provider.emptyCalendar = true
+        let conversation = UUID().uuidString
+        let origin = DispatchJob.MailOrigin(account: "owner@example.test", messageID: "invite-a",
+            threadID: "thread-a", sender: "Alex", subject: "Review")
+        let created = await CalendarTools.run(name: CalendarTools.create, argumentsJSON: GmailReadTools.json(create),
+            callID: "create-before-archive", conversationID: conversation, origin: origin)
+        XCTAssertFalse(created.failed)
+        provider.archiveFailure = true
+        let archive = await LocalMailWrites.run(name: "archive_message",
+            argumentsJSON: #"{"account":"owner@example.test","message_id":"invite-a"}"#,
+            defer: false, conversationId: conversation)
+        XCTAssertEqual(archive.ok, false)
+        let rows = await Container.shared.dispatchJobs().history()
+        let action = try XCTUnwrap(rows.first?.calendarAction)
+        XCTAssertEqual(action.state, .confirmed)
+        XCTAssertEqual(action.archiveState, "unconfirmed — archive failed")
+    }
+
+    func testFailedPreflightAndInterruptedPendingReceiptRemainTruthful() async throws {
+        var invalid = create; invalid["start"] = "not a date"
+        let result = await CalendarTools.run(name: CalendarTools.create, argumentsJSON: GmailReadTools.json(invalid), callID: "invalid")
+        XCTAssertTrue(result.failed)
+        var rows = await Container.shared.dispatchJobs().history()
+        XCTAssertEqual(rows.first?.calendarAction?.state, .failed)
+        XCTAssertEqual(provider.creates, 0)
+        let action = CalendarActionReceipt(tool: CalendarTools.create, arguments: create,
+            account: "owner@example.test", requestKey: "interrupted", parentJobID: nil)
+        _ = try await Container.shared.dispatchJobs().beginCalendarAction(action, ownerID: "regression-user",
+            profileID: nil, conversationID: nil, origin: nil)
+        let restarted = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        rows = await restarted.history()
+        XCTAssertEqual(rows.first { $0.calendarAction?.requestKey == "interrupted" }?.calendarAction?.state, .unknown)
+        ProfileRuntime.install(.init(profileId: "other", isDefault: false, emails: ["owner@example.test"]))
+        let otherRows = await restarted.history()
+        XCTAssertTrue(otherRows.isEmpty)
+    }
+
+
     func testRepeatedCreationReadsFirstAndCreatesOnlyOnce() async {
         provider.emptyCalendar = true
         let first = await CalendarTools.run(name: CalendarTools.create, argumentsJSON: GmailReadTools.json(create))
@@ -309,11 +451,42 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
         provider.onLabelsRead = {
             ProfileRuntime.install(.init(profileId: "other-profile", isDefault: false, emails: ["owner@example.test"]))
         }
-        let result = await LocalMailWrites.run(name: "label_message",
-            argumentsJSON: ##"{"message_id":"invite-a","account":"owner@example.test","label":"#Followup"}"##,
-            defer: false, source: source)
+        let result = await ApplicationTasks().perform(name: "label_message",
+            arguments: ##"{"message_id":"invite-a","account":"owner@example.test","label":"#Followup"}"##,
+            profile: nil, origin: .init(account: "owner@example.test", messageID: "invite-a",
+                threadID: "thread-a", sender: "Sender", subject: "Subject"), inputSource: "button")
         XCTAssertEqual(result.ok, false)
         XCTAssertFalse(provider.calls.contains { $0.httpMethod == "POST" })
+    }
+
+    func testDesktopActionsKeepAcceptedInboxWhenForegroundIsElsewhere() async throws {
+        let queue = await foregroundInOtherInbox()
+        let source = DispatchJob.MailOrigin(account: "owner@example.test", messageID: "invite-a",
+            threadID: "thread-a", sender: "Sender", subject: "Same subject")
+        let tasks = ApplicationTasks()
+        for name in ["archive_message", "label_message", "mark_spam", "trash_message"] {
+            let args = GmailReadTools.json(["account": source.account, "message_id": source.messageID, "label": "#Followup"])
+            let result = await tasks.perform(name: name, arguments: args, profile: nil, origin: source, inputSource: "button")
+            XCTAssertEqual(result.ok, true, result.text)
+            let count = provider.calls.filter { $0.httpMethod == "POST" }.count
+            _ = await tasks.perform(name: name, arguments: args, profile: nil, origin: source, inputSource: "button")
+            XCTAssertEqual(provider.calls.filter { $0.httpMethod == "POST" }.count, count)
+        }
+        let writes = provider.calls.filter { $0.httpMethod == "POST" }
+        XCTAssertFalse(writes.isEmpty)
+        XCTAssertTrue(writes.allSatisfy { $0.value(forHTTPHeaderField: "Authorization") == "Bearer owner@example.test" })
+        XCTAssertFalse(writes.contains { $0.url?.path.contains("booking-b") == true })
+        let mailbox = await queue.currentMailbox
+        XCTAssertEqual(mailbox, "work@example.test")
+        let rows = await Container.shared.dispatchJobs().history()
+        XCTAssertEqual(rows.count, 4)
+        XCTAssertTrue(rows.allSatisfy { $0.isDone && $0.origin == source })
+
+        let mismatch = await tasks.perform(name: "archive_message",
+            arguments: #"{"account":"work@example.test","message_id":"booking-b"}"#,
+            profile: nil, origin: source, inputSource: "button")
+        XCTAssertEqual(mismatch.ok, false)
+        XCTAssertEqual(provider.calls.filter { $0.httpMethod == "POST" }.count, writes.count)
     }
 
     func testFailedCommandRestoresItsPinnedSourceAndRetriesOnlyUnfinishedSteps() async throws {
@@ -773,6 +946,9 @@ private final class IssueProvider: HTTPDataTransport, @unchecked Sendable {
     var creates = 0, patches = 0
     var archived: [String] = []
     var onLabelsRead: (() -> Void)?
+    var onCalendarWrite: (() -> Void)?
+    var failAfterCreate = false
+    var omitCreateConfirmation = false
     var emptyFirstCalendarPage = false, repeatedCalendarPage = false
     var shiftCreatedTime = false, patchStartOnly = false
     var emptyCalendar = false, accepted = false, readFailure = false, patchFailure = false, archiveFailure = false, archiveThrottled = false
@@ -788,6 +964,7 @@ private final class IssueProvider: HTTPDataTransport, @unchecked Sendable {
         if url.path.contains("/calendar/") {
             if method == "GET", readFailure { return (500, [:]) }
             if method == "PATCH" {
+                onCalendarWrite?()
                 patches += 1
                 if patchFailure { return (404, [:]) }
                 accepted = true
@@ -795,14 +972,23 @@ private final class IssueProvider: HTTPDataTransport, @unchecked Sendable {
                 if patchStartOnly {
                     let body = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data())) as? [String: Any]
                     result["start"] = body?["start"]
+                } else {
+                    let body = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data())) as? [String: Any] ?? [:]
+                    for (key, value) in body { result[key] = value }
                 }
                 return (200, result)
             }
             if method == "POST" {
+                onCalendarWrite?()
                 if created != nil { return (409, [:]) }
                 creates += 1
                 created = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data())) as? [String: Any]
                 if shiftCreatedTime { created?["start"] = ["dateTime": "2026-11-02T11:00:00-08:00"] }
+                if failAfterCreate { return (500, [:]) }
+                if omitCreateConfirmation {
+                    var incomplete = created ?? [:]; incomplete.removeValue(forKey: "id")
+                    return (200, incomplete)
+                }
                 return (200, created ?? [:])
             }
             if url.path.hasSuffix("/events") {

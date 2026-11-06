@@ -1,4 +1,12 @@
 import XCTest
+import FactoryKit
+
+private struct BrainCalendarGrants: GoogleGrantStorage {
+    func all() -> [GoogleAccountStore.Grant] { [.init(email: "owner@example.test", refreshToken: "fixture", scopes: GoogleCredential.calendarScopes, grantedAt: Date(), isPrimary: true)] }
+    func save(_ grant: GoogleAccountStore.Grant) -> Bool { true }
+    func remove(_ email: String) {}
+    func removeAll() {}
+}
 @testable import CodenameJo
 
 final class LiveClientBrainTests: XCTestCase {
@@ -38,6 +46,229 @@ final class LiveClientBrainTests: XCTestCase {
     private static let call: [String: Any] = ["type": "function_call", "call_id": "c1",
         "name": "archive_message", "arguments": "{\"message_id\":\"a\"}"]
     @MainActor private func drain() async { for _ in 0..<20 { await Task.yield() } }
+
+    @MainActor func testConfirmedReplyTargetContinuesPreservedBodyInsteadOfAnotherDispositionQuestion() async throws {
+        let h = Harness()
+        let source = #"{"done":false,"item":{"id":"A","threadId":"thread-A","account":"owner@example.test","subject":"Coffee"}}"#
+        h.brain.updateState(source, scope: "work")
+        h.brain.user("a young woman", turn: 1)
+        h.brain.user("Reply thanking them for the insightful call, suggest coffee, and share https://example.test/weekly which runs every Tuesday.", turn: 2)
+        h.brain.begin("reply", live: true, turn: 2); h.brain.settle(turn: 2)
+        await waitForRequest(1, in: h)
+        h.reply([["type": "message", "content": [["text": "Which email did you mean?"]]]])
+        await drain()
+        h.brain.user("No, that's the one. I'm not mentioning a young woman.", turn: 3)
+        h.brain.begin("clarification", live: true, turn: 3); h.brain.settle(turn: 3)
+        await waitForRequest(2, in: h)
+        let context = try XCTUnwrap(h.requests.last?["context"] as? String)
+        XCTAssertTrue(context.contains("Tuesday"))
+        let preserved = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(context.utf8)) as? [String: Any])
+        XCTAssertTrue(((preserved["pendingReply"] as? [String: Any])?["original_request"] as? String)?.contains("example.test/weekly") == true)
+        XCTAssertTrue(context.contains("target_confirmed"))
+        h.reply([["type": "message", "content": [["text": "What would you like to do with it?"]]]])
+        await waitForRequest(3, in: h)
+        XCTAssertFalse(h.speech.contains { $0.contains("What would you like") })
+        h.reply([["type": "function_call", "call_id": "one-reply", "name": "reply_email",
+            "arguments": #"{"account":"owner@example.test","thread_id":"thread-A","body":"Thank you for the insightful call. Let's have coffee. https://example.test/weekly runs every Tuesday."}"#]])
+        await waitForCalls(1, in: h)
+        XCTAssertEqual(h.calls.count, 1)
+        XCTAssertTrue((h.calls.first?["arguments"] as? String)?.contains("Tuesday") == true)
+        h.brain.item(["type": "function_call_output", "call_id": "one-reply", "output": "Outcome unknown; inspect receipt before retrying."])
+        h.brain.continueResponse(delegation: "clarification")
+        await waitForRequest(4, in: h)
+        h.reply([["type": "function_call", "call_id": "duplicate", "name": "reply_email",
+            "arguments": #"{"account":"owner@example.test","thread_id":"thread-A","body":"Again"}"#]])
+        await waitForRequest(5, in: h)
+        XCTAssertEqual(h.calls.count, 1)
+        h.reply([["type": "message", "content": [["text": "The send outcome needs checking."]]]])
+        await drain()
+        h.brain.user("Start over", turn: 4)
+        h.brain.updateState(source, scope: "other-profile")
+        h.brain.user("What is selected?", turn: 5)
+        h.brain.begin("new-profile", live: true, turn: 5); h.brain.settle(turn: 5)
+        await waitForRequest(6, in: h)
+        XCTAssertFalse((h.requests.last?["context"] as? String)?.contains("pendingReply") == true)
+        h.reply([["type": "message", "content": [["text": "The selected email." ]]]])
+        await drain(); h.brain.close()
+    }
+
+    @MainActor func testLiveCalendarSpeechCannotContradictCheckedSlotOrInventStaleConflict() async throws {
+        Container.shared.manager.push()
+        let previous = ProfileRuntime.snapshot; ProfileRuntime.install(nil)
+        Container.shared.googleGrantStorage.register { BrainCalendarGrants() }
+        defer { Scope.singleton.reset(); Container.shared.manager.pop(); ProfileRuntime.install(previous) }
+        let h = Harness()
+        let checked = ISO8601DateFormatter().date(from: "2026-11-03T20:00:00Z")!
+        h.brain.now = { checked }; h.brain.timeZone = { TimeZone(identifier: "America/Los_Angeles")! }
+        h.brain.updateState("email A", scope: "calendar-fixture")
+        for turn in 1...2 {
+            h.brain.user("Check whether I am free Monday from 1 to 2 Pacific.", turn: turn)
+            XCTAssertTrue(h.brain.needsExactCalendarSpeech, "Specific-date checks also bypass speaker paraphrasing")
+            h.brain.begin("d\(turn)", live: true, turn: turn); h.brain.settle(turn: turn)
+            await waitForRequest((turn - 1) * 3 + 1, in: h)
+            let id = "read-\(turn)"
+            h.reply([["type": "function_call", "call_id": id, "name": CalendarTools.list,
+                "arguments": #"{"time_min":"2026-11-09T00:00:00-08:00","time_max":"2026-11-10T00:00:00-08:00","time_zone":"America/Los_Angeles"}"#]])
+            await waitForCalls(turn, in: h)
+            XCTAssertTrue((h.calls.last?["arguments"] as? String)?.contains("availability_check") == true)
+            let busy = turn == 1 ? [["start": "2026-11-09T20:00:00Z", "end": "2026-11-09T21:00:00Z"]]
+                : [["start": "2026-11-09T21:30:00Z", "end": "2026-11-09T22:00:00Z"]]
+            h.brain.item(["type": "function_call_output", "call_id": id, "output": GmailReadTools.json([
+                ["account": "owner@example.test", "complete": true, "coverage": "complete", "source": "live",
+                 "availability": ["timeMin": "2026-11-09T00:00:00-08:00", "timeMax": "2026-11-10T00:00:00-08:00", "busy": busy]]])])
+            h.brain.continueResponse(delegation: "d\(turn)"); await waitForRequest((turn - 1) * 3 + 2, in: h)
+            h.reply([["type": "function_call", "call_id": "slot-\(turn)", "name": CalendarAvailabilityEvidence.toolName,
+                "arguments": GmailReadTools.json(["receipt_id": id, "start": "2026-11-09T15:00:00-06:00", "end": "2026-11-09T16:00:00-06:00"])]])
+            await waitForRequest(turn * 3, in: h)
+            // Deliberately contradict the actual receipt in both directions.
+            h.reply([["type": "message", "content": [["text": turn == 1 ? "There is a conflict from 1:30 to 2 Pacific." : "You are free from 1 to 2 Pacific."]]]])
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while h.speech.count < turn, .now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+            XCTAssertEqual(h.speech.count, turn)
+            XCTAssertTrue(h.speech.last?.contains(turn == 1 ? "is free" : "conflict") == true)
+            XCTAssertEqual(h.speech.last?.contains("1:30 PM"), turn == 2)
+        }
+        h.brain.now = { checked.addingTimeInterval(CalendarTools.cacheFreshness + 1) }
+        h.brain.user("What is the calendar conflict?", turn: 3)
+        h.brain.begin("d3", live: true, turn: 3); h.brain.settle(turn: 3)
+        await waitForRequest(7, in: h)
+        h.reply([["type": "message", "content": [["text": "You have a conflict from 1:30 to 2."]]]])
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while h.failures.isEmpty, .now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+        XCTAssertEqual(h.speech.count, 3, "The unverified status is also spoken")
+        XCTAssertTrue(h.speech.last?.contains("unverified") == true)
+        XCTAssertTrue(h.failures.last?.contains("unverified") == true)
+        XCTAssertFalse(GmailReadTools.json(h.events).contains("There is a conflict from 1:30"))
+        h.brain.close()
+    }
+
+    @MainActor func testSchedulingReplyAdvanceKeepsOriginalIntentThroughClarificationAndRestart() async throws {
+        Container.shared.manager.push()
+        let previousProfile = ProfileRuntime.snapshot
+        ProfileRuntime.install(nil)
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let backend = BackendService(restoringSession: false); backend.userId = "calendar-intent-test"
+        Container.shared.backend.register { backend }
+        Container.shared.googleGrantStorage.register { BrainCalendarGrants() }
+        let store = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        Container.shared.dispatchJobs.register { store }
+        defer { Scope.singleton.reset(); Container.shared.manager.pop(); ProfileRuntime.install(previousProfile); try? FileManager.default.removeItem(at: folder) }
+        let a = #"{"done":false,"item":{"id":"A","threadId":"thread-A","account":"owner@example.test","from":"Alex <alex@example.test>","subject":"Cancelled Nov 4","emailContent":{"messages":[{"id":"A","threadId":"thread-A","from":"Alex","textComplete":true,"fullReadComplete":true,"text":"Reschedule to Monday November 9, 1:30–4 PM Central. Include Alex and Sam. Quoted history: cancelled November 4."}]}}}"#
+        let b = #"{"done":false,"item":{"id":"B","threadId":"thread-B","account":"owner@example.test","subject":"Order delivery","snippet":"Arrives tomorrow"}}"#
+        let h = Harness()
+        h.brain.now = { ISO8601DateFormatter().date(from: "2026-11-03T18:00:00Z")! }
+        h.brain.updateState(a, scope: "work")
+        h.brain.assistant("Monday November 9, 3–4 PM Central works.")
+        h.brain.user("Reply that 3–4 works and send an invite to both.", turn: 1)
+        h.brain.begin("d1", live: true, turn: 1); h.brain.settle(turn: 1)
+        await waitForRequest(1, in: h)
+        h.reply([["type": "function_call", "call_id": "availability", "name": CalendarTools.list,
+            "arguments": #"{"time_min":"2026-11-09T00:00:00-08:00","time_max":"2026-11-10T00:00:00-08:00","availability_check":true}"#]])
+        await waitForCalls(1, in: h)
+        h.brain.item(["type": "function_call_output", "call_id": "availability", "output": #"[{"account":"owner@example.test","complete":true,"availability":{"timeMin":"2026-11-09T00:00:00-08:00","timeMax":"2026-11-10T00:00:00-08:00","busy":[]}}]"#])
+        h.brain.continueResponse(delegation: "d1"); await waitForRequest(2, in: h)
+        h.reply([["type": "function_call", "call_id": "reply", "name": "send_email",
+            "arguments": #"{"account":"owner@example.test","thread_id":"thread-A","reply_message_id":"A","body":"November 9, 3–4 PM Central works."}"#]])
+        await waitForCalls(2, in: h)
+        let origin = try XCTUnwrap(DispatchJob.MailOrigin.captured(in: a))
+        let mail = MailActionReceipt(kind: .send, account: origin.account,
+            message: .init(to: "alex@example.test", cc: ["sam@example.test"], subject: "Re: meeting", body: "November 9 works", threadId: origin.threadID),
+            replyMessageID: "A", requestKey: "foreground:reply")
+        let (sent, _) = try await store.beginMailAction(mail, ownerID: backend.userId!, profileID: nil, conversationID: nil, origin: origin)
+        _ = await store.recordMailAction(sent.id, state: .sent, result: "Sent and archived", provider: ["id": "sent-a", "threadId": "thread-A"])
+        h.brain.updateState(b, scope: "work") // Autoarchive advances before its delayed result arrives.
+        h.brain.item(["type": "function_call_output", "call_id": "reply", "output": "Sent and archived"])
+        h.brain.user("What is the conflict? When did we agree to meet?", turn: 2)
+        h.brain.begin("d2", live: true, turn: 2); h.brain.settle(turn: 2)
+        await waitForRequest(3, in: h)
+        let raw = try XCTUnwrap(h.requests.last?["context"] as? String)
+        let context = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
+        XCTAssertTrue(GmailReadTools.json(context["selectedEmailEvidence"] as? [String: Any] ?? [:]).contains("November 9"))
+        XCTAssertFalse(GmailReadTools.json(context["selectedEmailEvidence"] as? [String: Any] ?? [:]).contains("delivery"))
+        XCTAssertEqual((context["calendarIntent"] as? [String: Any])?["reply"] as? String, "confirmed")
+        h.reply([["type": "message", "content": [["text": "We agreed November 9. The invitation is still pending."]]]]); await drain()
+        h.brain.close()
+
+        // Reconnect with B still visible; the accepted source and finished reply remain durable.
+        let restored = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        Container.shared.dispatchJobs.register { restored }
+        let next = Harness()
+        next.brain.now = h.brain.now
+        next.brain.updateState(b, scope: "work")
+        next.brain.user("Send the invite for 30 minutes to both.", turn: 1)
+        next.brain.begin("d3", live: true, turn: 1); next.brain.settle(turn: 1)
+        await waitForRequest(1, in: next)
+        let continued = try XCTUnwrap(next.requests.last?["context"] as? String)
+        XCTAssertTrue(continued.contains("November 9"))
+        let intent = try XCTUnwrap(restored.pendingCalendarIntent)
+        XCTAssertEqual(intent.source.messageID, "A")
+        XCTAssertEqual(intent.replyState, "confirmed")
+        XCTAssertEqual(intent.availability?.id, "availability")
+        XCTAssertTrue(intent.availability?.complete == true)
+        XCTAssertNotNil(intent.refusal(name: "send_email", arguments: "{}"))
+        XCTAssertNotNil(intent.refusal(name: CalendarTools.create, arguments: #"{"account":"owner@example.test","start":"2026-11-04T13:00:00-08:00","end":"2026-11-04T13:30:00-08:00"}"#))
+        XCTAssertFalse(intent.refers("When does this order arrive?", selection: b))
+        XCTAssertFalse(intent.refers("What does this email say?", selection: b))
+        let args: [String: Any] = ["account": origin.account, "summary": "Meeting", "start": "2026-11-09T13:00:00-08:00",
+            "end": "2026-11-09T13:30:00-08:00", "time_zone": "America/Los_Angeles", "attendees": ["alex@example.test", "sam@example.test"]]
+        next.reply([["type": "function_call", "call_id": "invite", "name": CalendarTools.create, "arguments": GmailReadTools.json(args)]])
+        await waitForCalls(1, in: next)
+        var event = CalendarActionReceipt(tool: CalendarTools.create, arguments: args, account: origin.account, requestKey: "invite", parentJobID: nil)
+        let (created, _) = try await restored.beginCalendarAction(event, ownerID: backend.userId!, profileID: nil, conversationID: nil, origin: origin)
+        event.state = .confirmed; event.providerID = "event-a"
+        _ = await restored.recordCalendarAction(created.id, action: event, result: "Created November 9")
+        next.brain.item(["type": "function_call_output", "call_id": "invite", "output": "Created November 9"])
+        XCTAssertNil(restored.pendingCalendarIntent)
+        XCTAssertEqual(h.calls.filter { $0["name"] as? String == "send_email" }.count, 1)
+        XCTAssertEqual(next.calls.filter { $0["name"] as? String == CalendarTools.create }.count, 1)
+        XCTAssertTrue(next.calls.allSatisfy { ($0["arguments"] as? String)?.contains("thread-B") != true })
+        next.brain.close()
+    }
+
+    @MainActor func testCalendarObligationPersistsOnlyFinalSpeechAndCorrectionSurvivesRestart() async throws {
+        Container.shared.manager.push()
+        let previous = ProfileRuntime.snapshot; ProfileRuntime.install(nil)
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let backend = BackendService(restoringSession: false); backend.userId = "calendar-finalization"
+        Container.shared.backend.register { backend }
+        let store = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        Container.shared.dispatchJobs.register { store }
+        defer { Scope.singleton.reset(); Container.shared.manager.pop(); ProfileRuntime.install(previous); try? FileManager.default.removeItem(at: folder) }
+        let source = #"{"done":false,"item":{"id":"A","threadId":"thread-A","account":"owner@example.test","subject":"Meeting"}}"#
+        let h = Harness()
+        h.brain.updateState(source, scope: "work")
+        var inputs = 0
+        h.brain.onCalendarIntent = { _ in inputs += 1 }
+        h.brain.assistant("Monday works.")
+        h.brain.user("Reply and send an invite", turn: 1, finalized: false)
+        await drain()
+        XCTAssertNil(store.pendingCalendarIntent)
+        h.brain.finalizeUser(turn: 1)
+        h.brain.finalizeUser(turn: 1)
+        XCTAssertEqual(inputs, 2, "Backchannels cannot recommit an already finalized request")
+        for _ in 0..<100 where store.pendingCalendarIntent == nil { await Task.yield() }
+        let accepted = try XCTUnwrap(store.pendingCalendarIntent)
+        XCTAssertEqual(accepted.proposal, "Monday works.")
+        h.brain.user("No, just email, just say I already sent the invite", turn: 2, finalized: false)
+        XCTAssertTrue(store.pendingCalendarIntent?.needsInvitation == true)
+        h.brain.finalizeUser(turn: 2)
+        for _ in 0..<100 where store.pendingCalendarIntent?.needsInvitation != false { await Task.yield() }
+        let corrected = try XCTUnwrap(store.pendingCalendarIntent)
+        XCTAssertFalse(corrected.needsInvitation)
+        XCTAssertEqual(corrected.inviteState, "not_requested")
+        XCTAssertNil(corrected.inviteCall)
+        XCTAssertEqual(corrected.source.messageID, "A")
+        let staleSave = await store.saveCalendarIntent(accepted, ownerID: backend.userId, profileID: nil)
+        XCTAssertFalse(staleSave,
+            "Delayed persistence must not resurrect the earlier obligation")
+        var restarted = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        for _ in 0..<200 where restarted.pendingCalendarIntent?.revision != corrected.revision {
+            try await Task.sleep(for: .milliseconds(10))
+            restarted = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        }
+        XCTAssertFalse(try XCTUnwrap(restarted.pendingCalendarIntent).needsInvitation)
+        h.brain.close()
+    }
 
     @MainActor func testReplyDestinationSurvivesFeedStopAndOtherMailboxDocumentLookup() async throws {
         let h = Harness()
@@ -475,7 +706,10 @@ final class LiveClientBrainTests: XCTestCase {
 
     @MainActor func testUnexecutedArchiveMayClarifyTheTargetWithoutClaimingSuccess() async throws {
         let h = Harness(); h.start(); await waitForRequest(1, in: h)
-        h.reply([["type": "message", "content": [["text": "Which email do you mean?"]]]]); await drain()
+        h.reply([["type": "message", "content": [["text": "Which email do you mean?"]]]])
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while h.brain.busy, .now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+        XCTAssertFalse(h.brain.busy, "Wait for the response to finish, not a fixed number of scheduler yields")
         XCTAssertEqual(h.speech, ["Which email do you mean?"])
         XCTAssertTrue(h.failures.isEmpty)
         XCTAssertTrue(h.calls.isEmpty)
@@ -631,9 +865,14 @@ final class LiveClientBrainTests: XCTestCase {
         h.reply([]); await drain()
     }
 
-    @MainActor func testTransportFailureDoesNotRetryWriteProposal() async {
-        let h = Harness(); h.start(); await drain()
-        h.replies.removeFirst().resume(throwing: NSError(domain: "network", code: 1)); await drain()
+    @MainActor func testTransportFailureDoesNotRetryWriteProposal() async throws {
+        let h = Harness(); defer { h.brain.close() }
+        h.start(); await waitForRequest(1, in: h)
+        let response = try XCTUnwrap(h.replies.first)
+        h.replies.removeFirst()
+        response.resume(throwing: NSError(domain: "network", code: 1))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while h.failures.isEmpty, .now < deadline { try await Task.sleep(for: .milliseconds(1)) }
         XCTAssertEqual(h.failures.count, 1); XCTAssertEqual(h.requests.count, 1)
         XCTAssertTrue(h.calls.isEmpty)
         XCTAssertEqual(h.speech, h.failures, "The failure line reaches the speaker")
@@ -719,7 +958,9 @@ final class LiveClientBrainTests: XCTestCase {
         let input = try XCTUnwrap(h.requests.last?["input"] as? [[String: Any]])
         XCTAssertEqual(input.last?["content"] as? String, "what is the next email about?")
         XCTAssertTrue((h.requests.last?["context"] as? String)?.contains("Archive queued for email A") == true)
-        h.reply([["type": "message", "content": [["text": "The next email asks for approval."]]]]); await drain()
+        h.reply([["type": "message", "content": [["text": "The next email asks for approval."]]]])
+        let speechDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while h.speech.isEmpty, .now < speechDeadline { try await Task.sleep(for: .milliseconds(1)) }
         XCTAssertEqual(h.speech, ["The next email asks for approval."])
     }
 
@@ -784,7 +1025,9 @@ final class LiveClientBrainTests: XCTestCase {
         let output = input.first { $0["type"] as? String == "function_call_output" }
         XCTAssertEqual(output?["call_id"] as? String, "c1")
         XCTAssertEqual(output?["output"] as? String, LiveSessionAdapter.toolCallUnfinished)
-        h.reply([["type": "message", "content": [["type": "output_text", "text": "That did not confirm."]]]]); await drain()
+        h.reply([["type": "message", "content": [["type": "output_text", "text": "That did not confirm."]]]])
+        let speechDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while h.speech.isEmpty || h.brain.busy, .now < speechDeadline { try await Task.sleep(for: .milliseconds(1)) }
         XCTAssertFalse(h.brain.busy)
         XCTAssertEqual(h.speech, ["That did not confirm."])
     }

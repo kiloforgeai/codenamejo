@@ -76,14 +76,15 @@ class DesktopEmailReader: ObservableObject {
         task = nil
         guard let request else { state = .idle; return }
         guard !request.headersOnly else { state = .headersOnly(request); return }
-        if !retry, case .ready(let previous, let content) = state,
+        if case .ready(let previous, let content) = state,
            previous.selection == request.selection, previous.threadID == request.threadID,
            previous.ownerID == request.ownerID, previous.profileID == request.profileID,
            previous.headersOnly == request.headersOnly {
             state = .ready(request, content)
-            return
+            if !retry { return }
+        } else {
+            state = .loading(request)
         }
-        state = .loading(request)
         task = Task { [weak self, loader] in
             do {
                 let content = try await loader(request)

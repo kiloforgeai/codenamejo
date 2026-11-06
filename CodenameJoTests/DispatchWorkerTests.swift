@@ -27,6 +27,19 @@ final class DispatchWorkerTests: XCTestCase {
         XCTAssertNil(DispatchWorker.target(standingOnJSON: #"{"from":"Bob","messages":[]}"#, facts: []))
     }
 
+    func testGroupProvenanceDoesNotTurnIntoSingleMessageWriteAuthorization() throws {
+        let source = #"{"account":"one@example.test","id":"A","threadId":"thread-A","from":"Sender","messages":[{"id":"A","from":"Sender"},{"id":"earlier","from":"Owner"}]}"#
+        XCTAssertEqual(DispatchJob.MailOrigin.captured(in: source)?.messageID, "A")
+        let writeTarget = DispatchWorker.target(standingOnJSON: source, facts: [])
+        XCTAssertEqual(writeTarget?["id"] as? String, "")
+        XCTAssertNil(DispatchJob.MailOrigin.from(writeTarget), "Provenance cannot authorize a representative write")
+        for invalid in [#"{"done":true,"item":{"account":"one@example.test","id":"A","threadId":"T"}}"#,
+                        #"{"account":"one@example.test","id":"A","threadId":"T","messages":[{"id":"B"}]}"#,
+                        #"{"account":"one@example.test","id":"A","threadId":"T","messages":[]}"#] {
+            XCTAssertNil(DispatchJob.MailOrigin.captured(in: invalid))
+        }
+    }
+
     func testQueueFactsOverrideTheRawTargetAndNeverFallBack() {
         let fact = prefix + #"{"from":"Fact sender","id":"fact-id"}"#
         XCTAssertEqual(DispatchWorker.target(standingOnJSON: raw, facts: ["Unrelated", fact])?["id"] as? String, "fact-id")

@@ -14,3 +14,12 @@ ask first. Marking something done is routine too: notion-update-page with
 update_properties sets the Status, checkbox or date, and insert_content adds to
 a page; say what changed in one clause. You can add and update but not delete
 or rewrite a page — if asked, say so plainly in one sentence.
+
+For a saved filing command, derive company, period and content from this invocation's
+captured email/account/profile. Search the existing workspace hierarchy each time and
+fetch the chosen database's schema before writing. Do not reuse a previous company's
+destination. If no destination or multiple plausible destinations remain, return
+needs_input with one focused question; do not call a forced write with guessed arguments.
+Clarifications resume this same task and source. Only a confirmed Notion write permits
+a later archive. Keep the provider's page link in the result. A transport timeout is an
+unknown write outcome, never permission to retry or create a duplicate page.

@@ -432,6 +432,13 @@ targets:
       - JoDesktopTests
       - JoDesktop/BrowserHTTPFixture.swift
       - JoDesktop/BackgroundBrowserFixture.swift
+      - CodenameJoTests/LocalForwardTests.swift
+      - CodenameJoTests/GrantAlertSweepTests.swift
+      - CodenameJoTests/MailMIMETests.swift
+      - CodenameJoTests/MailMIMEForwardTests.swift
+      - CodenameJoTests/CustomCommandRulesTests.swift
+      - CodenameJoTests/NotionToolsTests.swift
+      - CodenameJoTests/RemoteMCPClientTests.swift
       - CodenameJoTests/LocalSlackQueueTests.swift
       - CodenameJoTests/FeedOfferAnswerTests.swift
       - CodenameJoTests/FeedFocusTests.swift

@@ -15,8 +15,16 @@ final class LocalCalendarWritesTests: XCTestCase {
     private let owner = "owner@example.test"
     private var directory: URL!
 
+    private var previousProfile: ProfileRuntime.Scope?
+
     override func setUp() async throws {
         try await super.setUp()
+        Container.shared.manager.push()
+        previousProfile = ProfileRuntime.snapshot
+        ProfileRuntime.install(nil)
+        let backend = BackendService(restoringSession: false)
+        backend.userId = "calendar-tests"
+        Container.shared.backend.register { backend }
         let grants = CalendarGrantStorage()
         grants.store(GoogleAccountStore.Grant(email: owner, refreshToken: "refresh", scopes: [
             "https://www.googleapis.com/auth/calendar.readonly", "https://www.googleapis.com/auth/calendar.events",
@@ -25,17 +33,23 @@ final class LocalCalendarWritesTests: XCTestCase {
         Container.shared.googleTokenProvider.register { MainActor.assumeIsolated { CalendarTokenProvider() } }
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let jobs = DispatchJobStore(url: directory.appendingPathComponent("jobs.json"))
+        Container.shared.dispatchJobs.register { MainActor.assumeIsolated { jobs } }
         let url = directory.appendingPathComponent("context.sqlite")
         Container.shared.localContext.register { LocalContextStore(url: url) }
     }
 
     override func tearDown() async throws {
+        try Container.shared.localContext().dbPool?.close()
         Container.shared.googleGrantStorage.reset()
         Container.shared.googleTokenProvider.reset()
         Container.shared.providerHTTP.reset()
         Container.shared.localContext.reset()
         Container.shared.localWriteNotices.reset()
         try? FileManager.default.removeItem(at: directory)
+        Scope.singleton.reset()
+        Container.shared.manager.pop()
+        ProfileRuntime.install(previousProfile)
         try await super.tearDown()
     }
 
@@ -195,24 +209,22 @@ final class LocalCalendarWritesTests: XCTestCase {
         XCTAssertTrue(lost.text.hasPrefix("NOT ANSWERED — that event id doesn't resolve"), lost.text)
     }
 
-    func testADeferredWriteAnswersFirstAndTellsTheConversationWhenItFails() async throws {
+    func testCancellationWaitsForProviderFailureBeforeClaimingSuccess() async throws {
         let notices = LocalWriteNotices()
         Container.shared.localWriteNotices.register { notices }
         calendar(invitation(organizer: true), write: 404)
         let result = await run("cancel_calendar_event", ["event_id": "e1"], defer: true)
-        XCTAssertTrue(result.deferred)
-        XCTAssertEqual(result.ok, true)
-        XCTAssertTrue(result.text.hasPrefix("Cancelled \"Planning\""))
-        let told = try await firstNotice(notices)
-        XCTAssertEqual(told, "\n\nthat didn't go through — the event id doesn't resolve on \(owner)'s calendar, so the "
-            + "event is still on the calendar and nobody was told. List the calendar again and act on an id from those results.")
+        XCTAssertFalse(result.deferred)
+        XCTAssertEqual(result.ok, false)
+        XCTAssertTrue(result.text.hasPrefix("NOT CANCELLED"), result.text)
+        XCTAssertTrue(notices.appending(to: "", conversation: "call").isEmpty)
         XCTAssertEqual(LocalCalendarWrites.deferredFailure(CalendarAPI.Failure.unauthorized, target: owner,
             capability: "answer invitations", unchanged: "your answer wasn't sent and the organizer wasn't told"),
             "that didn't go through — \(owner) needs reconnecting before it can answer invitations, so your answer wasn't "
                 + "sent and the organizer wasn't told. Remove and re-add the account in Settings, then try again.")
     }
 
-    func testConfirmedRSVPAndDeferredCancellationUpdateTheCache() async throws {
+    func testConfirmedRSVPAndCancellationUpdateTheCache() async throws {
         let store = CalendarStore(database: Container.shared.localContext().dbPool)
         await store.cache(events: [cached("e1"), cached("e2")], attendees: [])
         calendar(invitation())
@@ -220,14 +232,16 @@ final class LocalCalendarWritesTests: XCTestCase {
         XCTAssertFalse(answered.deferred, "RSVPs wait for provider confirmation before advancing the feed")
         XCTAssertEqual(answered.ok, true)
         calendar(invitation(id: "e2", organizer: true))
-        _ = await run("cancel_calendar_event", ["event_id": "e2"], defer: true)
+        let cancelled = await run("cancel_calendar_event", ["event_id": "e2"], defer: true)
+        XCTAssertEqual(cancelled.ok, true)
+        XCTAssertFalse(cancelled.deferred)
         for _ in 0..<100 {
-            let response = await store.search(account: owner, timeMinMs: 0, timeMaxMs: 10_000)
+            let response = await store.search(account: owner, timeMinMs: 0, timeMaxMs: 2_000_000_000_000)
             if response.events.map(\.id) == ["e1"],
                response.attendees.first(where: { $0.email == owner })?.responseStatus == "accepted" { return }
             try await Task.sleep(for: .milliseconds(20))
         }
-        XCTFail("the deferred RSVP and cancel never reached the calendar cache")
+        XCTFail("the confirmed RSVP and cancellation never reached the calendar cache")
     }
 
     private func firstNotice(_ notices: LocalWriteNotices) async throws -> String {

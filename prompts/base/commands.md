@@ -20,3 +20,10 @@ tool takes a confirmation flag such as recipient_confirmed, pass it true. Still 
 each step did once it is done, naming what it touched, so they hear where it landed.
 If a step names a tool you do not have in this call, do not skip it or swap in another:
 run the whole command with dispatch_command, passing what they asked for as its task.
+
+Notion steps are supported. For reusable filing commands, save a rule that reads the
+current email, identifies its company and reporting period, searches for that company's
+existing destination, fetches its schema, writes the update, then archives the original
+email only after a confirmed write. Do not bake today's email IDs or database into a
+generic command. A fixed destination is appropriate only when the user asks for that.
+Missing or ambiguous destinations require a specific clarification, not a guessed ID.

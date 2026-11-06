@@ -23,17 +23,39 @@ protocol DesktopWorkspaceHandler {
 
 @MainActor
 extension DesktopWorkspaceHandler {
+    func setNarrationMode(_ mode: WorkSessionMode) { Container.shared.realtimeService().setNarrationMode(mode) }
     func controlBrowser(_ action: String, job: DispatchJob, model: DesktopWorkspaceModel) {
-        guard !model.updatingTask, let browser = model.browserTasks[job.id], browser.current() else { return }
-        if action == "pause" { browser.pause(); return }
-        if action == "takeover" { browser.takeOver(); return }
+        guard !model.updatingTask else { return }
+        let browser = model.browserTasks[job.id]
+        if action == "pause", browser?.current() == true { browser?.pause(); return }
         model.updatingTask = true
         model.resultSelectionError = nil
         Task {
             defer { model.updatingTask = false }
             do {
-                try await Container.shared.applicationTasks().resumeBrowser(job.id, version: job.taskRevision,
-                    approval: action == "approve" ? browser.approval?.id : nil)
+                if action == "inspect" {
+                    try await Container.shared.applicationTasks().inspectBrowser(job.id, version: job.taskRevision)
+                } else if action == "check_page", let browser, browser.inspectionOnly, browser.current() {
+                    try browser.resume()
+                    _ = try await browser.inspect()
+                    browser.message = Container.shared.backgroundBrowsers().recoveryNotice(job)
+                } else if action == "close_browser" {
+                    browser?.cancel()
+                    Container.shared.backgroundBrowsers().sessions[job.id] = nil
+                } else if action == "restart" || action == "verified_restart" {
+                    try await Container.shared.applicationTasks().restartBrowser(job.id, version: job.taskRevision,
+                        verifiedUnsubmitted: action == "verified_restart")
+                } else if action == "takeover", let browser, browser.current() {
+                    let retainedOutcome = browser.inspectionOnly && job.browserOutcomeUncertain
+                    let saved = retainedOutcome ? true : await Container.shared.dispatchJobs().recordBrowserState(job.id, state: .userControlled)
+                    guard saved else {
+                        throw BackgroundBrowser.Failure(message: "Could not save the browser handoff. Try again before taking control.")
+                    }
+                    browser.takeOver()
+                } else {
+                    try await Container.shared.applicationTasks().resumeBrowser(job.id, version: job.taskRevision,
+                        approval: action == "approve" ? browser?.approval?.id : nil)
+                }
             } catch { model.resultSelectionError = error.localizedDescription }
             model.jobs = await Container.shared.dispatchJobs().history()
             if model.selectedJob?.id == job.id { model.selectedJob = model.jobs.first { $0.id == job.id } }
@@ -168,7 +190,17 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
             }
         feedback.$voiceReceipt.sink { [weak viewModel] in viewModel?.feedbackReceipt = $0 }
         browsers.$sessions.sink { [weak viewModel] in viewModel?.browserTasks = $0 }
+        tasks.$selectedTaskID.removeDuplicates().sink { [weak self, weak viewModel] id in
+            guard let self, let viewModel else { return }
+            let job = id.flatMap { self.dispatchJobs.existing($0) }
+            guard job == nil || (job?.userId == self.backend.userId && job?.profileId == ProfileRuntime.snapshot?.profileId) else { return }
+            viewModel.applyTaskSelection(job)
+        }
         tasks.$revision.dropFirst().sink { [weak self, weak viewModel] _ in
+            guard let viewModel else { return }
+            self?.refresh(viewModel: viewModel)
+        }
+        dispatchJobs.$changes.dropFirst().receive(on: DispatchQueue.main).sink { [weak self, weak viewModel] _ in
             guard let viewModel else { return }
             self?.refresh(viewModel: viewModel)
         }
@@ -308,7 +340,8 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
             if action != .next {
                 let result = await tasks.perform(name: action.rawValue,
                     arguments: GmailReadTools.json(["account": origin.account, "message_id": origin.messageID]),
-                    profile: context.profileID, origin: origin, conversationID: context.conversationID, inputSource: "button")
+                    profile: context.profileID, origin: origin, conversationID: context.conversationID,
+                    diagnostics: realtime.actionDiagnostics(conversationID: context.conversationID), inputSource: "button")
                 guard owner == backend.userId, context.profileID == ProfileRuntime.snapshot?.profileId else { return }
                 if let effects = result.effects {
                     _ = await mailQueue.applyConfirmedEffects(effects, store: Container.shared.mailStore())
@@ -380,9 +413,19 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
         let profileOwner = Container.shared.workspaceProfiles().contextOwner
         Task { [weak self] in
             do {
-                let records = try await TurnStore(database: Container.shared.localContext().dbPool).history(owner: profileOwner)
-                let jobs = await Container.shared.dispatchJobs().history()
                 let logs = try await Container.shared.voiceDiagnostics().snapshot(userID: owner)
+                let conversations = try SessionExport.retainedConversationIDs(in: logs)
+                let turns = TurnStore(database: Container.shared.localContext().dbPool)
+                var records = try await turns.history(owner: profileOwner)
+                if let owner {
+                    let recent = try await turns.diagnosticHistory(userID: owner, conversations: conversations)
+                    let existing = Set(records.map(\.id))
+                    records += recent.filter { !existing.contains($0.id) }
+                }
+                let store = Container.shared.dispatchJobs()
+                var jobs = await store.history()
+                let existing = Set(jobs.map(\.id))
+                jobs += store.diagnosticHistory(conversations: conversations).filter { !existing.contains($0.id) }
                 let data = try SessionExport.append(records: records, jobs: jobs, to: logs, includeContent: includeContent)
                 guard self?.backend.userId == owner,
                       Container.shared.workspaceProfiles().contextOwner == profileOwner else { return }
@@ -394,8 +437,12 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
 
     func showFeedback() {
         guard let model, !model.savingFeedback else { return }
-        feedbackSubmission = feedback.capture()
-        if model.feedbackText.isEmpty { model.feedbackText = feedback.takeVoiceDraft() ?? "" }
+        if model.feedbackText.isEmpty {
+            if let draft = feedback.takeVoiceDraftSubmission() {
+                feedbackSubmission = draft.submission
+                model.feedbackText = draft.text
+            } else { feedbackSubmission = feedback.capture() }
+        } else if feedbackSubmission == nil { feedbackSubmission = feedback.capture() }
         model.feedbackError = nil
         model.feedbackReceipt = nil
         model.showingFeedback = true
@@ -475,10 +522,7 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
             viewModel.applySessionFeed(.init(mail: mail, slack: slack))
             if let error = mail.selectionError { viewModel.feedSelectionError = error }
             updateReader(viewModel)
-            viewModel.jobs = jobs
-            if let selected = viewModel.selectedJob {
-                viewModel.selectedJob = jobs.first { $0.id == selected.id }
-            }
+            viewModel.applyJobs(jobs)
         }
     }
 

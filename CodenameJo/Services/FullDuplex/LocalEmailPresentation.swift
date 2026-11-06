@@ -521,7 +521,7 @@ enum LocalEmailPresentation {
     }
 
     static var summaryInstructions: String {
-        emailSummaryGuidance + "Keep the summary within 210 UTF-8 bytes. "
+        emailSummaryGuidance + SelectedEmailInquiry.attributionRule + " Keep the summary within 210 UTF-8 bytes. "
             + "It is spoken to the mailbox owner (mailbox.owner): any of its addresses, and any of its names or a "
             + "short form of one (Katherine, Kate). \"You\" and \"your\" always mean the owner, never another recipient. "
             + "Who wrote a message is decided only by fromMe: fromMe true is the owner, and every other message was "

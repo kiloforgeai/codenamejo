@@ -105,7 +105,7 @@ final class FullDuplexVoiceClient {
     /// nobody waited for. A turn that never speaks reports nothing at all rather
     /// than a zero, because a missing measurement and an instant one have to stay
     /// distinguishable in the stored rows.
-    var onTurnLatency: ((TurnLatency) -> Void)?
+    var onTurnLatency: ((UUID, TurnLatency) -> Void)?
     var onBrainStep: ((CommandRecord.BrainStep) -> Void)?
     /// One turn failed, but the call is fine. Distinct from `onError`, which ends
     /// the session — conflating the two turned a 14-second rate-limit wait into a
@@ -212,6 +212,30 @@ final class FullDuplexVoiceClient {
     private var requestedOpening: SessionOpening = .none
     var acceptedOpening: SessionOpening = .none
     var openingWasAudible = false
+    var quietOpeningReady = false
+    var openingReadyForWork: Bool { openingWasAudible || quietOpeningReady }
+    var narrationMode: WorkSessionMode = .away
+
+    func setNarrationMode(_ mode: WorkSessionMode) {
+        let changed = narrationMode != mode
+        narrationMode = mode
+        guard let adapter = transport?.liveAdapter else { return }
+        adapter.setNarrationMode(mode)
+        if !mode.automaticNarration, standingStep != nil {
+            quietOpeningReady = true
+            releaseOpening()
+        }
+        guard changed, mode.automaticNarration else { return }
+        adapter.introduceCurrentWhenSettled { [weak self] in
+            guard let self, self.isActive, let current = self.standingStep,
+                  let key = LiveEmailPresentation.Key.step(current) else { return nil }
+            let privateMode = MailHeadersOnly.withholdsBodies || ProfileRuntime.snapshot?.mailHeadersOnly == true
+            let prepared = privateMode ? nil : self.livePreparation.ready(for: current, profileId: ProfileRuntime.snapshot?.profileId)
+            guard let line = LiveSpokenStepContract.line(step: current, lead: "In focus, ", prepared: prepared) else { return nil }
+            return .init(line: line, summary: prepared?.spokenBody, revision: prepared?.correctionRevision ?? 0,
+                reason: "away_mode_current_item", targetHash: self.diagnostics?.target(MailSelection(account: key.account, messageID: key.messageId).canonical) ?? "unknown")
+        }
+    }
     /// Once an automatic opening gives the floor back, later readiness and onboarding
     /// callbacks must not arm it again. Reset only for a new logical call, not a reconnect.
     private var openingAbandoned = false
@@ -529,6 +553,7 @@ final class FullDuplexVoiceClient {
     ) async throws {
         requestedOpening = opening
         openingWasAudible = false
+        quietOpeningReady = false
         openingAbandoned = false
         emailFirstMessageReadyAt = nil
         emailFirstMessageMeasured = false
@@ -689,6 +714,7 @@ final class FullDuplexVoiceClient {
         historyUserText = ""
         isBackgroundHistory = false
         historyIDsByInput.removeAll()
+        historyIDsByInput[0] = historyTurnID
         refusedLiveCalls.removeAll()
         historyTranscripts.removeAll()
         assistantHistoryOrigins.removeAll()
@@ -918,6 +944,7 @@ final class FullDuplexVoiceClient {
                     }
                     return result
                 }
+                setNarrationMode(.current)
             }
             try await transport.finish(
                 preRoll: FullDuplexAudioSession.vpioPreRoll, live: live)
@@ -1531,6 +1558,7 @@ final class FullDuplexVoiceClient {
             fireEndRequest()
         case .liveBackendIdle:
             responseInFlight = false
+            if !narrationMode.automaticNarration { return }
             if transport?.liveAdapter?.desktopQuiet == true { return }
             if emailReadTurn == liveUserTurn { return }
             if transport?.liveAdapter?.shouldHoldFeedForRequest == true { return }
@@ -1642,7 +1670,7 @@ final class FullDuplexVoiceClient {
             turn.contextUsageRatio = liveContextUsage
             RealtimeLog.log("latency: live turn \(liveUserTurn) spoke after \(ms)ms · context "
                 + (liveContextUsage.map { String(format: "%.3f", $0) } ?? "—"))
-            onTurnLatency?(turn)
+            if let id = historyIDsByInput[liveUserTurn] { onTurnLatency?(id, turn) }
         case .liveBackendUsage(let usage, let ms):
             responsesSeen += 1
             RealtimeLog.log("usage: live backend #\(responsesSeen) in \(ms)ms — "
@@ -1771,6 +1799,7 @@ final class FullDuplexVoiceClient {
             }
             audibleSince = nil
             assistantAudible = false
+            recordJobSpeechStopped()
             setMicGain(1)
             // The opening has finished speaking, so the floor is the user's now.
             releaseOpening()
@@ -1783,6 +1812,7 @@ final class FullDuplexVoiceClient {
 
         case .assistantTranscriptDelta(let itemId, let delta, let spoken):
             guard !delta.isEmpty else { return }
+            if spoken { recordJobSpeechTranscript(itemID: itemId, text: delta, complete: false) }
             if spoken { emailReader.transcript(delta) }
             // Recorded per turn so `response.done` can say which kind of reply this
             // was. One line, once, rather than per delta — this fires per token.
@@ -1817,6 +1847,7 @@ final class FullDuplexVoiceClient {
             currentAssistantItem = itemId
             captureAssistantOrigin(itemId)
             let text = transcript.isEmpty ? (assistantTurns[itemId] ?? "") : transcript
+            recordJobSpeechTranscript(itemID: itemId, text: text, complete: true)
             noteCoachingLessonSpoken(in: text, itemId: itemId)
             noteFeedQuestionSpoken(in: text)
             assistantTurns[itemId] = text
@@ -2088,7 +2119,7 @@ final class FullDuplexVoiceClient {
         // flow's `finish` asks again while that same response is speaking. The method claimed
         // to be idempotent but re-armed `greetPending`, producing a second response.create and
         // `conversation_already_has_active_response` on a clean install. Spend the duplicate.
-        if greetingSentAt != nil || openingWasAudible {
+        if greetingSentAt != nil || openingReadyForWork {
             RealtimeLog.log("opening: duplicate speak request ignored")
             return
         }
@@ -2182,6 +2213,7 @@ final class FullDuplexVoiceClient {
         let started = Date()
         let dial = dialGeneration
         let scope = ProfileRuntime.snapshot
+        let openingTurn = liveUserTurn
         Task {
             [weak self, localContext, localTriage] in
             let store = Container.shared.mailStore()
@@ -2189,16 +2221,15 @@ final class FullDuplexVoiceClient {
             let progress = await localTriage.progress
             let standing = await localTriage.standing
             let served = await localTriage.takeServedOutcomes()
-            // Warmed by the launch queue preparation, so this only reads what is already
-            // there — a summary still in flight is a miss, never a wait on the opening.
-            let prepared = !MailHeadersOnly.withholdsBodies
+            var prepared = !MailHeadersOnly.withholdsBodies
                 ? await Container.shared.liveEmailOpening().ready(
                     for: step.output, profileId: scope?.profileId, userId: Container.shared.backend().userId)
                 : nil
             let warmed = !MailHeadersOnly.withholdsBodies
                 ? await Container.shared.liveEmailOpening().warmed(profileId: scope?.profileId, userId: Container.shared.backend().userId)
                 : []
-            guard let self, self.isActive, dial == self.dialGeneration else { return }
+            guard let self, self.isActive, dial == self.dialGeneration,
+                  self.liveUserTurn == openingTurn, ProfileRuntime.snapshot?.profileId == scope?.profileId else { return }
 
             Container.shared.workspaceProfiles().prepareProfileOpenings(store: store)
             self.onEmailQueuePrepared?()
@@ -2207,6 +2238,29 @@ final class FullDuplexVoiceClient {
                            preparationAtArrival: ("opening", prepared))
             // After the step, so the cache this seeds is the one the advance reads.
             if self.liveConfiguration?.emailPreparation == true { self.livePreparation.seed(warmed) }
+            if !self.narrationMode.automaticNarration {
+                self.quietOpeningReady = true
+                self.releaseOpening()
+                self.onState?(.listening)
+                return
+            }
+            // Give cold preparation a short head start. The adapter re-resolves again at
+            // speech commit, so a result arriving after this wait can still replace fallback.
+            if prepared == nil, !MailHeadersOnly.withholdsBodies, scope?.mailHeadersOnly != true,
+               let key = LiveEmailPresentation.Key.step(step.output) {
+                await self.livePreparationSchedule?.value
+                for _ in 0..<40 {
+                    prepared = self.livePreparation.ready(for: step.output, profileId: scope?.profileId)
+                    if prepared != nil || self.livePreparationTasks[key.identity] == nil { break }
+                    if self.liveUserTurn != openingTurn || self.dialGeneration != dial { return }
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                prepared = self.livePreparation.ready(for: step.output, profileId: scope?.profileId)
+            }
+            guard self.isActive, self.dialGeneration == dial, self.liveUserTurn == openingTurn,
+                  ProfileRuntime.snapshot?.profileId == scope?.profileId,
+                  LiveEmailPresentation.Key.selection(self.standingStep ?? "")?.identity
+                    == LiveEmailPresentation.Key.selection(step.output)?.identity else { return }
             if !self.emailFirstMessageMeasured,
                self.emailFirstMessageReadyAt == nil,
                step.output.contains("\"item\"") {
@@ -2226,6 +2280,26 @@ final class FullDuplexVoiceClient {
             let script = self.onboardingFlow != nil ? nil
                 : stageScript.map { "Say exactly this, then stop: \"\($0)\"" }
                     ?? Self.presentableScript(step: step.output, lead: lead, prepared: prepared)
+            let stagedOpening = self.pendingRecoveredDigest.isEmpty && self.feedBriefing.isEmpty
+                && !self.openingFollowsOnboarding && self.onboardingFlow == nil
+                && LiveEmailPresentation.Key.step(step.output) != nil
+                && LiveSpokenStepContract.line(step: step.output, lead: lead, prepared: prepared) != nil
+            if stagedOpening {
+                let selected = LiveEmailPresentation.Key.step(step.output)?.identity
+                self.transport?.liveAdapter?.stageEmailOpening { [weak self] in
+                    guard let self, self.isActive, self.dialGeneration == dial,
+                          ProfileRuntime.snapshot?.profileId == scope?.profileId,
+                          let current = self.standingStep,
+                          LiveEmailPresentation.Key.step(current)?.identity == selected else { return nil }
+                    let privateMode = MailHeadersOnly.withholdsBodies || ProfileRuntime.snapshot?.mailHeadersOnly == true
+                    let latest = privateMode ? nil : self.livePreparation.ready(for: current, profileId: scope?.profileId)
+                    guard let line = LiveSpokenStepContract.line(step: current, lead: lead, prepared: latest) else { return nil }
+                    return .init(line: line, summary: latest?.spokenBody, revision: latest?.correctionRevision ?? 0,
+                        reason: privateMode ? "privacy_restriction" : latest != nil ? "ready"
+                            : self.livePreparationTasks.keys.contains(where: { $0 == selected }) ? "preparation_pending" : "preparation_unavailable",
+                        targetHash: self.diagnostics?.target(MailSelection(account: selected?.account ?? "", messageID: selected?.messageId ?? "").canonical) ?? "unknown")
+                }
+            }
             self.transport?.sendContextItem(
                 "This is the authoritative triage_next result for the automatic email "
                     + "opening. Address the user directly as you/your, never they/their. The "
@@ -2233,7 +2307,7 @@ final class FullDuplexVoiceClient {
                     + "field-by-field readout.\n"
                     + (prepared?.annotating(step.output) ?? step.output),
                 role: "system",
-                speakerBrief: script ?? LiveSpokenStepContract.line(
+                speakerBrief: stagedOpening ? "The application is resolving the selected email's presentation. Wait for its exact line; do not describe the message from a snippet." : script ?? LiveSpokenStepContract.line(
                     step: step.output, lead: lead, prepared: prepared))
 
             let ms = Date().timeIntervalSince(started) * 1000
@@ -2245,7 +2319,7 @@ final class FullDuplexVoiceClient {
                 RealtimeLog.log("feed: waiting for hosted tools before opening terminal feed")
                 return
             }
-            self.createOpeningAwareContinuationResponse(recitesSuppliedLine: script != nil, stageScript: stageScript)
+            self.createOpeningAwareContinuationResponse(recitesSuppliedLine: stagedOpening || script != nil, stageScript: stageScript)
         }
     }
 
@@ -2575,6 +2649,12 @@ final class FullDuplexVoiceClient {
         var revision: Int? = nil
         var state: String? = nil
         var sourceHash: String? = nil
+        var expectedText: String? = nil
+        var started = false
+        var stopped = false
+        var transcriptFinished = false
+        var itemOrder: [String] = []
+        var spokenItems: [String: String] = [:]
     }
     var pendingJobSpeech: PendingJobSpeech?
 
@@ -2847,7 +2927,7 @@ final class FullDuplexVoiceClient {
             + " · first word \(latency.toFirstTokenMs.map { "\($0)ms" } ?? "—")"
             // Tagged with where the words came from.
             + " (\(localTranscriptLive ? "on device" : "server"))")
-        onTurnLatency?(latency)
+        onTurnLatency?(historyTurnID, latency)
         latencyMark = nil
         latencyUtterance = nil
         turnCounted = false
@@ -2926,7 +3006,7 @@ final class FullDuplexVoiceClient {
 
     @discardableResult
     private func tryLiveFastAction(_ transcript: String, routed: LiveFastAction? = nil) -> Bool {
-        guard isActive, openingWasAudible, !userSpeaking, liveInputComplete,
+        guard isActive, openingReadyForWork, !userSpeaking, liveInputComplete,
               onboardingFlow == nil, endCueTask == nil, functionCallTask == nil,
               localTriageForEmailOpening, let action = LiveFastAction.parse(transcript) ?? routed,
               liveConfiguration?.fastActions?.contains(action.rawValue) == true,
@@ -3102,6 +3182,7 @@ final class FullDuplexVoiceClient {
         // made Live introduce an email with "I couldn't get the full message."
         let followupRead = LiveFastAction.allowsFollowup(
             name: call.name, arguments: call.arguments, step: standingStep)
+        let calendarSource = transport?.liveAdapter?.calendarSource(for: call)
         if let recovery = call.recoveryAnchor,
            recovery.profileId != ProfileRuntime.snapshot?.profileId
             || (!recovery.matches(step: standingStep, profileId: ProfileRuntime.snapshot?.profileId,
@@ -3118,13 +3199,13 @@ final class FullDuplexVoiceClient {
                 + (standingStep ?? "No email is currently selected."))
             return
         }
-        if liveUnheardDelegations.contains(call.delegation), !fastFollowup, !followupRead {
+        if liveUnheardDelegations.contains(call.delegation), !fastFollowup, !followupRead, calendarSource == nil {
             refuseLiveFunction(call, reason: "unheard", output:
                 "Not executed: the user said this before the current email was read to them, so it was meant for the previous email, which is already handled. Do not repeat it or advance. Present the current email now: "
                 + (standingStep ?? "No email is currently selected."))
             return
         }
-        if anchor != liveQueueRevision, !fastFollowup, !followupRead {
+        if anchor != liveQueueRevision, !fastFollowup, !followupRead, calendarSource == nil {
             refuseLiveFunction(call, reason: "stale_feed", output:
                 "Not executed: this action was for the previous email and the feed has moved. Do not repeat it or advance again. Anything not about that email can be requested again now. Current authoritative feed: "
                 + (standingStep ?? "The previous email is no longer active."))
@@ -3145,18 +3226,21 @@ final class FullDuplexVoiceClient {
             : call.arguments
         handle(.mcpCallStarted(name: call.name, itemId: call.id))
         let completeSource = call.name == GmailReadTools.getMessage && call.id.hasPrefix("selected-source-")
-            ? standingStep.flatMap(LiveEmailPresentation.Key.selection) : nil
+            ? (calendarSource ?? standingStep).flatMap(LiveEmailPresentation.Key.selection) : nil
+        let calendarOrigin = DispatchJob.MailOrigin.captured(in: calendarSource ?? liveQueueActionAnchor?.step ?? standingStep)
         Task { [weak self] in
             // A device tool runs here and is reported exactly as a relayed MCP result.
             let result: (output: String, failed: Bool, effects: [GmailWriteEffect]?)
             if GmailManageTools.names.contains(call.name) {
                 result = await GmailManageTools.run(name: call.name, argumentsJSON: arguments)
             } else if CalendarTools.names.contains(call.name) {
-                result = await CalendarTools.run(name: call.name, argumentsJSON: call.arguments, diagnostics: self?.diagnostics, callID: call.id)
+                result = await CalendarTools.run(name: call.name, argumentsJSON: call.arguments, diagnostics: self?.diagnostics, callID: call.id,
+                    conversationID: self?.conversationId(), origin: calendarOrigin)
             } else if let completeSource {
                 result = await GmailReadTools.readSelectedMessage(argumentsJSON: call.arguments, selection: completeSource) { [weak self] in
                     guard let self, self.isActive, self.dialGeneration == dial else { return false }
-                    return self.standingStep.flatMap(LiveEmailPresentation.Key.selection)?.identity == completeSource.identity
+                    let source = self.transport?.liveAdapter?.calendarSource(for: call) ?? self.standingStep
+                    return source.flatMap(LiveEmailPresentation.Key.selection)?.identity == completeSource.identity
                 }
             } else {
                 result = await GmailReadTools.run(name: call.name, argumentsJSON: call.arguments)

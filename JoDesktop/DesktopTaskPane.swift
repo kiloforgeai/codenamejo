@@ -1,4 +1,5 @@
 #if targetEnvironment(macCatalyst)
+import FactoryKit
 import SwiftUI
 
 struct DesktopTaskPane<Handler: DesktopWorkspaceHandler>: View {
@@ -7,6 +8,16 @@ struct DesktopTaskPane<Handler: DesktopWorkspaceHandler>: View {
     let job: DispatchJob
 
     var body: some View {
+        Group {
+            if let review = job.draftReview, job.mailAction?.state == .review || job.mailAction?.state == .failed {
+                DesktopDraftReviewPane(job: job, review: review, model: viewModel)
+            } else {
+                receiptPane
+            }
+        }.id(job.id)
+    }
+
+    private var receiptPane: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 HStack {
@@ -15,20 +26,74 @@ struct DesktopTaskPane<Handler: DesktopWorkspaceHandler>: View {
                     Spacer()
                     Button("Back to feed", systemImage: "arrow.uturn.backward") { viewModel.selectedJob = nil }
                         .buttonStyle(.borderless).accessibilityIdentifier("backToFeed")
-                        .disabled(viewModel.selectingResult)
+                        .disabled(viewModel.selectingResult || viewModel.updatingTask)
                 }
-                Text(job.mailAction?.subject ?? job.task).font(.title2.weight(.medium))
-                Label(job.desktopStatusLabel, systemImage: job.didFail ? "exclamationmark.triangle" : "bolt.horizontal.circle")
+                Text(job.calendarAction?.title ?? job.mailAction?.subject ?? job.task).font(.title2.weight(.medium))
+                Label(job.desktopStatusLabel, systemImage: job.desktopStatusSymbol)
                     .foregroundStyle(.secondary)
+                if let browser = viewModel.browserTasks[job.id], browser.webView != nil {
+                    DesktopBrowserTaskPanel(browser: browser, canResume: !job.isRunning && !viewModel.updatingTask) { action in
+                        interactor.controlBrowser(action, job: job, model: viewModel)
+                    }
+                } else if job.browserState != nil {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Label(job.isDone ? "Browser task finished" : "Previous form unavailable", systemImage: "globe").font(.headline)
+                        Text(Container.shared.backgroundBrowsers().recoveryNotice(job)).font(.callout)
+                        Button("Inspect website", systemImage: "globe") {
+                            interactor.controlBrowser("inspect", job: job, model: viewModel)
+                        }.disabled(viewModel.updatingTask).accessibilityIdentifier("inspectTaskWebsite")
+                        if job.state == "awaiting_input", !job.hasCommittedWrites, !job.browserOutcomeUncertain {
+                            let verified = job.browserState != .unsubmitted
+                            Button(verified ? "I checked: not submitted — reopen" : "Reopen form") {
+                                interactor.controlBrowser(verified ? "verified_restart" : "restart", job: job, model: viewModel)
+                            }.disabled(viewModel.updatingTask).accessibilityIdentifier("reopenExpiredBrowser")
+                        }
+                    }.padding(16).background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
+                }
+                if viewModel.browserTasks[job.id]?.inspectionOnly == true, job.state == "awaiting_input",
+                   !job.hasCommittedWrites, !job.browserOutcomeUncertain || (job.browserState == .userControlled && job.inFlightOperation == nil) {
+                    Button(job.browserState == .unsubmitted ? "Rebuild form" : "I checked: not submitted — reopen") {
+                        interactor.controlBrowser(job.browserState == .unsubmitted ? "restart" : "verified_restart", job: job, model: viewModel)
+                    }.disabled(viewModel.updatingTask).accessibilityIdentifier("rebuildInspectedBrowser")
+                }
+                if let resolution = job.resolution {
+                    Text("A later confirmed retry resolved this action. The original failure below is retained for history.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Button("View successful retry") { viewModel.selectedJob = viewModel.jobs.first { $0.id == resolution.jobID } }
+                        .buttonStyle(.borderless)
+                }
+                if job.browserState != nil { Text("Saved task report").font(.caption).foregroundStyle(.secondary) }
                 Text(job.result ?? (job.hasStopped()
                     ? "This job stopped reporting. Its outcome is unknown. Ask Jo to check before trying it again."
                     : "This job is still running. Its result will appear here."))
                     .font(.system(size: 15)).lineSpacing(5).textSelection(.enabled)
                 Divider()
-                if let browser = viewModel.browserTasks[job.id] {
-                    DesktopBrowserTaskPanel(browser: browser, canResume: !job.isRunning && !viewModel.updatingTask) { action in
-                        interactor.controlBrowser(action, job: job, model: viewModel)
-                    }
+                if let action = job.calendarAction {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(action.confirmed ? "Calendar-confirmed event" : "Requested calendar action").font(.headline)
+                        Text("Account: \(action.account)")
+                        Text("Calendar: \(action.calendarID)")
+                        Text("Start: \(action.start ?? action.requestedStart ?? "Unconfirmed")")
+                        Text("End: \(action.end ?? action.requestedEnd ?? "Unconfirmed")")
+                        Text("Time zone: \(action.timeZone)")
+                        if action.state == .unknown, action.start != action.requestedStart, let requested = action.requestedStart {
+                            Text("Requested start: \(requested)").foregroundStyle(.orange)
+                        }
+                        if let date = job.completedAt ?? job.startedAt { Text(date, format: .dateTime).font(.caption).foregroundStyle(.secondary) }
+                        Divider()
+                        if !action.attendees.isEmpty { Text("Attendees: " + action.attendees.joined(separator: ", ")) }
+                        if let response = action.response { Text("Your RSVP: \(response)") }
+                        Text(action.invitationOutcome).font(.callout)
+                        if let parentID = action.parentJobID {
+                            Text("Source task: " + (viewModel.jobs.first { $0.id == parentID }?.task ?? parentID.uuidString))
+                                .font(.callout)
+                        }
+                        if let id = action.providerID { Text("Event ID: \(id)").font(.caption.monospaced()) }
+                        if let url = action.providerURL { Link("Open in Google Calendar", destination: url) }
+                        Text("Source archive: \(action.archiveState ?? "No archive recorded")").font(.caption)
+                    }.textSelection(.enabled).padding(20).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                        .accessibilityIdentifier("calendarActionReceipt")
                 }
                 if let action = job.mailAction {
                     VStack(alignment: .leading, spacing: 10) {
@@ -50,9 +115,19 @@ struct DesktopTaskPane<Handler: DesktopWorkspaceHandler>: View {
                         if let thread = action.providerThreadID ?? action.threadID { Text("Thread: \(thread)").font(.caption.monospaced()).foregroundStyle(.secondary) }
                         if let header = action.inReplyTo { Text("In reply to: \(header)").font(.caption.monospaced()).foregroundStyle(.secondary) }
                         if let url = action.providerURL {
-                            Link(action.kind == .send ? "Open sent message in Gmail" : "Open draft in Gmail", destination: url)
+                            Link(action.kind.isDraft ? "Open draft in Gmail" : "Open sent message in Gmail", destination: url)
                                 .accessibilityIdentifier("openMailActionInGmail")
                         }
+                        if let resolution = action.forwardResolution {
+                            Text("Destination evidence: \(resolution.basis.replacingOccurrences(of: "_", with: " "))").font(.caption)
+                            Text("Original From: \(resolution.sender)").font(.caption)
+                            if !resolution.replyTo.isEmpty { Text("Original Reply-To: \(resolution.replyTo)").font(.caption) }
+                        }
+                        ForEach(Array((action.omittedAttachments ?? []).enumerated()), id: \.offset) { _, file in
+                            Text("Not included: \(file.filename) · \(AttachmentText.describeSize(file.size)) · \(file.reason)")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        if let archive = action.archiveState { Text("Source archive: \(archive)").font(.caption) }
                     }.textSelection(.enabled).padding(20).frame(maxWidth: .infinity, alignment: .leading)
                         .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
                 }
@@ -112,7 +187,7 @@ struct DesktopTaskPane<Handler: DesktopWorkspaceHandler>: View {
                         }
                     }
                 }
-                if job.needsReview {
+                if job.needsReview, job.draftReview == nil {
                     Button("Mark reviewed") { interactor.reviewTask(job, model: viewModel) }
                     Text("Reviewing this result does not approve or run any further action.").font(.caption).foregroundStyle(.secondary)
                 }

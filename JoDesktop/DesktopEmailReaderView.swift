@@ -22,8 +22,7 @@ struct DesktopEmailReaderView: View {
                         .font(.callout).accessibilityIdentifier("openFocusedEmail")
                 }
             }
-            Text(email.subject.isEmpty ? "No subject" : email.subject)
-                .font(.system(size: 26, weight: .semibold)).textSelection(.enabled)
+            selectable(email.subject.isEmpty ? "No subject" : email.subject, field: "subject", size: 26, weight: .semibold)
             if email.messageId == nil {
                 Text("This feed item has no email identifier, so its contents cannot be loaded.").foregroundStyle(.secondary)
             } else if matchesSelection {
@@ -46,7 +45,7 @@ struct DesktopEmailReaderView: View {
                 case .failed(_, let reason):
                     failure(reason)
                 case .headersOnly:
-                    Text(email.sender).font(.headline).textSelection(.enabled)
+                    selectable(email.sender, field: "sender", size: 14, weight: .semibold)
                     Text("This profile is set to headers only. Change the mail preference in Settings to display message bodies.")
                         .foregroundStyle(.secondary).accessibilityIdentifier("emailReaderHeadersOnly")
                 case .loading, .idle:
@@ -65,20 +64,19 @@ struct DesktopEmailReaderView: View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline) {
-                    Text(message.from).font(.system(size: 14, weight: .semibold)).textSelection(.enabled)
+                    selectable(message.from, field: "from_\(message.id)", size: 14, weight: .semibold)
                     Spacer()
                     if inThread, selected { Text("IN FOCUS").font(.caption2.weight(.semibold)).foregroundStyle(.tint) }
                 }
-                if !message.to.isEmpty { Text("To: \(message.to)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
-                if !message.cc.isEmpty { Text("Cc: \(message.cc)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+                if !message.to.isEmpty { selectable("To: \(message.to)", field: "to_\(message.id)", size: 12, secondary: true) }
+                if !message.cc.isEmpty { selectable("Cc: \(message.cc)", field: "cc_\(message.id)", size: 12, secondary: true) }
                 if !message.date.isEmpty { Text(message.date).font(.caption).foregroundStyle(.secondary) }
-                if inThread, message.subject != email.subject { Text(message.subject).font(.headline).textSelection(.enabled) }
+                if inThread, message.subject != email.subject { selectable(message.subject, field: "subject_\(message.id)", size: 14, weight: .semibold) }
             }
             Divider()
             if let reason = message.error { failure(reason) }
             else {
-                Text(message.body).font(.system(size: 16)).lineSpacing(5)
-                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                DesktopSelectableText(text: message.body, identity: "\(email.account):body:\(message.id)")
                     .accessibilityIdentifier("fullEmailBody_\(message.id)")
             }
             if !message.attachments.isEmpty {
@@ -91,6 +89,12 @@ struct DesktopEmailReaderView: View {
                 }.padding(.top, 6)
             }
         }.accessibilityIdentifier("readerMessage_\(message.id)")
+    }
+
+    private func selectable(_ text: String, field: String, size: CGFloat, weight: UIFont.Weight = .regular,
+                            secondary: Bool = false) -> some View {
+        DesktopSelectableText(text: AttributedString(text), identity: "\(email.account):\(email.messageId ?? "none"):\(field)",
+                              size: size, weight: weight, secondary: secondary, lineSpacing: 0)
     }
 
     private func failure(_ reason: String) -> some View {

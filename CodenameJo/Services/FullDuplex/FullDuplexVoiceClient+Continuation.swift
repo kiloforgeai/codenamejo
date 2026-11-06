@@ -335,6 +335,7 @@ extension FullDuplexVoiceClient {
     /// step where it was and the turn ends on the answer. Nothing else re-presents the step, so
     /// the feed reads as stopped until the user says "keep going" — the report in #824.
     func reofferPendingStepAfterAside(said: String?, queueUnchanged: Bool) {
+        guard narrationMode.automaticNarration else { return }
         guard transport != nil, isActive, !endAfterFarewell, endCueTask == nil, !isMuted,
               queueUnchanged, let standingStep, pendingCoaching == nil, !calendarFeedPending,
               !slackFeedPending, LiveFastAction.parse(latestCompletedUserUtterance) == nil,

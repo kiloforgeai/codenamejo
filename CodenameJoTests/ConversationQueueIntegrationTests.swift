@@ -1881,6 +1881,39 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         await queue.end()
     }
 
+    func testPublishedWorkerArchiveReleasesOnlyOriginalCursorWithoutAnotherProviderRead() async throws {
+        for moved in [false, true] {
+            let fixture = try StoreFixture()
+            let rows = [row("source", thread: "source", date: 30, sender: "First"),
+                        row("next", thread: "next", date: 20, sender: "Second")]
+            try await fixture.seed(rows, unread: Set(rows.map(\.id)))
+            let queue = makeQueue(live: true)
+            _ = await queue.step(.init(scope: .unread), store: fixture.store)
+            let captured = await queue.dispatchReconciliation(account: account)
+            let context = try XCTUnwrap(captured)
+            if moved { _ = await queue.step(.init(), store: fixture.store, dealtWith: false) }
+            let effect = GmailWriteEffect(account: account, scope: "thread", threadId: "source",
+                messageIds: ["source"], messageIdsComplete: true, operation: "modify", removeLabelIds: ["INBOX"])
+            _ = await queue.applyConfirmedEffects([effect], store: fixture.store)
+            let finished = await queue.reconcileDispatch(context, store: fixture.store, archivedThreads: { _, _ in [] })
+            XCTAssertEqual(finished, moved ? nil : "source")
+            #if targetEnvironment(macCatalyst)
+            let visible = await queue.desktopPreparedItems()
+            XCTAssertEqual(visible.map(\.id), ["next"])
+            #endif
+            if !moved { _ = await queue.step(.init(), store: fixture.store, dealtWith: true) }
+            _ = await queue.applyConfirmedEffects([effect], store: fixture.store)
+            let duplicate = await queue.reconcileDispatch(context, store: fixture.store, archivedThreads: { _, _ in [] })
+            XCTAssertNil(duplicate)
+            let current = await queue.currentId
+            XCTAssertEqual(current, "next")
+            await queue.end()
+            let ended = await queue.reconcileDispatch(context, store: fixture.store, archivedThreads: { _, _ in [] })
+            XCTAssertNil(ended)
+            fixture.close()
+        }
+    }
+
     func testRealtimePendingArchiveDiscardsCheckpoint() async throws {
         let fixture = try StoreFixture()
         defer { fixture.close() }

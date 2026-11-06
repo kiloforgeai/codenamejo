@@ -14,21 +14,59 @@ enum LocalCompose {
     static let archivedByRule = " Archived."
     static let archiveUnconfirmed = " The automatic archive was not confirmed; the mail may still be in the inbox."
 
+    struct ReplySource: Sendable {
+        let selection: LiveEmailPresentation.Key
+        let ownerID: String?
+        let profileID: String?
+        var isCurrent: @MainActor @Sendable () -> Bool
+
+        func validate() async throws {
+            let allowed = await MainActor.run {
+                Container.shared.backend().userId == ownerID && ProfileRuntime.snapshot?.profileId == profileID && isCurrent()
+            }
+            guard allowed else { throw Refusal(text: "NOT SENT — the selected email or profile changed while preparing this reply. Select the original source before retrying.") }
+        }
+
+        func binding(_ given: [String: Any]) throws -> [String: Any] {
+            var args = given
+            let selected = GmailReadTools.string(args, "reply_message_id") ?? selection.messageId
+            let thread = selection.messageThreads?[selected] ?? selection.threadId
+            guard selection.selectedIDs.contains(selected),
+                  GmailReadTools.string(args, "account").map({ $0.caseInsensitiveCompare(selection.account) == .orderedSame }) ?? true,
+                  GmailReadTools.string(args, "thread_id").map({ $0 == thread || $0 == selected }) ?? true else {
+                throw Refusal(text: "NOT SENT — the reply's account, thread and message IDs do not match the selected source. The email has not disappeared. Retry using the original selected email.")
+            }
+            args["account"] = selection.account
+            args["thread_id"] = thread
+            args["reply_message_id"] = selected
+            return args
+        }
+    }
+
     /// - Parameter defer: the caller advances on the receipt, so the Gmail call may land after it.
     static func run(name: String, argumentsJSON: String, defer deferred: Bool,
-                    conversationId: String? = nil, onboardingReply: Bool = false, parentJobID: UUID? = nil, callID: String? = nil) async -> FullDuplexBroker.ToolResult {
-        let args = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8))) as? [String: Any] ?? [:]
+                    conversationId: String? = nil, onboardingReply: Bool = false, parentJobID: UUID? = nil, callID: String? = nil,
+                    replySource: ReplySource? = nil, diagnostics: VoiceDiagnostics.Session? = nil) async -> FullDuplexBroker.ToolResult {
+        var args = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8))) as? [String: Any] ?? [:]
         let started = Date()
         do {
-            let result = try await compose(name, args, deferred: deferred, conversationId: conversationId,
-                                           onboardingReply: onboardingReply, parentJobID: parentJobID, callID: callID)
+            if let replySource { try await replySource.validate(); args = try replySource.binding(args) }
+            let result = try await compose(name, args, deferred: deferred && replySource == nil, conversationId: conversationId,
+                                           onboardingReply: onboardingReply, parentJobID: parentJobID, callID: callID, replySource: replySource, diagnostics: diagnostics)
             RealtimeLog.log("localCompose: \(name)\(GmailReadTools.string(args, "thread_id") == nil ? "" : " on a thread") "
                 + "\(result.ok == true ? "ok" : "not ok") in \(Int(Date().timeIntervalSince(started) * 1000))ms — "
                 + "\(result.text.prefix(80))")
             return result
         } catch let refusal as Refusal {
+            if let diagnostics {
+                diagnostics.record(.turnTransition, ["transition": "reply_preflight_refused",
+                    "reason": refusal.text.contains("IDs do not match") ? "tuple_mismatch" : refusal.text.contains("profile changed") ? "selection_changed" : "source_validation_failed",
+                    "target_hash": replySource.map { diagnostics.target($0.selection.account + ":" + $0.selection.messageId) } ?? "none",
+                    "requested_tuple_hash": diagnostics.target(["account", "thread_id", "reply_message_id"].map { text(args[$0]) }.joined(separator: ":"))])
+            }
+            let retained = await retainReply(name, args: args, reason: refusal.text, source: replySource, conversationId: conversationId, callID: callID)
             RealtimeLog.log("localCompose: \(name) refused — \(refusal.text.prefix(120))")
-            return .init(text: refusal.text, ok: false)
+            return .init(text: refusal.text + (retained ? " The composed reply is retained locally in Activity." : ""), ok: false)
         } catch {
             RealtimeLog.log("localCompose: \(name) failed — \(error)")
             return .init(text: "The \(name) call failed: \(Manage.detail(error))", ok: false)
@@ -38,13 +76,15 @@ enum LocalCompose {
     // MARK: - The write
 
     private static func compose(_ name: String, _ given: [String: Any], deferred: Bool,
-                                conversationId: String?, onboardingReply: Bool, parentJobID: UUID?, callID: String?) async throws -> FullDuplexBroker.ToolResult {
+                                conversationId: String?, onboardingReply: Bool, parentJobID: UUID?, callID: String?, replySource: ReplySource?,
+                                diagnostics: VoiceDiagnostics.Session?) async throws -> FullDuplexBroker.ToolResult {
         let attachmentReferences = try ReplyAttachments.references(given["attachments"])
         let attachmentOwner = await MainActor.run { Container.shared.backend().userId }
         let attachmentProfile = ProfileRuntime.snapshot
         let attachmentAccounts = ProfileRuntime.allowedMailAccounts(GoogleAccountStore.mailAccounts()).map { $0.lowercased() }.sorted()
         let validateAttachments: @Sendable () async throws -> Void = {
             try Task.checkCancellation()
+            try await replySource?.validate()
             let owner = await MainActor.run { Container.shared.backend().userId }
             let profile = ProfileRuntime.snapshot
             let accounts = ProfileRuntime.allowedMailAccounts(GoogleAccountStore.mailAccounts()).map { $0.lowercased() }
@@ -84,11 +124,24 @@ enum LocalCompose {
 
         if let threadId {
             var context: ThreadContext
-            if let fetched { context = fetched } else { context = try await threadContext(token, account: account, threadId: threadId) }
+            do {
+                if let fetched { context = fetched } else { context = try await threadContext(token, account: account, threadId: threadId) }
+            } catch {
+                guard let selectedId else { throw error }
+                let exact = try await refreshedParticipant(selectedId, threadId: threadId, account: account, token: token,
+                    diagnostics: diagnostics, source: replySource)
+                context = .init(subject: exact.subject, lastMessageId: exact.messageId, replyTo: exact.address,
+                    participants: [exact], fetchedThreadID: threadId)
+            }
             var selected = selectedId.flatMap { id in context.participants.first { $0.id == id } }
-            if selectedId != nil, selected == nil {
-                throw Refusal(text: "NOT SENT — that selected message is not available in this thread and mailbox. "
-                    + "Nothing has gone yet.")
+            diagnostics?.record(.turnTransition, ["transition": "reply_membership", "reason": selected == nil ? "refresh_required" : "member_found",
+                "target_hash": diagnostics?.target(account + ":" + (selectedId ?? "none")) ?? "none",
+                "requested_tuple_hash": diagnostics?.target(account + ":" + threadId + ":" + (selectedId ?? "none")) ?? "none",
+                "fetched_thread_hash": diagnostics?.target(account + ":" + (context.fetchedThreadID ?? "unknown")) ?? "none"])
+            if let selectedId, selected == nil || selected?.address.isEmpty == true {
+                selected = try await refreshedParticipant(selectedId, threadId: threadId, account: account, token: token,
+                    diagnostics: diagnostics, source: replySource)
+                if let selected { context.participants.removeAll { $0.id == selectedId }; context.participants.append(selected) }
             }
             if let picked = selected, picked.fromMe,
                let recipient = ([picked.address] + picked.to + picked.cc).first(where: { !selfAddressed($0) }) {
@@ -97,6 +150,7 @@ enum LocalCompose {
             if let selected {
                 context.replyTo = selected.address
                 context.lastMessageId = selected.messageId
+                if !selected.subject.isEmpty { context.subject = selected.subject }
             }
             subject = context.subject.replacingOccurrences(of: #"^(re:\s*)+"#, with: "",
                                                            options: [.regularExpression, .caseInsensitive])
@@ -181,6 +235,18 @@ enum LocalCompose {
         }
 
         if name == "create_draft" || (!onboardingReply && DraftsOnly.isOn(for: account)) {
+            #if targetEnvironment(macCatalyst)
+            guard let owner = attachmentOwner, !owner.isEmpty else { throw Refusal(text: "Sign in before preparing a local draft.") }
+            try await validateAttachments()
+            let key = callID.map { (parentJobID?.uuidString ?? conversationId ?? "foreground") + ":" + $0 }
+            let action = MailActionReceipt(kind: .draft, account: account, message: message,
+                replyMessageID: selectedId ?? replyingTo?.id, parentJobID: parentJobID, requestKey: key)
+            let origin = action.replyMessageID.map { DispatchJob.MailOrigin(account: account, messageID: $0,
+                threadID: threadId ?? "", sender: replyingTo?.from ?? to, subject: subject) }
+            return try await LocalDraftReview.stage(action: action, message: message, originalRaw: MailMIME.plain(message), owner: owner,
+                profile: attachmentProfile?.profileId, conversation: conversationId, origin: origin,
+                archiveAfterSave: files, attachmentAccounts: attachmentReferences.map(\.account))
+            #else
             var receipt = "Draft to \(to) saved in \(account)\(copies)." + (files ? archivedByRule : "")
             if name == "send_email" { receipt += " Nothing was sent because Drafts only is on for this inbox." }
             let (job, created) = try await audit(.draft)
@@ -188,6 +254,7 @@ enum LocalCompose {
             return try await finishDraft(name, message, receipt: receipt, account: account, token: token, files: files,
                                          deferred: deferred && attachments.isEmpty, conversationId: conversationId,
                                          validate: validateAttachments, job: job)
+            #endif
         }
         if !derivedTo, strictJSONBool(args["recipient_confirmed"]) != true,
            !(try await hasCorresponded(to, account: account, token: token)) {
@@ -395,6 +462,64 @@ enum LocalCompose {
 
     // MARK: - Reply context
 
+    private static func refreshedParticipant(_ id: String, threadId: String, account: String, token: String,
+                                              diagnostics: VoiceDiagnostics.Session?, source: ReplySource?) async throws -> Participant {
+        func record(_ reason: String, fetched: String? = nil) {
+            diagnostics?.record(.turnTransition, ["transition": "reply_membership_refresh", "reason": reason,
+                "target_hash": diagnostics?.target(account + ":" + id) ?? "none",
+                "requested_tuple_hash": diagnostics?.target(account + ":" + threadId + ":" + id) ?? "none",
+                "fetched_thread_hash": diagnostics?.target(account + ":" + (fetched ?? "unknown")) ?? "none"])
+        }
+        let message: [String: Any]
+        do {
+            try await source?.validate()
+            await GmailQuota.shared.spend(GmailQuota.Cost.get)
+            message = try await GmailAPI.call("GET", path: "messages/\(id)",
+                query: ["format": "full", "fields": "id,threadId,labelIds,payload/headers"], token: token)
+            try await source?.validate()
+        } catch GmailAPI.Failure.http(404) {
+            record("message_missing")
+            throw Refusal(text: "NOT SENT — Gmail could not find the exact selected message in this account. Refresh the feed and check that original message before retrying.")
+        } catch {
+            record("refresh_failed")
+            throw Refusal(text: "NOT SENT — the exact reply source could not be revalidated. No send was attempted; retry after the source is available.")
+        }
+        guard message["id"] as? String == id, message["threadId"] as? String == threadId else {
+            record("tuple_mismatch", fetched: message["threadId"] as? String)
+            throw Refusal(text: "NOT SENT — the requested message does not belong to the requested thread in this account. The email has not disappeared. Use the original selected message and its thread together.")
+        }
+        guard !labels(message).contains("DRAFT") else {
+            record("unsent_draft", fetched: threadId)
+            throw Refusal(text: "NOT SENT — the selected source is an unsent draft, not a delivered message to reply to.")
+        }
+        let refreshed = try context(["id": threadId, "messages": [message]], account: account, threadId: threadId)
+        guard let participant = refreshed.participants.first, looksLikeAddress(participant.address) else {
+            record("recipient_metadata_missing", fetched: threadId)
+            throw Refusal(text: "NOT SENT — Gmail confirms the selected message, but it has no usable reply address. Review its sender or specify the intended recipient.")
+        }
+        record("exact_source_revalidated", fetched: threadId)
+        return participant
+    }
+
+    private static func retainReply(_ name: String, args: [String: Any], reason: String, source: ReplySource?,
+                                     conversationId: String?, callID: String?) async -> Bool {
+        guard let source, !text(args["body"]).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let owner = source.ownerID else { return false }
+        let selection = source.selection
+        let message = MailMIME.Outgoing(to: "Recipient not verified", cc: [], bcc: [], subject: "Unsent reply",
+            body: text(args["body"]), threadId: selection.threadId, inReplyTo: nil, footer: false)
+        var action = MailActionReceipt(kind: name == "create_draft" ? .draft : .send, account: selection.account,
+            message: message, replyMessageID: selection.messageId, requestKey: callID.map { "reply-preflight:" + (conversationId ?? "foreground") + ":" + $0 })
+        action.state = .failed
+        do {
+            let store = await MainActor.run { Container.shared.dispatchJobs() }
+            let (job, _) = try await store.beginMailAction(action, ownerID: owner, profileID: source.profileID,
+                conversationID: conversationId, origin: .init(account: selection.account, messageID: selection.messageId,
+                    threadID: selection.threadId, sender: "", subject: "Unsent reply"))
+            return await store.recordMailAction(job.id, state: .failed, result: reason + " No send was attempted. The composed reply is retained here.")
+        } catch { return false }
+    }
+
     struct Participant: Equatable {
         var id: String?
         var fromMe: Bool
@@ -413,6 +538,7 @@ enum LocalCompose {
         var replyTo: String
         /// Every delivered message, newest last.
         var participants: [Participant]
+        var fetchedThreadID: String? = nil
     }
 
     /// One metadata fetch, the user's unsent drafts left out unless the thread is nothing else.
@@ -425,6 +551,9 @@ enum LocalCompose {
     }
 
     static func context(_ thread: [String: Any], account: String, threadId: String) throws -> ThreadContext {
+        if let actual = thread["id"] as? String, actual != threadId {
+            throw Refusal(text: "NOT SENT — Gmail returned a different thread from the one requested. Refresh the original source before retrying.")
+        }
         let all = thread["messages"] as? [[String: Any]] ?? []
         let delivered = all.filter { !labels($0).contains("DRAFT") }
         let messages = delivered.isEmpty ? all : delivered
@@ -437,12 +566,11 @@ enum LocalCompose {
             let mine = Set([account, from].map { bareAddress($0).lowercased() })
             let sentRecipient = (to + cc).first { !mine.contains(bareAddress($0).lowercased()) }
             let address = fromMe ? sentRecipient ?? to.first ?? cc.first ?? "" : replyAddress(message)
-            guard !address.isEmpty else { return nil }
             return Participant(id: message["id"] as? String, fromMe: fromMe, from: from, address: address,
                                messageId: header(message, "Message-ID"), subject: header(message, "Subject"), to: to, cc: cc)
         }
         return ThreadContext(subject: header(last, "Subject"), lastMessageId: header(last, "Message-ID"),
-                             replyTo: replyRecipient(messages), participants: participants)
+                             replyTo: replyRecipient(messages), participants: participants, fetchedThreadID: thread["id"] as? String)
     }
 
     /// The newest message the user did not send, `Reply-To` before `From`; else the last one's `To`.

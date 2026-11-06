@@ -93,6 +93,20 @@ final class CustomCommandRulesTests: XCTestCase {
         }
     }
 
+    func testReusableNotionFilingStepsCanBeSavedWithoutFreezingSourceOrDestination() throws {
+        let steps = [CommandAction(tool: "gmail_get_message", detail: "Read this invocation's source email"),
+            .init(tool: "notion-search", detail: "Find the current company's investor updates database"),
+            .init(tool: "notion-fetch", detail: "Read the matching database schema; ask if ambiguous"),
+            .init(tool: "notion-create-pages", detail: "File this update using that schema and reporting period"),
+            .init(tool: "archive_message", detail: "Archive the captured email only after confirmed filing")]
+        let saved = try CustomCommandRules.validateSave(keyword: "file investor update", actions: steps).get()
+        XCTAssertEqual(saved.actions, steps)
+        for tool in NotionTools.names {
+            XCTAssertTrue(CustomCommandRules.allows(tool))
+            XCTAssertTrue(CustomCommandRules.allowedNames(in: []).contains(tool))
+        }
+    }
+
     func testTheStepEnumIsEveryAllowedToolPlusThisSessionsCustomMCPTools() {
         let names = CustomCommandRules.allowedNames(in: ["triage_next", "mcp_x_y", "mcp_x_y"])
         XCTAssertTrue(names.contains("web_search"), "a call without web_search can still save a web step")

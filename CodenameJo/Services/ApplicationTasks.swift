@@ -61,8 +61,17 @@ class ApplicationTasks: ObservableObject {
             return id
         }
         let owner = source.ownerID ?? backend.userId
-        let origin = source.scope == .independent ? nil : DispatchJob.MailOrigin.from(
-            DispatchWorker.target(standingOnJSON: source.standingOnJSON, facts: source.facts))
+        let origin = source.scope == .independent ? nil : DispatchJob.MailOrigin.captured(in: source.standingOnJSON)
+        if (source.scope == .currentEmail || source.holdsDecision == true), origin == nil {
+            source.diagnostics?.record(.turnTransition, ["transition": "dispatch_source_refused", "reason": "missing_committed_source", "job_id": id.uuidString])
+            results[id] = .task(.init(text: "Not started: this task needs its original selected email. Select that email before retrying; no task or external action was started.", ok: false, status: .failed))
+            return id
+        }
+        if let origin, let account = source.account, !account.isEmpty,
+           account.caseInsensitiveCompare(origin.account) != .orderedSame {
+            results[id] = .task(.init(text: "Not started: the task account does not match its captured email. Select the original email before retrying.", ok: false, status: .failed))
+            return id
+        }
         if let origin, source.task.range(of: #"\b(?:link|url|rsvp|event time)\b"#, options: [.regularExpression, .caseInsensitive]) != nil,
            let pending = await store.history().first(where: { $0.sourceSelection == MailSelection(account: origin.account, messageID: origin.messageID)
                && $0.state == "awaiting_input" && $0.inputChoices?.isEmpty == false }) {
@@ -82,7 +91,7 @@ class ApplicationTasks: ObservableObject {
             authoredAt: source.authoredAt ?? Date(), timeZone: (source.authoredTimeZone ?? .current).identifier,
             input: source.inputSource, parksSource: origin != nil && source.scope != .independent
                 && (source.parksSource ?? (source.expects != .receipt)),
-            holdsDecision: source.holdsDecision, dependencyID: source.dependencyID)
+            holdsDecision: source.holdsDecision, dependencyID: source.dependencyID, userRequest: source.userRequest)
         guard await store.acceptContext(id, context: context, preference: source.completionPreference ?? .requested(in: source.task)) else {
             results[id] = .task(.init(text: store.persistenceError ?? "Task could not be saved.", ok: false, status: .failed))
             await store.finish(id, state: "failed", result: store.persistenceError ?? "Task could not be saved.")
@@ -161,11 +170,18 @@ class ApplicationTasks: ObservableObject {
 
     var selectedContext: [String: Any] {
         guard let selectedTaskID, let job = store.existing(selectedTaskID) else { return [:] }
+        var currentResult = job.result ?? "No result recorded yet."
+        #if targetEnvironment(macCatalyst)
+        if job.browserState != nil, !job.isDone, Container.shared.backgroundBrowsers().availability(job) != "live" {
+            currentResult = Container.shared.backgroundBrowsers().recoveryNotice(job)
+        }
+        #endif
         return ["id": job.id.uuidString, "revision": job.taskRevision, "request": job.task,
             "state": job.state, "account": job.origin?.account ?? "", "message_id": job.origin?.messageID ?? "",
-            "result": LiveCompactContext.bounded(job.result ?? "No result recorded yet.", bytes: 8_000),
+            "result": LiveCompactContext.bounded(job.resolution == nil ? currentResult :
+                "This attempt failed historically but was resolved by confirmed retry \(job.resolution!.jobID). Do not report it as outstanding. Original outcome: " + (job.result ?? ""), bytes: 8_000),
             "result_truncated": (job.result?.utf8.count ?? 0) > 8_000,
-            "deferred_archive": job.context?.deferredFeedbackArchive == true,
+            "deferred_archive": job.context?.deferredFeedbackArchive == true, "browser": TaskManagementTool.browserContext(job),
             "choices": (job.inputChoices ?? []).map { ["id": $0.id, "label": $0.label] },
             "rule": "This activity is in focus. Questions refer to its recorded request and result, never the email behind it. A truncated result is incomplete evidence. Use manage_task choose for an explicit candidate selection, or correct/cancel. A deferred_archive can be resumed with resume_archive only after the user explicitly asks to resume the saved archive. Earlier actions are history, not new authorization. Never dispatch a duplicate lookup while this task needs input. Stopping speech is not cancellation."]
     }
@@ -229,25 +245,95 @@ class ApplicationTasks: ObservableObject {
     }
 
     #if targetEnvironment(macCatalyst)
+    func inspectBrowser(_ id: UUID, version: Int) async throws {
+        let job = try authorized(id, version: version)
+        let browsers = Container.shared.backgroundBrowsers()
+        select(id)
+        if let existing = browsers.sessions[id], existing.current(), existing.webView != nil {
+            if existing.phase == .unknown, !job.isRunning { existing.useForInspection() }
+            if existing.phase != .failed { return }
+            existing.cancel(); browsers.sessions[id] = nil
+        }
+        guard editing.insert(id).inserted else { throw DispatchWorker.StepFailure(message: "This task is already opening. Wait for its browser.") }
+        defer { editing.remove(id) }
+        let trace = Container.shared.voiceDiagnostics().begin(engine: "browser_inspection", userID: job.userId)
+        do {
+            let destination = try await browsers.inspectionDestination(job)
+            _ = try authorized(id, version: version)
+            let browser = try await browsers.session(id, inspectionOnly: true)
+            browser.diagnostics = trace
+            guard BackgroundBrowser.validURL(destination, allowLocalFixture: browser.allowLocalFixture),
+                  !EmailLinkTool.stateChanging(destination) else {
+                browser.cancel()
+                throw BackgroundBrowser.Failure(message: "That saved link may perform an action just by opening it. Check the provider's account page directly; the earlier submission status is still unverified.")
+            }
+            _ = try await browser.open(destination)
+            browser.message = browsers.recoveryNotice(job) + (browser.phase == .takeover ? " Use Take over to sign in and check the site." : "")
+            trace.record(.turnTransition, ["transition": "browser_inspection_opened", "job_id": id.uuidString,
+                "recovery": "inspection", "task_revision": String(version), "inspection_only": "true"])
+        } catch {
+            if let browser = browsers.sessions[id], browser.inspectionOnly {
+                browser.phase = .failed
+                browser.message = "Website inspection could not finish: " + error.localizedDescription
+            }
+            trace.record(.turnTransition, ["transition": "browser_inspection_blocked", "job_id": id.uuidString,
+                "reason": error is BackgroundBrowserStore.CapacityLimit ? "capacity" : "source_or_navigation_unavailable"])
+            if error is BackgroundBrowserStore.CapacityLimit {
+                throw BackgroundBrowser.Failure(message: "Both task browsers are occupied. Close one before inspecting this website.")
+            }
+            throw error
+        }
+    }
+
+    func restartBrowser(_ id: UUID, version: Int, verifiedUnsubmitted: Bool = false) async throws {
+        let job = try authorized(id, version: version)
+        let browsers = Container.shared.backgroundBrowsers()
+        let checkedManualInspection = verifiedUnsubmitted && job.browserState == .userControlled
+            && browsers.sessions[id]?.inspectionOnly == true && job.inFlightOperation == nil && job.state != "unknown"
+        guard job.state == "awaiting_input", job.context != nil,
+              !job.hasCommittedWrites, !job.browserOutcomeUncertain || checkedManualInspection,
+              browsers.availability(job) != "live",
+              job.browserState == .unsubmitted || checkedManualInspection || ((job.browserState == nil || job.browserState == .unavailable) && verifiedUnsubmitted) else {
+            throw DispatchWorker.StepFailure(message: browsers.recoveryNotice(job))
+        }
+        browsers.sessions[id]?.cancel()
+        browsers.sessions[id] = nil
+        guard await store.recordBrowserState(id, state: .unsubmitted, verifiedInspection: checkedManualInspection) else {
+            throw DispatchWorker.StepFailure(message: store.persistenceError ?? "Recovery could not be saved.")
+        }
+        try await correct(id, version: version, instruction: "Reopen the original browser task from its original source. The previous browser expired. Reinspect and refill only; any submission needs fresh approval of the new page. Earlier approvals are invalid.", restartingBrowser: true)
+        RealtimeLog.log("task: \(id) browser_recovery=expired task_revision=\(version + 1) approval=required")
+    }
+
     func resumeBrowser(_ id: UUID, version: Int, approval: UUID? = nil) async throws {
         let job = try authorized(id, version: version)
         guard job.state == "awaiting_input", let browser = Container.shared.backgroundBrowsers().sessions[id],
-              browser.current(), browser.phase != .unknown else {
-            throw DispatchWorker.StepFailure(message: "Open the current browser task before resuming it.")
+              browser.current(), browser.phase != .unknown, !browser.inspectionOnly else {
+            throw DispatchWorker.StepFailure(message: Container.shared.backgroundBrowsers().recoveryNotice(job))
         }
+        guard !job.hasCommittedWrites, job.inFlightOperation == nil else {
+            throw DispatchWorker.StepFailure(message: "This task has a committed or uncertain action. Inspect its receipt before continuing; nothing was repeated.")
+        }
+        let previousPhase = browser.phase
         if let approval { try browser.approve(approval) }
         else {
-            guard browser.phase != .approval else { throw DispatchWorker.StepFailure(message: "Review and approve the exact form action in Activities first.") }
+            guard browser.phase != .approval else { throw DispatchWorker.StepFailure(message: "The form is open in the center pane. Use its Approve button, or inspect its exact approval ID and resume_browser after the user explicitly approves. Nothing was submitted; do not dispatch a new task.") }
             try browser.resume()
         }
-        try await correct(id, version: version, instruction: "Continue the original browser task.", resumingBrowser: true)
+        do {
+            try await correct(id, version: version, instruction: "Continue the original browser task.", resumingBrowser: true)
+        } catch {
+            browser.authorizedSubmission = nil
+            browser.phase = previousPhase
+            throw error
+        }
     }
     #endif
 
-    func correct(_ id: UUID, version: Int, instruction: String, linkChoice: String? = nil, resumingBrowser: Bool = false) async throws {
+    func correct(_ id: UUID, version: Int, instruction: String, linkChoice: String? = nil, resumingBrowser: Bool = false, restartingBrowser: Bool = false) async throws {
         let original = try authorized(id, version: version)
         guard !instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              original.context != nil, original.command == nil else {
+              original.context != nil, original.command == nil || original.state == "awaiting_input" else {
             throw DispatchWorker.StepFailure(message: "Use the Commands editor and the existing unfinished-step retry for a saved command. No step was repeated.")
         }
         guard editing.insert(id).inserted else { throw DispatchWorker.StepFailure(message: "A correction is already pending for this task.") }
@@ -260,7 +346,7 @@ class ApplicationTasks: ObservableObject {
         guard !settled.hasCommittedWrites, settled.state != "unknown", settled.inFlightOperation == nil else {
             throw DispatchWorker.StepFailure(message: "This task has committed or uncertain actions. Review its receipts and reconcile provider state before starting changed work. No action was repeated.")
         }
-        let updated = resumingBrowser ? original.task : original.task + "\nUser correction (same source and scope): " + instruction
+        let updated = resumingBrowser || restartingBrowser ? original.task : original.task + "\nUser correction (same source and scope): " + instruction
         guard await store.revise(id, revision: version, task: updated, linkChoice: linkChoice), let row = store.existing(id), let context = row.context else {
             throw DispatchWorker.StepFailure(message: store.persistenceError ?? "The task changed before the correction could be saved.")
         }
@@ -269,11 +355,14 @@ class ApplicationTasks: ObservableObject {
         let source = row.origin.map { GmailReadTools.json(["account": $0.account, "id": $0.messageID,
             "threadId": $0.threadID, "from": $0.sender, "subject": $0.subject]) }
         let job = DispatchWorker.Job(id: id, task: updated, account: row.origin?.account,
-            facts: context.facts + (resumingBrowser ? ["The user resumed this task's existing browser. Call task_browser inspect before continuing the original objective; it will execute any exact approved action first. Do not reopen the starting URL or repeat a submission."] : []), standingOnJSON: source, authoredAt: context.authoredAt,
+            facts: context.facts + (restartingBrowser ? [instruction] : resumingBrowser ? ["The user resumed this task's existing browser. Call task_browser inspect before continuing the original objective; it will execute any exact approved action first. Do not reopen the starting URL or repeat a submission."] : []), standingOnJSON: source, authoredAt: context.authoredAt,
             authoredTimeZone: TimeZone(identifier: context.timeZone),
-            expects: .init(rawValue: context.expects), scope: .init(rawValue: context.scope), profileId: row.profileId,
+            expects: .init(rawValue: context.expects), scope: .init(rawValue: context.scope),
+            commandSteps: row.command.map { Array($0.actions.dropFirst($0.completedSteps)) }, command: row.command,
+            profileId: row.profileId,
             revision: context.revision, inputSource: "correction", parksSource: context.parksSource,
-            holdsDecision: context.holdsDecision, dependencyID: context.dependencyID, linkChoice: context.linkChoice)
+            holdsDecision: context.holdsDecision, dependencyID: context.dependencyID, linkChoice: context.linkChoice,
+            userRequest: resumingBrowser || restartingBrowser ? context.userRequest : instruction)
         schedule(job, owner: row.userId, origin: row.origin, version: context.revision)
         RealtimeLog.log("task: \(id) revision=\(context.revision) correction_accepted")
     }
@@ -320,6 +409,12 @@ class ApplicationTasks: ObservableObject {
         }
         let origin = origin ?? explicitOrigin
         let owner = backend.userId
+        let mailSource = origin.map { GmailManageTools.WriteSource(
+            cursor: .init(messageId: $0.messageID, account: $0.account, senders: []),
+            ownerID: owner, profileID: profile) }
+        let sourceHash = diagnostics.flatMap { session in origin.map {
+            session.target(MailSelection(account: $0.account, messageID: $0.messageID).canonical)
+        } } ?? "none"
         let key = [owner ?? "", profile ?? "", name, arguments].joined(separator: "|")
         if let previous = operationIDs[key], accepted.contains(previous) {
             if case .tool(let result) = await result(previous) { return result }
@@ -335,7 +430,8 @@ class ApplicationTasks: ObservableObject {
         }
         operationIDs[key] = id
         await store.begin(id: id, task: LiveFastAction(rawValue: name)?.title ?? ToolNarration.progressLabel(for: name),
-            profileId: profile, conversationId: conversationID, turnId: turnID, origin: origin)
+            profileId: profile, conversationId: conversationID, turnId: turnID, origin: origin,
+            quickMailAction: .captured(tool: name, arguments: args, origin: origin))
         let source = ["voice", "button", "keyboard", "typed"].contains(inputSource) ? inputSource : "unknown"
         guard await store.acceptContext(id, context: .init(scope: "current_email", expects: "receipt", authoredAt: Date(), timeZone: TimeZone.current.identifier, input: source), preference: .quiet) else {
             let value = FullDuplexBroker.ToolResult(text: store.persistenceError ?? "Task could not be saved.", ok: false)
@@ -348,23 +444,26 @@ class ApplicationTasks: ObservableObject {
                 return .tool(.init(text: reason, ok: false))
             }
             await store.setState(id, state: "running")
-            diagnostics?.record(.jobStarted, ["job_id": id.uuidString, "tool": name, "input_source": source])
+            diagnostics?.record(.jobStarted, ["job_id": id.uuidString, "tool": name, "input_source": source,
+                "target_hash": sourceHash, "attribution": mailSource == nil ? "foreground" : "accepted_source"])
             guard !Task.isCancelled, await store.markOperation(id, revision: 1, callID: id.uuidString) else {
                 await store.finish(id, state: "cancelled", result: "Cancelled before execution.", revision: 1)
                 return .tool(.init(text: "Cancelled before execution.", ok: false))
             }
             let value = await FullDuplexBroker.runTool(name: name, argumentsJSON: arguments,
-                conversationId: conversationID?.uuidString, profileId: profile)
+                conversationId: conversationID?.uuidString, profileId: profile, mailSource: mailSource,
+                mailJobID: id, mailCallID: id.uuidString, diagnostics: diagnostics)
             let pending = value.pendingArchive != nil || value.pendingDraft != nil || value.deferred
             if !pending {
                 await store.receipt(id, callId: id.uuidString, tool: name, failed: value.ok != true,
                     targetHash: diagnostics?.target(VoiceDiagnostics.targetIdentity(arguments: arguments) ?? "unknown"))
             }
-            if !pending, value.ok == true || !Task.isCancelled { _ = await store.markOperation(id, revision: 1, callID: nil) }
-            let state = pending || (Task.isCancelled && value.ok != true) ? "unknown" : value.ok == true ? "done" : value.effects?.isEmpty == false ? "partial" : "failed"
+            if !pending, !value.outcomeUnknown, value.ok == true || !Task.isCancelled { _ = await store.markOperation(id, revision: 1, callID: nil) }
+            let state = pending || value.outcomeUnknown || (Task.isCancelled && value.ok != true) ? "unknown" : value.ok == true ? "done" : value.effects?.isEmpty == false ? "partial" : "failed"
             await store.finish(id, state: state, result: value.text, reportBack: pending || value.ok != true)
             if state == "done", let origin { await store.releaseDecisionHold(.init(account: origin.account, messageID: origin.messageID)) }
-            diagnostics?.record(.jobFinished, ["job_id": id.uuidString, "outcome": state])
+            diagnostics?.record(.jobFinished, ["job_id": id.uuidString, "outcome": state,
+                "target_hash": sourceHash, "attribution": mailSource == nil ? "foreground" : "accepted_source"])
             return .tool(value)
         }
         guard case .tool(let value) = await result(id) else { return .init(text: "The task result is unavailable.", ok: false) }
@@ -408,7 +507,8 @@ class ApplicationTasks: ObservableObject {
             "threadId": origin.threadID, "from": origin.sender, "subject": origin.subject]
         var job = DispatchWorker.Job(id: UUID(), task: request, account: origin.account,
             standingOnJSON: GmailReadTools.json(target), authoredAt: Date(), authoredTimeZone: .current,
-            expects: .answer, scope: .currentEmail, profileId: profile, inputSource: "typed", completionPreference: .requested(in: request), ownerID: backend.userId)
+            expects: .answer, scope: .currentEmail, profileId: profile, inputSource: "typed", completionPreference: .requested(in: request),
+            ownerID: backend.userId, userRequest: request)
         if let commandID {
             guard let saved = Container.shared.customCommands().commands.first(where: { $0.id == commandID }),
                   saved.enabled, !saved.actions.isEmpty else {

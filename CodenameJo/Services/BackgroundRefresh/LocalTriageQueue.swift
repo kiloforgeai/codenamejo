@@ -3968,6 +3968,17 @@ actor LocalTriageQueue {
                 continue
             }
             guard running, !adopted else { return nil }
+            // A worker may already have published the provider-confirmed effect. Its
+            // source then disappears from candidates, so a second network read cannot
+            // be required to release the live cursor. Never release a newer selection.
+            if items.indices.contains(position - 1) {
+                let current = items[position - 1]
+                if current.acted == "archive_message",
+                   current.account.caseInsensitiveCompare(context.account) == .orderedSame,
+                   context.sourceThread == current.threadId {
+                    return current.id
+                }
+            }
             let queueGeneration = generation
             let revision = confirmedEffectsRevision
             let candidates = items.dropFirst(max(0, position - 1)).filter {

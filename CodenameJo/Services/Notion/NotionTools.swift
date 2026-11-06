@@ -91,10 +91,25 @@ enum NotionTools {
                 last = result
             } catch {
                 RealtimeLog.log("notion: \(name) on \(grant.label) failed — \(error)")
+                if writes.contains(name), uncertainWrite(error) {
+                    return .init(text: "Notion did not confirm this write. It may have completed. Check the destination before retrying; do not repeat the write or archive the source.",
+                                 ok: false, outcomeUnknown: true)
+                }
                 if workspaces.count == 1 { return .init(text: explain(error), ok: false) }
             }
         }
         return .init(text: last?.text ?? "That Notion request failed before it finished.", ok: false)
+    }
+
+    static func uncertainWrite(_ error: Error) -> Bool {
+        switch error as? RemoteMCPError {
+        case .unauthorized?: return false
+        case .http(let code, _)? where (400..<500).contains(code) && code != 408: return false
+        // Parse/invalid-request/missing-method/invalid-params errors reject the call
+        // before execution. An internal or unknown RPC error gives no write receipt.
+        case .rpc(let code, _)? where [-32700, -32600, -32601, -32602].contains(code): return false
+        default: return true
+        }
     }
 
     /// Transport and auth failures in words the model can act on. A tool that failed inside Notion

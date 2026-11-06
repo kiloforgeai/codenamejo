@@ -12,6 +12,7 @@ final class OnboardingDispatchRepeatTests: XCTestCase {
         defer { client.cancelDispatchesForTesting() }
 
         let flow = EmailOnboardingFlow(version: 2, runId: "repeat", welcome: nil)
+        client.latestCompletedUserUtterance = "Look up tomorrow’s weather in Paris."
         let args = #"{"task":"Look up tomorrow's weather in Paris","scope":"independent"}"#
         client.startOnboardingDispatchForTesting(flow: flow, callId: "first", argumentsJSON: args)
         client.startOnboardingDispatchForTesting(flow: flow, callId: "second", argumentsJSON: args)

@@ -46,6 +46,45 @@ final class ApplicationTasksTests: XCTestCase {
         .init(account: account, messageID: id, threadID: "thread-" + id, sender: "Same sender", subject: "Same subject")
     }
 
+    func testCompletedForwardCannotAuthorizeAnotherSourceFromNoiseOrPartialInput() async throws {
+        var requests = 0
+        let tasks = ApplicationTasks(request: { _ in requests += 1; return self.answer("Accepted explicit request") })
+        Container.shared.applicationTasks.register { tasks }
+        Container.shared.realtimeService.register { RealtimeService() }
+        let client = FullDuplexVoiceClient(localContext: context, localTriage: LocalTriageQueue(), dispatchJobs: store)
+        let earlier = try tasks.job(request: "Forward update A to trusted@example.test", commandID: nil, origin: origin("A"), profile: nil)
+        _ = await tasks.run(earlier)
+        let receipt = MailActionReceipt(kind: .forward, account: "one@example.test",
+            message: .init(to: "trusted@example.test", subject: "Fwd: Update", body: "Original note"),
+            replyMessageID: "A", parentJobID: earlier.id, requestKey: "original-forward")
+        let (sent, _) = try await store.beginMailAction(receipt, ownerID: backend.userId!, profileID: nil,
+            conversationID: nil, origin: origin("A"))
+        _ = await store.recordMailAction(sent.id, state: .sent, result: "Forward sent", provider: ["id": "confirmed-original"])
+        let originalCount = requests
+        client.standingStep = #"{"done":false,"item":{"id":"B","account":"two@example.test","threadId":"thread-B"}}"#
+        var accepted: [UUID] = []
+        client.onDispatchStarted = { id, _ in accepted.append(id) }
+        for (index, speech) in ["sniffing", "[sniff", "[sighs]", "forward, an", "go ahead"].enumerated() {
+            client.latestCompletedUserUtterance = speech
+            client.startDispatch(callId: "noise-\(index)", argumentsJSON: #"{"task":"Forward this to trusted@example.test with the old investment note","scope":"current_email","expects":"receipt"}"#)
+            XCTAssertTrue(accepted.isEmpty, speech)
+        }
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertTrue(accepted.isEmpty)
+        XCTAssertEqual(requests, originalCount, "No worker, contact lookup or write may start, even with a trusted destination")
+        let history = await store.history()
+        XCTAssertEqual(history.count, 2)
+        XCTAssertTrue(history.allSatisfy { $0.origin?.messageID == "A" })
+        XCTAssertEqual(history.filter { $0.mailAction?.state == .sent }.count, 1)
+        client.latestCompletedUserUtterance = "Forward this one to the same person too"
+        client.startDispatch(callId: "explicit-B", argumentsJSON: #"{"task":"Forward this to trusted@example.test","scope":"current_email","expects":"receipt"}"#)
+        await waitFor { !accepted.isEmpty }
+        let next = try XCTUnwrap(accepted.first)
+        _ = await tasks.result(next)
+        XCTAssertEqual(store.existing(next)?.origin?.messageID, "B")
+        XCTAssertEqual(store.existing(next)?.origin?.account, "two@example.test")
+    }
+
     func testRelatedDependencyRetainsSourceAndDecisionPolicyAcrossDelayedResultAndRestart() async throws {
         var continuation: CheckedContinuation<[[String: Any]], Never>?
         let tasks = ApplicationTasks(request: { _ in await withCheckedContinuation { continuation = $0 } })
@@ -78,6 +117,64 @@ final class ApplicationTasksTests: XCTestCase {
         brain.close()
         backend.userId = "another-owner"
         XCTAssertTrue(restored.decisionDependencies.isEmpty)
+    }
+
+    func testVoiceGroupLookupAndFirstFollowupKeepCommittedSourceAndDestination() async throws {
+        var requests: [String] = []
+        var pending: CheckedContinuation<[[String: Any]], Never>?
+        let tasks = ApplicationTasks(request: { body in
+            requests.append(GmailReadTools.json(body))
+            if requests.count == 1 { return await withCheckedContinuation { pending = $0 } }
+            return self.answer("Used the verified destination DB-A for the original source.")
+        })
+        Container.shared.applicationTasks.register { tasks }
+        Container.shared.realtimeService.register { RealtimeService() }
+        let client = FullDuplexVoiceClient(localContext: context, localTriage: LocalTriageQueue(), dispatchJobs: store)
+        client.standingStep = #"{"done":false,"item":{"id":"A","account":"one@example.test","from":"Sender A","subject":"Same topic","threadId":"thread-A","messages":[{"id":"A","from":"Sender A"},{"id":"earlier-A","from":"Owner"}]}}"#
+        client.latestCompletedUserUtterance = "Where should this email go in Notion?"
+        var accepted: [UUID] = []
+        client.onDispatchStarted = { id, _ in accepted.append(id) }
+        client.startDispatch(callId: "lookup", argumentsJSON: #"{"task":"Find the Notion destination for this email","scope":"current_email","expects":"answer"}"#)
+        await waitFor { pending != nil }
+        let lookup = try XCTUnwrap(accepted.first)
+        XCTAssertEqual(store.existing(lookup)?.origin?.messageID, "A")
+        XCTAssertEqual(store.existing(lookup)?.context?.holdsDecision, true)
+        XCTAssertEqual(store.decisionDependencies.map(\.id), [lookup])
+        XCTAssertTrue(requests.first?.contains("earlier-A") == true, "Keep the complete captured group for the worker")
+        client.standingStep = #"{"done":false,"item":{"id":"B","account":"two@example.test","from":"Sender B","subject":"Same topic","threadId":"thread-B"}}"#
+        pending?.resume(returning: answer("The destination is DB-A in Notion.")); pending = nil
+        _ = await tasks.result(lookup)
+        client.latestCompletedUserUtterance = "Put that email there and archive it."
+        client.startDispatch(callId: "followup", argumentsJSON: GmailReadTools.json([
+            "task": "File the source email in the verified Notion destination and archive it", "scope": "current_email",
+            "expects": "answer", "source_task_id": lookup.uuidString]))
+        await waitFor { requests.count == 2 }
+        let followup = try XCTUnwrap(accepted.last)
+        _ = await tasks.result(followup)
+        let row = try XCTUnwrap(store.existing(followup))
+        XCTAssertEqual(accepted.count, 2, "One task for the first complete follow-up")
+        XCTAssertEqual(row.origin?.messageID, "A")
+        XCTAssertEqual(row.origin?.account, "one@example.test")
+        XCTAssertEqual(row.context?.dependencyID, lookup)
+        XCTAssertTrue(row.context?.facts.contains(where: { $0.contains("DB-A") }) == true)
+        XCTAssertFalse(requests.last?.contains("thread-B") == true)
+    }
+
+    func testCurrentEmailTasksRefuseMissingSourceAndConflictingAccountsBeforeExecution() async throws {
+        var requests = 0
+        let tasks = ApplicationTasks(request: { _ in requests += 1; return self.answer("Unexpected") })
+        for source in [nil, "{}", #"{"account":"one@example.test","id":"A"}"#] as [String?] {
+            let job = DispatchWorker.Job(id: UUID(), task: "Find the Notion destination", facts: ["The source is A in one@example.test"],
+                standingOnJSON: source, expects: .answer, scope: .currentEmail, holdsDecision: true)
+            let result = await tasks.run(job)
+            XCTAssertEqual(result.status, .failed)
+            XCTAssertNil(store.existing(job.id), "Never persist an unbound related task")
+        }
+        let mismatched = DispatchWorker.Job(id: UUID(), task: "Research this source", account: "two@example.test",
+            standingOnJSON: #"{"account":"one@example.test","id":"A","threadId":"thread-A"}"#, scope: .currentEmail)
+        let mismatch = await tasks.run(mismatched)
+        XCTAssertEqual(mismatch.status, .failed)
+        XCTAssertEqual(requests, 0)
     }
 
     func testResearchRowsKeepIdentityThroughEveryStateWhileRoutineReceiptsStayInActivity() {
@@ -205,6 +302,83 @@ final class ApplicationTasksTests: XCTestCase {
         XCTAssertTrue(restored.existing(job.id)?.hasCommittedWrites == true)
     }
 
+    func testShowingPendingFormRetainsBrowserValuesWithoutSubmissionInFocusMode() async throws {
+        let browsers = browserStore(), fixture = BackgroundBrowserFixture()
+        defer { browsers.purge(); fixture.server.stop() }
+        let tasks = ApplicationTasks(request: { try await fixture.respond($0) })
+        Container.shared.applicationTasks.register { tasks }
+        let job = try tasks.job(request: "browser form fixture", commandID: nil, origin: origin("A"), profile: nil)
+        _ = await tasks.run(job)
+        let browser = try XCTUnwrap(browsers.sessions[job.id])
+        let page = try XCTUnwrap(browser.webView)
+        let key = try XCTUnwrap(browser.url?.query)
+        let values = try await page.evaluateJavaScript("document.querySelector('input').value") as? String
+        let model = DesktopWorkspaceModel()
+        model.focusMode = true
+        model.jobs = await store.history()
+        model.browserTasks = browsers.sessions
+        let binding = tasks.$selectedTaskID.sink { id in model.applyTaskSelection(id.flatMap { self.store.existing($0) }) }
+        defer { binding.cancel() }
+        let selected = await TaskManagementTool.run(GmailReadTools.json(["action": "select", "reference": job.id.uuidString]))
+        XCTAssertFalse(selected.1)
+        XCTAssertEqual(model.selectedJob?.id, job.id)
+        XCTAssertEqual(model.pendingBrowserJobs.map(\.id), [job.id])
+        XCTAssertTrue(model.focusMode, "Opening a browser must also work with the sidebar hidden")
+        XCTAssertTrue(browsers.sessions[job.id]?.webView === page)
+        let retained = try await page.evaluateJavaScript("document.querySelector('input').value") as? String
+        XCTAssertEqual(values, retained)
+        let count = await fixture.server.count(key)
+        XCTAssertEqual(count, 0, "Showing the form never approves or submits it")
+        browser.takeOver()
+        XCTAssertTrue(page.isUserInteractionEnabled)
+        XCTAssertEqual(browser.phase, .takeover)
+        model.applyTaskSelection(nil)
+        XCTAssertNil(model.selectedJob)
+        XCTAssertTrue(browsers.sessions[job.id]?.webView === page)
+    }
+
+    func testSpokenBrowserApprovalUsesSameTaskAndRejectsStaleDuplicateAndAmbiguousApprovals() async throws {
+        let browsers = browserStore(), fixture = BackgroundBrowserFixture()
+        defer { browsers.purge(); fixture.server.stop() }
+        let tasks = ApplicationTasks(request: { try await fixture.respond($0) })
+        Container.shared.applicationTasks.register { tasks }
+        let first = try tasks.job(request: "browser form fixture", commandID: nil, origin: origin("A"), profile: nil)
+        _ = await tasks.run(first)
+        let browser = try XCTUnwrap(browsers.sessions[first.id])
+        let approval = try XCTUnwrap(browser.approval)
+        let key = try XCTUnwrap(browser.url?.query)
+        let second = try tasks.job(request: "browser form fixture second", commandID: nil, origin: origin("B"), profile: nil)
+        _ = await tasks.run(second)
+        tasks.select(nil)
+        let args: [String: Any] = ["action": "resume_browser", "reference": first.id.uuidString,
+            "revision": 1, "approval_id": approval.id.uuidString]
+        let ambiguous = await TaskManagementTool.run(GmailReadTools.json(args), userRequest: "Go ahead and submit it")
+        XCTAssertTrue(ambiguous.1)
+        XCTAssertTrue(ambiguous.0.contains("More than one form"))
+        let inspect = await TaskManagementTool.run(GmailReadTools.json(["action": "browser", "reference": first.id.uuidString]))
+        XCTAssertTrue(inspect.0.contains(approval.id.uuidString))
+        let refusal = await TaskManagementTool.run(GmailReadTools.json(args), userRequest: "Don't submit it yet")
+        XCTAssertTrue(refusal.1)
+        let before = await fixture.server.count(key)
+        XCTAssertEqual(before, 0)
+        var stale = args; stale["approval_id"] = UUID().uuidString
+        let staleResult = await TaskManagementTool.run(GmailReadTools.json(stale), userRequest: "Submit it")
+        XCTAssertTrue(staleResult.1)
+        let resumed = await TaskManagementTool.run(GmailReadTools.json(args), userRequest: "Go ahead and submit it")
+        XCTAssertFalse(resumed.1, resumed.0)
+        _ = await tasks.result(first.id)
+        XCTAssertEqual(store.existing(first.id)?.state, "done")
+        XCTAssertEqual(store.existing(first.id)?.taskRevision, 2)
+        XCTAssertTrue(browsers.sessions[first.id] === browser)
+        let duplicate = await TaskManagementTool.run(GmailReadTools.json(args), userRequest: "Submit it")
+        XCTAssertTrue(duplicate.1)
+        let count = await fixture.server.count(key)
+        XCTAssertEqual(count, 1)
+        XCTAssertEqual(store.existing(second.id)?.state, "awaiting_input")
+        let history = await store.history()
+        XCTAssertEqual(history.filter { $0.context != nil }.count, 2, "No redispatched task")
+    }
+
     func testBrowserCapacityQueuesThirdContextAndRejectsAnotherOwner() async throws {
         let browsers = browserStore()
         defer { browsers.purge() }
@@ -228,6 +402,154 @@ final class ApplicationTasksTests: XCTestCase {
         backend.userId = "different-owner"
         do { _ = try await browsers.session(ids[2]); XCTFail("Another owner accessed this browser") } catch {}
         XCTAssertFalse(third.current())
+    }
+
+    func testExpiredBrowserRecoversSameTaskWithNewApprovalAndOneSubmission() async throws {
+        let browsers = browserStore(), fixture = BackgroundBrowserFixture()
+        defer { browsers.purge(); fixture.server.stop() }
+        let tasks = ApplicationTasks(request: { try await fixture.respond($0) })
+        let job = try tasks.job(request: "browser form fixture", commandID: nil, origin: origin("A"), profile: nil)
+        _ = await tasks.run(job)
+        let old = try XCTUnwrap(browsers.sessions[job.id])
+        let oldApproval = try XCTUnwrap(old.approval).id
+        let oldKey = try XCTUnwrap(old.url?.query)
+        XCTAssertEqual(store.existing(job.id)?.browserState, .unsubmitted)
+        browsers.purge()
+        let restarted = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        Container.shared.dispatchJobs.register { restarted }
+        let resumed = ApplicationTasks(request: { try await fixture.respond($0) })
+        Container.shared.applicationTasks.register { resumed }
+        let saved = try XCTUnwrap(restarted.existing(job.id))
+        XCTAssertEqual(browsers.availability(saved), "expired")
+        XCTAssertTrue(saved.result?.contains("expired") == true)
+        let shown = await TaskManagementTool.run(GmailReadTools.json(["action": "browser", "reference": job.id.uuidString]))
+        XCTAssertTrue(shown.0.contains("inspection"))
+        XCTAssertTrue(browsers.sessions[job.id]?.inspectionOnly == true)
+        XCTAssertFalse(shown.0.contains(oldApproval.uuidString))
+        var approval: [String: Any] = ["action": "resume_browser", "reference": job.id.uuidString,
+            "revision": 1, "approval_id": oldApproval.uuidString]
+        let rejected = await TaskManagementTool.run(GmailReadTools.json(approval), userRequest: "I approve it")
+        XCTAssertTrue(rejected.1)
+        XCTAssertTrue(rejected.0.contains("inspection"))
+        let recovered = await TaskManagementTool.run(GmailReadTools.json(["action": "restart_browser",
+            "reference": job.id.uuidString, "revision": 1]), userRequest: "Reopen the form")
+        XCTAssertFalse(recovered.1, recovered.0)
+        _ = await resumed.result(job.id)
+        let fresh = try XCTUnwrap(browsers.sessions[job.id])
+        XCTAssertFalse(fresh === old)
+        XCTAssertEqual(restarted.existing(job.id)?.origin, origin("A"))
+        XCTAssertEqual(restarted.existing(job.id)?.task, job.task)
+        XCTAssertEqual(restarted.existing(job.id)?.taskRevision, 2)
+        let freshApproval = try XCTUnwrap(fresh.approval).id
+        XCTAssertNotEqual(freshApproval, oldApproval)
+        approval["revision"] = 2
+        let stale = await TaskManagementTool.run(GmailReadTools.json(approval), userRequest: "I approve it")
+        XCTAssertTrue(stale.1)
+        approval["approval_id"] = freshApproval.uuidString
+        let approved = await TaskManagementTool.run(GmailReadTools.json(approval), userRequest: "I approve this form")
+        XCTAssertFalse(approved.1, approved.0)
+        _ = await resumed.result(job.id)
+        let oldCount = await fixture.server.count(oldKey)
+        let newCount = await fixture.server.count(try XCTUnwrap(fresh.url?.query))
+        XCTAssertEqual(oldCount, 0)
+        XCTAssertEqual(newCount, 1)
+        XCTAssertEqual(restarted.existing(job.id)?.browserState, .confirmed)
+        browsers.purge()
+        do { try await resumed.restartBrowser(job.id, version: 3); XCTFail("Committed submission replayed") } catch {}
+    }
+
+    func testBrowserRecoveryRejectsUnknownManualAndForeignProfileAndRequiresLegacyVerification() async throws {
+        let browsers = browserStore()
+        defer { browsers.purge() }
+        let tasks = ApplicationTasks(request: { _ in self.answer("Reopened without submitting") })
+        Container.shared.applicationTasks.register { tasks }
+        for state in [DispatchJob.BrowserState.submitting, .unknown, .userControlled] {
+            let id = UUID()
+            await store.begin(id: id, task: "Browser", profileId: nil, origin: origin("A"))
+            _ = await store.acceptContext(id, context: .init(scope: "current_email", expects: "answer",
+                authoredAt: Date(), timeZone: "UTC", input: "voice"))
+            _ = await store.recordBrowserState(id, state: state)
+            await store.finish(id, state: "awaiting_input", result: "Old form open")
+            do { try await tasks.restartBrowser(id, version: 1, verifiedUnsubmitted: true); XCTFail("Uncertain browser replayed") } catch {}
+            XCTAssertEqual(browsers.availability(try XCTUnwrap(store.existing(id))), "unknown")
+        }
+        let legacy = UUID()
+        await store.begin(id: legacy, task: "Browser", profileId: nil, origin: origin("B"))
+        _ = await store.acceptContext(legacy, context: .init(scope: "current_email", expects: "answer",
+            authoredAt: Date(), timeZone: "UTC", input: "voice"))
+        await store.finish(legacy, state: "awaiting_input", result: "The form is filled and open")
+        do { try await tasks.restartBrowser(legacy, version: 1); XCTFail("Legacy state needs verification") } catch {}
+        let speech = try XCTUnwrap(store.existing(legacy)?.recoveredAnswer())
+        XCTAssertFalse(speech.contains("filled"))
+        ProfileRuntime.install(.init(profileId: "different", isDefault: false, emails: ["one@example.test"]))
+        do { try await tasks.restartBrowser(legacy, version: 1, verifiedUnsubmitted: true); XCTFail("Wrong profile") } catch {}
+        ProfileRuntime.install(nil)
+        try await tasks.restartBrowser(legacy, version: 1, verifiedUnsubmitted: true)
+        _ = await tasks.result(legacy)
+        XCTAssertEqual(store.existing(legacy)?.taskRevision, 2)
+        XCTAssertEqual(store.existing(legacy)?.origin, origin("B"))
+    }
+
+    func testLegacyUnknownAndConfirmedBrowsersCanBeInspectedWithoutReplayingOrChangingOutcome() async throws {
+        let browsers = browserStore(), server = BrowserHTTPFixture()
+        let base = try await server.start()
+        defer { browsers.purge(); server.stop() }
+        browsers.inspectionDestination = { job in base.appendingPathComponent("event").appending(queryItems: [.init(name: job.id.uuidString, value: nil)]) }
+        let tasks = ApplicationTasks(request: { _ in XCTFail("Inspection must not redispatch the task"); return [] })
+        Container.shared.applicationTasks.register { tasks }
+        for state in [DispatchJob.BrowserState.unavailable, .unknown, .confirmed] {
+            let id = UUID()
+            await store.begin(id: id, task: "Inspect registration", profileId: nil, origin: origin("A"))
+            _ = await store.acceptContext(id, context: .init(scope: "current_email", expects: "answer",
+                authoredAt: Date(), timeZone: "UTC", input: "voice"))
+            _ = await store.recordBrowserState(id, state: state)
+            await store.finish(id, state: "awaiting_input", result: "Historical form report")
+            let result = await TaskManagementTool.run(GmailReadTools.json(["action": "browser", "reference": id.uuidString]),
+                userRequest: "Click the link and fill in the details")
+            XCTAssertFalse(result.1, result.0)
+            let browser = try XCTUnwrap(browsers.sessions[id])
+            XCTAssertEqual(tasks.selectedTaskID, id)
+            XCTAssertTrue(browser.inspectionOnly)
+            XCTAssertTrue(browser.text.contains("Controlled Jo browser fixture"))
+            XCTAssertNotNil(browser.webView)
+            XCTAssertEqual(store.existing(id)?.browserState, state)
+            XCTAssertEqual(store.existing(id)?.taskRevision, 1)
+            let field = try XCTUnwrap(browser.controls.first { $0.kind == "field" })
+            do { _ = try await browser.fill(field.id, revision: browser.revision, value: "Guest"); XCTFail("Inspection filled a form") } catch {}
+            let submit = try XCTUnwrap(browser.controls.first { $0.kind == "submit" })
+            do { _ = try await browser.click(submit.id, revision: browser.revision, receipt: "Registered"); XCTFail("Inspection submitted") } catch {}
+            XCTAssertThrowsError(try browser.approve(UUID()))
+            do { try await tasks.resumeBrowser(id, version: 1); XCTFail("Inspection resumed a write") } catch {}
+            let count = await server.count(id.uuidString)
+            XCTAssertEqual(count, 0)
+            browsers.purge()
+        }
+        XCTAssertTrue(TaskManagementTool.requestsBrowser("Click the link and fill in the details"))
+        XCTAssertTrue(TaskManagementTool.requestsBrowser("View the registration website"))
+    }
+
+    func testVerifiedManualInspectionCanRebuildButProviderUnknownStillCannot() async throws {
+        let browsers = browserStore(), server = BrowserHTTPFixture()
+        let base = try await server.start()
+        defer { browsers.purge(); server.stop() }
+        browsers.inspectionDestination = { _ in base.appendingPathComponent("event") }
+        let tasks = ApplicationTasks(request: { _ in self.answer("Fresh inspection; approval still required") })
+        for state in [DispatchJob.BrowserState.userControlled, .unknown] {
+            let id = UUID()
+            await store.begin(id: id, task: "Inspect registration", profileId: nil, origin: origin("A"))
+            _ = await store.acceptContext(id, context: .init(scope: "current_email", expects: "answer", authoredAt: Date(), timeZone: "UTC", input: "voice"))
+            _ = await store.recordBrowserState(id, state: state)
+            await store.finish(id, state: "awaiting_input", result: "Historical outcome")
+            try await tasks.inspectBrowser(id, version: 1)
+            do {
+                try await tasks.restartBrowser(id, version: 1, verifiedUnsubmitted: true)
+                XCTAssertEqual(state, .userControlled)
+                _ = await tasks.result(id)
+                XCTAssertEqual(store.existing(id)?.taskRevision, 2)
+                XCTAssertEqual(store.existing(id)?.browserState, .unsubmitted)
+            } catch { XCTAssertEqual(state, .unknown) }
+            browsers.purge()
+        }
     }
 
     func testSelectedActivitySuppliesItsResultAndClearsWithoutReplayingWork() async throws {
@@ -718,6 +1040,85 @@ final class ApplicationTasksTests: XCTestCase {
         XCTAssertEqual(requests, 1)
     }
 
+    func testConfirmedQuickActionResolvesExactOlderFailureAcrossRestartWithoutMovingSelection() async throws {
+        let source = origin("A")
+        let failure = UUID()
+        await store.begin(id: failure, task: "Archive", profileId: nil, origin: source)
+        _ = await store.acceptContext(failure, context: .init(scope: "current_email", expects: "receipt",
+            authoredAt: Date(), timeZone: "UTC", input: "button"), preference: .quiet)
+        await store.receipt(failure, callId: "failed", tool: "archive_message", failed: true)
+        await store.finish(failure, state: "failed", result: "Nothing changed: mailbox mismatch.", reportBack: true)
+        let model = DesktopWorkspaceModel()
+        model.applyJobs(await store.history())
+        XCTAssertEqual(model.workQueueTasks.count, 1)
+        let tasks = ApplicationTasks()
+        tasks.select(failure)
+        let success = UUID()
+        let args = #"{"account":"one@example.test","message_id":"A"}"#
+        let result = await tasks.perform(id: success, name: "archive_message", arguments: args,
+            profile: nil, origin: source, inputSource: "button")
+        XCTAssertEqual(result.ok, true, result.text)
+        _ = await tasks.perform(id: success, name: "archive_message", arguments: args,
+            profile: nil, origin: source, inputSource: "button")
+        let resolved = try XCTUnwrap(store.existing(failure))
+        XCTAssertEqual(resolved.state, "failed")
+        XCTAssertEqual(resolved.receipts?.first?.outcome, "failed")
+        XCTAssertEqual(resolved.resolution?.jobID, success)
+        XCTAssertFalse(resolved.activityNeedsAttention)
+        XCTAssertFalse(store.shouldPresent(failure))
+        model.applyJobs(await store.history())
+        XCTAssertEqual(model.workQueueTasks.count, 0)
+        XCTAssertEqual(model.activityReviewCount, 0)
+        XCTAssertEqual(model.activityJobs.count, 2)
+        XCTAssertEqual(tasks.selectedTaskID, failure, "Resolution must not steal focus")
+        let restarted = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        XCTAssertEqual(restarted.existing(failure)?.resolution?.jobID, success)
+        let recovered = await restarted.recover()
+        XCTAssertTrue(recovered.isEmpty)
+        let writes = await provider.writes()
+        XCTAssertEqual(writes, ["A", "thread-A"])
+    }
+
+    func testRetryResolutionExcludesOtherScopesArgumentsAndUncertainOrCompoundOutcomes() async throws {
+        let source = origin("A")
+        let action = DispatchJob.QuickMailAction.captured(tool: "archive_message", arguments: [:], origin: source)!
+        func row(_ state: String = "failed") -> DispatchJob {
+            .init(id: UUID(), task: "Archive", state: state, result: "Original result",
+                startedAt: Date(timeIntervalSince1970: 100), completedAt: Date(timeIntervalSince1970: 110),
+                userId: "task-user", receipts: [.init(callId: UUID().uuidString, tool: "archive_message", outcome: "failed")],
+                origin: source, quickMailAction: action)
+        }
+        let matching = row()
+        var variants = [row("unknown"), row("partial"), row(), row(), row(), row(), row(), row()]
+        variants[2].profileId = "other"
+        variants[3].userId = "other"
+        variants[4].origin = origin("B")
+        variants[5].quickMailAction = .captured(tool: "trash_message", arguments: [:], origin: source)
+        variants[6].quickMailAction = .captured(tool: "archive_message", arguments: ["extra": "different"], origin: source)
+        variants[7].inFlightOperation = "uncertain"
+        var compound = row()
+        compound.command = .init(keyword: "compound", actions: [.init(tool: "archive_message", detail: "Archive")])
+        var otherAccount = row()
+        otherAccount.origin = origin("A", account: "two@example.test")
+        var success = row("done")
+        success.startedAt = Date(timeIntervalSince1970: 120)
+        success.receipts = [.init(callId: "success", tool: "archive_message", outcome: "success")]
+        let url = folder.appendingPathComponent("reconcile.json")
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode([matching] + variants + [compound, otherAccount, success]).write(to: url)
+        let restarted = DispatchJobStore(url: url)
+        XCTAssertEqual(restarted.existing(matching.id)?.resolution?.jobID, success.id)
+        for candidate in variants + [compound, otherAccount] {
+            XCTAssertNil(restarted.existing(candidate.id)?.resolution)
+        }
+        let recovered = await restarted.recover()
+        XCTAssertFalse(recovered.contains { $0.id == matching.id })
+        XCTAssertTrue(recovered.contains { $0.id == compound.id })
+        XCTAssertTrue(recovered.contains { $0.id == variants[0].id })
+        XCTAssertTrue(recovered.contains { $0.id == variants[1].id })
+        XCTAssertTrue(recovered.contains { $0.id == otherAccount.id })
+    }
+
     func testSameTargetWaitsAndCallerCancellationDoesNotCancelAcceptedWork() async throws {
         var continuation: CheckedContinuation<[[String: Any]], Never>?
         let tasks = ApplicationTasks(request: { _ in await withCheckedContinuation { continuation = $0 } })
@@ -1059,6 +1460,7 @@ final class ApplicationTasksTests: XCTestCase {
         let queue = LocalTriageQueue()
         let client = FullDuplexVoiceClient(localContext: context, localTriage: queue)
         client.standingStep = #"{"done":false,"item":{"id":"A","account":"one@example.test","from":"Same sender","subject":"Same subject","threadId":"thread-A"}}"#
+        client.latestCompletedUserUtterance = "Research this source in the background"
         client.startDispatch(callId: "background-A", argumentsJSON: #"{"task":"Research this source","scope":"current_email","expects":"answer","requested_background":true,"completion_preference":"quiet"}"#)
         client.standingStep = #"{"done":false,"item":{"id":"B","account":"two@example.test","from":"Same sender","subject":"Same subject","threadId":"thread-B"}}"#
         await waitFor { submitted != nil }
@@ -1096,6 +1498,135 @@ final class ApplicationTasksTests: XCTestCase {
         XCTAssertEqual(model.taskOrigin(context)?.messageID, "A")
         model.previewSelection = .email(account: "two@example.test", messageID: "C", subject: "Same", sender: "Same")
         XCTAssertNil(model.taskOrigin(context))
+    }
+
+    private var notionFilingSteps: [CommandAction] { [
+        .init(tool: "gmail_get_message", detail: "Read this invocation's email and identify company and period"),
+        .init(tool: "notion-search", detail: "Find that company's existing Investor Updates destination; clarify if missing or ambiguous"),
+        .init(tool: "notion-fetch", detail: "Read the matching destination and its schema"),
+        .init(tool: "notion-create-pages", detail: "File this update using that schema and retain its link"),
+        .init(tool: "archive_message", detail: "Archive this invocation's source only after the filing is confirmed")
+    ] }
+
+    private func notionFixture(failure: String? = nil) -> ScriptedMCPServer {
+        let storage = InMemoryRemoteMCPGrantStorage()
+        Container.shared.remoteMCPGrantStorage.register { storage }
+        for id in failure == "timeout" ? ["workspace", "other"] : ["workspace"] {
+            RemoteMCPGrantStore.save(.init(id: id, label: id, profileId: nil, accessToken: "synthetic", refreshToken: "r",
+                expiresAt: Date().addingTimeInterval(3600), needsReauth: false, clientId: "c",
+                tokenEndpoint: "https://mcp.notion.com/token", resource: "https://mcp.notion.com/mcp", grantedAt: Date()), .notion)
+        }
+        let server = ScriptedMCPServer { call in
+            let id = call.json["id"] ?? NSNull()
+            switch call.json["method"] as? String {
+            case "initialize": return ScriptedMCPServer.sse(id: id, result: #"{"protocolVersion":"2025-06-18"}"#)
+            case "notifications/initialized": return .init(status: 202, body: "")
+            default:
+                let name = (call.json["params"] as? [String: Any])?["name"] as? String
+                if name == "notion-create-pages", failure == "timeout" { return .init(status: 504) }
+                let failed = name == "notion-create-pages" && failure != nil
+                let text = failed ? failure! : "Verified destination/schema; receipt https://notion.so/synthetic-update"
+                return ScriptedMCPServer.sse(id: id, result: GmailReadTools.json([
+                    "isError": failed, "content": [["type": "text", "text": text]]]))
+            }
+        }
+        Container.shared.remoteMCPCredentials.register { RemoteMCPCredentials(transport: server) }
+        return server
+    }
+
+    private func notionStep(_ body: [String: Any], source: DispatchJob.MailOrigin, needsInput: Bool = false) -> [[String: Any]] {
+        let instruction = (body["input"] as? [[String: Any]])?.last?["content"] as? String ?? ""
+        guard let suffix = instruction.components(separatedBy: "You must call ").dropFirst().first,
+              let name = suffix.split(separator: " ").first.map(String.init) else {
+            return answer(#"{"status":"completed","report":"Filed the update: https://notion.so/synthetic-update","report_back":true}"#)
+        }
+        if name == "notion-fetch", needsInput {
+            return answer(#"{"status":"needs_input","report":"Which Investor Updates database should I use?","report_back":true}"#)
+        }
+        let database = source.messageID == "A" ? "1f8d872b-594c-80a4-b2f4-00370af2b13f" : "2f8d872b-594c-80a4-b2f4-00370af2b13f"
+        let args: [String: Any]
+        switch name {
+        case "notion-search": args = ["query": "Company \(source.messageID) Investor Updates"]
+        case "notion-fetch": args = ["id": database]
+        case "notion-create-pages": args = ["parent_database_id": database, "title": "Company \(source.messageID) October update", "content": "Synthetic source \(source.messageID)"]
+        default: args = ["message_id": source.messageID, "account": source.account]
+        }
+        return [["type": "function_call", "name": name, "call_id": UUID().uuidString, "arguments": GmailReadTools.json(args)]]
+    }
+
+    func testSavedNotionCommandRestartsAndFilesTwoSourcesIntoSeparateDestinations() async throws {
+        let server = notionFixture()
+        let commands = Container.shared.customCommands()
+        _ = await commands.save(keyword: "file investor update", label: "File investor update", actions: notionFilingSteps)
+        let reopened = CustomCommandStore()
+        await reopened.refresh()
+        let command = try XCTUnwrap(reopened.commands.first)
+        XCTAssertEqual(command.actions, notionFilingSteps)
+        for source in [origin("A"), origin("B", account: "two@example.test")] {
+            let tasks = ApplicationTasks(request: { self.notionStep($0, source: source) })
+            let job = try tasks.job(request: command.title, commandID: command.id, origin: source, profile: nil)
+            let result = await tasks.run(job)
+            let row = try XCTUnwrap(store.existing(job.id))
+            XCTAssertTrue(row.isDone, result.text)
+            XCTAssertEqual(row.command?.completedSteps, 5)
+            XCTAssertEqual(row.receipts?.filter { $0.outcome == "success" }.map(\.tool), ["notion-create-pages", "archive_message"])
+            XCTAssertTrue(row.command?.completedResults.contains { $0.contains("https://notion.so/synthetic-update") } == true)
+        }
+        let creates = server.calls.compactMap { $0.json["params"] as? [String: Any] }.filter { $0["name"] as? String == "notion-create-pages" }
+        XCTAssertEqual(creates.count, 2)
+        XCTAssertTrue(GmailReadTools.json(creates[0]).contains("1f8d872b"))
+        XCTAssertTrue(GmailReadTools.json(creates[1]).contains("2f8d872b"))
+        let writes = await provider.writes()
+        XCTAssertEqual(writes.filter { $0.hasPrefix("thread-") }, ["thread-A", "thread-B"])
+    }
+
+    func testAmbiguousNotionCommandClarifiesWithoutLosingSourceOrRepeatingFinishedSteps() async throws {
+        let server = notionFixture()
+        let commands = Container.shared.customCommands()
+        _ = await commands.save(keyword: "file investor update", label: "", actions: notionFilingSteps)
+        let command = try XCTUnwrap(commands.commands.first)
+        var ambiguous = true
+        let tasks = ApplicationTasks(request: { self.notionStep($0, source: self.origin("A"), needsInput: ambiguous) })
+        let job = try tasks.job(request: command.title, commandID: command.id, origin: origin("A"), profile: nil)
+        _ = await tasks.run(job)
+        XCTAssertEqual(store.existing(job.id)?.state, "awaiting_input")
+        XCTAssertEqual(store.existing(job.id)?.command?.completedSteps, 2)
+        let before = await provider.writes()
+        XCTAssertTrue(before.isEmpty)
+        ambiguous = false
+        try await tasks.correct(job.id, version: 1, instruction: "Use the Company A database under Published.")
+        let result = await tasks.result(job.id)
+        XCTAssertTrue(store.existing(job.id)?.isDone == true, result.text)
+        XCTAssertEqual(store.existing(job.id)?.origin?.messageID, "A")
+        XCTAssertEqual(store.existing(job.id)?.command?.completedSteps, 5)
+        let names = server.calls.compactMap { ($0.json["params"] as? [String: Any])?["name"] as? String }
+        XCTAssertEqual(names, ["notion-search", "notion-fetch", "notion-create-pages"])
+        let writes = await provider.writes()
+        XCTAssertEqual(writes.filter { $0.hasPrefix("thread-") }, ["thread-A"])
+    }
+
+    func testNotionCommandDoesNotArchiveFailedOrUncertainWritesOrRepeatUnknownPages() async throws {
+        let commands = Container.shared.customCommands()
+        _ = await commands.save(keyword: "file investor update", label: "", actions: notionFilingSteps)
+        let command = try XCTUnwrap(commands.commands.first)
+        for failure in ["Schema mismatch", "Permission denied", "timeout"] {
+            let server = notionFixture(failure: failure)
+            let tasks = ApplicationTasks(request: { self.notionStep($0, source: self.origin("A")) })
+            let job = try tasks.job(request: command.title, commandID: command.id, origin: origin("A"), profile: nil)
+            let result = await tasks.run(job)
+            XCTAssertNotEqual(result.ok, true)
+            let row = try XCTUnwrap(store.existing(job.id))
+            XCTAssertEqual(row.command?.completedSteps, 3)
+            if failure == "timeout" {
+                XCTAssertEqual(row.state, "unknown")
+                XCTAssertThrowsError(try row.commandRetry(using: command, profileID: nil, accounts: ["one@example.test"]))
+                do { try await tasks.correct(job.id, version: 1, instruction: "Try again"); XCTFail("Unknown write replayed") } catch {}
+            }
+            let writes = server.calls.filter { ($0.json["params"] as? [String: Any])?["name"] as? String == "notion-create-pages" }
+            XCTAssertEqual(writes.count, 1, "Never fall through to a second workspace after an uncertain write")
+        }
+        let writes = await provider.writes()
+        XCTAssertTrue(writes.filter { $0.hasPrefix("thread-") }.isEmpty)
     }
 
     func testSavedLabelResolvesPerInboxAndPersistsMappingsAcrossRestart() async throws {

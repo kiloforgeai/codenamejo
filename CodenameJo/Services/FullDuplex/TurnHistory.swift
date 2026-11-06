@@ -82,15 +82,62 @@ struct TurnHistory {
         let previous = records[turn.id]
         var record = turn
         if failedTurns.contains(turn.id) { record.status = .failed }
-        record.durationSeconds += previous?.durationSeconds ?? 0
+        // Finalization receives a cumulative span for this turn, not a new segment.
+        record.durationSeconds = max(record.durationSeconds, previous?.durationSeconds ?? 0)
         record.issuedAt = previous?.issuedAt ?? turn.issuedAt
         record.toolSteps = turn.toolSteps ?? previous?.toolSteps
         record.latency = turn.latency ?? previous?.latency
-        let brainSteps = (previous?.brainSteps ?? []) + (turn.brainSteps ?? [])
+        var brainSteps = previous?.brainSteps ?? []
+        for step in turn.brainSteps ?? [] {
+            if let id = step.responseID, let index = brainSteps.firstIndex(where: { $0.responseID == id }) { brainSteps[index] = step }
+            else if !brainSteps.contains(step) { brainSteps.append(step) }
+        }
         record.brainSteps = brainSteps.isEmpty ? nil : brainSteps
         record = record.preservingTerminalAttempts(from: previous)
         records[record.id] = record
         return record
+    }
+
+    mutating func telemetry(_ entry: TurnTelemetry.Entry, id: UUID, at date: Date) -> CommandRecord? {
+        guard var record = records[id] else { return nil }
+        record.durationSeconds = max(record.durationSeconds, entry.duration(at: date))
+        record.latency = entry.latency ?? record.latency
+        record.brainSteps = entry.brainSteps.isEmpty ? record.brainSteps : entry.brainSteps
+        records[id] = record
+        return record
+    }
+}
+
+/// Timing belongs to an identified turn within one connection generation. A late response
+/// may update that turn, but can never consume the current turn's timer or brain steps.
+struct TurnTelemetry {
+    struct Entry {
+        var started: Date?
+        var ended: Date?
+        var brainSteps: [CommandRecord.BrainStep] = []
+        var latency: TurnLatency?
+        var finalizedReply: String?
+        func duration(at now: Date) -> TimeInterval { started.map { max(0, (ended ?? now).timeIntervalSince($0)) } ?? 0 }
+    }
+    private(set) var entries: [UUID: Entry] = [:]
+    mutating func begin(_ id: UUID, at date: Date) {
+        if entries[id]?.started == nil { entries[id, default: .init()].started = date }
+    }
+    mutating func end(_ id: UUID, at date: Date) {
+        if entries[id]?.ended == nil { entries[id, default: .init()].ended = date }
+    }
+    mutating func record(_ step: CommandRecord.BrainStep, for id: UUID) {
+        var entry = entries[id, default: .init()]
+        if let response = step.responseID, let index = entry.brainSteps.firstIndex(where: { $0.responseID == response }) {
+            entry.brainSteps[index] = step
+        } else if !entry.brainSteps.contains(step) { entry.brainSteps.append(step) }
+        entries[id] = entry
+    }
+    mutating func record(_ latency: TurnLatency, for id: UUID) { entries[id, default: .init()].latency = latency }
+    mutating func finish(_ id: UUID, reply: String, at date: Date) {
+        guard entries[id]?.finalizedReply != reply else { return }
+        entries[id, default: .init()].ended = date
+        entries[id, default: .init()].finalizedReply = reply
     }
 }
 

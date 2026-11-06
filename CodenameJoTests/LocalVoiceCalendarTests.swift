@@ -83,7 +83,8 @@ final class LocalVoiceCalendarTests: XCTestCase {
         }
         XCTAssertTrue(LocalVoiceCalendar.saysDecline("can you decline that standup for me"))
         XCTAssertFalse(LocalVoiceCalendar.saysDecline("cancel the standup"))
-        for text in ["is the dentist still on tomorrow", "don't cancel the dentist", "move the dentist to 4"] {
+        for text in ["is the dentist still on tomorrow", "don't cancel the dentist", "move the dentist to 4",
+                     "don't take standup off my calendar", "never take standup off my calendar", "take a look at my calendar"] {
             XCTAssertFalse(LocalVoiceCalendar.allowsCancel(text), text)
         }
     }

@@ -55,9 +55,13 @@ struct DesktopFeedSidebar: View {
                         ForEach(viewModel.workQueueTasks) { job in
                             DesktopTaskRow(job: job, selected: viewModel.selectedJob?.id == job.id) { viewModel.selectedJob = job }
                                 .disabled(viewModel.selectingResult)
+                            if viewModel.browserTasks[job.id]?.needsInput == true {
+                                Button("View form", systemImage: "globe") { viewModel.applyTaskSelection(job) }
+                                    .buttonStyle(.borderless).padding(.horizontal, 12).padding(.bottom, 8)
+                            }
                         }
                     }.padding(.horizontal, 10)
-                }.frame(maxHeight: min(260, CGFloat(viewModel.workQueueTasks.count * 112 + 36)))
+                }.frame(maxHeight: min(300, CGFloat(viewModel.workQueueTasks.count * 112 + viewModel.pendingBrowserJobs.count * 36 + 36)))
                 Divider().padding(.vertical, 8)
             }
             ScrollViewReader { proxy in

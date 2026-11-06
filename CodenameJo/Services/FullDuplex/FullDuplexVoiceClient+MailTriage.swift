@@ -329,6 +329,7 @@ extension FullDuplexVoiceClient {
     }
 
     func resetLivePreparation(keepingCorrections: Bool = true) {
+        transport?.liveAdapter?.cancelEmailOpening(reason: "preparation_scope_reset")
         livePreparationSchedule?.cancel()
         livePreparationSchedule = nil
         for task in livePreparationTasks.values { task.cancel() }
@@ -405,6 +406,7 @@ extension FullDuplexVoiceClient {
                                 && result.emailContent?.messages.allSatisfy(\.textComplete) == true),
                             "task_revision": String(result.correctionRevision ?? 0),
                             "target_hash": self.diagnostics?.target(MailSelection(account: key.account, messageID: key.messageId).canonical) ?? "unknown"])
+                        self.transport?.liveAdapter?.refreshEmailOpening()
                     }
                     RealtimeLog.log("livePreparation: \(result == nil ? "miss" : "ready") in \(Int(Date().timeIntervalSince(started) * 1000))ms")
                 }
@@ -487,7 +489,7 @@ extension FullDuplexVoiceClient {
                                       ms: Double, outcome: String, query: String, dial: Int, userTurn: Int,
                                       lead: String? = nil, context: String = "") -> Bool {
         guard isActive, dialGeneration == dial, liveUserTurn == userTurn, endCueTask == nil, !userSpeaking,
-              transport != nil, !MailHeadersOnly.withholdsBodies, openingWasAudible,
+              transport != nil, !MailHeadersOnly.withholdsBodies, openingReadyForWork,
               standingStep == step else { return false }
         let cleanupLine = LiveEmailPresentation.cleanupSpeakerLine(for: step, lead: lead ?? "")
         let profileId = ProfileRuntime.snapshot?.profileId
@@ -513,11 +515,13 @@ extension FullDuplexVoiceClient {
     private static let unheardPresentationLimit: TimeInterval = 20
 
     private func markPresentationUnheard(_ step: String?) {
+        guard narrationMode.automaticNarration else { unheardPresentation = nil; return }
         let sender = step.map(Self.senderWords) ?? []
         unheardPresentation = sender.isEmpty ? nil : (liveQueueRevision, sender, "", Date())
     }
 
     func presentationUnheard() -> Bool {
+        guard narrationMode.automaticNarration else { unheardPresentation = nil; return false }
         guard let unheard = unheardPresentation, unheard.revision == liveQueueRevision,
               Date().timeIntervalSince(unheard.at) < Self.unheardPresentationLimit else {
             unheardPresentation = nil
@@ -1296,6 +1300,7 @@ extension FullDuplexVoiceClient {
     ///
     /// - Returns: true when the phone took the turn.
     func speakFeedCompletionIfDue() -> Bool {
+        guard narrationMode.automaticNarration else { return false }
         guard let completion = pendingFeedCompletion, !completion.asked,
               let adapter = transport?.liveAdapter,
               isActive, endCueTask == nil, !calendarFeedPending, !userSpeaking,
@@ -1687,6 +1692,21 @@ extension FullDuplexVoiceClient {
         let userTurn = liveUserTurn
         let deferDraft = transport != nil
         let profileId = ProfileRuntime.snapshot?.profileId
+        let userRequest = latestCompletedUserUtterance
+        let replySource: LocalCompose.ReplySource? = {
+            guard tool != "forward_email", let key = (liveQueueActionAnchor?.step ?? standingStep).flatMap(LiveEmailPresentation.Key.selection),
+                  Self.stringArgument("thread_id", in: argumentsJSON) == key.threadId
+                    || Self.stringArgument("reply_message_id", in: argumentsJSON).map(key.selectedIDs.contains) == true
+                    || (Self.stringArgument("thread_id", in: argumentsJSON) != nil && LiveRequestRecovery.refersToCurrentMessage(userRequest))
+                    || userRequest.range(of: #"(?i)^\s*(?:please\s+)?(?:reply|respond)\s+(?:saying|with|that|to this|to it)\b"#, options: .regularExpression) != nil
+            else { return nil }
+            return .init(selection: key, ownerID: Container.shared.backend().userId, profileID: profileId,
+                isCurrent: { [weak self] in
+                    guard let self, isActive, dialGeneration == dial else { return false }
+                    return standingStep.flatMap(LiveEmailPresentation.Key.selection)?.identity == key.identity
+                        && renderedSelectionRefusal() == nil
+                })
+        }()
         functionCallTask = Task { [weak self, localContext, localTriage] in
             if tool != "forward_email", await localTriage.requiresTopicReplySelection(argumentsJSON) {
                 self?.sendFunctionOutput(callId: callId,
@@ -1716,8 +1736,8 @@ extension FullDuplexVoiceClient {
                 name: runAs, argumentsJSON: relayArguments,
                 conversationId: self?.conversationId(),
                 deferDraft: deferDraft && runAs == "create_draft",
-                deferSend: deferDraft && runAs != "create_draft" && !onboardingReply,
-                onboardingReply: onboardingReply, mailCallID: callId)
+                deferSend: deferDraft && runAs != "create_draft" && !onboardingReply, onboardingReply: onboardingReply, mailCallID: callId, userRequest: userRequest,
+                replySource: replySource, diagnostics: self?.diagnostics)
             guard let self, self.isActive, dial == self.dialGeneration else { return }
             guard !Task.isCancelled else {
                 self.finishSupersededTool(callId: callId, tool: tool, result: result.text,
@@ -1731,6 +1751,13 @@ extension FullDuplexVoiceClient {
                     ms: Date().timeIntervalSince(started) * 1000,
                     outcome: result.deferred ? "pending" : result.ok == true ? "wrote" : "refused", query: "", detail: "profile changed",
                     subsystem: "localMailWrite", failed: result.ok != true, dial: dial)
+                return
+            }
+
+            if result.localDraftID != nil {
+                self.finishContextTool(callId: callId, tool: tool, output: result.text,
+                    ms: Date().timeIntervalSince(started) * 1000, outcome: "awaiting_review", query: "",
+                    detail: "local draft preview; no Gmail write or feed advance", subsystem: "localMailWrite", dial: dial)
                 return
             }
 
@@ -2141,11 +2168,12 @@ extension FullDuplexVoiceClient {
         let sourceID = args["source_message_id"] as? String
         let sourceAccount = args["source_account"] as? String
         let deferCalendar = false
+        let calendarOrigin = DispatchJob.MailOrigin.captured(in: liveQueueActionAnchor?.step ?? standingStep)
         functionCallTask = Task { [weak self] in
             let result = await FullDuplexBroker.runTool(
                 name: name, argumentsJSON: argumentsJSON,
                 conversationId: self?.conversationId(),
-                deferCalendar: deferCalendar)
+                deferCalendar: deferCalendar, mailCallID: callId, calendarOrigin: calendarOrigin)
             guard let self, self.isActive, dial == self.dialGeneration else { return }
             guard !Task.isCancelled else {
                 self.finishSupersededTool(callId: callId, tool: name, result: result.text,
