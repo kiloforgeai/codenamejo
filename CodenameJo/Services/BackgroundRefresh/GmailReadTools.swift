@@ -142,7 +142,11 @@ enum GmailReadTools {
 
     static func token(_ account: String) async throws -> String {
         switch await GoogleCredential.token(for: account) {
-        case .success(let token): return token.accessToken
+        case .success(let token):
+            guard token.email?.caseInsensitiveCompare(account) == .orderedSame else {
+                throw Refusal(text: "Google returned credentials for a different mailbox. Reconnect this account before trying again.")
+            }
+            return token.accessToken
         case .failure(.noStoredGrant), .failure(.grantRevoked), .failure(.scopesMissing):
             throw Refusal(text: "Google access for \(account) needs reconnecting in Settings. Say so plainly.")
         case .failure:
@@ -204,7 +208,32 @@ enum GmailReadTools {
         return min(Int(asked), 25)
     }
 
-    struct AccountPage { let hits: [[String: Any]]; let floor: Int64? }
+    struct AccountPage {
+        let account: String
+        let hits: [[String: Any]]
+        let floor: Int64?
+    }
+
+    struct AccountSearchResult {
+        let account: String
+        let page: Result<AccountPage, Error>
+    }
+
+    private struct SearchScope: Equatable {
+        let owner: String?
+        let profile: String?
+        let membership: Int?
+        let accounts: [String]
+        let headersOnly: Bool?
+
+        @MainActor static func current() -> Self {
+            let scope = ProfileRuntime.snapshot
+            return Self(owner: Container.shared.backend().userId, profile: scope?.profileId,
+                        membership: scope?.membershipRevision,
+                        accounts: ProfileRuntime.allowedMailAccounts(GoogleAccountStore.mailAccounts()),
+                        headersOnly: scope?.mailHeadersOnly)
+        }
+    }
 
     /// The next `before`, or nil with a stall note when the page could not move past its own second.
     static func nextCursor(floors: [Int64], before: Int?) -> (before: Int?, stalled: Bool) {
@@ -218,37 +247,61 @@ enum GmailReadTools {
         guard let query = string(args, "query") else {
             throw Refusal(text: "No query — pass a Gmail search.")
         }
-        let accounts = try targets(args)
+        let scope = await SearchScope.current()
+        let accounts = try targets(args, connected: scope.accounts)
         let before = try cursor(args["before"])
         let size = pageSize(args["max_results"])
         let q = before.map { "\(query) before:\($0)" } ?? query
-        let pages = await withTaskGroup(of: (Int, Result<AccountPage, Error>).self) { group in
+        let output = try await searchAccounts(accounts, query: q, size: size, before: before)
+        guard await SearchScope.current() == scope else {
+            throw Refusal(text: "The profile or mailbox access changed during this search. Its results were discarded; search again in the current profile.")
+        }
+        return output
+    }
+
+    static func searchAccounts(_ accounts: [String], query: String, size: Int, before: Int?,
+                               load: @escaping (String, String, Int) async throws -> AccountPage = searchPage) async throws -> String {
+        let request = UUID().uuidString
+        let pages = await withTaskGroup(of: AccountSearchResult.self) { group in
             for (index, account) in accounts.enumerated() {
                 group.addTask {
-                    do { return (index, .success(try await searchPage(account: account, query: q, size: size))) }
-                    catch { return (index, .failure(error)) }
+                    RealtimeLog.log("gmailSearch: request=\(request) mailbox=\(index) started")
+                    do {
+                        let page = try await load(account, query, size)
+                        guard page.account == account,
+                              page.hits.allSatisfy({ $0["account"] as? String == account }) else {
+                            throw Refusal(text: "Mailbox identity did not match the search result. These results were withheld; reconnect the account and try again.")
+                        }
+                        RealtimeLog.log("gmailSearch: request=\(request) mailbox=\(index) hits=\(page.hits.count)")
+                        return AccountSearchResult(account: account, page: .success(page))
+                    } catch {
+                        RealtimeLog.log("gmailSearch: request=\(request) mailbox=\(index) failed")
+                        return AccountSearchResult(account: account, page: .failure(error))
+                    }
                 }
             }
-            var out = [(Int, Result<AccountPage, Error>)]()
+            var out = [AccountSearchResult]()
             for await item in group { out.append(item) }
-            return out.sorted { $0.0 < $1.0 }.map(\.1)
+            let order = Dictionary(accounts.enumerated().map { ($0.element, $0.offset) }, uniquingKeysWith: min)
+            return out.sorted { (order[$0.account] ?? 0) < (order[$1.account] ?? 0) }
         }
         var entries: [[String: Any]] = []
         var floors: [Int64] = []
         var failed = 0
-        for (account, page) in zip(accounts, pages) {
-            switch page {
+        for result in pages {
+            switch result.page {
             case .success(let page):
-                entries.append(["account": account, "result": page.hits])
+                entries.append(["account": page.account, "result": page.hits])
                 if let floor = page.floor { floors.append(floor) }
             case .failure(let error):
                 failed += 1
-                entries.append(["account": account, "error": (error as? Refusal)?.text ?? describe(error)])
+                entries.append(["account": result.account, "error": (error as? Refusal)?.text ?? describe(error)])
             }
         }
         if failed == accounts.count, let error = entries.first?["error"] as? String { throw Refusal(text: error) }
         let next = nextCursor(floors: floors, before: before)
-        var result: [String: Any] = ["accounts": entries, "more": !floors.isEmpty || failed > 0]
+        var result: [String: Any] = ["accounts": entries, "more": !floors.isEmpty || failed > 0, "query": query,
+            "searchGuidance": "This result describes only the exact query and accounts shown. Empty results do not prove that an approximately described message is absent. For a document lookup, relax uncertain topic/file-type clues, search the sender, and inspect candidate attachment metadata. Never broaden an authorized bulk-action query. Preserve partial errors and pagination in any coverage claim."]
         if let value = next.before { result["before"] = value }
         if next.stalled {
             result["unreachable"] = "More than one page of these arrived within the same second, so there is no "
@@ -258,7 +311,7 @@ enum GmailReadTools {
         return json(result)
     }
 
-    private static func searchPage(account: String, query: String, size: Int) async throws -> AccountPage {
+    static func searchPage(account: String, query: String, size: Int) async throws -> AccountPage {
         let token = try await token(account)
         await GmailQuota.shared.spend(GmailQuota.Cost.list)
         let page = try await GmailAPI.messagePage(token: token, query: query, limit: size)
@@ -276,32 +329,76 @@ enum GmailReadTools {
         }
         let filled = page.nextPageToken != nil && !ordered.isEmpty
         let floor = filled ? ordered.compactMap { $0.internalDate.flatMap { Int64($0) } }.min() : nil
-        return AccountPage(hits: hits, floor: floor)
+        return AccountPage(account: account, hits: hits, floor: floor)
     }
 
     // MARK: - get_message
 
-    private static func runGetMessage(_ args: [String: Any]) async throws -> String {
+    static func readSelectedMessage(argumentsJSON: String, selection: LiveEmailPresentation.Key,
+                                    isCurrent: @MainActor () -> Bool) async -> (output: String, failed: Bool, effects: [GmailWriteEffect]?) {
+        let args = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8))) as? [String: Any] ?? [:]
+        let owner = await MainActor.run { Container.shared.backend().userId }
+        let profile = ProfileRuntime.snapshot
+        do {
+            guard let id = string(args, "message_id"), selection.selectedIDs.contains(id),
+                  string(args, "account")?.lowercased() == selection.account.lowercased(),
+                  !MailBodyCache.withheld, await isCurrent() else {
+                throw Refusal(text: "A complete read requires the currently selected email and full-body access.")
+            }
+            _ = try targets(args)
+            try Task.checkCancellation()
+            let output = try await runGetMessage(args, completeSelectedSource: true)
+            let currentOwner = await MainActor.run { Container.shared.backend().userId }
+            let current = ProfileRuntime.snapshot
+            guard currentOwner == owner, current?.profileId == profile?.profileId,
+                  current?.membershipRevision == profile?.membershipRevision, current?.emails == profile?.emails,
+                  !MailBodyCache.withheld,
+                  await isCurrent(), !Task.isCancelled else {
+                throw Refusal(text: "The selected email, account or profile changed during the read; its text was discarded.")
+            }
+            return (output, false, nil)
+        } catch { return ((error as? Refusal)?.text ?? describe(error), true, nil) }
+    }
+
+    private static func runGetMessage(_ args: [String: Any], completeSelectedSource: Bool = false) async throws -> String {
         guard let id = string(args, "message_id") else {
             throw Refusal(text: "No message id — search first, then open a message from a result.")
         }
         let accounts = try targets(args)
         if let hit = await MailBodyCache.cached(accounts: accounts, id: id, store: await Container.shared.mailStore()) {
-            return json([["account": hit.account, "result": envelope(hit.message)]])
+            let value = try await messageEnvelope(hit.message, account: hit.account, completeSelectedSource: completeSelectedSource)
+            return json([["account": hit.account, "result": value]])
         }
         let found = try await firstAnswering(accounts) { token in
-            try await GmailAPI.fullMessage(token: token, id: id)
+            let message = try await GmailAPI.fullMessage(token: token, id: id)
+            guard message.id == id else { throw Refusal(text: "Gmail returned a different message; the requested source could not be verified.") }
+            return message
         }
         if !MailBodyCache.withheld { await Container.shared.mailStore().saveBodies([found.value], account: found.account) }
-        return json([["account": found.account, "result": envelope(found.value)]])
+        let value = try await messageEnvelope(found.value, account: found.account, completeSelectedSource: completeSelectedSource)
+        return json([["account": found.account, "result": value]])
     }
 
-    static func envelope(_ message: GmailAPI.FullMessage) -> [String: Any] {
+    private static func messageEnvelope(_ message: GmailAPI.FullMessage, account: String,
+                                        completeSelectedSource: Bool) async throws -> [String: Any] {
+        var result = envelope(message)
+        guard completeSelectedSource else { return result }
+        let source = try await FullEmailSource.read(selection: .init(account: account, messageID: message.id),
+            threadID: message.threadId, prepared: nil, fetch: { message }, attachment: { _ in
+                throw Refusal(text: "The complete email body is not available inline. Open it in Gmail to inspect the original.")
+            })
+        result["body"] = source.text
+        result["bodyComplete"] = true
+        return result
+    }
+
+    static func envelope(_ message: GmailAPI.FullMessage, completeSelectedSource: Bool = false) -> [String: Any] {
         var body = MailBodyText.plainText(message.payload).trimmingCharacters(in: .whitespacesAndNewlines)
+        let bodyComplete = !body.isEmpty && MailBodyText.isComplete(message.payload) && (completeSelectedSource || body.count <= 20_000)
         if body.isEmpty, let snippet = message.snippet?.trimmingCharacters(in: .whitespacesAndNewlines), !snippet.isEmpty {
             body = snippet + "\n\n[Message body had no readable text; Gmail's preview follows.]"
         }
-        body = String(body.prefix(20_000))
+        if !completeSelectedSource { body = String(body.prefix(20_000)) }
         let files = attachments(in: message.payload)
         if !files.isEmpty {
             let listed = files.map { "\($0.filename) (\(AttachmentText.describeSize($0.size)))" }.joined(separator: ", ")
@@ -309,7 +406,13 @@ enum GmailReadTools {
         }
         var out: [String: Any] = ["id": message.id, "threadId": message.threadId,
             "from": message.header("From") ?? "", "to": message.header("To") ?? "",
-            "subject": message.header("Subject") ?? "", "date": message.header("Date") ?? "", "body": body]
+            "subject": message.header("Subject") ?? "", "date": message.header("Date") ?? "", "body": body,
+            "bodyComplete": bodyComplete]
+        out["attachments"] = files.map { file -> [String: Any] in
+            var metadata: [String: Any] = ["filename": file.filename, "mimeType": file.mimeType, "size": file.size]
+            if let id = file.attachmentId { metadata["attachment_id"] = id }
+            return metadata
+        }
         if !(message.header("In-Reply-To") ?? "").isEmpty || !(message.header("References") ?? "").isEmpty {
             out["isReply"] = true
             out["note"] = replyNote

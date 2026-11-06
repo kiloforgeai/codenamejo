@@ -21,9 +21,20 @@ struct DesktopFixtureComponent {
         let jobs = DispatchJobStore(url: FileManager.default.temporaryDirectory
             .appendingPathComponent("jo-fixture-jobs-" + UUID().uuidString + ".json"))
         Container.shared.dispatchJobs.register { jobs }
+        let browsers = BackgroundBrowserStore()
+        browsers.makeBrowser = { job, current in
+            let browser = BackgroundBrowser(job: job, current: current)
+            browser.allowLocalFixture = true
+            return browser
+        }
+        Container.shared.backgroundBrowsers.register { browsers }
+        let browserFixture = BackgroundBrowserFixture()
         let tasks = ApplicationTasks(request: { body in
             let request = (body["input"] as? [[String: Any]])?.first?["content"] as? String ?? ""
-            if request.contains("pause fixture") { try await Task.sleep(for: .seconds(10)) }
+            if request.contains("browser fixture") || request.contains("browser form fixture") {
+                return try await browserFixture.respond(body)
+            }
+            if request.contains("pause fixture") { try await Task.sleep(for: .seconds(15)) }
             let result = request.contains("input fixture")
                 ? #"{"status":"needs_input","report":"Which of the two synthetic dates should I use? No external action was taken."}"#
                 : "Synthetic task completed for the selected source. No external request was sent."
@@ -65,9 +76,14 @@ struct DesktopFixtureView: View {
                     Button("Archive fixture") { interactor.archive() }
                     Button("Delay projection") { interactor.next(delayProjection: true) }
                     Button("Delay session startup") { interactor.delaySessionStartup() }
+                    Button("Refresh continuity fixture") { interactor.refreshContinuity() }
                     Button("Apply projection") { interactor.applyProjection() }
                     Button("Section feed") { interactor.sectionFeed() }
                     Button("Finish fixture") { interactor.finish() }
+                    Button("Completed actions fixture") { interactor.completedActions() }
+                    Button("Sent receipts fixture") { interactor.sentReceipts() }
+                    Button("Background browser fixture") { interactor.backgroundBrowser(form: false) }
+                    Button("Background form fixture") { interactor.backgroundBrowser(form: true) }
                     Button("Export evidence") { interactor.exportEvidence() }
                     Button("Save bundle…") { interactor.saveEvidenceBundle() }
                     Button("Browser fixture") {
@@ -132,6 +148,7 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
     override func onLoad(viewModel: DesktopWorkspaceModel) -> [AnyCancellable] {
         super.onLoad(viewModel: viewModel)
         model = viewModel
+        Container.shared.backgroundBrowsers().$sessions.sink { [weak viewModel] in viewModel?.browserTasks = $0 }
         Container.shared.applicationTasks().$revision.dropFirst().sink { [weak viewModel] _ in
             Task { @MainActor in
                 guard let viewModel else { return }
@@ -244,6 +261,49 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
         }
     }
 
+    func refreshContinuity() {
+        guard let model, !busy, !model.sessionFeed.rows.isEmpty else { return }
+        busy = true
+        let original = model.sessionFeed
+        let focus = model.displayedFocus
+        Task {
+            defer { busy = false }
+            @MainActor func capture(_ phase: String) async {
+                trace.record(.feedRefresh, ["phase": phase, "queue_revision": String(model.sessionFeed.revision),
+                    "visible_count": String(model.feedRows.count), "queue_order": model.feedRows.map { trace.target($0.id) }.joined(separator: ",")])
+                try? await Task.sleep(for: .milliseconds(350))
+                exportEvidence()
+                try? await Task.sleep(for: .seconds(1))
+            }
+            await capture("baseline")
+            toggleSession()
+            await capture("ended")
+            model.conversationID = UUID(); model.inSession = true
+            model.applySessionFeed(.init(status: .loading, revision: 1))
+            await capture("delayed_start")
+            model.applySessionFeed(.init(status: .unavailable, revision: 2))
+            await capture("unavailable")
+            model.focus = focus
+            var refreshed = original
+            refreshed.revision = max(original.revision, 3)
+            model.applySessionFeed(refreshed)
+            await capture("reconnected")
+            model.refreshingFeed = true
+            await capture("manual_refresh")
+            refreshed.rows.append(.email(account: "qa@example.test", messageID: "inserted", subject: "New arrival", sender: "Fixture Sender"))
+            refreshed.revision += 1
+            model.applySessionFeed(refreshed); model.refreshingFeed = false
+            await capture("inserted")
+            if refreshed.rows.count > 2 { refreshed.rows.remove(at: 2) }
+            refreshed.revision += 1
+            model.applySessionFeed(refreshed)
+            await capture("removed")
+            model.applySessionFeed(original)
+            await capture("old_response_rejected")
+            updateFixtureEmailReader()
+        }
+    }
+
     private func updateFixtureEmailReader() {
         guard let model else { return }
         if case .email(let email) = model.displayedFocus, let id = email.messageId {
@@ -316,6 +376,24 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
         }
     }
 
+    func backgroundBrowser(form: Bool) {
+        guard let model else { return }
+        Task {
+            do {
+                let tasks = Container.shared.applicationTasks()
+                let origin = DispatchJob.MailOrigin(account: "qa@example.test", messageID: "fixture-1",
+                    threadID: "thread-1", sender: "Synthetic sender", subject: "Workshop")
+                let job = try tasks.job(request: form ? "browser form fixture: request a place after approval"
+                    : "browser fixture: bring back the workshop times", commandID: nil, origin: origin, profile: nil)
+                await tasks.submit(job)
+                model.jobs = await Container.shared.dispatchJobs().history()
+                model.showingActivity = true
+                model.selectedJob = model.jobs.first { $0.id == job.id }
+                tasks.select(job.id)
+            } catch { model.resultSelectionError = error.localizedDescription }
+        }
+    }
+
     func submitTask(_ text: String, commandID: String?, context: FeedActionContext) {
         guard let model, let origin = model.taskOrigin(context) else { return }
         Task {
@@ -331,7 +409,7 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
                     model.jobs = await Container.shared.dispatchJobs().history()
                     return
                 }
-                let job = try tasks.job(request: text, commandID: commandID, origin: origin, profile: context.profileID, preference: model.taskPreference)
+                let job = try tasks.job(request: text, commandID: commandID, origin: origin, profile: context.profileID)
                 let id = await tasks.submit(job)
                 if let accepted = Container.shared.dispatchJobs().existing(id),
                    let step = await queue.parkTaskSource(accepted, store: mail) {
@@ -459,6 +537,47 @@ class DesktopFixtureInteractor: ViewModelInteractor<DesktopWorkspaceModel>, Desk
             let jobs = Container.shared.dispatchJobs()
             await jobs.begin(id: context.jobID, task: context.request, profileId: context.profileID, origin: context.origin)
             await jobs.finish(context.jobID, state: state, result: result)
+            model?.jobs = await jobs.history()
+        }
+    }
+
+    func sentReceipts() {
+        Task {
+            do {
+                let jobs = Container.shared.dispatchJobs()
+                for index in 0..<17 {
+                    let message = MailMIME.Outgoing(to: "Dana <dana@example.test>", cc: ["team@example.test"],
+                        subject: "Fixture reply \(index + 1)", body: "Thanks, Dana.\n\nThe synthetic review is ready.\nNate",
+                        threadId: "fixture-thread-\(index)", inReplyTo: "<fixture-\(index)@example.test>")
+                    let action = MailActionReceipt(kind: index == 15 ? .draft : .send, account: "qa@example.test",
+                        message: message, replyMessageID: "fixture-source-\(index)")
+                    let origin = DispatchJob.MailOrigin(account: action.account, messageID: action.replyMessageID!,
+                        threadID: message.threadId!, sender: "Dana", subject: message.subject)
+                    let (job, _) = try await jobs.beginMailAction(action, ownerID: "fixture-user", profileID: nil,
+                        conversationID: nil, origin: origin)
+                    _ = try await MailActionAudit.write(job, receipt: "Synthetic provider confirmed this message. No external request was made.") {
+                        let sent: [String: Any] = ["id": "fixture-sent-\(index)", "threadId": message.threadId!]
+                        return action.kind == .draft ? ["id": "fixture-draft-\(index)", "message": sent] : sent
+                    }
+                }
+                model?.jobs = await jobs.history()
+            } catch { model?.resultSelectionError = "Receipt fixture failed: \(error.localizedDescription)" }
+        }
+    }
+
+    func completedActions() {
+        Task {
+            let jobs = Container.shared.dispatchJobs()
+            for (index, state) in ["done", "done", "done", "partial", "unknown"].enumerated() {
+                let id = UUID(), subject = index == 2 ? "Project update — a deliberately long subject with café ☕ and extensive release details" : "Project update"
+                let origin = DispatchJob.MailOrigin(account: index == 1 ? "personal@example.test" : "qa@example.test",
+                    messageID: "activity-\(index)", threadID: "thread-\(index)", sender: "Dana", subject: subject)
+                await jobs.begin(id: id, task: "Archive only the original email from Dana about \(subject). Keep its account and thread unchanged. Do not archive any other email.", profileId: nil, origin: origin)
+                if state != "unknown" { await jobs.receipt(id, callId: "fixture", tool: index == 1 ? "send_email" : "archive_message", failed: state == "partial") }
+                await jobs.finish(id, state: state, result: state == "done"
+                    ? "Confirmed synthetic action on \(subject). Complete original receipt retained here for inspection. No provider request was made."
+                    : "The archive was not confirmed. Check the original email before retrying.", reportBack: false)
+            }
             model?.jobs = await jobs.history()
         }
     }

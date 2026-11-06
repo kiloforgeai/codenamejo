@@ -31,11 +31,14 @@ struct DesktopFeedSidebar: View {
                 Text("Slack").tag("Slack")
                 Text("Calendar").tag("Calendar")
             }.pickerStyle(.menu).padding(.horizontal, 14).padding(.bottom, 12)
-            if viewModel.isStartingFeed {
-                Text("Starting session · keeping your place")
+            if viewModel.isStartingFeed || viewModel.scopeHydrating {
+                Text(viewModel.scopeHydrating ? "Connecting · keeping your place" : "Starting session · keeping your place")
                     .font(.caption).foregroundStyle(.secondary)
                     .padding(.horizontal, 18).padding(.bottom, 12)
                     .accessibilityIdentifier("desktopFeedHandoff")
+            } else if viewModel.inSession && viewModel.sessionFeed.status == .unavailable {
+                Text("Couldn’t refresh · keeping your place. Try Refresh feed.")
+                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 18).padding(.bottom, 12)
             } else if !viewModel.inSession {
                 Text(viewModel.feedPreview?.incomplete == true
                      ? "Some sources couldn’t refresh. Showing available work; counts may be incomplete."
@@ -44,26 +47,23 @@ struct DesktopFeedSidebar: View {
                     .padding(.horizontal, 18).padding(.bottom, 12)
                     .accessibilityIdentifier("desktopFeedPreviewStatus")
             }
+            if !viewModel.workQueueTasks.isEmpty {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 4) {
+                        Label("Research & results · \(viewModel.workQueueTasks.count)", systemImage: "tray.and.arrow.down")
+                            .font(.caption.weight(.semibold)).padding(8)
+                        ForEach(viewModel.workQueueTasks) { job in
+                            DesktopTaskRow(job: job, selected: viewModel.selectedJob?.id == job.id) { viewModel.selectedJob = job }
+                                .disabled(viewModel.selectingResult)
+                        }
+                    }.padding(.horizontal, 10)
+                }.frame(maxHeight: min(260, CGFloat(viewModel.workQueueTasks.count * 112 + 36)))
+                Divider().padding(.vertical, 8)
+            }
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 4) {
-                        if !viewModel.returnedTasks.isEmpty {
-                            Label("Returned work · \(viewModel.returnedTasks.count)", systemImage: "tray.and.arrow.down")
-                                .font(.caption.weight(.semibold)).padding(8)
-                            ForEach(viewModel.returnedTasks) { job in
-                                Button { viewModel.selectedJob = job } label: {
-                                    VStack(alignment: .leading, spacing: 5) {
-                                        Text(job.desktopStatusLabel).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                                        Text(job.task).font(.system(size: 13, weight: .medium)).lineLimit(2)
-                                        if let origin = job.origin { Text(origin.account).font(.caption).foregroundStyle(.secondary) }
-                                    }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
-                                        .background(DesktopWorkspaceStyle.accent.opacity(viewModel.selectedJob?.id == job.id ? 0.16 : 0.07), in: RoundedRectangle(cornerRadius: 8))
-                                }.buttonStyle(.plain).accessibilityIdentifier("returnedTask_\(job.id)")
-                                    .disabled(viewModel.selectingResult)
-                            }
-                            Divider().padding(.vertical, 8)
-                        }
-                        if rows.isEmpty {
+                        if rows.isEmpty && viewModel.workQueueTasks.isEmpty {
                             feedEmptyState
                         }
                         ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
@@ -80,7 +80,7 @@ struct DesktopFeedSidebar: View {
                                     .accessibilityIdentifier("feedSection_\(section.id)")
                             }
                             DesktopFeedRowButton(row: row, selected: viewModel.isCurrentRow(row)) { select(row) }
-                                .disabled(viewModel.selectingFeedItem || viewModel.selectingResult || viewModel.isStartingFeed)
+                                .disabled(viewModel.selectingFeedItem || viewModel.selectingResult || viewModel.isStartingFeed || viewModel.scopeHydrating)
                                 .id(row.id)
                         }
                     }.padding(.horizontal, 10).padding(.bottom, 8)
@@ -126,6 +126,35 @@ struct DesktopFeedSidebar: View {
         }.padding(18).accessibilityIdentifier(done ? "feedComplete" : "feedEmptyState")
     }
 
+}
+
+private struct DesktopTaskRow: View {
+    let job: DispatchJob
+    let selected: Bool
+    let action: () -> Void
+
+    private var accessibilityText: String {
+        job.task + ", " + job.desktopStatusLabel + (job.origin.map { ", " + $0.subject + ", " + $0.account } ?? "")
+    }
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 7) {
+                    if job.isRunning && !job.hasStopped() { ProgressView().controlSize(.mini) }
+                    else { Image(systemName: job.desktopStatusSymbol).font(.caption) }
+                    Text(job.desktopStatusLabel).font(.caption.weight(.semibold))
+                }.foregroundStyle(job.activityNeedsAttention ? Color.orange : Color.secondary)
+                Text(job.task).font(.system(size: 13, weight: .medium)).lineLimit(2)
+                if let origin = job.origin {
+                    Text(origin.subject + " · " + origin.account).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                }
+            }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                .background(DesktopWorkspaceStyle.accent.opacity(selected ? 0.16 : 0.07), in: RoundedRectangle(cornerRadius: 8))
+        }.buttonStyle(.plain).accessibilityIdentifier("returnedTask_\(job.id)")
+            .accessibilityLabel(accessibilityText)
+            .accessibilityHint("Show this task and its original source in the center pane")
+    }
 }
 
 private struct DesktopFeedRowButton: View {

@@ -41,7 +41,7 @@ struct DesktopFeedPresentation {
         return presentedSelection.map { row.selection == $0 } ?? false
     }
 
-    private static func selection(for focus: FeedFocus?) -> MailSelection? {
+    static func selection(for focus: FeedFocus?) -> MailSelection? {
         guard case .email(let email) = focus, let id = email.messageId else { return nil }
         return .init(account: email.account, messageID: id)
     }

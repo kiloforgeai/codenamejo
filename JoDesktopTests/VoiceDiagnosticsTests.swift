@@ -15,6 +15,16 @@ final class VoiceDiagnosticsTests: XCTestCase {
         XCTAssertTrue(events.allSatisfy { $0["session_id"] as? String == first.id.uuidString })
     }
 
+    func testEmailReadProgressExportsWithoutSourceText() {
+        let fields = VoiceDiagnostics.safeFields(["transition": "email_read_chunk_completed",
+            "chunk_index": "2", "chunk_count": "8", "source_bytes": "6000", "completed_bytes": "1500",
+            "cached": "false", "body": "PRIVATE SOURCE", "transcript": "PRIVATE SPEECH"])
+        XCTAssertEqual(fields.count, 6)
+        XCTAssertEqual(fields["completed_bytes"], "1500")
+        XCTAssertNil(fields["body"])
+        XCTAssertNil(fields["transcript"])
+    }
+
     func testRenderedSelectionAndWriteReceiptUseTheSameRedactedIdentity() {
         let selection = MailSelection(account: "OWNER@example.test", messageID: "same-id")
         let write = VoiceDiagnostics.targetIdentity(arguments: #"{"account":"owner@example.test","message_id":"same-id","label_id":"Label_42","thread_id":"thread"}"#)
@@ -116,6 +126,12 @@ final class VoiceDiagnosticsTests: XCTestCase {
             XCTAssertGreaterThan(Int(fields["dropped_events"] ?? "0") ?? 0, 0)
         }
         XCTAssertEqual(rows.filter { $0["event"] as? String == "brainAttemptEnded" }.count, 3)
+        for id in ids.suffix(3) {
+            XCTAssertTrue(rows.contains { row in
+                row["session_id"] as? String == id && row["event"] as? String == "workspaceRendered"
+                    && (row["fields"] as? [String: String])?["render_revision"] == "0"
+            }, "Startup renders must survive later render churn")
+        }
         let exported = try SessionExport.append(records: [], jobs: [], to: data, includeContent: false)
         XCTAssertTrue(String(decoding: exported, as: UTF8.self).contains("missing_ranges"))
         let other = try await restored.snapshot(userID: "other")

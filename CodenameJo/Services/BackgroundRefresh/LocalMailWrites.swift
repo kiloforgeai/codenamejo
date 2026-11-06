@@ -14,13 +14,13 @@ enum LocalMailWrites {
 
     /// - Parameter defer: the caller advances on the receipt, so the Gmail call may land after it.
     static func run(name: String, argumentsJSON: String, defer deferred: Bool,
-                    conversationId: String? = nil) async -> FullDuplexBroker.ToolResult {
+                    conversationId: String? = nil, source: GmailManageTools.WriteSource? = nil) async -> FullDuplexBroker.ToolResult {
         let args = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8))) as? [String: Any] ?? [:]
         let started = Date()
         do {
             let result = name == "count_messages"
                 ? try await count(args)
-                : try await write(name, args, deferred: deferred, conversationId: conversationId)
+                : try await write(name, args, deferred: deferred, conversationId: conversationId, source: source)
             RealtimeLog.log("localMailWrites: \(name) \(result.ok == false ? "failed" : "ok") in "
                 + "\(Int(Date().timeIntervalSince(started) * 1000))ms — \(result.text.prefix(80))")
             return result
@@ -69,9 +69,9 @@ enum LocalMailWrites {
     // MARK: - The four writes
 
     private static func write(_ name: String, _ given: [String: Any], deferred: Bool,
-                              conversationId: String?) async throws -> FullDuplexBroker.ToolResult {
-        var (args, accounts) = try await Manage.bind(name: name, given)
-        if name == "label_message" { return try await label(args, accounts, deferred: deferred, conversationId: conversationId) }
+                              conversationId: String?, source: Manage.WriteSource?) async throws -> FullDuplexBroker.ToolResult {
+        var (args, accounts) = try await Manage.bind(name: name, given, source: source)
+        if name == "label_message" { return try await label(args, accounts, deferred: deferred, conversationId: conversationId, source: source) }
         guard let messageId = GmailReadTools.string(args, "message_id") else { throw Refusal(text: noMessageId) }
         // A message lives in one mailbox, so which one to archive in is not a question to ask.
         if name == "archive_message", accounts.count > 1, let owner = await owner(of: messageId, among: accounts) {
@@ -87,6 +87,7 @@ enum LocalMailWrites {
         let token = try await GmailReadTools.token(account)
         let effects = Manage.Effects()
         let run = { (id: String) async throws in
+            try await source?.validate(messageID: id)
             switch name {
             case "archive_message":
                 try await Manage.modifyThreadWide(token, account: account, id: id, add: [], remove: ["INBOX", "UNREAD"], effects)
@@ -179,7 +180,7 @@ enum LocalMailWrites {
     // MARK: - label_message
 
     private static func label(_ args: [String: Any], _ accounts: [String], deferred: Bool,
-                              conversationId: String?) async throws -> FullDuplexBroker.ToolResult {
+                              conversationId: String?, source: Manage.WriteSource?) async throws -> FullDuplexBroker.ToolResult {
         guard let label = GmailReadTools.string(args, "label") else {
             throw Refusal(text: "No label given — ask the user what to call it.")
         }
@@ -207,9 +208,11 @@ enum LocalMailWrites {
             : "Labelled \"\(name)\" in \(account)."
 
         let apply = { (effects: Manage.Effects) async throws in
+            try await source?.validate(messageID: messageId)
             let labelId: String
             if let existing { labelId = existing.id } else { labelId = try await Manage.resolveLabel(token, label) }
             try await retryingDeadId("label_message", token: token, args: args, messageId: messageId) { id in
+                try await source?.validate(messageID: id)
                 let confirmed = try await Manage.modify(token, account: account, id: id, add: [labelId],
                     remove: (alsoArchive ? ["INBOX"] : []) + ["UNREAD"], effects)
                 // A rule that cannot file is not a label that failed: the message stays in the inbox and comes round again.

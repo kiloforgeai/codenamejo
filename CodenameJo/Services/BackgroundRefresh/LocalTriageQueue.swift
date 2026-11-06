@@ -443,8 +443,12 @@ actor LocalTriageQueue {
 
     private func refreshTaskOwnership() async {
         let snapshot = await MainActor.run { (Container.shared.backend().userId, ProfileRuntime.snapshot?.profileId) }
-        let taskStore = await MainActor.run { Container.shared.dispatchJobs() }
-        let jobs = await taskStore.history()
+        let store = await MainActor.run { Container.shared.dispatchJobs() }
+        let jobs = await store.history()
+        let held = outcomes + pausedOutcomes.values.flatMap { $0 }
+        let obsolete = await MainActor.run {
+            Set(held.filter { !store.shouldPresent($0.jobId, revision: $0.taskRevision) }.map(\.deliveryKey))
+        }
         let current = await MainActor.run { (Container.shared.backend().userId, ProfileRuntime.snapshot?.profileId) }
         guard snapshot == current else { return }
         let scope = (snapshot.0 ?? "") + ":" + (snapshot.1 ?? "default")
@@ -455,10 +459,11 @@ actor LocalTriageQueue {
         let pending = jobs.filter { $0.ownsFeedSource && $0.needsReview && $0.id != suppressedTaskResult }
         let versions = Set(pending.map { $0.id.uuidString + ":" + String($0.taskRevision) })
         for account in Array(pausedOutcomes.keys) {
-            pausedOutcomes[account]?.removeAll { $0.taskRevision != nil }
+            pausedOutcomes[account]?.removeAll { $0.taskRevision != nil || obsolete.contains($0.deliveryKey) }
         }
         outcomes.removeAll { outcome in
-            outcome.taskRevision.map { !versions.contains(outcome.jobId.uuidString + ":" + String($0)) } ?? false
+            obsolete.contains(outcome.deliveryKey)
+                || (outcome.taskRevision != nil && !versions.contains(outcome.deliveryKey))
         }
         for job in pending.sorted(by: { ($0.completedAt ?? .distantPast) < ($1.completedAt ?? .distantPast) }) {
             let version = job.id.uuidString + ":" + String(job.taskRevision)
@@ -3015,12 +3020,14 @@ actor LocalTriageQueue {
             "stopped": true,
             "note": closing,
         ]
-        // Nothing served these and nothing is going to: the walk they were waiting on is over.
+        // Stopping closes the reader; pending results remain unread for recovery or the report watchdog.
         for waiting in pausedOutcomes.values { outcomes.append(contentsOf: waiting) }
         pausedOutcomes = [:]
         offeredAccount = nil
         completedAccounts = []
-        payload.merge(Self.farewell(takeOutcomes())) { a, _ in a }
+        if !outcomes.isEmpty {
+            payload["pendingResultNote"] = "Pending task results were not presented. They remain unread; do not claim they were delivered."
+        }
         return Self.json(payload)
     }
 
@@ -3632,8 +3639,7 @@ actor LocalTriageQueue {
         return nil
     }
 
-    /// Every held answer, for a stop or a close: the walk is ending and there is no step left
-    /// to serve them one at a time.
+    /// Every held answer for the queue's completion presentation.
     private func takeOutcomes() -> [Outcome] {
         defer {
             for outcome in outcomes {

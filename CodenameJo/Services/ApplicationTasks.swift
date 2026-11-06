@@ -81,8 +81,9 @@ class ApplicationTasks: ObservableObject {
             expects: source.expects?.rawValue ?? "answer", facts: source.facts,
             authoredAt: source.authoredAt ?? Date(), timeZone: (source.authoredTimeZone ?? .current).identifier,
             input: source.inputSource, parksSource: origin != nil && source.scope != .independent
-                && (source.parksSource ?? (source.expects != .receipt)))
-        guard await store.acceptContext(id, context: context, preference: source.completionPreference ?? (source.expects == .receipt ? .quiet : .bringBack)) else {
+                && (source.parksSource ?? (source.expects != .receipt)),
+            holdsDecision: source.holdsDecision, dependencyID: source.dependencyID)
+        guard await store.acceptContext(id, context: context, preference: source.completionPreference ?? .requested(in: source.task)) else {
             results[id] = .task(.init(text: store.persistenceError ?? "Task could not be saved.", ok: false, status: .failed))
             await store.finish(id, state: "failed", result: store.persistenceError ?? "Task could not be saved.")
             revision += 1
@@ -197,6 +198,9 @@ class ApplicationTasks: ObservableObject {
 
     func cancel(_ id: UUID, version: Int) async throws {
         let job = try authorized(id, version: version)
+        #if targetEnvironment(macCatalyst)
+        Container.shared.backgroundBrowsers().cancel(id)
+        #endif
         if job.state == "awaiting_input" {
             await store.finish(id, state: "cancelled", result: "Cancelled while waiting for input. No further action was taken.", reportBack: false, revision: version)
             _ = await Container.shared.localTriage().release(jobId: id)
@@ -224,7 +228,23 @@ class ApplicationTasks: ObservableObject {
         try await correct(id, version: version, instruction: "Read only the selected page: " + selected.label + ". Do not RSVP or submit anything.", linkChoice: choice)
     }
 
-    func correct(_ id: UUID, version: Int, instruction: String, linkChoice: String? = nil) async throws {
+    #if targetEnvironment(macCatalyst)
+    func resumeBrowser(_ id: UUID, version: Int, approval: UUID? = nil) async throws {
+        let job = try authorized(id, version: version)
+        guard job.state == "awaiting_input", let browser = Container.shared.backgroundBrowsers().sessions[id],
+              browser.current(), browser.phase != .unknown else {
+            throw DispatchWorker.StepFailure(message: "Open the current browser task before resuming it.")
+        }
+        if let approval { try browser.approve(approval) }
+        else {
+            guard browser.phase != .approval else { throw DispatchWorker.StepFailure(message: "Review and approve the exact form action in Activities first.") }
+            try browser.resume()
+        }
+        try await correct(id, version: version, instruction: "Continue the original browser task.", resumingBrowser: true)
+    }
+    #endif
+
+    func correct(_ id: UUID, version: Int, instruction: String, linkChoice: String? = nil, resumingBrowser: Bool = false) async throws {
         let original = try authorized(id, version: version)
         guard !instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               original.context != nil, original.command == nil else {
@@ -240,7 +260,7 @@ class ApplicationTasks: ObservableObject {
         guard !settled.hasCommittedWrites, settled.state != "unknown", settled.inFlightOperation == nil else {
             throw DispatchWorker.StepFailure(message: "This task has committed or uncertain actions. Review its receipts and reconcile provider state before starting changed work. No action was repeated.")
         }
-        let updated = original.task + "\nUser correction (same source and scope): " + instruction
+        let updated = resumingBrowser ? original.task : original.task + "\nUser correction (same source and scope): " + instruction
         guard await store.revise(id, revision: version, task: updated, linkChoice: linkChoice), let row = store.existing(id), let context = row.context else {
             throw DispatchWorker.StepFailure(message: store.persistenceError ?? "The task changed before the correction could be saved.")
         }
@@ -249,10 +269,11 @@ class ApplicationTasks: ObservableObject {
         let source = row.origin.map { GmailReadTools.json(["account": $0.account, "id": $0.messageID,
             "threadId": $0.threadID, "from": $0.sender, "subject": $0.subject]) }
         let job = DispatchWorker.Job(id: id, task: updated, account: row.origin?.account,
-            facts: context.facts, standingOnJSON: source, authoredAt: context.authoredAt,
+            facts: context.facts + (resumingBrowser ? ["The user resumed this task's existing browser. Call task_browser inspect before continuing the original objective; it will execute any exact approved action first. Do not reopen the starting URL or repeat a submission."] : []), standingOnJSON: source, authoredAt: context.authoredAt,
             authoredTimeZone: TimeZone(identifier: context.timeZone),
             expects: .init(rawValue: context.expects), scope: .init(rawValue: context.scope), profileId: row.profileId,
-            revision: context.revision, inputSource: "correction", linkChoice: context.linkChoice)
+            revision: context.revision, inputSource: "correction", parksSource: context.parksSource,
+            holdsDecision: context.holdsDecision, dependencyID: context.dependencyID, linkChoice: context.linkChoice)
         schedule(job, owner: row.userId, origin: row.origin, version: context.revision)
         RealtimeLog.log("task: \(id) revision=\(context.revision) correction_accepted")
     }
@@ -342,6 +363,7 @@ class ApplicationTasks: ObservableObject {
             if !pending, value.ok == true || !Task.isCancelled { _ = await store.markOperation(id, revision: 1, callID: nil) }
             let state = pending || (Task.isCancelled && value.ok != true) ? "unknown" : value.ok == true ? "done" : value.effects?.isEmpty == false ? "partial" : "failed"
             await store.finish(id, state: state, result: value.text, reportBack: pending || value.ok != true)
+            if state == "done", let origin { await store.releaseDecisionHold(.init(account: origin.account, messageID: origin.messageID)) }
             diagnostics?.record(.jobFinished, ["job_id": id.uuidString, "outcome": state])
             return .tool(value)
         }
@@ -378,7 +400,7 @@ class ApplicationTasks: ObservableObject {
         return await withCheckedContinuation { waiters[id, default: []].append($0) }
     }
 
-    func job(request: String, commandID: String?, origin: DispatchJob.MailOrigin, profile: String?, preference: DispatchJob.CompletionPreference = .bringBack) throws -> DispatchWorker.Job {
+    func job(request: String, commandID: String?, origin: DispatchJob.MailOrigin, profile: String?) throws -> DispatchWorker.Job {
         if let reason = refusal(owner: backend.userId, profile: profile, origin: origin) {
             throw DispatchWorker.StepFailure(message: reason)
         }
@@ -386,7 +408,7 @@ class ApplicationTasks: ObservableObject {
             "threadId": origin.threadID, "from": origin.sender, "subject": origin.subject]
         var job = DispatchWorker.Job(id: UUID(), task: request, account: origin.account,
             standingOnJSON: GmailReadTools.json(target), authoredAt: Date(), authoredTimeZone: .current,
-            expects: .answer, scope: .currentEmail, profileId: profile, inputSource: "typed", completionPreference: .requested(in: request) ?? preference, ownerID: backend.userId)
+            expects: .answer, scope: .currentEmail, profileId: profile, inputSource: "typed", completionPreference: .requested(in: request), ownerID: backend.userId)
         if let commandID {
             guard let saved = Container.shared.customCommands().commands.first(where: { $0.id == commandID }),
                   saved.enabled, !saved.actions.isEmpty else {
@@ -405,6 +427,10 @@ class ApplicationTasks: ObservableObject {
 
     func next(queue: LocalTriageQueue, input: LocalTriageQueue.Input = .init(), store: MailStore,
               dealtWith: Bool = true) async -> (output: String, served: LocalTriageQueue.Served) {
-        await queue.step(input, store: store, dealtWith: dealtWith)
+        if let source = await queue.standingOnJSON,
+           let origin = DispatchJob.MailOrigin.from(DispatchWorker.target(standingOnJSON: source, facts: [])) {
+            await self.store.releaseDecisionHold(.init(account: origin.account, messageID: origin.messageID))
+        }
+        return await queue.step(input, store: store, dealtWith: dealtWith)
     }
 }

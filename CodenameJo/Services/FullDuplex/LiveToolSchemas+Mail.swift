@@ -55,6 +55,17 @@ extension LiveToolSchemas {
         ]
     }
 
+    private static var replyAttachments: [String: Any] {
+        ["type": "array", "maxItems": 12,
+         "description": "Attach only files the user requested, using exact references returned by gmail_get_message. The source account/message may differ from the reply destination account/thread_id/reply_message_id. This copies the selected files only, never the source correspondence. Do not forward the source email as a substitute. Never pass base64 bytes.",
+         "items": ["type": "object", "properties": [
+            "account": ["type": "string", "description": "Attachment source mailbox."],
+            "message_id": ["type": "string", "description": "Attachment source Gmail message ID."],
+            "filename": ["type": "string", "description": "Exact filename from attachment metadata."],
+            "attachment_id": ["type": "string", "description": "Exact attachment_id from metadata; omit only for an inline file without that ID."]
+         ], "required": ["account", "message_id", "filename"]]]
+    }
+
     static func createDraft(_ accounts: LiveSessionSetup.Accounts) -> [String: Any] {
         let inboxes = accounts.inboxes.joined(separator: ", ")
         return [
@@ -64,6 +75,7 @@ extension LiveToolSchemas {
             "parameters": [
                 "type": "object",
                 "properties": [
+                    "attachments": replyAttachments,
                     "to": [
                         "type": "string",
                         "description": "Omit when replying and the newest sender on the thread is answered. On a conversation with several senders, pass the address of the one the user named to answer that person instead. Always an email address, never a person's name.",
@@ -125,6 +137,7 @@ extension LiveToolSchemas {
             "parameters": [
                 "type": "object",
                 "properties": [
+                    "attachments": replyAttachments,
                     "to": [
                         "type": "string",
                         "description": "Omit when replying and the newest sender on the thread is answered. On a conversation with several senders, pass the address of the one the user named to answer that person instead. Always an email address, never a person's name.",

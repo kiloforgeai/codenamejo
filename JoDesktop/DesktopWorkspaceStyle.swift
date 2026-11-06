@@ -3,7 +3,7 @@ import SwiftUI
 
 enum DesktopWorkspaceStyle {
     static let accent = Color(uiColor: .systemBlue)
-    static let brand = Color(red: 0.75, green: 0.43, blue: 0.28)
+    static let brand = Color("JoBrand")
     static let canvas = Color(uiColor: .systemBackground)
     static let inset = Color(uiColor: .secondarySystemBackground)
     static let line = Color.primary.opacity(0.09)

@@ -88,6 +88,7 @@ struct PendingMailWrite: Codable, FetchableRecord, PersistableRecord, Equatable,
         let raw: String
         let to: String
         let threadId: String?
+        var mailActionID: UUID? = nil
     }
 
     var draft: PendingDraft? {
@@ -177,6 +178,14 @@ actor PendingMailWrites {
         let row = try await accept(userId: userId, operation: "create_draft", account: account,
                                    messageId: Self.digest(draft), threadId: draft.threadId,
                                    conversationId: conversationId, delay: delay, payload: payload)
+        if let id = draft.mailActionID,
+           let existing = row.payload.flatMap({ try? JSONDecoder().decode(PendingMailWrite.QueuedDraft.self, from: Data($0.utf8)) }),
+           existing.mailActionID != id {
+            let text = "This draft was not saved. An identical draft is already waiting to retry; its original activity will show the result."
+            let store = await MainActor.run { Container.shared.dispatchJobs() }
+            await store.recordMailAction(id, state: .failed, result: text)
+            throw Unrecoverable(text: text)
+        }
         guard let pending = row.draft else { throw Unrecoverable(text: "the queued draft could not be read back") }
         return pending
     }
@@ -379,7 +388,31 @@ actor PendingMailWrites {
             // A retried draft never files the thread it answers.
             guard let queued = job.payload.flatMap({ try? JSONDecoder().decode(PendingMailWrite.QueuedDraft.self, from: Data($0.utf8)) })
             else { throw Unrecoverable(text: "the queued draft could not be read back") }
-            try await LocalCompose.saveDraft(token, raw: queued.raw, threadId: queued.threadId)
+            if let id = queued.mailActionID {
+                let store = await MainActor.run { Container.shared.dispatchJobs() }
+                guard let receipt = await store.mailAction(id), receipt.userId == job.user_id else {
+                    throw Unrecoverable(text: "the draft's action receipt is unavailable; no write was repeated")
+                }
+                if receipt.mailAction?.confirmed == true { return ([], nil) }
+                guard receipt.mailAction?.state == .queued else {
+                    throw Unrecoverable(text: "the draft's previous outcome is unresolved; check Gmail before retrying")
+                }
+                guard await store.recordMailAction(id, state: .pending, result: "Retrying the rate-limited draft; awaiting Gmail.") else {
+                    throw Unrecoverable(text: "the draft attempt could not be recorded")
+                }
+                do {
+                    await GmailQuota.shared.spend(10)
+                    _ = try await MailActionAudit.write(receipt, receipt: "Draft to \(queued.to) saved in \(job.account).") {
+                        try await LocalCompose.saveDraft(token, raw: queued.raw, threadId: queued.threadId, spendQuota: false)
+                    }
+                } catch {
+                    if GmailManageTools.isThrottle(error) {
+                        await store.recordMailAction(id, state: .queued, result: "Draft still rate limited; waiting to retry.")
+                        throw error
+                    }
+                    throw Unrecoverable(text: LocalCompose.draftFailure(error, account: job.account))
+                }
+            } else { try await LocalCompose.saveDraft(token, raw: queued.raw, threadId: queued.threadId) }
             return ([], nil)
         case "mark_spam", "trash_message":
             _ = try await GmailManageTools.modify(token, account: job.account, id: job.messageId,
@@ -416,6 +449,12 @@ actor PendingMailWrites {
 
     /// The default `Settled`: confirmed effects reach the cache and the queue; a failure is told and shown again.
     @Sendable static func report(_ job: PendingMailWrite, _ outcome: Outcome) async {
+        if case .failed(let sentence) = outcome, let queued = job.payload.flatMap({ try? JSONDecoder().decode(PendingMailWrite.QueuedDraft.self, from: Data($0.utf8)) }),
+           let id = queued.mailActionID {
+            let store = await MainActor.run { Container.shared.dispatchJobs() }
+            let current = await store.mailAction(id)?.mailAction?.state
+            if current == .queued { await store.recordMailAction(id, state: .failed, result: sentence) }
+        }
         let triage = Container.shared.localTriage()
         switch outcome {
         case .succeeded(let effects):

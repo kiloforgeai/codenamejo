@@ -93,6 +93,12 @@ final class FullDuplexTransport: NSObject {
 
     /// The assistant's track, held so its renderer can be detached on close.
     private var remoteAudioTrack: RTCAudioTrack?
+    private var outputSuppressed = false
+
+    func setOutputSuppressed(_ suppressed: Bool) {
+        outputSuppressed = suppressed
+        remoteAudioTrack?.isEnabled = !suppressed
+    }
     private let assistantVolume: Double
     private let diagnostics: VoiceDiagnostics.Session?
 
@@ -222,6 +228,7 @@ final class FullDuplexTransport: NSObject {
     func enableLive() {
         liveAdapter = LiveSessionAdapter(wire: { [weak self] payload in self?.sendWire(payload) },
                                          emit: { [weak self] signal in self?.emit.yield(signal) })
+        liveAdapter?.onOutputSuppressed = { [weak self] in self?.setOutputSuppressed($0) }
         liveAdapter?.prepareConversation()
         inputDriver.start { [weak self] in self?.liveAdapter?.isWorkSettled == true }
 
@@ -503,6 +510,7 @@ extension FullDuplexTransport: RTCPeerConnectionDelegate {
     private func attachRecorder(to track: RTCAudioTrack) {
         guard remoteAudioTrack !== track else { return }
         remoteAudioTrack = track
+        track.isEnabled = !outputSuppressed
         track.source.volume = assistantVolume
 #if DEBUG
         track.add(recorder)

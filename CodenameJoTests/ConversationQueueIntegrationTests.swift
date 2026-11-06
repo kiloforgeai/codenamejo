@@ -28,6 +28,48 @@ final class ConversationQueueIntegrationTests: XCTestCase {
         super.tearDown()
     }
 
+    func testQueueInitializesColdTaskStoreOnMainActor() async throws {
+        let fixture = try StoreFixture()
+        let previousProfile = ProfileRuntime.snapshot
+        Container.shared.manager.push()
+        ProfileRuntime.install(nil)
+        defer {
+            Container.shared.dispatchJobs.reset()
+            Container.shared.backend.reset()
+            Container.shared.manager.pop()
+            ProfileRuntime.install(previousProfile)
+            fixture.close()
+        }
+        let backend = BackendService(restoringSession: false)
+        backend.userId = "test-user"
+        Container.shared.backend.register { backend }
+        let jobsURL = fixture.directory.appendingPathComponent("jobs.json")
+        let fallback = DispatchJobStore(url: jobsURL)
+        var initializations = 0
+        Container.shared.dispatchJobs.register {
+            // Report an assertion instead of crashing the host if resolution leaves the main actor.
+            guard Thread.isMainThread else {
+                XCTFail("The queue must resolve the task-store factory on the main actor")
+                return fallback
+            }
+            return MainActor.assumeIsolated {
+                initializations += 1
+                return DispatchJobStore(url: jobsURL)
+            }
+        }
+        try await fixture.seed([row("first", thread: "first", date: 20, sender: "Sender"),
+                                row("second", thread: "second", date: 10, sender: "Sender")],
+                               unread: ["first", "second"])
+        XCTAssertEqual(initializations, 0)
+        let queue = makeQueue()
+        let first = await queue.step(.init(scope: .unread), store: fixture.store)
+        XCTAssertEqual(try current(first.output)["id"] as? String, "first")
+        let second = await queue.step(.init(), store: fixture.store, dealtWith: false)
+        XCTAssertEqual(try current(second.output)["id"] as? String, "second")
+        XCTAssertEqual(initializations, 1, "Subsequent steps reuse the same initialized store")
+        await queue.end()
+    }
+
     private func topicTestBatch() -> [MailStore.Ingest] {
         (0..<10).map { index in
             let detail = GmailAPI.MessageDetail(id: "fresh-\(index)", threadId: "thread-\(index)",
@@ -151,7 +193,8 @@ final class ConversationQueueIntegrationTests: XCTestCase {
             ok: true, expects: .answer, about: .init(account: account, id: "R", threadId: "R", from: "Same sender", subject: "Same subject"))
         let output = await queue.selectReturnedResult(result, profileID: nil)
         let selected = try XCTUnwrap(output)
-        XCTAssertEqual(LiveEmailPresentation.Key.step(selected)?.messageId, "R")
+        XCTAssertEqual(LiveEmailPresentation.Key.selection(selected)?.messageId, "R")
+        XCTAssertNil(LiveEmailPresentation.Key.step(selected), "A selected result must not trigger a fresh email introduction")
         #if targetEnvironment(macCatalyst)
         let snapshot = await queue.desktopSnapshot()
         XCTAssertEqual(snapshot.currentID, "R")
@@ -189,7 +232,8 @@ final class ConversationQueueIntegrationTests: XCTestCase {
             ok: true, expects: .answer, about: .init(account: account, id: "R", threadId: "R", from: "Same sender", subject: "Same subject"))
         _ = await queue.hold(result)
         let presentation = await queue.step(.init(direction: "next"), store: fixture.store, dealtWith: false)
-        XCTAssertEqual(LiveEmailPresentation.Key.step(presentation.output)?.messageId, "R")
+        XCTAssertEqual(LiveEmailPresentation.Key.selection(presentation.output)?.messageId, "R")
+        XCTAssertNil(LiveEmailPresentation.Key.step(presentation.output), "A returned result is presented as a receipt")
         let displayed = await queue.currentId
         XCTAssertEqual(displayed, "R")
         let receipt = GmailWriteEffect(account: account, scope: "message", threadId: "R",

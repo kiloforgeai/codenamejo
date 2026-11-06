@@ -2,24 +2,50 @@ import Foundation
 
 /// A Gmail MIME tree reduced to the words the user typed.
 enum MailBodyText {
-    /// The best plain-text body in the tree: a `text/plain` leaf if there is one, else
-    /// `text/html` with the tags taken out. Attachments and images are skipped.
+    static func isComplete(_ part: GmailAPI.FullPart?) -> Bool {
+        guard let part else { return false }
+        if !(part.filename ?? "").isEmpty { return true }
+        if let children = part.parts, !children.isEmpty { return children.allSatisfy { isComplete($0) } }
+        guard (part.mimeType ?? "").lowercased().hasPrefix("text/") else { return true }
+        guard let encoded = part.body?.data, let data = GmailAPI.decodeBase64URL(encoded) else { return false }
+        return part.body?.size.map { data.count >= $0 } ?? true
+    }
+
+    /// Prefer real plain text; replace empty bodies and HTML notices with inert HTML text.
     static func plainText(_ part: GmailAPI.FullPart?) -> String {
         guard let part else { return "" }
         var plain: [String] = []
         var html: [String] = []
         collect(part, plain: &plain, html: &html)
-        if !plain.isEmpty { return plain.joined(separator: "\n") }
-        return html.map(stripHTML).joined(separator: "\n")
+        let text = plain.joined(separator: "\n")
+        let alternative = html.map(stripHTML).joined(separator: "\n")
+        return preferHTML(over: text, alternative: alternative) ? alternative : text
+    }
+
+    static func preferHTML(over plain: String, alternative: String) -> Bool {
+        !alternative.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && isHTMLPlaceholder(plain)
+    }
+
+    static func isHTMLPlaceholder(_ plain: String) -> Bool {
+        let text = plain.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return true }
+        guard text.count <= 1_500 else { return false }
+        let notice = #"^(?:your (?:e-?mail|mail) (?:software|client|program|application) (?:can(?:not|'t|’t)|does(?: not|n't|n’t)) (?:display|support|read|render) (?:this |the )?html|this (?:e-?mail|message) (?:is|was) (?:sent )?(?:in|as) html)\b"#
+        if text.range(of: notice, options: [.regularExpression, .caseInsensitive]) != nil { return true }
+        let withoutURLs = text.replacingOccurrences(of: #"https?://\S+"#, with: "", options: [.regularExpression, .caseInsensitive])
+        return withoutURLs.split(whereSeparator: \.isWhitespace).count <= 25
+            && text.range(of: #"^(?:to )?(?:view|read) (?:this|the) (?:e-?mail|message)(?: online)?(?:,? please)? (?:in (?:your|a) (?:web )?browser|click|visit)\b"#,
+                          options: [.regularExpression, .caseInsensitive]) != nil
     }
 
     private static func collect(_ part: GmailAPI.FullPart, plain: inout [String], html: inout [String]) {
+        guard (part.filename ?? "").isEmpty else { return }
         let mime = (part.mimeType ?? "").lowercased()
         if let children = part.parts, !children.isEmpty {
             for child in children { collect(child, plain: &plain, html: &html) }
             return
         }
-        guard (part.filename ?? "").isEmpty, let data = part.body?.data,
+        guard let data = part.body?.data,
               let text = decodeBase64URL(data) else { return }
         if mime.hasPrefix("text/plain") { plain.append(text) }
         else if mime.hasPrefix("text/html") { html.append(text) }
@@ -33,19 +59,7 @@ enum MailBodyText {
     }
 
     static func stripHTML(_ html: String) -> String {
-        var text = html
-        for tag in ["br", "/p", "/div", "/li", "/tr", "/h1", "/h2", "/h3"] {
-            text = text.replacingOccurrences(
-                of: "<\(tag)\\b[^>]*>", with: "\n", options: [.regularExpression, .caseInsensitive])
-        }
-        text = text.replacingOccurrences(
-            of: "<(style|script)\\b[^>]*>[\\s\\S]*?</\\1>", with: "",
-            options: [.regularExpression, .caseInsensitive])
-        text = text.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
-        for (entity, char) in ["&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&#39;": "'"] {
-            text = text.replacingOccurrences(of: entity, with: char)
-        }
-        return text
+        LocalEmailPresentation.htmlToText(html)
     }
 }
 

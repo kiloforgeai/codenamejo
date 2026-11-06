@@ -4,14 +4,14 @@ import XCTest
 final class LiveRequestRecoveryTests: XCTestCase {
     func testAskingAboutAnActionDoesNotRequestThatAction() {
         for text in ["How can you archive this?", "Can you explain how to delete an email?",
-                     "Could you tell me what archive means?", "What is next?", "No archive", "Okay, no archive",
+                     "Could you tell me what archive means?", "What is next for this project?", "No archive", "Okay, no archive",
                      "Uh, so what w- what's his email?", "Can I create a new command?",
                      "Please record feedback: archive did not work."] {
             XCTAssertFalse(LiveRequestRecovery.requiresQueueAction(text), text)
         }
         for text in ["Can you archive this?", "Could you please archive this?", "Just archive that",
                      "You can delete it", "Okay, let's archive this", "Go ahead and archive it",
-                     "I want you to label this", "Move on", "Go to next email"] {
+                     "I want you to label this", "Move on", "Go to next email", "What is next?"] {
             XCTAssertTrue(LiveRequestRecovery.requiresQueueAction(text), text)
         }
         XCTAssertTrue(LiveRequestRecovery.isCorrection("No, skip it"))

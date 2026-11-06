@@ -12,12 +12,33 @@ class DesktopFeedPreview: ObservableObject {
         let slackTeams: [String]
         var sections: [FeedSection]? = nil
         var forceRefresh = false
+
+        func sharesOwner(with other: Context?) -> Bool {
+            other?.userID == userID && other?.profileID == profileID
+        }
+
+        func allows(_ row: DesktopFeedRow) -> Bool {
+            if let section = row.section, let sections,
+               !sections.contains(where: { $0.id == section.id && $0.enabled }) { return false }
+            if let selection = row.selection {
+                return emails.contains { $0.caseInsensitiveCompare(selection.account) == .orderedSame }
+            }
+            if row.source == "Overview" { return true }
+            guard let data = row.context?.data(using: .utf8),
+                  let fields = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+            if row.source == "Slack", let team = fields["team_id"] as? String { return slackTeams.contains(team) }
+            if row.source == "Calendar", let account = fields["account"] as? String {
+                return emails.contains { $0.caseInsensitiveCompare(account) == .orderedSame }
+            }
+            return false
+        }
     }
 
     struct Part: Sendable {
         var rows: [DesktopFeedRow] = []
         var count: Int? = 0
         var incomplete = false
+        var unavailableAccounts: Set<String>? = nil
         static var unavailable: Part { Part(count: nil, incomplete: true) }
     }
 
@@ -43,10 +64,40 @@ class DesktopFeedPreview: ObservableObject {
 
         func retainingUnavailable(from previous: Snapshot?) -> Snapshot {
             var next = self
-            if mail.count == nil, var saved = previous?.mail { saved.incomplete = true; next.mail = saved }
-            if slack.count == nil, var saved = previous?.slack { saved.incomplete = true; next.slack = saved }
-            if calendar.count == nil, var saved = previous?.calendar { saved.incomplete = true; next.calendar = saved }
+            func retain(_ part: Part, _ saved: Part?) -> Part {
+                guard part.incomplete || part.count == nil, let saved else { return part }
+                var result = part
+                let fresh = Set(part.rows.map(\.id))
+                result.rows += saved.rows.filter { row in
+                    guard !fresh.contains(row.id) else { return false }
+                    guard let accounts = part.unavailableAccounts else { return true }
+                    return row.selection.map { accounts.contains($0.account.lowercased()) } ?? false
+                }
+                result.count = max(part.count ?? 0, saved.count ?? result.rows.count)
+                result.incomplete = true
+                return result
+            }
+            next.mail = retain(mail, previous?.mail)
+            next.slack = retain(slack, previous?.slack)
+            next.calendar = retain(calendar, previous?.calendar)
             return next
+        }
+
+        func restricted(to context: Context) -> Snapshot {
+            func restrict(_ part: Part) -> Part {
+                let rows = part.rows.filter(context.allows)
+                return .init(rows: rows, count: rows.count == part.rows.count ? part.count : rows.count,
+                             incomplete: part.incomplete)
+            }
+            return .init(mail: restrict(mail), slack: restrict(slack), calendar: restrict(calendar), sections: context.sections)
+        }
+
+        static func visible(_ rows: [DesktopFeedRow]) -> Snapshot {
+            func part(_ source: String) -> Part {
+                let rows = rows.filter { $0.source == source }
+                return .init(rows: rows, count: rows.count)
+            }
+            return .init(mail: part("Email"), slack: part("Slack"), calendar: part("Calendar"))
         }
     }
 
@@ -56,6 +107,8 @@ class DesktopFeedPreview: ObservableObject {
     private var lastAttempt: Date?
     private var task: Task<Void, Never>?
     private var generation = UUID()
+    private var removedDuringRefresh = Set<MailSelection>()
+    private var trace: VoiceDiagnostics.Session?
     private let load: @Sendable (Context) async -> Snapshot
     static let refreshInterval: TimeInterval = 120
 
@@ -63,11 +116,22 @@ class DesktopFeedPreview: ObservableObject {
         self.load = load
     }
 
-    func update(context: Context?, inSession: Bool, now: Date = Date(), force: Bool = false) {
-        if self.context != context {
+    func update(context: Context?, inSession: Bool, now: Date = Date(), force: Bool = false,
+                hydratingOwner: String? = nil, hydratingProfile: String? = nil) {
+        if context == nil, let hydratingOwner, self.context?.userID == hydratingOwner,
+           hydratingProfile == nil || self.context?.profileID == hydratingProfile {
             pause()
+            return
+        }
+        if self.context != context {
+            let retain = context?.sharesOwner(with: self.context) == true
+            pause()
+            if !retain {
+                record("clear", ["reason": context == nil ? "signed_out" : "owner_or_profile_changed"])
+                trace = context.map { Container.shared.voiceDiagnostics().begin(engine: "desktop_feed", userID: $0.userID) }
+            }
             self.context = context
-            snapshot = nil
+            snapshot = retain ? context.flatMap { snapshot?.restricted(to: $0) } : nil
         }
         guard let context else { return }
         guard !inSession else { pause(); return }
@@ -76,12 +140,23 @@ class DesktopFeedPreview: ObservableObject {
         refreshing = true
         let request = UUID()
         generation = request
+        removedDuringRefresh = []
+        record("started", ["request_id": request.uuidString, "reason": force ? "manual" : "periodic_or_open"])
         task = Task { [weak self, load] in
             var requestContext = context
             requestContext.forceRefresh = force
             let result = await load(requestContext)
-            guard let self, !Task.isCancelled, self.generation == request, self.context == context else { return }
-            self.snapshot = result.retainingUnavailable(from: self.snapshot)
+            guard let self else { return }
+            guard !Task.isCancelled, self.generation == request, self.context == context else {
+                self.record("discarded", ["request_id": request.uuidString, "reason": "superseded"])
+                return
+            }
+            var next = result.retainingUnavailable(from: self.snapshot)
+            let removed = next.mail.rows.filter { row in row.selection.map { self.removedDuringRefresh.contains($0) } ?? false }.count
+            next.mail.rows.removeAll { row in row.selection.map { self.removedDuringRefresh.contains($0) } ?? false }
+            if let count = next.mail.count { next.mail.count = max(next.mail.rows.count, count - removed) }
+            self.recordChange(from: self.snapshot?.rows ?? [], to: next.rows, request: request)
+            self.snapshot = next
             self.refreshing = false
             self.task = nil
         }
@@ -97,7 +172,41 @@ class DesktopFeedPreview: ObservableObject {
 
     deinit { task?.cancel() }
 
+    func seed(_ value: Snapshot, context: Context) {
+        guard context.sharesOwner(with: self.context) else { return }
+        pause()
+        snapshot = value.restricted(to: context)
+        record("retained", ["reason": "session_ended"])
+    }
+
+    func record(_ phase: String, _ fields: [String: String] = [:]) {
+        var fields = fields
+        fields["phase"] = phase
+        fields["sidebar_source"] = "preview"
+        trace?.record(.feedRefresh, fields)
+    }
+
+    func recordSession(_ phase: String, feed: DesktopSessionFeed) {
+        guard let trace else { return }
+        trace.record(.feedRefresh, ["phase": phase, "sidebar_source": "session",
+            "queue_revision": String(feed.revision), "visible_count": String(feed.rows.count),
+            "queue_order": feed.rows.map { trace.target($0.id) }.joined(separator: ","),
+            "target_hash": feed.current.map { trace.target($0.canonical) } ?? "none"])
+    }
+
+    private func recordChange(from old: [DesktopFeedRow], to new: [DesktopFeedRow], request: UUID) {
+        guard let trace else { return }
+        let previous = Dictionary(old.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let next = Set(new.map(\.id))
+        record("applied", ["request_id": request.uuidString, "visible_count": String(new.count),
+            "queue_order": new.map { trace.target($0.id) }.joined(separator: ","),
+            "inserted_count": String(new.filter { previous[$0.id] == nil }.count),
+            "updated_count": String(new.filter { previous[$0.id] != nil && previous[$0.id] != $0 }.count),
+            "removed_count": String(old.filter { !next.contains($0.id) }.count)])
+    }
+
     func remove(_ selection: MailSelection) {
+        if task != nil { removedDuringRefresh.insert(selection) }
         guard var value = snapshot else { return }
         let count = value.mail.rows.count
         value.mail.rows.removeAll { $0.selection == selection }
@@ -116,6 +225,7 @@ enum DesktopFeedPreviewLoader {
 
     private static func mail(_ context: DesktopFeedPreview.Context) async -> DesktopFeedPreview.Part {
         var result = DesktopFeedPreview.Part()
+        result.unavailableAccounts = []
         var answered = 0
         let sections = context.sections ?? FeedSection.resolved(nil, accounts: context.emails)
         let accounts = context.emails.filter { account in sections.contains { $0.isMail && $0.enabled && $0.account?.lowercased() == account.lowercased() } }
@@ -124,6 +234,7 @@ enum DesktopFeedPreviewLoader {
             guard !Task.isCancelled else { return .unavailable }
             guard case .success(let token) = await GoogleCredential.token(for: account) else {
                 result.incomplete = true
+                result.unavailableAccounts?.insert(account.lowercased())
                 continue
             }
             do {
@@ -137,10 +248,14 @@ enum DesktopFeedPreviewLoader {
                 let refs = try await GmailAPI.recentMessageIds(token: token.accessToken, query: "in:inbox", limit: limit)
                 guard !Task.isCancelled else { return .unavailable }
                 let details = await GmailAPI.metadata(token: token.accessToken, ids: refs.map(\.id))
-                if details.count != refs.count { result.incomplete = true }
+                if details.count != refs.count {
+                    result.incomplete = true
+                    result.unavailableAccounts?.insert(account.lowercased())
+                }
                 let byID = Dictionary(details.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
                 guard let importantIDs = await store.importantFeedIDs(among: refs.map(\.id), account: account) else {
                     result.incomplete = true
+                    result.unavailableAccounts?.insert(account.lowercased())
                     continue
                 }
                 if enabledKinds.contains(.important) {
@@ -163,6 +278,7 @@ enum DesktopFeedPreviewLoader {
                 if enabledKinds.count < 2 { result.count = (result.count ?? 0) + result.rows.count - priorRows }
             } catch {
                 result.incomplete = true
+                result.unavailableAccounts?.insert(account.lowercased())
                 RealtimeLog.log("desktop feed: inbox preview failed — \(error.localizedDescription)")
             }
         }

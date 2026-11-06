@@ -54,6 +54,9 @@ enum LiveFastAction: String {
         while let suffix = [" please", " for me", " as well", " too", " now"].first(where: { text.hasSuffix($0) }) {
             text.removeLast(suffix.count)
         }
+        let continuation = text.replacingOccurrences(of: "’", with: "'").trimmingCharacters(in: CharacterSet(charactersIn: "?"))
+        if ["what's next", "what is next", "what's next in the feed", "what is next in the feed",
+            "what's the next email", "what is the next email", "continue the feed", "go to the next email"].contains(continuation) { return .next }
         switch text {
         case "archive", "archive it", "archive this", "archive that", "archive this one", "archive that one",
              "archive this email", "archive that email", "archive this message", "archive that message": return .archive
@@ -78,6 +81,10 @@ enum LiveFastAction: String {
     ]
 
     static func allowsFollowup(name: String, arguments: String, step: String?) -> Bool {
+        if name == GmailReadTools.search {
+            guard let args = try? JSONSerialization.jsonObject(with: Data(arguments.utf8)) as? [String: Any] else { return false }
+            return GmailReadTools.string(args, "query") != nil
+        }
         if feedIndependent.contains(name) || GitHubTools.readTools.contains(name)
             || CustomMCPTools.isCustomTool(name) { return true }
         guard let step, let key = LiveEmailPresentation.Key.selection(step),

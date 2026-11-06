@@ -3,6 +3,42 @@ import XCTest
 
 @MainActor
 final class FeedButtonActionTests: XCTestCase {
+    func testDesktopActionsSilenceLateSpeechButKeepAcceptedResultsAndNewVoiceRequests() throws {
+        var wire: [[String: Any]] = [], captions: [String] = [], input: [String] = [], gates: [Bool] = []
+        let adapter = LiveSessionAdapter(wire: { wire.append($0) }, emit: {
+            if case .event(.assistantTranscriptDelta(_, let text, _)) = $0 { captions.append(text) }
+            if case .liveInputText(let text) = $0 { input.append(text) }
+        })
+        defer { adapter.close() }
+        adapter.onOutputSuppressed = { gates.append($0) }
+        try started(adapter, wire: { wire })
+        try receive(adapter, ["type": "session.delegation.created", "delegation": ["id": "d", "response_id": "r"]])
+        try receive(adapter, ["type": "response.event", "delegation_id": "d", "event": ["type": "response.output_item.done", "response_id": "r",
+            "item": ["type": "function_call", "call_id": "accepted", "name": "triage_status", "arguments": "{}"]]])
+        for revision in 1...3 { adapter.beginDesktopInteraction(origin: "button", revision: revision) }
+        adapter.presentPreparedEmail("Obsolete email A")
+        adapter.speakExactly("Obsolete action receipt")
+        adapter.outbound(["type": "response.create"])
+        adapter.outbound(["type": "conversation.item.create", "item": ["type": "function_call_output", "call_id": "accepted", "output": "Verified receipt"]])
+        try receive(adapter, ["type": "response.event", "event": ["type": "response.completed", "response": ["id": "r", "output": []]]])
+        try receive(adapter, ["type": "session.output_transcript.delta", "delta": "Late email A", "start_ms": 100, "end_ms": 200])
+        try receive(adapter, ["type": "session.input_transcript.delta", "delta": "Okay", "start_ms": 300, "end_ms": 400])
+        XCTAssertTrue(adapter.desktopQuiet)
+        XCTAssertTrue(captions.isEmpty)
+        XCTAssertTrue(input.isEmpty)
+        XCTAssertFalse(wire.contains { $0["type"] as? String == "session.commentary.append" })
+        XCTAssertTrue(wire.contains { ($0["item"] as? [String: Any])?["output"] as? String == "Verified receipt" })
+        try receive(adapter, ["type": "session.input_transcript.delta", "delta": "What does email C say?", "start_ms": 600, "end_ms": 700])
+        XCTAssertFalse(adapter.desktopQuiet)
+        XCTAssertEqual(gates, [true, true, true, false])
+        XCTAssertEqual(input, ["What does email C say?"])
+        try receive(adapter, ["type": "session.output_transcript.delta", "delta": "Answer about C", "start_ms": 800, "end_ms": 900])
+        XCTAssertEqual(captions, ["Answer about C"])
+        adapter.beginDesktopInteraction(origin: "keyboard", revision: 4)
+        try receive(adapter, ["type": "session.input_transcript.delta", "delta": "Archive this and go to the next one", "start_ms": 1000, "end_ms": 1100])
+        XCTAssertFalse(adapter.desktopQuiet, "An explicit spoken progression resumes voice")
+    }
+
     private func receive(_ adapter: LiveSessionAdapter, _ event: [String: Any]) throws {
         adapter.receive(try JSONSerialization.data(withJSONObject: event))
     }

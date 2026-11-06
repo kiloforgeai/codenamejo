@@ -257,6 +257,65 @@ final class CalendarWorkflowRegressionTests: XCTestCase {
               expects: .receipt, commandSteps: steps)
     }
 
+    private func foregroundInOtherInbox() async -> LocalTriageQueue {
+        let mail = MailStore(database: context.dbPool, userId: "regression-user")
+        Container.shared.mailStore.register { mail }
+        let queue = LocalTriageQueue(mailAccounts: { ["owner@example.test", "work@example.test"] }, unreadOpeningLoader: { _ in nil })
+        Container.shared.localTriage.register { queue }
+        await queue.adopt([.init(user_id: "regression-user", id: "booking-b", account: "work@example.test",
+            threadId: "thread-b", sender: "Other sender", recipient: nil, subject: "Foreground", snippet: "Other email",
+            internalDate: 1, cachedAt: Date())], store: mail)
+        return queue
+    }
+
+    func testSavedFollowupFinishesOnOriginalAccountAfterForegroundInboxChanges() async throws {
+        let queue = await foregroundInOtherInbox()
+        let label = CommandAction(tool: "label_message", detail: "#Followup",
+            resolvedLabel: .init(id: "Label_42", name: "#Followup", account: "owner@example.test"))
+        let steps = [label, CommandAction(tool: "archive_message", detail: "this email")]
+        _ = await Container.shared.customCommands().save(keyword: "follow up", label: "Follow up", actions: steps)
+        var job = commandJob(steps: steps)
+        job.command = .init(keyword: "follow up", actions: steps)
+        var names: [String] = []
+        let result = await DispatchWorker.run(job) { body in
+            let name = (body["tool_choice"] as? [String: Any])?["name"] as? String ?? "unexpected"
+            names.append(name)
+            return [["type": "function_call", "name": name, "call_id": "pinned-\(names.count)", "arguments": "{}"]]
+        }
+        XCTAssertEqual(result.status, .success, result.text)
+        XCTAssertEqual(names, ["label_message", "archive_message"])
+        let writes = provider.calls.filter { $0.httpMethod == "POST" }
+        XCTAssertFalse(writes.isEmpty)
+        XCTAssertTrue(writes.allSatisfy { $0.value(forHTTPHeaderField: "Authorization") == "Bearer owner@example.test" })
+        XCTAssertFalse(writes.contains { $0.url?.path.contains("booking-b") == true })
+        let foreground = await queue.currentMailbox
+        XCTAssertEqual(foreground, "work@example.test")
+        let history = await Container.shared.dispatchJobs().history()
+        let row = try XCTUnwrap(history.first { $0.id == job.id })
+        XCTAssertEqual(row.receipts?.map(\.outcome), ["success", "success"])
+        _ = await DispatchWorker.run(job) { _ in XCTFail("Completed command must not run twice"); return [] }
+        XCTAssertEqual(provider.calls.filter { $0.httpMethod == "POST" }.count, writes.count)
+    }
+
+    func testTaskSourceRejectsForeignTargetsAndProfileChangesBeforeLabelWrite() async {
+        _ = await foregroundInOtherInbox()
+        let source = GmailManageTools.WriteSource(cursor: .init(messageId: "invite-a", account: "owner@example.test", senders: []),
+            ownerID: "regression-user", profileID: nil)
+        for args in [["message_id": "booking-b", "account": "owner@example.test"],
+                     ["message_id": "invite-a", "account": "work@example.test"]] {
+            let result = await LocalMailWrites.run(name: "archive_message", argumentsJSON: GmailReadTools.json(args), defer: false, source: source)
+            XCTAssertEqual(result.ok, false)
+        }
+        provider.onLabelsRead = {
+            ProfileRuntime.install(.init(profileId: "other-profile", isDefault: false, emails: ["owner@example.test"]))
+        }
+        let result = await LocalMailWrites.run(name: "label_message",
+            argumentsJSON: ##"{"message_id":"invite-a","account":"owner@example.test","label":"#Followup"}"##,
+            defer: false, source: source)
+        XCTAssertEqual(result.ok, false)
+        XCTAssertFalse(provider.calls.contains { $0.httpMethod == "POST" })
+    }
+
     func testFailedCommandRestoresItsPinnedSourceAndRetriesOnlyUnfinishedSteps() async throws {
         let label = CommandAction(tool: "label_message", detail: "follow up",
             resolvedLabel: .init(id: "Label_42", name: "#Followup", account: "owner@example.test"))
@@ -784,7 +843,7 @@ private final class IssueProvider: HTTPDataTransport, @unchecked Sendable {
 @MainActor
 private final class IssueTokens: GoogleTokenProvider {
     func token(for email: String?, requiredScopes: [String]) async -> Result<GoogleCredential.Token, GoogleCredential.Failure> {
-        .success(.init(accessToken: "test-access", email: email ?? "owner@example.test", scopes: requiredScopes))
+        .success(.init(accessToken: email ?? "owner@example.test", email: email ?? "owner@example.test", scopes: requiredScopes))
     }
 }
 private final class IssueGrants: GoogleGrantStorage, @unchecked Sendable {

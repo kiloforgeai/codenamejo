@@ -16,11 +16,12 @@ enum LocalCompose {
 
     /// - Parameter defer: the caller advances on the receipt, so the Gmail call may land after it.
     static func run(name: String, argumentsJSON: String, defer deferred: Bool,
-                    conversationId: String? = nil, onboardingReply: Bool = false) async -> FullDuplexBroker.ToolResult {
+                    conversationId: String? = nil, onboardingReply: Bool = false, parentJobID: UUID? = nil, callID: String? = nil) async -> FullDuplexBroker.ToolResult {
         let args = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8))) as? [String: Any] ?? [:]
         let started = Date()
         do {
-            let result = try await compose(name, args, deferred: deferred, conversationId: conversationId, onboardingReply: onboardingReply)
+            let result = try await compose(name, args, deferred: deferred, conversationId: conversationId,
+                                           onboardingReply: onboardingReply, parentJobID: parentJobID, callID: callID)
             RealtimeLog.log("localCompose: \(name)\(GmailReadTools.string(args, "thread_id") == nil ? "" : " on a thread") "
                 + "\(result.ok == true ? "ok" : "not ok") in \(Int(Date().timeIntervalSince(started) * 1000))ms — "
                 + "\(result.text.prefix(80))")
@@ -37,7 +38,24 @@ enum LocalCompose {
     // MARK: - The write
 
     private static func compose(_ name: String, _ given: [String: Any], deferred: Bool,
-                                conversationId: String?, onboardingReply: Bool) async throws -> FullDuplexBroker.ToolResult {
+                                conversationId: String?, onboardingReply: Bool, parentJobID: UUID?, callID: String?) async throws -> FullDuplexBroker.ToolResult {
+        let attachmentReferences = try ReplyAttachments.references(given["attachments"])
+        let attachmentOwner = await MainActor.run { Container.shared.backend().userId }
+        let attachmentProfile = ProfileRuntime.snapshot
+        let attachmentAccounts = ProfileRuntime.allowedMailAccounts(GoogleAccountStore.mailAccounts()).map { $0.lowercased() }.sorted()
+        let validateAttachments: @Sendable () async throws -> Void = {
+            try Task.checkCancellation()
+            let owner = await MainActor.run { Container.shared.backend().userId }
+            let profile = ProfileRuntime.snapshot
+            let accounts = ProfileRuntime.allowedMailAccounts(GoogleAccountStore.mailAccounts()).map { $0.lowercased() }
+            guard owner == attachmentOwner, profile?.profileId == attachmentProfile?.profileId,
+                  accounts.sorted() == attachmentAccounts,
+                  profile?.membershipRevision == attachmentProfile?.membershipRevision,
+                  attachmentReferences.isEmpty || (!MailHeadersOnly.withholdsBodies && profile?.mailHeadersOnly != true),
+                  attachmentReferences.allSatisfy({ accounts.contains($0.account.lowercased()) }) else {
+                throw Refusal(text: "Nothing was sent or saved. The profile or attachment access changed; choose the source again.")
+            }
+        }
         let threadId = GmailReadTools.string(given, "thread_id")
         // The route's guard: a fresh message's `to` must at least parse. A reply's comes off the thread.
         if threadId == nil, !looksLikeAddress(given["to"]) {
@@ -140,17 +158,36 @@ enum LocalCompose {
                 + "go. Read the list back to the user and let them cut it.")
         }
 
+        try await validateAttachments()
+        let attachments = try await ReplyAttachments.load(attachmentReferences)
         let message = MailMIME.Outgoing(to: to, cc: cc, bcc: bcc, subject: subject, body: text(args["body"]),
-                                        threadId: threadId, inReplyTo: inReplyTo, footer: MailFooter.isOn)
+                                        threadId: threadId, inReplyTo: inReplyTo, footer: MailFooter.isOn,
+                                        attachments: attachments)
         // A rule about replying has nothing to file when this is a fresh message to somebody.
         let files = threadId != nil && StandingRule.archiveAfterReply.isOn
         let copies = copiesFor(message)
+        func audit(_ kind: MailActionReceipt.Kind) async throws -> (DispatchJob, Bool) {
+            guard let owner = attachmentOwner, !owner.isEmpty else {
+                throw Refusal(text: "Nothing was sent or saved. Sign in again so this action can be recorded under your account.")
+            }
+            let key = callID.map { (parentJobID?.uuidString ?? conversationId ?? "foreground") + ":" + $0 }
+            let action = MailActionReceipt(kind: kind, account: account, message: message,
+                replyMessageID: selectedId ?? replyingTo?.id, parentJobID: parentJobID, requestKey: key)
+            let origin = action.replyMessageID.map { DispatchJob.MailOrigin(account: account, messageID: $0,
+                threadID: threadId ?? "", sender: replyingTo?.from ?? to, subject: subject) }
+            let store = await MainActor.run { Container.shared.dispatchJobs() }
+            return try await store.beginMailAction(action, ownerID: owner,
+                profileID: attachmentProfile?.profileId, conversationID: conversationId, origin: origin)
+        }
 
         if name == "create_draft" || (!onboardingReply && DraftsOnly.isOn(for: account)) {
             var receipt = "Draft to \(to) saved in \(account)\(copies)." + (files ? archivedByRule : "")
             if name == "send_email" { receipt += " Nothing was sent because Drafts only is on for this inbox." }
+            let (job, created) = try await audit(.draft)
+            guard created else { return MailActionAudit.replay(job) }
             return try await finishDraft(name, message, receipt: receipt, account: account, token: token, files: files,
-                                         deferred: deferred, conversationId: conversationId)
+                                         deferred: deferred && attachments.isEmpty, conversationId: conversationId,
+                                         validate: validateAttachments, job: job)
         }
         if !derivedTo, strictJSONBool(args["recipient_confirmed"]) != true,
            !(try await hasCorresponded(to, account: account, token: token)) {
@@ -158,22 +195,30 @@ enum LocalCompose {
                 + "and if they say yes, call this again with recipient_confirmed: true. Nothing has gone yet.")
         }
         let receipt = "Sent to \(to) from \(account)\(copies)." + (files ? archivedByRule : "")
+        let (job, created) = try await audit(.send)
+        guard created else { return MailActionAudit.replay(job) }
         return await finishSend(message, receipt: receipt, account: account, token: token, files: files,
-                                deferred: deferred, conversationId: conversationId)
+                                deferred: deferred && attachments.isEmpty, conversationId: conversationId,
+                                validate: validateAttachments, job: job)
     }
 
     // MARK: - After the receipt
 
     private static func finishDraft(_ name: String, _ message: MailMIME.Outgoing, receipt: String, account: String,
                                     token: String, files: Bool, deferred: Bool,
-                                    conversationId: String?) async throws -> FullDuplexBroker.ToolResult {
+                                    conversationId: String?, validate: @escaping @Sendable () async throws -> Void,
+                                    job: DispatchJob) async throws -> FullDuplexBroker.ToolResult {
         let raw = MailMIME.plain(message)
         let save = { (effects: Manage.Effects) async throws in
-            try await saveDraft(token, raw: raw, threadId: message.threadId)
+            await GmailQuota.shared.spend(10)
+            let warning = try await MailActionAudit.write(job, receipt: receipt.replacingOccurrences(of: archivedByRule, with: ""), validate: validate) {
+                try await saveDraft(token, raw: raw, threadId: message.threadId, spendQuota: false)
+            }
             // After the draft, never before: a rule files the original once the reply it is filing behind exists.
             if files { await fileByRule(token, account: account, threadId: message.threadId, effects) }
+            await MailActionAudit.update(job, result: confirmed(receipt, effects.list) + warning)
         }
-        let queued = PendingMailWrite.QueuedDraft(raw: raw, to: message.to, threadId: message.threadId)
+        let queued = PendingMailWrite.QueuedDraft(raw: raw, to: message.to, threadId: message.threadId, mailActionID: job.id)
         guard !deferred else {
             Task.detached {
                 let effects = Manage.Effects()
@@ -181,20 +226,21 @@ enum LocalCompose {
                     try await save(effects)
                     await applyEffects(effects.list)
                 } catch {
-                    // A throttled draft becomes a queued one, silently: the receipt already said it was saved, and it will be.
-                    if Manage.isThrottle(error),
+                    // Only a definite throttle can retry; an uncertain write stays stopped.
+                    if (message.attachments ?? []).isEmpty, Manage.isThrottle(error),
                        (try? await enqueue(queued, account: account, conversationId: conversationId)) != nil { return }
                     Container.shared.localWriteNotices().push(draftFailure(error, account: account),
                                                               conversation: conversationId)
                 }
             }
-            return .init(text: receipt, ok: true, deferred: true, performedTool: "create_draft")
+            return .init(text: "Saving a draft to \(message.to). Gmail has not confirmed it yet; its receipt will appear in activity.",
+                         ok: true, deferred: true, performedTool: "create_draft")
         }
         let effects = Manage.Effects()
         do {
             try await save(effects)
         } catch {
-            if Manage.isThrottle(error),
+            if (message.attachments ?? []).isEmpty, Manage.isThrottle(error),
                let pending = try? await enqueue(queued, account: account, conversationId: conversationId) {
                 // A queued draft does not file the message it answers. Said, not swallowed.
                 let filed = files ? " The message it answers was not filed." : ""
@@ -203,21 +249,27 @@ enum LocalCompose {
                     + " then continue. Do not wait or claim it has been saved.",
                     ok: false, pendingDraft: pending, performedTool: "create_draft")
             }
-            return .init(text: draftFailure(error, account: account), ok: false, performedTool: "create_draft")
+            return .init(text: draftFailure(error, account: account), ok: false, performedTool: "create_draft",
+                         outcomeUnknown: error is MailActionAudit.Failure)
         }
-        return .init(text: confirmed(receipt, effects.list), ok: true, effects: effects.list, performedTool: "create_draft")
+        return .init(text: await MailActionAudit.result(job, fallback: confirmed(receipt, effects.list)),
+                     ok: true, effects: effects.list, performedTool: "create_draft")
     }
 
     /// A send is never retried: `messages/send` has no idempotency key, so a retry could send it twice.
     private static func finishSend(_ message: MailMIME.Outgoing, receipt: String, account: String, token: String,
-                                   files: Bool, deferred: Bool, conversationId: String?) async -> FullDuplexBroker.ToolResult {
+                                   files: Bool, deferred: Bool, conversationId: String?,
+                                   validate: @escaping @Sendable () async throws -> Void, job: DispatchJob) async -> FullDuplexBroker.ToolResult {
         let send = { (effects: Manage.Effects) async throws in
             await GmailQuota.shared.spend(100)
             var body: [String: Any] = ["raw": MailMIME.plain(message)]
             if let threadId = message.threadId { body["threadId"] = threadId }
-            _ = try await GmailAPI.call("POST", path: "messages/send", body: body, token: token)
+            let warning = try await MailActionAudit.write(job, receipt: receipt.replacingOccurrences(of: archivedByRule, with: ""), validate: validate) {
+                try await GmailAPI.call("POST", path: "messages/send", body: body, token: token)
+            }
             await Container.shared.contactStore().recordSent(account: account, email: bareAddress(message.to))
             if files { await fileByRule(token, account: account, threadId: message.threadId, effects) }
+            await MailActionAudit.update(job, result: confirmed(receipt, effects.list) + warning)
         }
         guard !deferred else {
             Task.detached {
@@ -229,15 +281,15 @@ enum LocalCompose {
                     Container.shared.localWriteNotices().push(sendFailure(error), conversation: conversationId)
                 }
             }
-            return .init(text: receipt, ok: true, deferred: true)
+            return .init(text: "Sending to \(message.to). Gmail has not confirmed it yet; its receipt will appear in activity.", ok: true, deferred: true)
         }
         let effects = Manage.Effects()
         do {
             try await send(effects)
         } catch {
-            return .init(text: sendFailure(error), ok: false)
+            return .init(text: sendFailure(error), ok: false, outcomeUnknown: error is MailActionAudit.Failure)
         }
-        return .init(text: confirmed(receipt, effects.list), ok: true, effects: effects.list)
+        return .init(text: await MailActionAudit.result(job, fallback: confirmed(receipt, effects.list)), ok: true, effects: effects.list)
     }
 
     /// A receipt that claims a rule filed the mail says so only when Gmail confirmed it.
@@ -247,11 +299,14 @@ enum LocalCompose {
         return receipt.replacingOccurrences(of: archivedByRule, with: archiveUnconfirmed)
     }
 
-    static func saveDraft(_ token: String, raw: String, threadId: String?) async throws {
-        await GmailQuota.shared.spend(10)
+    @discardableResult
+    static func saveDraft(_ token: String, raw: String, threadId: String?, spendQuota: Bool = true,
+                          validate: @Sendable () async throws -> Void = {}) async throws -> [String: Any] {
+        if spendQuota { await GmailQuota.shared.spend(10) }
         var message: [String: Any] = ["raw": raw]
         if let threadId { message["threadId"] = threadId }
-        _ = try await GmailAPI.call("POST", path: "drafts", body: ["message": message], token: token)
+        try await validate()
+        return try await GmailAPI.call("POST", path: "drafts", body: ["message": message], token: token)
     }
 
     /// A failure is logged and swallowed; the receipt's clause is corrected by `confirmed`.
@@ -273,10 +328,20 @@ enum LocalCompose {
     private static func enqueue(_ draft: PendingMailWrite.QueuedDraft, account: String,
                                 conversationId: String?) async throws -> PendingDraft {
         let userId = await MainActor.run { Container.shared.backend().userId ?? "" }
+        let store = await MainActor.run { Container.shared.dispatchJobs() }
+        if let id = draft.mailActionID {
+            let job = await store.mailAction(id)
+            guard job?.userId == userId, job?.profileId == ProfileRuntime.snapshot?.profileId else {
+                throw PendingMailWrites.Unrecoverable(text: "The active user or profile changed; this draft was not queued.")
+            }
+        }
         let queue = Container.shared.pendingMailWrites()
         let pending = try await queue.enqueueDraft(userId: userId, account: account, draft: draft,
                                                    conversationId: conversationId,
                                                    delay: PendingMailWritePolicy.delay(attempt: 1))
+        if let id = draft.mailActionID {
+            await store.recordMailAction(id, state: .queued, result: "Draft queued after Gmail's rate limit. No draft has been confirmed yet.")
+        }
         queue.drainSoon(userId: userId)
         return pending
     }
@@ -284,12 +349,14 @@ enum LocalCompose {
     // MARK: - Failure sentences
 
     static func draftFailure(_ error: Error, account: String) -> String {
+        if let failure = error as? MailActionAudit.Failure { return failure.text }
         if Manage.isThrottle(error) { return "\(Manage.throttled) No draft was saved." }
         let detail = (error as? PendingMailWrites.Unrecoverable)?.text ?? Manage.detail(error)
         return "that draft didn't save (\(detail)) — there is nothing in \(account)'s drafts, so it needs asking for again."
     }
 
     static func sendFailure(_ error: Error) -> String {
+        if let failure = error as? MailActionAudit.Failure { return failure.text }
         if Manage.isThrottle(error) { return "\(Manage.throttled) Nothing went out." }
         return "that didn't send (\(Manage.detail(error))) — nothing went out, so it needs asking for again."
     }

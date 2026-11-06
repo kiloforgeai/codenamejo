@@ -17,6 +17,7 @@ enum LiveRequestRecovery {
     }
 
     static func requiresQueueAction(_ text: String) -> Bool {
+        if LiveFastAction.parse(text) == .next { return true }
         let normalized = FullDuplexVoiceClient.normalize(text)
         var tokens = normalized.split(separator: " ").map(String.init)
         let words = Set(tokens)
@@ -103,6 +104,7 @@ enum LiveRequestRecovery {
 
     /// A question that names no mail action. Live answers it itself, so assessing it again repeats the answer.
     static func isQuestion(_ text: String) -> Bool {
+        guard LiveFastAction.parse(text) != .next else { return false }
         let words = text.lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init)
         guard !words.contains(where: actionWords.contains),
               let first = words.firstIndex(where: { !questionFillers.contains($0) }) else { return false }

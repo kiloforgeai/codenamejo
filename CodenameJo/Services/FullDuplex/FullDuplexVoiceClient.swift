@@ -165,7 +165,11 @@ final class FullDuplexVoiceClient {
     /// **It exists so an out-of-band item can name the referent, and nothing else reads
     /// it.** See `renderLocalDispatchReportAnchor`. This is the only place on the phone that knows
     /// where the cursor actually is at the moment a report lands.
-    var standingStep: String?
+    var standingStep: String? {
+        didSet { if emailReader.reading != nil { emailReader.valid() } }
+    }
+    lazy var emailReader = makeEmailReader()
+    var emailReadTurn: Int?
     /// The opening asked "want to do some cleanup?"; a yes steps the queue here, not via the model.
     var cleanupOffer: PendingFeedOffer?
     var nothingImportantOfferStanding: Bool {
@@ -676,6 +680,7 @@ final class FullDuplexVoiceClient {
         transport.enableLive()
         liveConfiguration = nil
         liveAnchors.removeAll()
+        liveDelegationScopes.removeAll()
         liveFastAnchor = nil
         liveInputComplete = false
         liveTurnQueueRevisions = [:]
@@ -1010,6 +1015,7 @@ final class FullDuplexVoiceClient {
     /// line that drops the last reference is how a live microphone gets stranded.
     func stopWithEndCue() {
         guard isActive else { return }
+        emailReader.cancel()
         // Nothing new starts from here: a second tap, a spoken phrase and the model's
         // tool can all arrive during the cue, and the first one to get here owns the
         // teardown.
@@ -1129,6 +1135,16 @@ final class FullDuplexVoiceClient {
     #if targetEnvironment(macCatalyst)
     private var selectingFeedItem = false
 
+    func beginDesktopInteraction() {
+        guard isActive else { return }
+        releaseOpening()
+        interrupt()
+        queueFinisherAwaitingAdvance = nil
+        queueReceiptInstructionsPending = nil
+        unheardPresentation = nil
+        transport?.liveAdapter?.beginDesktopInteraction(origin: "button", revision: liveQueueRevision)
+    }
+
     func selectFeedItem(_ row: DesktopFeedRow) async -> String? {
         guard isActive, !selectingFeedItem else {
             return "The selection is changing. Try this item again."
@@ -1137,7 +1153,7 @@ final class FullDuplexVoiceClient {
         defer { selectingFeedItem = false }
         let dial = dialGeneration
         let profile = ProfileRuntime.snapshot?.profileId
-        interrupt()
+        beginDesktopInteraction()
         let selectedStep: String?
         if let selection = row.selection {
             selectedStep = await localTriage.selectPreparedEmail(selection, profileID: profile)
@@ -1172,7 +1188,7 @@ final class FullDuplexVoiceClient {
             return "The selected item changed. Nothing was advanced."
         }
         let dial = dialGeneration
-        interrupt()
+        beginDesktopInteraction()
         let step = await Container.shared.applicationTasks().next(queue: localTriage, store: Container.shared.mailStore())
         guard isActive, dial == dialGeneration, ProfileRuntime.snapshot?.profileId == context.profileID else { return nil }
         let progress = await localTriage.progress
@@ -1191,6 +1207,7 @@ final class FullDuplexVoiceClient {
         // tap from doing it either. Once Jo finishes speaking the hold releases and
         // taps work normally.
         guard !openingHold else { return }
+        emailReader.pause()
         // Clearing the buffer is the audible half and is always right — there may
         // be audio draining even when generation has already finished.
         // `response.cancel` is only meaningful against a live response, and sending
@@ -1309,6 +1326,8 @@ final class FullDuplexVoiceClient {
     }
 
     private func teardown(reason: String) {
+        emailReader.cancel()
+        emailReadTurn = nil
         pendingFeedButton = nil
         cancelJobSpeech(reason: "session_ended")
         checkpointHistory()
@@ -1502,6 +1521,7 @@ final class FullDuplexVoiceClient {
             executeFeedButton(id: id, action: action, context: pending.context)
         case .liveDelegation(let id, let userTurn):
             liveAnchors[id] = userTurn == 0 ? liveQueueRevision : liveTurnQueueRevisions[userTurn]
+            liveDelegationScopes[id] = .current
             if liveTurnsBeforeHearing.contains(userTurn) { liveUnheardDelegations.insert(id) }
             if liveInputComplete, userTurn == liveUserTurn { tryLiveFastAction(latestCompletedUserUtterance) }
         case .liveFunction(let call):
@@ -1511,6 +1531,8 @@ final class FullDuplexVoiceClient {
             fireEndRequest()
         case .liveBackendIdle:
             responseInFlight = false
+            if transport?.liveAdapter?.desktopQuiet == true { return }
+            if emailReadTurn == liveUserTurn { return }
             if transport?.liveAdapter?.shouldHoldFeedForRequest == true { return }
             let recovery = transport?.liveAdapter?.recoveryContext
             let anchored = recovery.map { liveAnchors[$0.delegation] == liveQueueRevision } == true
@@ -1530,6 +1552,8 @@ final class FullDuplexVoiceClient {
                     queueUnchanged: liveTurnQueueRevisions[liveUserTurn] == liveQueueRevision)
             }
         case .liveQueueActionUnworked(let exhausted):
+            if transport?.liveAdapter?.desktopQuiet == true { return }
+            if emailReadTurn == liveUserTurn { return }
             guard let adapter = transport?.liveAdapter else { return }
             guard isActive, !endAfterFarewell, !userSpeaking, functionCallTask == nil else {
                 adapter.stopQueueActionRecovery()
@@ -1550,6 +1574,8 @@ final class FullDuplexVoiceClient {
                 _ = adapter.recoverUnworkedRequest(anchor: anchor, preparedStep: preparedEmailStep(anchor.step))
             }
         case .liveTurnIdleWithoutDelegation(let speech):
+            if transport?.liveAdapter?.desktopQuiet == true { return }
+            if emailReadTurn == liveUserTurn { return }
             if tryLiveFastAction(latestCompletedUserUtterance) { return }
             let anchored = liveUserTurn == 0 || liveTurnQueueRevisions[liveUserTurn] == liveQueueRevision
             let stalled = anchored && functionCallTask == nil && !userSpeaking
@@ -1562,11 +1588,13 @@ final class FullDuplexVoiceClient {
             }
         case .liveTranscriptFinished:
             responseInFlight = false
+            if transport?.liveAdapter?.desktopQuiet == true { return }
             // Not `.liveBackendIdle`: that one needs a completed delegation, and the turn that
             // answers the lesson's question is answered conversationally without one.
-            _ = resumeFeedAfterLessonIfSettled()
+            if emailReadTurn != liveUserTurn { _ = resumeFeedAfterLessonIfSettled() }
             emitFinalTranscript(responseCompleted: false)
         case .liveUserActivity:
+            emailReader.pause()
             cancelJobSpeech(reason: "user_started")
             checkpointHistory()
             onHistoryInterrupted?(historyTurnID)
@@ -1626,6 +1654,7 @@ final class FullDuplexVoiceClient {
         case .liveContextUsage(let ratio):
             liveContextUsage = ratio
         case .liveInputText(let text):
+            emailReader.pause()
             if transport?.liveAdapter?.answersPendingOffer == nil {
                 transport?.liveAdapter?.answersPendingOffer = { [weak self] text in
                     self?.feedOfferStanding == true && FeedOfferAnswer.answer(to: text) == .accepted
@@ -1670,6 +1699,8 @@ final class FullDuplexVoiceClient {
                     "Feedback is handled locally. Wait for its actual save confirmation; do not claim it was saved, revive email presentation, write mail, or advance.", allowPresentation: false)
             } else if tryOnboardingAnswer(text) {
                 // The phone handles its onboarding answer directly.
+            } else if tryEmailReadAloud(text) {
+                break
             } else if trySavedCommandRetry(text) {
                 break
             } else if tryLocalCoachingAnswer(text) || tryFeedOfferAnswer(text) {
@@ -1689,6 +1720,7 @@ final class FullDuplexVoiceClient {
         switch event {
 
         case .outputAudioStarted:
+            emailReader.audioStarted()
             recordJobSpeechStarted()
             assistantAudible = true
             audibleSince = ContinuousClock.now
@@ -1743,6 +1775,7 @@ final class FullDuplexVoiceClient {
             // The opening has finished speaking, so the floor is the user's now.
             releaseOpening()
             onState?(.listening)
+            emailReader.audioStopped()
             // The speaker going quiet is the most likely gap there is. Only a nudge —
             // `drainDispatchReports` polls, so a missed kick costs 250 ms, never a
             // lost answer.
@@ -1750,6 +1783,7 @@ final class FullDuplexVoiceClient {
 
         case .assistantTranscriptDelta(let itemId, let delta, let spoken):
             guard !delta.isEmpty else { return }
+            if spoken { emailReader.transcript(delta) }
             // Recorded per turn so `response.done` can say which kind of reply this
             // was. One line, once, rather than per delta — this fires per token.
             if !spoken, !replyCameBackAsText {
@@ -2689,6 +2723,17 @@ final class FullDuplexVoiceClient {
     }
     var liveConfiguration: FullDuplexBroker.LiveConfiguration?
     private var liveAnchors: [String: Int] = [:]
+    private struct DelegationScope: Equatable {
+        let owner: String?
+        let profile: String?
+        let membership: Int?
+        @MainActor static var current: Self {
+            let scope = ProfileRuntime.snapshot
+            return Self(owner: Container.shared.backend().userId, profile: scope?.profileId,
+                        membership: scope?.membershipRevision)
+        }
+    }
+    private var liveDelegationScopes: [String: DelegationScope] = [:]
     private var liveTurnQueueRevisions: [Int: Int] = [:]
     var liveUserTurn = 0
     /// An email handed to the speaker that the user has not heard yet, marked heard once its sender is spoken.
@@ -2956,6 +3001,7 @@ final class FullDuplexVoiceClient {
         liveUnheardDelegations.remove(id)
         liveTurnsBeforeHearing.remove(liveUserTurn)
         liveAnchors[id] = liveQueueRevision
+        liveDelegationScopes[id] = .current
         toolCalledThisResponse = true
         let arguments = action == .next ? [:] : ["message_id": key.messageId, "account": key.account]
         runFunctionTool(callId: id, name: action.rawValue, argumentsJSON: GmailReadTools.json(arguments))
@@ -3044,6 +3090,11 @@ final class FullDuplexVoiceClient {
             refuseLiveFunction(call, reason: "missing_delegation", output: "Not executed: missing delegation context.")
             return
         }
+        guard let scope = liveDelegationScopes[call.delegation], scope == .current else {
+            refuseLiveFunction(call, reason: "stale_profile", output:
+                "Not executed: the account or profile changed during this request. Start a new request in the current profile.")
+            return
+        }
         // A read pinned to the *current* step passes both gates below, whoever advanced the
         // queue. The stale-anchor refusal exists to stop a repeated write or advance; the
         // backend's own instructions require a body fetch for the item this same turn's
@@ -3093,6 +3144,8 @@ final class FullDuplexVoiceClient {
                                                  cursor: GmailManageTools.cursor(step: standingStep))
             : call.arguments
         handle(.mcpCallStarted(name: call.name, itemId: call.id))
+        let completeSource = call.name == GmailReadTools.getMessage && call.id.hasPrefix("selected-source-")
+            ? standingStep.flatMap(LiveEmailPresentation.Key.selection) : nil
         Task { [weak self] in
             // A device tool runs here and is reported exactly as a relayed MCP result.
             let result: (output: String, failed: Bool, effects: [GmailWriteEffect]?)
@@ -3100,10 +3153,20 @@ final class FullDuplexVoiceClient {
                 result = await GmailManageTools.run(name: call.name, argumentsJSON: arguments)
             } else if CalendarTools.names.contains(call.name) {
                 result = await CalendarTools.run(name: call.name, argumentsJSON: call.arguments, diagnostics: self?.diagnostics, callID: call.id)
+            } else if let completeSource {
+                result = await GmailReadTools.readSelectedMessage(argumentsJSON: call.arguments, selection: completeSource) { [weak self] in
+                    guard let self, self.isActive, self.dialGeneration == dial else { return false }
+                    return self.standingStep.flatMap(LiveEmailPresentation.Key.selection)?.identity == completeSource.identity
+                }
             } else {
                 result = await GmailReadTools.run(name: call.name, argumentsJSON: call.arguments)
             }
             guard let self, self.isActive, self.dialGeneration == dial else { return }
+            if scope != .current, GmailReadTools.names.contains(call.name) || call.name == CalendarTools.list {
+                self.refuseLiveFunction(call, reason: "stale_profile", output:
+                    "The account or profile changed while this tool ran. Its results were discarded; start a new request in the current profile.")
+                return
+            }
             let output = result.output
             var item: [String: Any] = ["type": "mcp_call", "name": call.name,
                 "server_label": "aurex", "arguments": arguments, "output": output,

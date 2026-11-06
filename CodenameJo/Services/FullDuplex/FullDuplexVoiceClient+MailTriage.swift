@@ -340,6 +340,10 @@ extension FullDuplexVoiceClient {
     }
 
     func captureEmailCorrection(_ text: String) {
+        if transport?.liveAdapter?.correctLookup(text) == true {
+            diagnostics?.record(.turnTransition, ["transition": "email_lookup_corrected", "phase": "explicit_user_statement"])
+            return
+        }
         guard liveQueueActionAnchor == nil || liveQueueActionAnchor?.profileId == ProfileRuntime.snapshot?.profileId,
               LiveEmailPreparationCache.isFactualCorrection(text), let step = liveQueueActionAnchor?.step ?? standingStep,
               let key = LiveEmailPresentation.Key.step(step), key.selectedIDs.count == 1 else { return }
@@ -1713,7 +1717,7 @@ extension FullDuplexVoiceClient {
                 conversationId: self?.conversationId(),
                 deferDraft: deferDraft && runAs == "create_draft",
                 deferSend: deferDraft && runAs != "create_draft" && !onboardingReply,
-                onboardingReply: onboardingReply)
+                onboardingReply: onboardingReply, mailCallID: callId)
             guard let self, self.isActive, dial == self.dialGeneration else { return }
             guard !Task.isCancelled else {
                 self.finishSupersededTool(callId: callId, tool: tool, result: result.text,

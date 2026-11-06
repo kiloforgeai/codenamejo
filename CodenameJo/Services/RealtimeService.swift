@@ -397,6 +397,11 @@ class RealtimeService: ObservableObject {
     }
 
     #if targetEnvironment(macCatalyst)
+    func beginDesktopInteraction() {
+        fullDuplex?.beginDesktopInteraction()
+        answerIsStale = !responseText.isEmpty
+    }
+
     func advanceDesktopFeed(_ context: FeedActionContext) async -> String? {
         guard let client = fullDuplex else { return "The feed session ended. Select an item from the refreshed feed." }
         let error = await client.advanceDesktopFeed(context)

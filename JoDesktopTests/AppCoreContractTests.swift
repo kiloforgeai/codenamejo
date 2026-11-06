@@ -15,7 +15,7 @@ final class AppCoreContractTests: XCTestCase {
         }
         let data = try JSONSerialization.data(withJSONObject: catalogs, options: [.sortedKeys])
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        XCTAssertEqual(digest, "0e337a3c94437291b52c9e0effa210494974db452b3c121bed6af737a27ce77d",
+        XCTAssertEqual(digest, "0d83bd7bf24ffd8eaec9c4a2f64f5278f82848dc3daaba177fd3cfbf99c2b059",
                        "Tool contract changes require deliberate review, including account-scoped wording")
     }
 

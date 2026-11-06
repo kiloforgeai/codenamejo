@@ -31,6 +31,7 @@ enum FeedbackError: LocalizedError {
 
 enum FeedbackText {
     static let maximumCharacters = 4_000
+    static let savedAcknowledgment = "Feedback saved locally."
 
     static func validated(_ text: String) throws -> String {
         let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -62,6 +63,8 @@ class UserFeedback: ObservableObject {
     private var voiceDraft: VoiceDraft?
     private var voiceSaveTask: Task<Void, Never>?
     private var handledVoiceTurns: [String] = []
+    private var savedVoiceNote: (id: UUID, draft: VoiceDraft)?
+    private var savingVoiceNote: VoiceDraft?
 
     var pendingVoiceText: String? {
         guard let draft = voiceDraft, sameOwner(draft.submission, capture()) else { return nil }
@@ -88,6 +91,21 @@ class UserFeedback: ObservableObject {
         context.turnID = turnID
         let submission = Submission(userID: captured.userID, context: context)
         let request = VoiceFeedbackText.request(text)
+        if VoiceFeedbackText.retry(text), voiceDraft == nil {
+            if let savingVoiceNote, sameOwner(savingVoiceNote.submission, submission) {
+                reply("Your feedback is still being saved. I don't have a save receipt yet.")
+                return true
+            }
+            if let savedVoiceNote, sameOwner(savedVoiceNote.draft.submission, submission) {
+                settled([turnID], savedVoiceNote.id, .success)
+                transition("already_saved")
+                reply(FeedbackText.savedAcknowledgment)
+                return true
+            }
+            reply("I don't have a saved feedback receipt or a retained note for this profile. Please tell me the feedback again.")
+            transition("missing_draft")
+            return true
+        }
         if handledVoiceTurns.contains(turnID) { return true }
         guard request != nil || voiceDraft != nil else { return false }
         if let draft = voiceDraft, !sameOwner(draft.submission, submission) {
@@ -141,18 +159,23 @@ class UserFeedback: ObservableObject {
             guard sameOwner(draft.submission, capture()) else { transition("scope_changed"); return }
             // Freeze this note before the asynchronous disk write; a later request is a new note.
             voiceDraft = nil
-            handledVoiceTurns = Array((handledVoiceTurns + [draft.requestTurnID] + draft.turns.map(\.id)).suffix(128))
+            savingVoiceNote = draft
             do {
                 let ids = Array(Set([draft.requestTurnID, turnID] + draft.turns.map(\.id))).sorted()
                 var context = draft.submission.context
+                context.turnID = draft.turns.first?.id
                 context.fragmentTurnIDs = ids
                 let id = try await save(draft.text, source: .voice, submission: .init(userID: draft.submission.userID, context: context))
+                savedVoiceNote = (id, draft)
+                savingVoiceNote = nil
+                handledVoiceTurns = Array((handledVoiceTurns + ids).suffix(128))
                 settled(ids, id, .success)
                 transition("saved")
                 guard sameOwner(draft.submission, capture()) else { return }
                 voiceReceipt = "Feedback saved"
-                reply("Feedback saved locally. Your current email is unchanged.")
+                reply(FeedbackText.savedAcknowledgment)
             } catch {
+                savingVoiceNote = nil
                 if voiceDraft == nil { voiceDraft = draft }
                 settled(Array(Set([draft.requestTurnID, turnID] + draft.turns.map(\.id))).sorted(), nil, .failed)
                 transition("failed")
@@ -175,7 +198,9 @@ class UserFeedback: ObservableObject {
 
 enum VoiceFeedbackText {
     static func request(_ text: String) -> String? {
-        let pattern = #"(?is)^\s*(?:(?:yeah|yes|okay|ok|please|just|uh|um)[\s,.]+)*(?:(?:can you|could you|i want to|i'd like to)\s+)?(?:file|log|record|save|submit|give)\s+(?:(?:some|this|my)\s+)?feedback\b[\s:,.!\-]*(.*)$"#
+        if retry(text) { return nil }
+        if text.range(of: #"(?is)^\s*(?:so[,\s]+)?(?:the|my) feedback is\b"#, options: .regularExpression) != nil { return text }
+        let pattern = #"(?is)^\s*(?:(?:hey(?: jo)?|yeah|yes|okay|ok|please|just|uh|um)[\s,.!]+)*(?:(?:can you |could you )?stop for (?:one|a) second[\s,.!?]+)?(?:(?:can (?:you|i)|could (?:you|i)|may i|i want to|i wanna|i'd like to|i would like to)\s+)?(?:file|log|record|save|submit|give)\s+(?:you\s+)?(?:(?:some|this|my|the)\s+)?feedback\b[\s:,.!?\-]*(.*)$"#
         guard let regex = try? NSRegularExpression(pattern: pattern),
               let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
               let range = Range(match.range(at: 1), in: text) else { return nil }
@@ -188,8 +213,14 @@ enum VoiceFeedbackText {
     }
 
     static func resume(_ text: String) -> Bool {
+        if retry(text) { return true }
         let words = SpokenAnswerText.words(text).filter { !["yeah", "yes", "okay", "ok", "uh", "um"].contains($0) }.joined(separator: " ")
         return ["let s go through the feed", "go through the feed", "continue the feed", "resume the feed", "save it", "that s it", "try again"].contains(words)
+    }
+
+    static func retry(_ text: String) -> Bool {
+        text.range(of: #"(?is)^\s*(?:(?:okay|ok|yeah|please)[\s,.]+)*(?:(?:can|could|would) you\s+)?(?:try (?:to )?(?:save|log|record) (?:the |that |my |this )?feedback(?: again)?|(?:save|log|record) (?:the |that |my |this )?feedback again)[\s.!?]*$"#,
+            options: .regularExpression) != nil
     }
 }
 
@@ -205,7 +236,7 @@ enum UserFeedbackTool {
             }
             let id = try await save(FeedbackText.validated(message))
             return ("Feedback saved locally in Jo's logs. Reference: \(id.uuidString). "
-                + "Acknowledge briefly; do not read the reference aloud. Nothing was uploaded and no issue was filed. "
+                + "Say exactly: \(FeedbackText.savedAcknowledgment) Do not paraphrase or interpret the feedback, infer a preference, or read the reference aloud. Nothing was uploaded and no issue was filed. "
                 + "Keep the current task selected; this does not advance the feed.", false)
         } catch {
             return ("Feedback was NOT saved: \(error.localizedDescription)", true)

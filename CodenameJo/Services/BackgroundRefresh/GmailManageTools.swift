@@ -440,11 +440,36 @@ enum GmailManageTools {
 
     private static let reads: Set<String> = [listLabels, listFilters]
 
-    /// Writes stay on the feed's mailbox; a read goes where it was pointed, else the feed's.
-    static func bind(name: String, _ args: [String: Any]) async throws -> ([String: Any], [String]) {
+    struct WriteSource {
+        let cursor: Cursor
+        let ownerID: String?
+        let profileID: String?
+
+        func validate(messageID: String? = nil) async throws {
+            let owner = await MainActor.run { Container.shared.backend().userId }
+            guard owner == ownerID, (ProfileRuntime.snapshot?.profileId ?? "") == (profileID ?? ""),
+                  ProfileRuntime.allowedMailAccounts(GoogleAccountStore.mailAccounts()).contains(where: {
+                      $0.caseInsensitiveCompare(cursor.account) == .orderedSame
+                  }), messageID == nil || messageID == cursor.messageId else {
+                throw Refusal(text: "Nothing was changed. The task's original email or authorized profile is no longer available.")
+            }
+        }
+    }
+
+    /// Background writes retain their validated source; foreground writes follow the feed.
+    static func bind(name: String, _ args: [String: Any], source: WriteSource? = nil) async throws -> ([String: Any], [String]) {
         let connected = ProfileRuntime.allowedMailAccounts(GoogleAccountStore.mailAccounts())
         guard !connected.isEmpty else { throw Refusal(text: "No Gmail account is connected on this phone. Say so plainly.") }
         let requested = GmailReadTools.string(args, "account")
+        if let source {
+            try await source.validate(messageID: GmailReadTools.string(args, "message_id"))
+            guard requested == nil || requested?.caseInsensitiveCompare(source.cursor.account) == .orderedSame else {
+                throw Refusal(text: "Nothing was changed. This task belongs to a different mailbox; use its original account.")
+            }
+            var out = args
+            out["account"] = source.cursor.account
+            return (out, [source.cursor.account])
+        }
         let mailbox = reads.contains(name) && requested != nil ? nil : await Container.shared.localTriage().currentMailbox
         let targetsItem = ["message_id", "thread_id", "draft_id"].contains { GmailReadTools.string(args, $0) != nil }
         if !reads.contains(name), targetsItem, let mailbox, let requested,

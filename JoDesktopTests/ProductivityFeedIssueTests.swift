@@ -6,10 +6,10 @@ import XCTest
 @MainActor
 final class ProductivityFeedIssueTests: XCTestCase {
     func testInformationAndFeedbackDoNotStartActionRecovery() {
-        for text in ["Um, what's his email?", "What does archive mean?", "What is next?", "Can you tell me his email?", "save a command to archive", "I have feedback: archive did not work", "yeah", "don't archive this"] {
+        for text in ["Um, what's his email?", "What does archive mean?", "What is next for this project?", "Can you tell me his email?", "save a command to archive", "I have feedback: archive did not work", "yeah", "don't archive this"] {
             XCTAssertFalse(LiveRequestRecovery.requiresQueueAction(text), text)
         }
-        for text in ["Archive this", "please delete it", "can you archive this", "next"] {
+        for text in ["Archive this", "please delete it", "can you archive this", "next", "What is next?"] {
             XCTAssertTrue(LiveRequestRecovery.requiresQueueAction(text), text)
         }
     }

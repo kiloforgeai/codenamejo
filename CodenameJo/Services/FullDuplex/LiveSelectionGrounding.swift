@@ -21,7 +21,9 @@ enum LiveSelectionGrounding {
         }
         let thread = item["threadId"] as? String ?? ""
         let ids = (item["messages"] as? [[String: Any]])?.compactMap { $0["id"] as? String }.sorted() ?? [id]
-        return .init(known: true, identity: [account.lowercased(), id, thread] .joined(separator: "|") + "|" + ids.joined(separator: ","))
+        let result = json["returnedWorkSelection"] as? String
+        return .init(known: true, identity: [account.lowercased(), id, thread] .joined(separator: "|") + "|" + ids.joined(separator: ",")
+            + (result.map { "|result:" + $0 } ?? ""))
     }
 
     static func unsupportedIntroduction(_ text: String, state: String) -> Bool {

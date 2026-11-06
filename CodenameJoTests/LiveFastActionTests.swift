@@ -13,6 +13,19 @@ final class LiveFastActionTests: XCTestCase {
         }
     }
 
+    func testExplicitContinuationQuestionsRequestNavigationWithoutAuthorizingWrites() {
+        for text in ["Okay, what's next.", "What's next?", "What’s next?", "What is next?", "What's the next email?", "Continue the feed"] {
+            XCTAssertEqual(LiveFastAction.parse(text), .next, text)
+            XCTAssertTrue(LiveRequestRecovery.requiresQueueAction(text), text)
+            XCTAssertFalse(LiveRequestRecovery.isQuestion(text), text)
+        }
+        for text in ["What's next week?", "What's next for this project?", "Don't go to the next email",
+                     "The email says what's next", "What's next, actually wait", "Can you tell me what's next for the company?"] {
+            XCTAssertNil(LiveFastAction.parse(text), text)
+            XCTAssertFalse(LiveRequestRecovery.requiresQueueAction(text), text)
+        }
+    }
+
     func testOnlyWholeExplicitCommandsMatch() {
         for text in ["Archive.", "archive this email", "please archive it", "archive that please!"] {
             XCTAssertEqual(LiveFastAction.parse(text), .archive, text)

@@ -98,7 +98,7 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
         XCTAssertEqual(delivered, [answer.jobId])
     }
 
-    func testStoppedQueueNamesAnUnrelatedAnswerAsUnrelated() async throws {
+    func testStoppingLeavesAnUnrelatedAnswerUnservedForTheReportWatchdog() async throws {
         let (store, directory) = try makeStore()
         defer {
             try? store.database?.close()
@@ -113,8 +113,14 @@ final class DispatchQueueReturnPolicyTests: XCTestCase {
         let held = await queue.hold(answer)
         XCTAssertTrue(held)
         let stopped = await queue.step(.init(stop: true), store: store)
-        XCTAssertTrue(stopped.output.contains("unrelatedToMail"))
-        XCTAssertTrue(stopped.output.contains("69 and cloudy."))
+        XCTAssertFalse(stopped.output.contains("69 and cloudy."))
+        let delivered = await queue.takeServedOutcomes()
+        XCTAssertTrue(delivered.isEmpty)
+        let retained = await queue.release(jobId: answer.jobId)
+        XCTAssertEqual(retained?.text, answer.text)
+        XCTAssertTrue(retained?.independent == true)
+        let duplicate = await queue.release(jobId: answer.jobId)
+        XCTAssertNil(duplicate)
     }
 
     /// A result spoken into the silence after "what's the feedback?" loses the capture.

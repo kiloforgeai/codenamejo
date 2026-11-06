@@ -183,6 +183,7 @@ final class RenderedSelectionRegressionTests: XCTestCase {
         model.conversationID = UUID(); model.inSession = true
         XCTAssertTrue(model.selectionIsTransitioning)
         XCTAssertFalse(model.feedComplete)
+        XCTAssertEqual(model.feedCountLabel, "—", "Cold startup has no confirmed zero count")
         XCTAssertNil(model.feedActionContext)
         model.applySessionFeed(.init(status: .unavailable, revision: 1))
         XCTAssertFalse(model.isStartingFeed)
@@ -192,6 +193,78 @@ final class RenderedSelectionRegressionTests: XCTestCase {
         model.sessionIntent = .quickAction
         model.conversationID = UUID(); model.inSession = true
         XCTAssertFalse(model.isStartingFeed)
+    }
+
+    func testSessionEndRestartAndTransientRefreshNeverReplaceVisibleRowsWithEmpty() {
+        let model = DesktopWorkspaceModel()
+        model.profileID = "work"
+        let row = DesktopFeedRow.email(account: "work@example.test", messageID: "A", subject: "Subject", sender: "Sender")
+        model.feedPreview = .visible([row]); model.previewSelection = row
+        model.conversationID = UUID(); model.inSession = true
+        model.focus = row.previewFocus
+        model.applySessionFeed(.init(rows: [row], current: row.selection, status: .ready, revision: 1))
+        let visible = model.displayedFocus
+        for status: LocalTriageQueue.DesktopStatus in [.loading, .unavailable, .idle] {
+            model.applySessionFeed(.init(status: status, revision: model.sessionFeed.revision + 1))
+            XCTAssertEqual(model.feedRows, [row])
+            XCTAssertEqual(model.displayedFocus, visible)
+            XCTAssertNil(model.feedActionContext)
+        }
+        model.applySessionFeed(.init(rows: [row], current: row.selection, status: .ready, revision: 9))
+        model.conversationID = nil; model.inSession = false; model.focus = nil
+        XCTAssertEqual(model.feedRows, [row])
+        XCTAssertEqual(model.displayedFocus, visible)
+        XCTAssertEqual(model.currentFeedRowID, row.id)
+        model.conversationID = UUID(); model.inSession = true
+        model.applySessionFeed(.init(status: .unavailable, revision: 1))
+        XCTAssertEqual(model.feedRows, [row])
+        XCTAssertEqual(model.displayedFocus, visible)
+        XCTAssertNil(model.feedActionContext)
+        model.focus = row.previewFocus
+        model.applySessionFeed(.init(rows: [row], current: row.selection, status: .ready, revision: 2))
+        XCTAssertNotNil(model.feedActionContext)
+        model.focus = .complete(.init())
+        model.applySessionFeed(.init(status: .complete, revision: 3))
+        XCTAssertTrue(model.feedRows.isEmpty, "Confirmed completion can clear the list")
+    }
+
+    func testOwnerHydrationAndMembershipRemovalPreserveOnlyAuthorizedContent() {
+        let model = DesktopWorkspaceModel()
+        let context = DesktopFeedPreview.Context(userID: "owner", profileID: "work", emails: ["work@example.test"], slackTeams: [])
+        model.reconcileScope(owner: "owner", profile: "work", context: context)
+        let row = DesktopFeedRow.email(account: "work@example.test", messageID: "A", subject: "Subject", sender: "Sender")
+        model.feedPreview = .visible([row]); model.previewSelection = row
+        model.reconcileScope(owner: "owner", profile: nil, context: nil)
+        XCTAssertEqual(model.feedRows, [row])
+        XCTAssertEqual(model.displayedFocus, row.previewFocus)
+        XCTAssertNil(model.feedActionContext)
+        XCTAssertEqual(model.profileID, "work")
+        model.reconcileScope(owner: "owner", profile: "work", context: context)
+        XCTAssertNotNil(model.feedActionContext)
+        model.reconcileScope(owner: "owner", profile: "work", context: .init(userID: "owner", profileID: "work", emails: [], slackTeams: []))
+        XCTAssertTrue(model.feedRows.isEmpty)
+        XCTAssertNil(model.displayedFocus)
+        model.feedPreview = .visible([row]); model.previewSelection = row
+        model.reconcileScope(owner: "another", profile: nil, context: nil)
+        XCTAssertTrue(model.feedRows.isEmpty)
+        XCTAssertNil(model.displayedFocus)
+        XCTAssertNil(model.profileID)
+        model.reconcileScope(owner: nil, profile: nil, context: nil)
+        XCTAssertFalse(model.scopeHydrating)
+    }
+
+    func testEndingDuringSelectionTransitionNeverAttachesTheOldReaderToANewRow() {
+        let model = DesktopWorkspaceModel()
+        let rows = ["A", "B"].map { DesktopFeedRow.email(account: "work@example.test", messageID: $0, subject: $0, sender: "Sender") }
+        model.conversationID = UUID(); model.inSession = true
+        model.focus = rows[0].previewFocus
+        model.applySessionFeed(.init(rows: rows, current: rows[0].selection, status: .ready, revision: 1))
+        model.applySessionFeed(.init(rows: rows, current: rows[1].selection, status: .ready, revision: 2))
+        XCTAssertTrue(model.selectionIsTransitioning)
+        model.conversationID = nil; model.inSession = false; model.focus = nil
+        XCTAssertEqual(model.previewSelection?.selection, rows[0].selection)
+        XCTAssertEqual(model.feedActionContext?.selection, rows[0].selection)
+        XCTAssertEqual(model.currentFeedRowID, rows[0].id)
     }
 
     func testCalendarAndCompletionCanReplaceAnEmailWithoutWaitingForMailQueueToMove() {

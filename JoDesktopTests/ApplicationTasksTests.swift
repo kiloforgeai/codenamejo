@@ -46,6 +46,190 @@ final class ApplicationTasksTests: XCTestCase {
         .init(account: account, messageID: id, threadID: "thread-" + id, sender: "Same sender", subject: "Same subject")
     }
 
+    func testRelatedDependencyRetainsSourceAndDecisionPolicyAcrossDelayedResultAndRestart() async throws {
+        var continuation: CheckedContinuation<[[String: Any]], Never>?
+        let tasks = ApplicationTasks(request: { _ in await withCheckedContinuation { continuation = $0 } })
+        var job = try tasks.job(request: "Find the Notion database for this email", commandID: nil, origin: origin("A"), profile: nil)
+        job.parksSource = false
+        job.holdsDecision = true
+        await tasks.submit(job)
+        await waitFor { continuation != nil }
+        XCTAssertEqual(store.decisionDependencies.first?.origin?.messageID, "A")
+        XCTAssertFalse(try XCTUnwrap(store.existing(job.id)).ownsFeedSource)
+        let writes = await provider.writes()
+        XCTAssertTrue(writes.isEmpty, "A lookup has not authorized a write")
+        continuation?.resume(returning: answer("Investor Updates database id DB-A"))
+        _ = await tasks.result(job.id)
+        let restored = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        let dependency = try XCTUnwrap(restored.decisionDependencies.first)
+        XCTAssertEqual(dependency.id, job.id)
+        XCTAssertEqual(dependency.origin?.messageID, "A")
+        XCTAssertEqual(dependency.context?.holdsDecision, true)
+        XCTAssertEqual(dependency.result, "Investor Updates database id DB-A")
+        Container.shared.dispatchJobs.register { restored }
+        let brain = LiveClientBrain(request: { _ in [:] }, deliver: { _ in }, speak: { _, _ in }, failed: { _ in })
+        brain.updateState(#"{"done":false,"item":{"id":"A","threadId":"thread-A","account":"one@example.test"}}"#, scope: nil)
+        XCTAssertTrue(brain.holdsFeedDecision, "A reconnect restores the source decision hold")
+        brain.updateState(#"{"done":false,"item":{"id":"B","threadId":"thread-B","account":"one@example.test"}}"#, scope: nil)
+        XCTAssertFalse(brain.holdsFeedDecision, "The dependency must not hold an unrelated selected email")
+        await restored.releaseDecisionHold(.init(account: "one@example.test", messageID: "A"))
+        brain.updateState(#"{"done":false,"item":{"id":"A","threadId":"thread-A","account":"one@example.test"}}"#, scope: nil)
+        XCTAssertFalse(brain.holdsFeedDecision)
+        brain.close()
+        backend.userId = "another-owner"
+        XCTAssertTrue(restored.decisionDependencies.isEmpty)
+    }
+
+    func testResearchRowsKeepIdentityThroughEveryStateWhileRoutineReceiptsStayInActivity() {
+        let model = DesktopWorkspaceModel()
+        var research = DispatchJob(id: UUID(), task: "Research A", state: "queued", startedAt: Date(),
+            origin: origin("A"), context: .init(scope: "current_email", expects: "answer", authoredAt: Date(), timeZone: "UTC", input: "voice"))
+        let second = DispatchJob(id: UUID(), task: "Research B", state: "running", startedAt: Date().addingTimeInterval(1),
+            origin: origin("B"), context: .init(scope: "current_email", expects: "answer", authoredAt: Date(), timeZone: "UTC", input: "voice"))
+        var receipt = DispatchJob(id: UUID(), task: "Reply sent", state: "done", startedAt: Date(), reportBack: false,
+            origin: origin("C"), context: .init(scope: "current_email", expects: "receipt", authoredAt: Date(), timeZone: "UTC", input: "button"))
+        for state in ["queued", "running", "done", "awaiting_input", "failed", "partial", "unknown", "cancelled"] {
+            research.state = state
+            model.jobs = [second, receipt, research]
+            XCTAssertEqual(model.workQueueTasks.map(\.id), [research.id, second.id])
+            XCTAssertEqual(model.activityJobs.map(\.id), [receipt.id])
+            XCTAssertNil(model.selectedJob, "Progress must not steal the selected email")
+            XCTAssertEqual(model.feedCountLabel, "≥2")
+        }
+        model.selectedJob = research
+        research.state = "done"
+        model.jobs = [research, second, receipt]
+        XCTAssertEqual(model.selectedJob?.id, research.id)
+        research.deliveredAt = Date()
+        receipt.state = "failed"
+        model.jobs = [research, second, receipt]
+        XCTAssertFalse(model.workQueueTasks.contains { $0.id == research.id })
+        XCTAssertTrue(model.workQueueTasks.contains { $0.id == receipt.id }, "A failed routine action can need attention in the feed")
+    }
+
+    private func browserStore() -> BackgroundBrowserStore {
+        let browsers = BackgroundBrowserStore()
+        browsers.makeBrowser = { job, current in
+            let browser = BackgroundBrowser(job: job, current: current)
+            browser.allowLocalFixture = true
+            return browser
+        }
+        Container.shared.backgroundBrowsers.register { browsers }
+        return browsers
+    }
+
+    func testActualBrowserKeepsSourceAcrossForegroundTurnsQuickActionAndCallerDisconnect() async throws {
+        let browsers = browserStore(), fixture = BackgroundBrowserFixture()
+        defer { browsers.purge(); fixture.server.stop() }
+        var finished: [[String: Any]] = []
+        var continuation: CheckedContinuation<Void, Never>?
+        var hold = true
+        let tasks = ApplicationTasks(request: { body in
+            let result = try await fixture.respond(body)
+            if hold, result.first?["type"] as? String == "message" {
+                finished = result
+                await withCheckedContinuation { continuation = $0 }
+            }
+            return result
+        })
+        Container.shared.applicationTasks.register { tasks }
+        let mail = Container.shared.mailStore()
+        let queue = LocalTriageQueue(mailAccounts: { ["one@example.test"] }, unreadOpeningLoader: { _ in nil })
+        await queue.adopt([feedMessage("A"), feedMessage("B"), feedMessage("C"), feedMessage("D")], store: mail)
+        let job = try tasks.job(request: "browser fixture: bring back the options", commandID: nil, origin: origin("A"), profile: nil)
+        let caller = Task { await tasks.run(job) }
+        for _ in 0..<1000 { if continuation != nil { break }; try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertNotNil(continuation)
+        XCTAssertFalse(finished.isEmpty)
+        let browser = try XCTUnwrap(browsers.sessions[job.id])
+        let browserIdentity = browser.jobID
+        _ = await queue.parkTaskSource(try XCTUnwrap(store.existing(job.id)), store: mail)
+        let first = await queue.currentId
+        XCTAssertEqual(first, "B")
+        _ = await queue.step(.init(direction: "next"), store: mail, dealtWith: false)
+        let second = await queue.currentId
+        XCTAssertEqual(second, "C")
+        caller.cancel()
+        let archive = await tasks.perform(name: "archive_message", arguments: #"{"account":"one@example.test","message_id":"D"}"#,
+            profile: nil, origin: origin("D"), inputSource: "button")
+        XCTAssertEqual(archive.ok, true)
+        XCTAssertEqual(browser.origin?.messageID, "A")
+        XCTAssertEqual(browser.jobID, browserIdentity)
+        hold = false; continuation?.resume(); continuation = nil
+        _ = await caller.value
+        XCTAssertEqual(store.existing(job.id)?.state, "done")
+        XCTAssertEqual(store.existing(job.id)?.origin?.messageID, "A")
+        XCTAssertNil(browser.webView)
+        let writes = await provider.writes()
+        XCTAssertEqual(writes, ["D", "thread-D"])
+        let returned = await queue.step(.init(direction: "next"), store: mail, dealtWith: false)
+        XCTAssertTrue(returned.output.contains("Tuesday 10 am"), returned.output)
+        let delivered = await queue.takeServedOutcomes()
+        XCTAssertEqual(delivered, [job.id])
+        let next = await queue.step(.init(direction: "next"), store: mail, dealtWith: false)
+        XCTAssertFalse(next.output.contains("Tuesday 10 am"))
+        tasks.select(job.id)
+        XCTAssertTrue((tasks.selectedContext["result"] as? String)?.contains("Tuesday 10 am") == true)
+        let quiet = try tasks.job(request: "browser fixture quiet. No need to tell me when it succeeds", commandID: nil, origin: origin("E"), profile: nil)
+        _ = await tasks.run(quiet)
+        XCTAssertEqual(store.existing(quiet.id)?.state, "done")
+        XCTAssertFalse(store.shouldPresent(quiet.id, revision: 1))
+        await queue.end()
+    }
+
+    func testBrowserApprovalResumesSameApplicationTaskAndPersistsOneReceipt() async throws {
+        let browsers = browserStore(), fixture = BackgroundBrowserFixture()
+        defer { browsers.purge(); fixture.server.stop() }
+        let tasks = ApplicationTasks(request: { try await fixture.respond($0) })
+        let job = try tasks.job(request: "browser form fixture", commandID: nil, origin: origin("A"), profile: nil)
+        _ = await tasks.run(job)
+        let browser = try XCTUnwrap(browsers.sessions[job.id])
+        XCTAssertEqual(store.existing(job.id)?.state, "awaiting_input")
+        XCTAssertNil(store.existing(job.id)?.inFlightOperation)
+        let key = try XCTUnwrap(browser.url?.query)
+        let before = await fixture.server.count(key)
+        XCTAssertEqual(before, 0)
+        try await tasks.resumeBrowser(job.id, version: 1, approval: try XCTUnwrap(browser.approval).id)
+        _ = await tasks.result(job.id)
+        XCTAssertEqual(store.existing(job.id)?.taskRevision, 2)
+        XCTAssertEqual(store.existing(job.id)?.task, job.task, "Internal continuation must not replace the visible request")
+        XCTAssertEqual(store.existing(job.id)?.state, "done")
+        XCTAssertTrue(store.existing(job.id)?.hasCommittedWrites == true)
+        XCTAssertNil(store.existing(job.id)?.inFlightOperation)
+        XCTAssertEqual(store.existing(job.id)?.origin?.messageID, "A")
+        XCTAssertTrue(browsers.sessions[job.id] === browser)
+        let after = await fixture.server.count(key)
+        XCTAssertEqual(after, 1)
+        do { try await tasks.correct(job.id, version: 2, instruction: "Try again"); XCTFail("Committed browser form replayed") } catch {}
+        let restored = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        XCTAssertTrue(restored.existing(job.id)?.hasCommittedWrites == true)
+    }
+
+    func testBrowserCapacityQueuesThirdContextAndRejectsAnotherOwner() async throws {
+        let browsers = browserStore()
+        defer { browsers.purge() }
+        let ids = [UUID(), UUID(), UUID()]
+        for (index, id) in ids.enumerated() { await store.begin(id: id, task: "Browser \(index)", profileId: nil, origin: origin(String(index))) }
+        let first = try await browsers.session(ids[0])
+        let second = try await browsers.session(ids[1])
+        let waiting = Task { try await browsers.session(ids[2]) }
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(browsers.sessions.count, 2)
+        XCTAssertFalse(first.webView === second.webView)
+        first.finish()
+        let third = try await waiting.value
+        XCTAssertEqual(third.origin?.messageID, "2")
+        XCTAssertEqual(browsers.sessions.values.filter { $0.webView != nil }.count, 2)
+        let pending = UUID()
+        await store.begin(id: pending, task: "Fourth browser", profileId: nil)
+        let capacity = await browsers.run(#"{"action":"inspect"}"#, jobID: pending, callID: "capacity", diagnostics: nil)
+        XCTAssertTrue(capacity.output.contains("needs_input"))
+        XCTAssertFalse(capacity.write)
+        backend.userId = "different-owner"
+        do { _ = try await browsers.session(ids[2]); XCTFail("Another owner accessed this browser") } catch {}
+        XCTAssertFalse(third.current())
+    }
+
     func testSelectedActivitySuppliesItsResultAndClearsWithoutReplayingWork() async throws {
         let tasks = ApplicationTasks(request: { _ in XCTFail("Selection must not start a task"); return [] })
         let id = UUID()
@@ -212,6 +396,70 @@ final class ApplicationTasksTests: XCTestCase {
         }
     }
 
+    func testVoiceAttachmentQuestionHoldsSourceUnlessBackgroundWasRequested() async throws {
+        for background in [false, true] {
+            for fast in [false, true] {
+                var continuation: CheckedContinuation<[[String: Any]], Never>?
+                let tasks = ApplicationTasks(request: { _ in
+                    if fast { return self.answer("The candidate has five years of experience.") }
+                    return await withCheckedContinuation { continuation = $0 }
+                })
+                Container.shared.applicationTasks.register { tasks }
+                let source = UUID().uuidString
+                let mail = Container.shared.mailStore()
+                let queue = LocalTriageQueue(mailAccounts: { ["one@example.test"] }, unreadOpeningLoader: { _ in nil })
+                await queue.adopt([feedMessage(source), feedMessage("B"), feedMessage("C")], store: mail)
+                let realtime = RealtimeService()
+                Container.shared.realtimeService.register { realtime }
+                realtime.isConversing = true
+                let selected = MailSelection(account: "one@example.test", messageID: source)
+                realtime.renderedWorkspace = .init(profileID: nil, conversationID: nil, focus: selected, queueCurrent: selected)
+                let client = FullDuplexVoiceClient(queueStanding: {
+                    .init(account: "one@example.test", position: 1, queued: 3, remaining: 3, done: false)
+                }, localContext: context, localTriage: queue, dispatchJobs: store)
+                client.activateFeedForTesting(transport: FullDuplexTransport())
+                client.userSpeaking = true
+                client.standingStep = GmailReadTools.json(["done": false, "item": ["id": source,
+                    "threadId": "thread-" + source, "account": "one@example.test", "from": "Candidate", "subject": "Resume"]])
+                client.latestCompletedUserUtterance = background ? "Read the resume in the background and keep going" : "What does the resume say?"
+                var id: UUID?
+                client.onDispatchStarted = { started, _ in id = started }
+                client.startDispatch(callId: "attachment", argumentsJSON: GmailReadTools.json([
+                    "task": "Read the attached resume and summarize the candidate's experience", "scope": "current_email",
+                    "expects": "answer", "requested_background": background]))
+                let accepted = try XCTUnwrap(id)
+                await waitFor { self.store.existing(accepted)?.context != nil && (fast || continuation != nil) }
+                if background {
+                    await waitFor { client.standingStep.flatMap(LiveEmailPresentation.Key.selection)?.messageId == "B" }
+                }
+                let job = try XCTUnwrap(store.existing(accepted))
+                XCTAssertEqual(job.origin?.messageID, source)
+                XCTAssertEqual(job.context?.parksSource, background)
+                XCTAssertEqual(job.ownsFeedSource, background)
+                if !fast {
+                    let waiting = await queue.currentId
+                    XCTAssertEqual(waiting, background ? "B" : source)
+                    continuation?.resume(returning: answer("The candidate has five years of experience."))
+                }
+                _ = await tasks.result(accepted)
+                await waitFor { client.dispatchTasks["attachment"] == nil }
+                let after = await queue.currentId
+                XCTAssertEqual(after, background ? "B" : source)
+                XCTAssertEqual(store.existing(accepted)?.state, "done")
+                XCTAssertTrue(store.existing(accepted)?.result?.contains("five years") == true)
+                let writes = await provider.writes()
+                XCTAssertTrue(writes.isEmpty)
+                client.reportDrain?.cancel()
+                client.reportDrain = nil
+                client.pendingReports = []
+                client.cancelDispatchesForTesting()
+                realtime.isConversing = false
+                await store.settle(accepted)
+                await queue.end()
+            }
+        }
+    }
+
     func testQuietSuccessStaysInActivitiesButFailureAndInputReturnWithState() async throws {
         let mail = Container.shared.mailStore()
         for state in ["done", "failed", "partial", "awaiting_input"] {
@@ -234,6 +482,119 @@ final class ApplicationTasksTests: XCTestCase {
             await store.settle(job.id)
             await queue.end()
         }
+    }
+
+    func testStoppingFeedKeepsCompletedResultsUnreadAcrossRestartAndProfiles() async throws {
+        let ids = [UUID(), UUID()]
+        for (index, id) in ids.enumerated() {
+            await store.begin(id: id, task: "Inspect attachment \(index)", profileId: nil,
+                origin: origin("source-\(index)", account: index == 0 ? "one@example.test" : "two@example.test"))
+            let accepted = await store.acceptContext(id, context: .init(scope: "current_email", expects: "answer",
+                authoredAt: Date(), timeZone: "UTC", input: "voice", parksSource: true))
+            XCTAssertTrue(accepted)
+            await store.finish(id, state: "done", result: "Requested finding \(index)", reportBack: true)
+        }
+        let quiet = UUID()
+        await store.begin(id: quiet, task: "Archive quietly", profileId: nil, origin: origin("quiet"))
+        await store.finish(quiet, state: "done", result: "Archived", reportBack: false)
+        let mail = Container.shared.mailStore()
+        let queue = LocalTriageQueue(mailAccounts: { ["one@example.test", "two@example.test"] }, unreadOpeningLoader: { _ in nil })
+        await queue.adopt([feedMessage("foreground"), feedMessage("next")], store: mail)
+        let stopped = await queue.step(.init(stop: true), store: mail)
+        XCTAssertTrue(stopped.output.contains("stopped"))
+        XCTAssertFalse(stopped.output.contains("Requested finding"))
+        let delivered = await queue.takeServedOutcomes()
+        XCTAssertTrue(delivered.isEmpty, "Closing a reader is not a delivery acknowledgment")
+        for id in ids { XCTAssertNil(store.existing(id)?.deliveredAt) }
+        XCTAssertNotNil(store.existing(quiet)?.deliveredAt)
+        await queue.end()
+
+        let restored = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        Container.shared.dispatchJobs.register { restored }
+        let unread = await restored.recover()
+        XCTAssertEqual(Set(unread.map(\.id)), Set(ids))
+        ProfileRuntime.install(.init(profileId: "another", isDefault: false, emails: ["one@example.test"]))
+        let foreign = await restored.recover()
+        XCTAssertTrue(foreign.isEmpty)
+        ProfileRuntime.install(nil)
+        let resumed = LocalTriageQueue(mailAccounts: { ["one@example.test", "two@example.test"] }, unreadOpeningLoader: { _ in nil })
+        await resumed.adopt([feedMessage("foreground"), feedMessage("next")], store: mail)
+        var presented = Set<UUID>()
+        for _ in ids {
+            let step = await resumed.step(.init(direction: "next"), store: mail, dealtWith: false)
+            XCTAssertTrue(step.output.contains("Requested finding"))
+            let served = await resumed.takeServedOutcomes()
+            XCTAssertEqual(served.count, 1)
+            for id in served {
+                XCTAssertTrue(presented.insert(id).inserted)
+                await restored.settle(id)
+            }
+        }
+        XCTAssertEqual(presented, Set(ids))
+        let remaining = await restored.recover()
+        XCTAssertTrue(remaining.isEmpty)
+        await resumed.end()
+    }
+
+    func testLegacyHeldResultDoesNotReplayAfterDeliveryOrCancellation() async throws {
+        for cancelled in [false, true] {
+            let mail = Container.shared.mailStore()
+            let queue = LocalTriageQueue(mailAccounts: { ["one@example.test"] }, unreadOpeningLoader: { _ in nil })
+            await queue.adopt([feedMessage("A"), feedMessage("B"), feedMessage("C")], store: mail)
+            let id = UUID()
+            await store.begin(id: id, task: "Research A", profileId: nil, origin: origin("A"))
+            await store.finish(id, state: "done", result: "Previously delivered answer", reportBack: true)
+            let held = await queue.hold(.init(jobId: id, task: "Research A", text: "Previously delivered answer",
+                ok: true, expects: .answer, about: origin("A").about))
+            XCTAssertTrue(held)
+            if cancelled {
+                await store.finish(id, state: "cancelled", result: "Cancelled", reportBack: false)
+            } else {
+                await store.settle(id)
+            }
+            let next = await queue.step(.init(direction: "next"), store: mail, dealtWith: false)
+            XCTAssertEqual(LiveEmailPresentation.Key.selection(next.output)?.messageId, "B", next.output)
+            XCTAssertFalse(next.output.contains("Previously delivered answer"), next.output)
+            XCTAssertFalse(next.output.contains("presentedForOutcome"), next.output)
+            let served = await queue.takeServedOutcomes()
+            XCTAssertTrue(served.isEmpty)
+            await queue.end()
+        }
+    }
+
+    func testWhatsNextDismissesCompletedArchiveResultWithoutReintroducingSource() async throws {
+        let mail = Container.shared.mailStore()
+        let queue = LocalTriageQueue(mailAccounts: { ["one@example.test"] }, unreadOpeningLoader: { _ in nil })
+        await queue.adopt([feedMessage("A"), feedMessage("B"), feedMessage("C")], store: mail)
+        let id = UUID()
+        await store.begin(id: id, task: "Archive A and report back", profileId: nil, origin: origin("A"))
+        _ = await store.acceptContext(id, context: .init(scope: "current_email", expects: "receipt", authoredAt: Date(),
+            timeZone: "UTC", input: "voice", parksSource: true))
+        _ = await queue.parkTaskSource(try XCTUnwrap(store.existing(id)), store: mail)
+        await queue.markActed(id: "A", as: "archive_message")
+        await store.receipt(id, callId: "archive-A", tool: "archive_message", failed: false)
+        await store.finish(id, state: "done", result: "A was archived.", reportBack: true)
+        await queue.markActed(id: "B", as: "archive_message")
+        let returned = await queue.step(.init(direction: "next"), store: mail, dealtWith: false)
+        XCTAssertTrue(returned.output.contains("presentedForOutcome"), returned.output)
+        XCTAssertEqual(LiveEmailPresentation.Key.selection(returned.output)?.messageId, "A")
+        XCTAssertNil(LiveEmailPresentation.Key.step(returned.output), "A task result must not prepare the original email introduction")
+        let plain = GmailReadTools.json(["done": false, "item": ["id": "A", "threadId": "thread-A", "account": "one@example.test"]])
+        XCTAssertNotEqual(LiveSelectionGrounding.selection(returned.output), LiveSelectionGrounding.selection(plain))
+        let served = await queue.takeServedOutcomes()
+        XCTAssertEqual(served, [id])
+        await store.settle(id)
+        let writesBefore = await provider.writes()
+        XCTAssertEqual(LiveFastAction.parse("Okay, what's next."), .next)
+        XCTAssertTrue(LiveRequestRecovery.requiresQueueAction("Okay, what's next."))
+        let next = await queue.step(.init(direction: "next"), store: mail, dealtWith: false)
+        XCTAssertEqual(LiveEmailPresentation.Key.selection(next.output)?.messageId, "C")
+        XCTAssertFalse(next.output.contains("presentedForOutcome"))
+        let repeated = await queue.takeServedOutcomes()
+        XCTAssertTrue(repeated.isEmpty)
+        let writesAfter = await provider.writes()
+        XCTAssertEqual(writesAfter, writesBefore, "Dismissing a receipt is navigation, not another provider write")
+        await queue.end()
     }
 
     func testRestartReturnsUnreviewedResultAndKeepsSameSubjectAccountIdentity() async throws {
@@ -538,9 +899,77 @@ final class ApplicationTasksTests: XCTestCase {
         catch { XCTAssertTrue(error.localizedDescription.contains("reconcile")) }
     }
 
+    func testContextualRoutineCompletionStaysInHistoryWithoutReturningToFeed() async throws {
+        var requests = 0
+        let tasks = ApplicationTasks(request: { body in
+            requests += 1
+            let format = (body["text"] as? [String: Any])?["format"] as? [String: Any]
+            let schema = format?["schema"] as? [String: Any]
+            XCTAssertTrue((schema?["required"] as? [String])?.contains("report_back") == true)
+            XCTAssertTrue((body["instructions"] as? String)?.contains("Infer report_back from the user's request") == true)
+            if requests == 1 {
+                return [["type": "function_call", "name": "archive_message", "call_id": "archive-A",
+                    "arguments": #"{"account":"one@example.test","message_id":"A"}"#]]
+            }
+            return self.answer(#"{"status":"completed","report":"Archived the selected email.","report_back":false}"#)
+        })
+        let job = try tasks.job(request: "Archive this email", commandID: nil, origin: origin("A"), profile: nil)
+        XCTAssertNil(job.completionPreference)
+        let outcome = await tasks.run(job)
+        let row = try XCTUnwrap(store.existing(job.id))
+        XCTAssertEqual(requests, 2, "Reporting is inferred in the existing worker response")
+        XCTAssertFalse(outcome.reportBack)
+        XCTAssertNil(row.completionPreference)
+        XCTAssertEqual(row.result, "Archived the selected email.")
+        XCTAssertFalse(row.needsReview)
+        XCTAssertNotNil(row.deliveredAt)
+        XCTAssertTrue(row.hasCommittedWrites)
+        XCTAssertFalse(store.shouldPresent(job.id, revision: 1))
+        let restored = DispatchJobStore(url: folder.appendingPathComponent("jobs.json"))
+        XCTAssertEqual(restored.existing(job.id)?.reportBack, false)
+        XCTAssertFalse(restored.existing(job.id)?.needsReview ?? true)
+    }
+
+    func testContextualFindingsAndUncertainReportingRemainVisible() async throws {
+        for response in [
+            #"{"status":"completed","report":"The workshop starts at six.","report_back":true}"#,
+            #"{"status":"completed","report":"The workshop starts at six."}"#,
+            #"{"report":"Incomplete response metadata","report_back":false}"#,
+            #"{"status":"needs_input","report":"Which workshop should I use?","report_back":false}"#
+        ] {
+            let tasks = ApplicationTasks(request: { _ in self.answer(response) })
+            let job = try tasks.job(request: "Find the workshop time in this email", commandID: nil, origin: origin("A"), profile: nil)
+            let outcome = await tasks.run(job)
+            let row = try XCTUnwrap(store.existing(job.id))
+            XCTAssertNil(row.completionPreference)
+            XCTAssertTrue(outcome.reportBack)
+            XCTAssertTrue(row.needsReview)
+            XCTAssertTrue(store.shouldPresent(job.id, revision: 1))
+            XCTAssertNil(row.deliveredAt)
+        }
+        let tasks = ApplicationTasks(request: { _ in throw DispatchWorker.StepFailure(message: "Could not complete the lookup") })
+        let job = try tasks.job(request: "Find the workshop time", commandID: nil, origin: origin("B"), profile: nil)
+        let outcome = await tasks.run(job)
+        XCTAssertTrue(outcome.reportBack)
+        XCTAssertTrue(store.existing(job.id)?.needsReview == true)
+        let writes = await provider.writes()
+        XCTAssertTrue(writes.isEmpty)
+    }
+
+    func testExplicitRequestToReportOverridesInferredQuietSuccess() async throws {
+        let tasks = ApplicationTasks(request: { _ in
+            self.answer(#"{"status":"completed","report":"The work is done.","report_back":false}"#)
+        })
+        let job = try tasks.job(request: "Do this and bring me the result when it's ready", commandID: nil, origin: origin("A"), profile: nil)
+        let outcome = await tasks.run(job)
+        XCTAssertTrue(outcome.reportBack)
+        XCTAssertEqual(store.existing(job.id)?.completionPreference, .bringBack)
+        XCTAssertTrue(store.existing(job.id)?.needsReview == true)
+    }
+
     func testQuietSuccessHasNoReturnedItemOrSpeechAndPersistsPreference() async throws {
         let tasks = ApplicationTasks(request: { _ in self.answer("Done") })
-        let job = try tasks.job(request: "Research A", commandID: nil, origin: origin("A"), profile: nil, preference: .quiet)
+        let job = try tasks.job(request: "Research A. No need to tell me when it succeeds", commandID: nil, origin: origin("A"), profile: nil)
         let outcome = await tasks.run(job)
         let row = try XCTUnwrap(store.existing(job.id))
         XCTAssertFalse(outcome.reportBack)
@@ -593,7 +1022,7 @@ final class ApplicationTasksTests: XCTestCase {
             requests += 1
             return self.answer(#"{"status":"needs_input","report":"Which date should I use?"}"#)
         })
-        let job = try tasks.job(request: "Find a time", commandID: nil, origin: origin("A"), profile: nil, preference: .quiet)
+        let job = try tasks.job(request: "Find a time. No need to tell me when it succeeds", commandID: nil, origin: origin("A"), profile: nil)
         let outcome = await tasks.run(job)
         XCTAssertTrue(outcome.reportBack)
         XCTAssertEqual(store.existing(job.id)?.state, "awaiting_input")
@@ -686,6 +1115,9 @@ final class ApplicationTasksTests: XCTestCase {
             let job = try tasks.job(request: "follow up", commandID: command.id, origin: selected, profile: nil)
             let result = await tasks.run(job)
             XCTAssertEqual(result.ok, true, result.text)
+            XCTAssertFalse(result.reportBack, "An action-only saved command infers quiet completion")
+            XCTAssertNil(store.existing(job.id)?.completionPreference)
+            XCTAssertFalse(store.existing(job.id)?.needsReview ?? true)
             XCTAssertEqual(store.existing(job.id)?.command?.completedSteps, 2)
         }
         let reopened = CustomCommandStore()
