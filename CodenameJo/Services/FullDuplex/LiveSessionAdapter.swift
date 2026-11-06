@@ -14,6 +14,8 @@ final class LiveSessionAdapter {
     let emit: (RealtimeSignal) -> Void
     private var clientBrain: LiveClientBrain?
     var calendarWindow: CalendarRequestWindow? { clientBrain?.calendarWindow }
+    func replySource(for callID: String) -> String? { clientBrain?.replySource(for: callID) }
+
     func calendarSource(for call: Call) -> String? { clientBrain?.calendarSource(for: call) }
     private var presentationDelegations = Set<String>()
     private var abandonedPresentations = Set<String>()

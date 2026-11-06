@@ -23,6 +23,41 @@ final class LiveReplyCompositionTests: XCTestCase {
         XCTAssertTrue(reply.targetConfirmed, "Repeating a resolved question cannot erase the confirmation")
     }
 
+    func testNamedPriorSourcesRequireAccountClarificationWhenSubjectsRepeat() throws {
+        let sameSubject = other.replacingOccurrences(of: "other@example.test\"", with: "other@example.test\",\"subject\":\"Coffee\"")
+        let matches = LiveReplyComposition.namedSources("Reply to the Coffee email", recent: [source, sameSubject])
+        XCTAssertEqual(matches.count, 2)
+        XCTAssertEqual(LiveReplyComposition.namedSources("Reply to the Coffee email in owner@example.test", recent: matches), [source])
+        var reply = LiveReplyComposition(source: try XCTUnwrap(DispatchJob.MailOrigin.captured(in: source)),
+            selection: source, request: dictation, turn: 1)
+        reply.candidateSelections = matches
+        reply.clarification = "Which account's Coffee email?"
+        reply.recoveredBody = dictation
+        XCTAssertNotNil(reply.refusal(name: "send_email", arguments: "{}", selection: source))
+        reply.user("Retry the reply", turn: 2, selection: sameSubject)
+        XCTAssertTrue(reply.targetConfirmed)
+        XCTAssertEqual(reply.source.account, "other@example.test")
+        XCTAssertEqual(reply.recoveredBody, dictation)
+        XCTAssertNil(reply.refusal(name: "send_email", arguments: #"{"account":"other@example.test","thread_id":"thread-B","reply_message_id":"B"}"#, selection: sameSubject))
+    }
+
+    func testUnavailableNamedSourceRequiresExplicitSelectionWithoutLosingText() throws {
+        XCTAssertTrue(LiveReplyComposition.namesPriorSource("Reply to the Project check-in email: yes"))
+        XCTAssertFalse(LiveReplyComposition.namesPriorSource("Reply to this email saying yes"))
+        var reply = LiveReplyComposition(source: try XCTUnwrap(DispatchJob.MailOrigin.captured(in: source)),
+            selection: source, request: dictation, turn: 1)
+        reply.needsSourceSelection = true
+        reply.clarification = "Which exact email?"
+        reply.recoveredBody = dictation
+        XCTAssertNotNil(reply.refusal(name: "send_email", arguments: "{}", selection: source))
+        XCTAssertEqual(reply.context["original_source"] as? String, "")
+        reply.user("Retry the reply", turn: 2, selection: other)
+        XCTAssertFalse(reply.needsSourceSelection)
+        XCTAssertTrue(reply.targetConfirmed)
+        XCTAssertEqual(reply.source.messageID, "B")
+        XCTAssertEqual(reply.recoveredBody, dictation)
+    }
+
     func testDifferentSelectionAndUnknownWriteCannotRetargetOrRepeatComposition() throws {
         var reply = LiveReplyComposition(source: try XCTUnwrap(DispatchJob.MailOrigin.captured(in: source)),
             selection: source, request: dictation, turn: 1)

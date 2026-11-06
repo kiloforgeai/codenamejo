@@ -1693,8 +1693,9 @@ extension FullDuplexVoiceClient {
         let deferDraft = transport != nil
         let profileId = ProfileRuntime.snapshot?.profileId
         let userRequest = latestCompletedUserUtterance
+        let capturedReply = transport?.liveAdapter?.replySource(for: callId)
         let replySource: LocalCompose.ReplySource? = {
-            guard tool != "forward_email", let key = (liveQueueActionAnchor?.step ?? standingStep).flatMap(LiveEmailPresentation.Key.selection),
+            guard tool != "forward_email", let key = (capturedReply ?? liveQueueActionAnchor?.step ?? standingStep).flatMap(LiveEmailPresentation.Key.selection),
                   Self.stringArgument("thread_id", in: argumentsJSON) == key.threadId
                     || Self.stringArgument("reply_message_id", in: argumentsJSON).map(key.selectedIDs.contains) == true
                     || (Self.stringArgument("thread_id", in: argumentsJSON) != nil && LiveRequestRecovery.refersToCurrentMessage(userRequest))
@@ -1705,7 +1706,7 @@ extension FullDuplexVoiceClient {
                     guard let self, isActive, dialGeneration == dial else { return false }
                     return standingStep.flatMap(LiveEmailPresentation.Key.selection)?.identity == key.identity
                         && renderedSelectionRefusal() == nil
-                })
+                }, isOriginalRequestSource: capturedReply != nil)
         }()
         functionCallTask = Task { [weak self, localContext, localTriage] in
             if tool != "forward_email", await localTriage.requiresTopicReplySelection(argumentsJSON) {

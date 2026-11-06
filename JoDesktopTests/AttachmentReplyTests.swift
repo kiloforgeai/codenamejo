@@ -81,7 +81,7 @@ final class AttachmentReplyTests: XCTestCase {
     private func selectedReply(current: @escaping @MainActor @Sendable () -> Bool = { true }) -> LocalCompose.ReplySource {
         .init(selection: .init(account: "reply@example.test", threadId: "reply-thread", messageId: "reply-mail",
             exchangeId: "", messageIDs: ["reply-mail"], selectedIDs: ["reply-mail"]),
-            ownerID: "attachment-user", profileID: "attachment-profile", isCurrent: current)
+            ownerID: "attachment-user", profileID: "attachment-profile", isCurrent: current, isOriginalRequestSource: true)
     }
 
     func testSelectedReplyBindsOneTupleAndRepairsOnlyItsExactMetadata() async throws {
@@ -126,6 +126,38 @@ final class AttachmentReplyTests: XCTestCase {
         XCTAssertEqual(rows.filter { $0.mailAction?.confirmed == true }.count, 1)
         let requests = await provider.requests
         XCTAssertEqual(requests.filter { $0.httpMethod == "POST" }.count, 1)
+    }
+
+    func testUnknownIntendedTupleNeverBecomesTheNewlySelectedEmail() async throws {
+        let body = String(repeating: "Preserve the entire reply. ", count: 100)
+        let currentB = LocalCompose.ReplySource(selection: .init(account: "source@example.test", threadId: "other-thread", messageId: "other-mail", exchangeId: "", messageIDs: ["other-mail"], selectedIDs: ["other-mail"]),
+            ownerID: "attachment-user", profileID: "attachment-profile", isCurrent: { true })
+        let result = await LocalCompose.run(name: "send_email", argumentsJSON: GmailReadTools.json([
+            "account": "reply@example.test", "thread_id": "reply-thread", "reply_message_id": "reply-mail", "body": body]),
+            defer: false, callID: "ambiguous", replySource: currentB)
+        XCTAssertEqual(result.ok, false)
+        let rows = await Container.shared.dispatchJobs().history()
+        let action = try XCTUnwrap(rows.first?.mailAction)
+        XCTAssertNil(rows.first?.origin, "A mismatch cannot silently turn B into the intended reply source")
+        XCTAssertEqual(action.account, "reply@example.test")
+        XCTAssertEqual(action.replyMessageID, "reply-mail")
+        XCTAssertEqual(action.requestedReplySource?.threadID, "reply-thread")
+        XCTAssertEqual(action.body, body)
+        XCTAssertEqual(action.replyPreflight, true)
+        let requests = await provider.requests
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testFailedPreflightCannotDowngradeAnUnknownSendReceipt() async throws {
+        await provider.configure("reply-timeout")
+        _ = await LocalCompose.run(name: "send_email", argumentsJSON: #"{"body":"Keep this uncertain reply"}"#,
+            defer: false, callID: "attempt", replySource: selectedReply())
+        _ = await LocalCompose.run(name: "send_email", argumentsJSON: #"{"body":"Keep this uncertain reply"}"#,
+            defer: false, callID: "refused", replySource: selectedReply(current: { false }))
+        let rows = await Container.shared.dispatchJobs().history()
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows.first?.mailAction?.state, .unknown)
+        XCTAssertNotEqual(rows.first?.mailAction?.replyPreflight, true)
     }
 
     func testReplyRecoveryDistinguishesMissingMessageWrongThreadAndMissingRecipient() async throws {

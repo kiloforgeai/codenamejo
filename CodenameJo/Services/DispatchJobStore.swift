@@ -223,9 +223,17 @@ class DispatchJobStore: ObservableObject {
 
     func existing(_ id: UUID) -> DispatchJob? { visible.first { $0.id == id } }
 
+    func preflightReply(_ callID: String, source: DispatchJob.MailOrigin) -> DispatchJob? {
+        visible.first { job in
+            guard let action = job.mailAction, action.replyPreflight == true, action.state == .failed,
+                  action.requestKey?.hasSuffix(":" + callID) == true, let origin = job.origin else { return false }
+            return LiveReplyComposition.sameSource(origin, source)
+        }
+    }
+
     func resolvedMailCall(_ callID: String, source: DispatchJob.MailOrigin) -> Bool {
         visible.contains { job in
-            guard let action = job.mailAction, action.requestKey?.hasSuffix(":" + callID) == true,
+            guard let action = job.mailAction, action.replyPreflight != true, action.requestKey?.hasSuffix(":" + callID) == true,
                   action.account.lowercased() == source.account.lowercased(),
                   action.replyMessageID == source.messageID else { return false }
             return [.sent, .draft, .review, .discarded, .failed].contains(action.state)

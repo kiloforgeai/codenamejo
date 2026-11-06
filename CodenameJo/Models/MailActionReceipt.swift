@@ -49,6 +49,9 @@ struct MailActionReceipt: Codable, Hashable, Sendable {
     var forwardHTML: String?
     var omittedAttachments: [OmittedAttachment]?
     var archiveState: String?
+    /// A typed local preflight refusal is safe to resume; a failed/unknown provider write is not.
+    var replyPreflight: Bool?
+    var requestedReplySource: DispatchJob.MailOrigin?
 
     struct OmittedAttachment: Codable, Hashable, Sendable {
         let filename: String

@@ -17,6 +17,7 @@ final class LiveClientBrain {
     private var requestZone: TimeZone?
     private var calendar = LiveCalendarConversation()
     private var replyComposition: LiveReplyComposition?
+    private var recentReplySources: [String] = []
     private var replyRecoveryTurns = Set<Int>()
     var automaticNarration = true
     var onReplyComposition: (([String: String]) -> Void)?
@@ -29,6 +30,18 @@ final class LiveClientBrain {
     func calendarSource(for call: LiveSessionAdapter.Call) -> String? {
         guard functionItems[call.id] != nil else { return nil }
         return calendar.source(for: call)
+    }
+
+    func replySource(for callID: String) -> String? {
+        guard functionItems[callID] != nil, replyComposition?.writeCall == callID else { return nil }
+        return replyComposition?.selection
+    }
+
+    private func recoverReplyPreflight() {
+        guard let composition = replyComposition, let call = composition.writeCall,
+              let job = Container.shared.dispatchJobs().preflightReply(call, source: composition.source) else { return }
+        replyComposition?.recover(job)
+        recordReplyComposition("reply_preflight_recovery")
     }
 
     private func persistCalendarIntent() {
@@ -181,6 +194,7 @@ final class LiveClientBrain {
             priorReplyDestination = nil
             calendar.scopeChanged()
             replyComposition = nil
+            recentReplySources.removeAll()
             replyRecoveryTurns.removeAll()
             investigating = false
             releasedDecisionSources.removeAll()
@@ -191,6 +205,17 @@ final class LiveClientBrain {
             turnHistoryIndex = nil
         }
         state = LiveCompactContext.bounded(text, bytes: 24_000)
+        if let source = DispatchJob.MailOrigin.captured(in: state) {
+            recentReplySources.removeAll { LiveReplyComposition.sameSource(DispatchJob.MailOrigin.captured(in: $0), source) }
+            if var reference = try? JSONSerialization.jsonObject(with: Data(LiveCompactContext.selectionReference(state).utf8)) as? [String: Any],
+               var item = reference["item"] as? [String: Any] {
+                item["subject"] = source.subject
+                item["from"] = source.sender
+                reference["item"] = item
+                recentReplySources.append(GmailReadTools.json(reference))
+            }
+            if recentReplySources.count > 12 { recentReplySources.removeFirst() }
+        }
         if let object = try? JSONSerialization.jsonObject(with: Data(state.utf8)) as? [String: Any],
            object["done"] as? Bool == false, let item = object["item"] as? [String: Any] {
             let origin = DispatchJob.MailOrigin.from(item)
@@ -211,6 +236,7 @@ final class LiveClientBrain {
     func user(_ text: String, turn: Int, finalized: Bool = true) {
         userInputFinalized = finalized
         if finalized {
+            recoverReplyPreflight()
             if let replyComposition, let call = replyComposition.writeCall,
                LiveReplyComposition.requestsReply(text),
                Container.shared.dispatchJobs().resolvedMailCall(call, source: replyComposition.source) {
@@ -221,7 +247,20 @@ final class LiveClientBrain {
                 replyComposition?.user(text, turn: turn, selection: state)
             } else if LiveReplyComposition.requestsReply(text), let source = DispatchJob.MailOrigin.captured(in: state) {
                 if replyComposition?.turn == turn { replyComposition?.user(text, turn: turn, selection: state) }
-                else { replyComposition = .init(source: source, selection: state, request: text, turn: turn) }
+                else {
+                    let candidates = LiveReplyComposition.namedSources(text, recent: recentReplySources)
+                    let selected = candidates.count == 1 ? candidates[0] : state
+                    replyComposition = .init(source: DispatchJob.MailOrigin.captured(in: selected) ?? source,
+                        selection: selected, request: text, turn: turn)
+                    if candidates.isEmpty, LiveReplyComposition.namesPriorSource(text) {
+                        replyComposition?.needsSourceSelection = true
+                        replyComposition?.clarification = "Which exact email should receive the reply? Select it and retry."
+                    }
+                    if candidates.count > 1 {
+                        replyComposition?.candidateSelections = candidates
+                        replyComposition?.clarification = "Which account's email with this subject should receive the reply? Select it and retry."
+                    }
+                }
             }
             recordReplyComposition("reply_input")
         }
@@ -548,6 +587,7 @@ final class LiveClientBrain {
                 calendar.reconcile(jobs: Container.shared.dispatchJobs())
                 persistCalendarIntent()
             }
+            recoverReplyPreflight()
             functionItems.removeValue(forKey: id)
             while actionRecords.count > 12 { actionRecords.removeFirst() }
         }
@@ -932,13 +972,41 @@ final class LiveClientBrain {
                 }
                 if !calls.isEmpty { armCallWatchdog(for: calls) }
                 var localResultCalls = false
-                for item in output {
+                for originalItem in output {
+                    var item = originalItem
+                    if let name = item["name"] as? String, ["send_email", "reply_email", "create_draft"].contains(ToolNarration.canonical(name)),
+                       let id = item["call_id"] as? String, let composition = replyComposition,
+                       composition.writeCall == nil, composition.recoveryJobID == nil, composition.candidateSelections.count <= 1, !composition.needsSourceSelection, !LiveReplyComposition.sameSource(DispatchJob.MailOrigin.captured(in: state), composition.source),
+                       let key = LiveEmailPresentation.Key.selection(composition.selection) {
+                        let args = (item["arguments"] as? String).flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] } ?? [:]
+                        let source = LocalCompose.ReplySource(selection: key, ownerID: Container.shared.backend().userId,
+                            profileID: ProfileRuntime.snapshot?.profileId, isCurrent: { false }, isOriginalRequestSource: true)
+                        let reason = "NOT SENT — the feed moved away from the original reply. The complete body is retained in Activity. Use Work on this email there, then retry. Nothing was sent or saved to Gmail."
+                        _ = await LocalCompose.retainReply(name, args: args, reason: reason, source: source,
+                            conversationId: nil, callID: id)
+                        guard requestScope == scopeRevision, requestTurn == currentTurn else { return }
+                        replyComposition?.writeCall = id
+                        self.item(["type": "function_call_output", "call_id": id, "output": reason])
+                        localResultCalls = true
+                        continue
+                    }
                     if let name = item["name"] as? String, let id = item["call_id"] as? String,
                        let refusal = replyComposition?.refusal(name: name, arguments: item["arguments"] as? String ?? "{}", selection: state) {
+                        if (replyComposition?.candidateSelections.count ?? 0 > 1 || replyComposition?.needsSourceSelection == true),
+                           let args = item["arguments"] as? String, let body = ToolArguments(args).string("body") {
+                            replyComposition?.recoveredBody = body
+                        }
                         recordReplyComposition("reply_write_refused")
                         self.item(["type": "function_call_output", "call_id": id, "output": refusal])
                         localResultCalls = true
                         continue
+                    }
+                    if let name = item["name"] as? String, ["send_email", "reply_email", "create_draft"].contains(ToolNarration.canonical(name)),
+                       let body = replyComposition?.recoveredBody, replyComposition?.targetConfirmed == true,
+                       (LiveReplyComposition.requestsRetry(latestUser) || LiveReplyComposition.confirmsTarget(latestUser)), let raw = item["arguments"] as? String,
+                       var args = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any] {
+                        args["body"] = body
+                        item["arguments"] = GmailReadTools.json(args)
                     }
                     if item["type"] as? String == "message", needsExactCalendarSpeech,
                        CalendarAvailabilityEvidence.claimsAvailability(GmailReadTools.json(item)) { continue }
