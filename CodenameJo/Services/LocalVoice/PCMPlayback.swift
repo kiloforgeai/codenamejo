@@ -14,7 +14,7 @@ actor PCMPlayback {
     private var queuedSeconds: Double = 0
     private var epoch = UUID()
     private var waiters: [CheckedContinuation<Void, Never>] = []
-    private static let format = AVAudioFormat(standardFormatWithSampleRate: ParadeeTTS.sampleRate, channels: 1)!
+    private static let format = AVAudioFormat(standardFormatWithSampleRate: 24_000, channels: 1)!
 
     func start() throws -> UUID {
         stop()

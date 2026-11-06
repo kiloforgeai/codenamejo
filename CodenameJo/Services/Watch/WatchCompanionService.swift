@@ -1,3 +1,4 @@
+#if !targetEnvironment(macCatalyst)
 import AVFoundation
 import Combine
 import FactoryKit
@@ -182,3 +183,8 @@ final class WatchCompanionService {
         RealtimeLog.log("watch: call ended\(error.map { ": \($0)" } ?? "")")
     }
 }
+
+#else
+@MainActor
+final class WatchCompanionService { func start() {} }
+#endif

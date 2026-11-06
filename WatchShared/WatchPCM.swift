@@ -1,3 +1,4 @@
+#if !targetEnvironment(macCatalyst)
 import AVFoundation
 
 // Queue-confined: one converter preserves resampling state across successive audio buffers.
@@ -65,3 +66,5 @@ enum WatchAudioError: LocalizedError {
         }
     }
 }
+
+#endif

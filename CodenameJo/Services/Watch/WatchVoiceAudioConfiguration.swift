@@ -1,3 +1,4 @@
+#if !targetEnvironment(macCatalyst)
 import AVFoundation
 import LiveKitWebRTC
 
@@ -59,3 +60,5 @@ final class WatchVoiceAudioConfiguration: NSObject, VoiceAudioConfiguration,
                            configureOutputFromSource source: AVAudioNode, toDestination destination: AVAudioNode?,
                            format: AVAudioFormat, context: [AnyHashable: Any]) -> Int { 0 }
 }
+
+#endif

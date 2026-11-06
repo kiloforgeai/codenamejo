@@ -1,3 +1,4 @@
+#if !targetEnvironment(macCatalyst)
 import AppIntents
 import AVFoundation
 import FactoryKit
@@ -158,4 +159,6 @@ struct HandsFreeStartSection: View {
         .onAppear { runs = HandsFreeStartLog.runs }
     }
 }
+#endif
+
 #endif

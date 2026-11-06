@@ -1,3 +1,4 @@
+#if !targetEnvironment(macCatalyst)
 import CarPlay
 import UIKit
 
@@ -8,3 +9,9 @@ enum CarPlayPresence {
         UIApplication.shared.connectedScenes.contains { $0 is CPTemplateApplicationScene }
     }
 }
+
+#endif
+
+#if targetEnvironment(macCatalyst)
+enum CarPlayPresence { static let isConnected = false }
+#endif

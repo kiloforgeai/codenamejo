@@ -50,6 +50,13 @@ actor LocalSlackQueue {
     /// Feed's Slack stage holds only the rest.
     private var walked: [String: Set<String>] = [:]
 
+    #if targetEnvironment(macCatalyst)
+    func desktopPreparedItems() -> [SlackQueueSnapshot.Item] {
+        guard let queue else { return [] }
+        return Array(queue.items.dropFirst(max(0, position - 1)).prefix(30))
+    }
+    #endif
+
     var isRunning: Bool { queue != nil }
 
     func end() {

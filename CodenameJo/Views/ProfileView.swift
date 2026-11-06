@@ -61,7 +61,7 @@ struct ProfileView<Interactor: ViewWithModelLifecycleObserver<ProfileViewModel> 
     /// Optional because the default is the account's `voice_notes` column, so absent
     /// (*never chosen*) differs from *chosen false*.
     @AppStorage(VoiceSettings.Key.voiceNotes) private var voiceNotesChoice: Bool?
-    @AppStorage(LocalVoice.storageKey) private var localVoice = LocalVoice.paradee.rawValue
+    @AppStorage(LocalVoice.storageKey) private var localVoice = LocalVoice.current.rawValue
     @ObservedObject private var localSpeech = Container.shared.localSpeech()
     @AppStorage(LocalVoiceSettings.allLocalKey) private var allLocal = false
     @AppStorage(JoTips.storageKey) private var joTips = true

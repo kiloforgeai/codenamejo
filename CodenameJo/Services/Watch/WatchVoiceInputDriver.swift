@@ -1,3 +1,4 @@
+#if !targetEnvironment(macCatalyst)
 import AVFoundation
 import Foundation
 import Synchronization
@@ -128,3 +129,10 @@ final class WatchAudioRouter: @unchecked Sendable {
         return DeviceVoiceAudioConfiguration()
     }
 }
+
+#else
+final class WatchAudioRouter: Sendable {
+    func inputDriver() -> any VoiceInputDriver { MicrophoneInputDriver() }
+    func audioConfiguration() -> any VoiceAudioConfiguration { DeviceVoiceAudioConfiguration() }
+}
+#endif

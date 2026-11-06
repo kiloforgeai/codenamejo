@@ -1,3 +1,4 @@
+#if !targetEnvironment(macCatalyst)
 import CarPlay
 import FactoryKit
 import UIKit
@@ -48,3 +49,5 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
         Container.shared.realtimeService().carPlayDisconnected()
     }
 }
+
+#endif
