@@ -85,13 +85,15 @@ class UserFeedback: ObservableObject {
         var text: String { turns.map(\.text).joined(separator: "\n") }
     }
     private var voiceDraft: VoiceDraft?
+    private var retainedDrafts: [VoiceDraft] = []
+    private var endedVoiceSessions: [UUID] = []
     private var voiceSaveTask: Task<Void, Never>?
     private var handledVoiceTurns: [String] = []
     private var savedVoiceNote: (id: UUID, draft: VoiceDraft)?
     private var savingVoiceNote: VoiceDraft?
 
     var pendingVoiceText: String? {
-        guard let draft = voiceDraft, sameOwner(draft.submission, capture()) else { return nil }
+        guard let draft = voiceDraft, sameCapture(draft.submission, capture()) else { return nil }
         return draft.text
     }
 
@@ -100,9 +102,15 @@ class UserFeedback: ObservableObject {
     }
 
     func takeVoiceDraftSubmission() -> (text: String, submission: Submission)? {
-        guard var draft = voiceDraft, sameOwner(draft.submission, capture()) else { return nil }
-        voiceSaveTask?.cancel()
-        voiceDraft = nil
+        let owner = capture()
+        let draftIndex = retainedDrafts.lastIndex { sameOwner($0.submission, owner) }
+        guard var draft = voiceDraft.flatMap({ sameOwner($0.submission, owner) ? $0 : nil })
+                ?? draftIndex.map({ retainedDrafts[$0] }) else { return nil }
+        if voiceDraft?.id == draft.id {
+            voiceSaveTask?.cancel()
+            voiceDraft = nil
+        } else if let draftIndex { retainedDrafts.remove(at: draftIndex) }
+        voiceReceipt = nil
         draft.revision += 1
         handledVoiceTurns = Array((handledVoiceTurns + [draft.requestTurnID] + draft.turns.map(\.id)).suffix(128))
         return (draft.text, draftSubmission(draft, persistence: .saved))
@@ -112,17 +120,62 @@ class UserFeedback: ObservableObject {
         a.userID == b.userID && a.context.profileID == b.context.profileID
     }
 
-    /// Solicited notes stay local and survive pauses without depending on the mail brain.
-    func voiceInput(_ text: String, turnID: String, reply: @escaping (String) -> Void,
+    private func sameCapture(_ a: Submission, _ b: Submission) -> Bool {
+        sameOwner(a, b) && a.context.sessionID == b.context.sessionID
+            && a.context.conversationID == b.context.conversationID
+            && !endedVoiceSessions.contains(where: { $0 == a.context.sessionID })
+    }
+
+    func suspendVoiceCapture(endingSession: Bool = false) {
+        if endingSession, let session = capture().context.sessionID {
+            endedVoiceSessions = Array((endedVoiceSessions + [session]).suffix(32))
+        }
+        guard var draft = voiceDraft else { return }
+        voiceSaveTask?.cancel()
+        voiceDraft = nil
+        draft.revision += 1
+        retainedDrafts.append(draft)
+        handledVoiceTurns = Array((handledVoiceTurns + [draft.requestTurnID] + draft.turns.map(\.id)).suffix(128))
+        voiceReceipt = "Feedback paused · open Feedback to review or save"
+        guard !draft.text.isEmpty else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do { _ = try await save(draft.text, source: .voice, submission: draftSubmission(draft, persistence: .draft)) }
+            catch {
+                guard sameOwner(draft.submission, capture()) else { return }
+                voiceReceipt = "Feedback could not be saved · open Feedback to recover the note"
+            }
+        }
+    }
+
+    /// Only the originating conversation can append speech; paused notes stay in the editor.
+
+    func voiceInput(_ text: String, turnID: String, sessionID: UUID? = nil, reply: @escaping (String) -> Void,
                     transition: @escaping (String) -> Void,
                     settled: @escaping ([String], UUID?, CommandRecord.CommandStatus) -> Void = { _, _, _ in }) -> Bool {
         let captured = capture()
+        guard sessionID == nil || sessionID == captured.context.sessionID,
+              !endedVoiceSessions.contains(where: { $0 == captured.context.sessionID }) else { return true }
+        if let draft = voiceDraft, !sameCapture(draft.submission, captured) { suspendVoiceCapture() }
         var context = captured.context
         context.turnID = turnID
         let submission = Submission(userID: captured.userID, context: context)
         let request = VoiceFeedbackText.request(text)
+        if let draft = voiceDraft, request == nil, !draft.turns.contains(where: { $0.id == turnID }),
+           VoiceFeedbackText.switchesToTask(text) {
+            suspendVoiceCapture()
+            transition("task_resumed")
+            return false
+        }
+        if VoiceFeedbackText.reopen(text), voiceDraft == nil {
+            reply(retainedDrafts.contains(where: { sameOwner($0.submission, submission) })
+                ? "Your unfinished note is in Feedback. Open Feedback to review or save it."
+                : "There is no unfinished feedback for this profile. You can record a new note.")
+            transition("review_requested")
+            return true
+        }
         if VoiceFeedbackText.retry(text), voiceDraft == nil {
-            if let savingVoiceNote, sameOwner(savingVoiceNote.submission, submission) {
+            if let savingVoiceNote, sameCapture(savingVoiceNote.submission, submission) {
                 reply("Your feedback is still being saved. I don't have a save receipt yet.")
                 return true
             }
@@ -141,7 +194,7 @@ class UserFeedback: ObservableObject {
             // A later final ASR transcript may replace a fragment after explicit completion.
             // Amend the same durable note instead of silently discarding it or creating a duplicate.
             guard voiceDraft == nil, let saved = savedVoiceNote,
-                  sameOwner(saved.draft.submission, submission),
+                  sameCapture(saved.draft.submission, submission),
                   let previous = saved.draft.turns.first(where: { $0.id == turnID }),
                   previous.text != (request ?? text), !VoiceFeedbackText.resume(text) else { return true }
             voiceDraft = saved.draft
@@ -172,12 +225,12 @@ class UserFeedback: ObservableObject {
                     guard let self else { return }
                     do { _ = try await save(draft.text, source: .voice, submission: draftSubmission(draft, persistence: .cancelled)) }
                     catch {
-                        if voiceDraft == nil { voiceDraft = draft }
-                        guard sameOwner(draft.submission, capture()) else { return }
+                        retainedDrafts.append(draft)
+                        guard sameCapture(draft.submission, capture()) else { return }
                         reply("The feedback draft could not be cancelled. It is kept; use the Feedback button to review it.")
                         return
                     }
-                    if sameOwner(draft.submission, capture()) { reply("Feedback cancelled.") }
+                    if sameCapture(draft.submission, capture()) { reply("Feedback cancelled.") }
                 }
             } else { reply("Feedback cancelled.") }
             return true
@@ -211,7 +264,7 @@ class UserFeedback: ObservableObject {
         voiceSaveTask = Task { [weak self] in
             do { try await Task.sleep(for: delay) } catch { return }
             guard let self, !Task.isCancelled, voiceDraft?.id == draft.id else { return }
-            guard sameOwner(draft.submission, capture()) else { transition("scope_changed"); return }
+            guard sameCapture(draft.submission, capture()) else { transition("scope_changed"); return }
             savingVoiceNote = draft
             do {
                 let record = draftSubmission(draft, persistence: resume ? .saved : .draft)
@@ -219,7 +272,7 @@ class UserFeedback: ObservableObject {
                 if savingVoiceNote?.revision == draft.revision { savingVoiceNote = nil }
                 // A slow write cannot acknowledge an obsolete fragment or clear a newer note.
                 guard voiceDraft?.id == draft.id, voiceDraft?.revision == draft.revision else { return }
-                guard sameOwner(draft.submission, capture()) else { return }
+                guard sameCapture(draft.submission, capture()) else { return }
                 if resume {
                     voiceDraft = nil
                     savedVoiceNote = (id, draft)
@@ -242,7 +295,7 @@ class UserFeedback: ObservableObject {
                 guard voiceDraft?.id == draft.id, voiceDraft?.revision == draft.revision else { return }
                 settled(Array(Set([draft.requestTurnID, turnID] + draft.turns.map(\.id))).sorted(), nil, .failed)
                 transition("failed")
-                guard sameOwner(draft.submission, capture()) else { return }
+                guard sameCapture(draft.submission, capture()) else { return }
                 reply("Feedback was not saved. Your draft is kept; use the Feedback button or ask to try again.")
             }
         }
@@ -270,6 +323,18 @@ class UserFeedback: ObservableObject {
 }
 
 enum VoiceFeedbackText {
+    static func reopen(_ text: String) -> Bool {
+        ["resume feedback", "continue feedback", "finish feedback", "resume the feedback", "finish the feedback"]
+            .contains(SpokenAnswerText.words(text).joined(separator: " "))
+    }
+
+    static func switchesToTask(_ text: String) -> Bool {
+        guard !resume(text), !cancel(text), !retry(text), !reopen(text) else { return false }
+        if LiveFastAction.parse(text) != nil { return true }
+        let pattern = #"(?is)^\s*(?:(?:okay|ok|yeah|now|instead|actually|please|just)[\s,.]+)*(?:(?:can|could|would) you\s+|(?:i want you to|go ahead and)\s+)?(?:reply|respond|draft|send|forward|archive|trash|delete|read|search|find|schedule|book|check|open)\b"#
+        return text.range(of: pattern, options: .regularExpression) != nil
+    }
+
     static func request(_ text: String) -> String? {
         if retry(text) { return nil }
         if text.range(of: #"(?is)^\s*(?:so[,\s]+)?(?:the|my) feedback is\b"#, options: .regularExpression) != nil { return text }

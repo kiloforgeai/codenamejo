@@ -149,7 +149,9 @@ final class UserFeedbackTests: XCTestCase {
         XCTAssertTrue(feedback.saved.isEmpty)
         XCTAssertNil(feedback.pendingVoiceText)
         feedback.owner = .init(userID: "user", context: .init(sessionID: UUID(), profileID: "work"))
-        XCTAssertEqual(feedback.pendingVoiceText, "original note", "Reconnect retains the original scoped draft")
+        XCTAssertNil(feedback.pendingVoiceText, "Reconnect never resumes input capture")
+        XCTAssertEqual(feedback.takeVoiceDraft(), "original note", "The editor can explicitly recover the original note")
+        input("record feedback: a new note", "new-note")
         input("cancel feedback", "b")
         XCTAssertNil(feedback.pendingVoiceText)
         try await Task.sleep(for: .milliseconds(50))
@@ -273,6 +275,104 @@ final class UserFeedbackTests: XCTestCase {
         XCTAssertEqual(exported.first?["message"] as? String, "Corrected in the button editor")
         XCTAssertEqual(exported.first?["feedback_state"] as? String, "saved")
         XCTAssertEqual(exported.first?["fragment_turn_ids"] as? [String], ["note"])
+    }
+
+    func testSessionEndRetainsNoteButNeverConsumesNewReplyOrLateCorrection() async throws {
+        let feedback = CaptureHarness()
+        feedback.voiceSaveDelay = .seconds(5)
+        let original = feedback.owner
+        var replies: [String] = []
+        func input(_ text: String, _ turn: String, session: UUID? = nil) -> Bool {
+            feedback.voiceInput(text, turnID: turn, sessionID: session,
+                reply: { replies.append($0) }, transition: { _ in })
+        }
+        XCTAssertTrue(input("Record feedback: workspace search did not start", "note"))
+        feedback.suspendVoiceCapture(endingSession: true)
+        XCTAssertNil(feedback.pendingVoiceText)
+        feedback.owner = .init(userID: "user", context: .init(sessionID: UUID(), conversationID: UUID(), profileID: "work"))
+        XCTAssertFalse(input("Reply to this email: thanks, received", "reply"))
+        XCTAssertTrue(input("Record feedback: a late fragment", "note", session: original.context.sessionID))
+        try await Task.sleep(for: .milliseconds(70))
+        XCTAssertEqual(feedback.saved.map(\.0), ["workspace search did not start"])
+        XCTAssertTrue(replies.isEmpty, "An old save must not speak into a new session")
+        XCTAssertTrue(input("resume feedback", "resume"))
+        XCTAssertTrue(replies.last?.contains("Open Feedback") == true)
+        XCTAssertFalse(input("Reply: thanks", "reply-again"))
+        let recovered = try XCTUnwrap(feedback.takeVoiceDraftSubmission())
+        XCTAssertEqual(recovered.text, "workspace search did not start")
+        XCTAssertEqual(recovered.submission.context.sessionID, original.context.sessionID)
+        XCTAssertEqual(recovered.submission.context.fragmentTurnIDs, ["note"])
+    }
+
+    func testClearTaskSwitchReleasesCaptureButSameTurnCorrectionRemainsFeedback() async throws {
+        let feedback = CaptureHarness()
+        feedback.voiceSaveDelay = .seconds(5)
+        func input(_ text: String, _ turn: String) -> Bool {
+            feedback.voiceInput(text, turnID: turn, reply: { _ in }, transition: { _ in })
+        }
+        XCTAssertTrue(input("Record feedback: the reply failed", "note"))
+        XCTAssertTrue(input("Reply controls are too small", "note"), "ASR correction stays with its original turn")
+        XCTAssertFalse(input("Could you reply to this email: thanks", "task"))
+        XCTAssertNil(feedback.pendingVoiceText)
+        XCTAssertTrue(input("Record feedback: obsolete correction", "note"))
+        XCTAssertNil(feedback.pendingVoiceText)
+        XCTAssertFalse(input("Archive this", "archive"))
+        XCTAssertEqual(feedback.takeVoiceDraft(), "Reply controls are too small")
+        for command in ["Send this reply", "Find the Project notes page", "Check my calendar", "Now read this email"] {
+            XCTAssertTrue(VoiceFeedbackText.switchesToTask(command), command)
+        }
+        for note in ["The reply button is too small", "When I say archive, it stalls", "Also show the original recipients."] {
+            XCTAssertFalse(VoiceFeedbackText.switchesToTask(note), note)
+        }
+    }
+
+    func testConversationAndProfileChangesDoNotTakeOwnershipOfAnotherNote() async throws {
+        let feedback = CaptureHarness()
+        feedback.voiceSaveDelay = .seconds(5)
+        func input(_ text: String, _ turn: String) -> Bool {
+            feedback.voiceInput(text, turnID: turn, reply: { _ in }, transition: { _ in })
+        }
+        let original = feedback.owner
+        XCTAssertTrue(input("Record feedback: work note", "work"))
+        var changed = feedback.owner.context
+        changed.conversationID = UUID()
+        feedback.owner = .init(userID: "user", context: changed)
+        XCTAssertFalse(input("Reply to this email: thanks", "reply"))
+        feedback.owner = .init(userID: "user", context: .init(sessionID: UUID(), profileID: "personal"))
+        XCTAssertNil(feedback.takeVoiceDraft())
+        XCTAssertTrue(input("Record feedback: personal note", "personal"))
+        feedback.suspendVoiceCapture()
+        feedback.owner = original
+        XCTAssertEqual(feedback.takeVoiceDraft(), "work note")
+        changed = feedback.owner.context
+        changed.profileID = "personal"
+        feedback.owner = .init(userID: "user", context: changed)
+        XCTAssertEqual(feedback.takeVoiceDraft(), "personal note")
+    }
+
+    func testSlowSaveAfterEndCannotReopenCaptureOrSpeakAndKeepsNewestRevision() async throws {
+        let feedback = CaptureHarness()
+        feedback.log = VoiceDiagnostics(directory: try directory())
+        feedback.voiceSaveDelay = .milliseconds(5)
+        feedback.delayNextSave = true
+        var replies: [String] = []
+        XCTAssertTrue(feedback.voiceInput("Record feedback: incomplete", turnID: "note", reply: { replies.append($0) }, transition: { _ in }))
+        for _ in 0..<100 where feedback.gate == nil { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertNotNil(feedback.gate)
+        XCTAssertTrue(feedback.voiceInput("Record feedback: complete complaint", turnID: "note", reply: { replies.append($0) }, transition: { _ in }))
+        feedback.suspendVoiceCapture(endingSession: true)
+        var changed = feedback.owner.context
+        changed.sessionID = UUID()
+        feedback.owner = .init(userID: "user", context: changed)
+        try await Task.sleep(for: .milliseconds(40))
+        feedback.gate?.resume(); feedback.gate = nil
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertTrue(replies.isEmpty)
+        XCTAssertNil(feedback.pendingVoiceText)
+        XCTAssertEqual(feedback.takeVoiceDraft(), "complete complaint")
+        let notes = try rows(await feedback.log!.snapshot(userID: "user"))
+        XCTAssertEqual(notes.first?["message"] as? String, "complete complaint")
+        XCTAssertEqual(notes.count, 1)
     }
 
     private func directory() throws -> URL {

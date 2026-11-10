@@ -1470,6 +1470,7 @@ class RealtimeService: ObservableObject {
         opening: SessionOpening = .none
     ) {
         guard let client = fullDuplex, !isConversing else { return }
+        Container.shared.userFeedback().suspendVoiceCapture(endingSession: true)
         activeConversationId = conversationId
         turnTelemetry = TurnTelemetry()
         telemetrySessionStarted = telemetryNow()
@@ -1948,6 +1949,7 @@ class RealtimeService: ObservableObject {
     /// of a reconnect, so `onEnded` is deliberately not raised on that path. A guard in
     /// this method could not tell the difference.
     func finishConversation(reason: String) {
+        Container.shared.userFeedback().suspendVoiceCapture(endingSession: true)
         guard let id = activeConversationId, !endedConversations.contains(id) else { return }
         endedConversations.insert(id)
         if let owner = backend.userId {

@@ -1707,7 +1707,7 @@ final class FullDuplexVoiceClient {
             let mixed = feedback.pendingVoiceText == nil ? LiveRequestRecovery.feedbackAfterArchive(text) : nil
             let archiveNotice = mixed.map { _ in deferFeedbackArchive() }
             var firstFeedbackReply = true
-            let handledFeedback = feedback.voiceInput(mixed ?? text, turnID: feedbackTurn,
+            let handledFeedback = feedback.voiceInput(mixed ?? text, turnID: feedbackTurn, sessionID: diagnostics?.id,
                 reply: { [weak self] line in
                     guard let self, isActive else { return }
                     let notice = firstFeedbackReply ? archiveNotice : nil
@@ -1718,6 +1718,8 @@ final class FullDuplexVoiceClient {
                 }, settled: { [onFeedbackSettled] ids, feedbackID, status in
                     onFeedbackSettled?(ids, feedbackID, status)
                 })
+            feedbackDiagnostics?.record(.turnTransition, ["transition": "input_routed",
+                "turn_id": feedbackTurn, "route": handledFeedback ? "feedback" : "request"])
             if firstFeedbackReply, let archiveNotice {
                 firstFeedbackReply = false
                 speakFeedback("I'm collecting your feedback.", after: archiveNotice)
