@@ -304,6 +304,14 @@ final class UserFeedbackTests: XCTestCase {
         XCTAssertEqual(recovered.submission.context.fragmentTurnIDs, ["note"])
     }
 
+    func testAnExplicitFeedbackClauseKeepsAnActionQuoteInsideTheNote() {
+        for note in ["Archive it. I want to give feedback: the wrong email was archived",
+                     "Reply failed. Please record feedback about the missing draft"] {
+            XCTAssertFalse(VoiceFeedbackText.switchesToTask(note))
+        }
+        XCTAssertTrue(VoiceFeedbackText.switchesToTask("Reply to the feedback email: thanks"))
+    }
+
     func testClearTaskSwitchReleasesCaptureButSameTurnCorrectionRemainsFeedback() async throws {
         let feedback = CaptureHarness()
         feedback.voiceSaveDelay = .seconds(5)

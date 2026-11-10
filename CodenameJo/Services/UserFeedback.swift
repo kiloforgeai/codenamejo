@@ -330,6 +330,8 @@ enum VoiceFeedbackText {
 
     static func switchesToTask(_ text: String) -> Bool {
         guard !resume(text), !cancel(text), !retry(text), !reopen(text) else { return false }
+        if text.range(of: #"\b(?:give|record|log|save|submit|file)\s+(?:(?:some|this|my|the)\s+)?feedback\b"#,
+                      options: [.regularExpression, .caseInsensitive]) != nil { return false }
         if LiveFastAction.parse(text) != nil { return true }
         let pattern = #"(?is)^\s*(?:(?:okay|ok|yeah|now|instead|actually|please|just)[\s,.]+)*(?:(?:can|could|would) you\s+|(?:i want you to|go ahead and)\s+)?(?:reply|respond|draft|send|forward|archive|trash|delete|read|search|find|schedule|book|check|open)\b"#
         return text.range(of: pattern, options: .regularExpression) != nil
