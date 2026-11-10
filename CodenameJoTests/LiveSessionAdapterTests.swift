@@ -745,11 +745,13 @@ final class LiveSessionAdapterTests: XCTestCase {
     @MainActor
     func testPresenceLineCoversTheBackendDecidingBeforeItsFirstTool() async throws {
         let h = Harness()
+        defer { h.adapter.close() }
         h.adapter.waitBeatQuiet = 0.05
         try h.receive(["type": "session.started"])
         try h.receive(["type": "session.input_transcript.delta", "start_ms": 100,
                        "end_ms": 200, "delta": "When am I free on Monday?"])
-        try await Task.sleep(for: .milliseconds(1050))
+        for _ in 0..<200 where h.completedInputs.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(h.completedInputs, ["When am I free on Monday?"], "Wait for input finalization before testing delegated-work presence")
         h.adapter.observePlayback(0)
         XCTAssertTrue(waitBeats(h).isEmpty, "Nothing was delegated, so nothing is running")
         try h.start("r100", delegation: "d100")

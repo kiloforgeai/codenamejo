@@ -337,7 +337,16 @@ final class LiveClientBrain {
     }
 
     private func groundedReply(_ text: String) -> String {
-        let text = holdsFeedDecision ? Self.withoutDispositionQuestion(text) : text
+        var text = holdsFeedDecision ? Self.withoutDispositionQuestion(text) : text
+        if !automaticNarration {
+            let confirmations = actionRecords.filter { $0["origin_turn"] as? Int == requestTurn }.compactMap { record -> String? in
+                guard let call = record["call"] as? [String: Any], let tool = call["name"] as? String,
+                      let result = record["result"] as? String else { return nil }
+                return LiveNarrationPolicy.confirmation(tool: tool, result: result)
+            }
+            if !presentationOnly, !confirmations.isEmpty { return confirmations.joined(separator: " ") }
+            text = LiveNarrationPolicy.answer(text)
+        }
         if let coverage = lookup?.searchCoverage, Self.negativeSearchClaim(text) {
             if coverage["complete"] as? Bool == false {
                 return "The search was incomplete, so I can't rule out a match in the remaining mail."
@@ -693,7 +702,9 @@ final class LiveClientBrain {
         pendingPresentation = nil
         guard pending.turn == currentTurn else { return }
         input = [["type": "message", "role": "user", "content":
-            "Present this verified application result and its current queue item. The action already ran. "
+            (automaticNarration ? "Present this verified application result and its current queue item. "
+                : "Report only the verified application result briefly. Do not read or introduce any feed item. ")
+            + "The action already ran. "
             + "Only retrieve email content needed for the presentation; never write or advance again.\n" + pending.result]]
         delegation = pending.id
         liveDelegation = nil
