@@ -236,6 +236,18 @@ class DesktopWorkspaceModel: ViewModel {
     @Published var showingCommands = false
     @Published var feedActionError: String?
     @Published var requestedActionContext: FeedActionContext?
+    @Published var pendingFeedActions = Set<MailSelection>()
+    @Published var showingShortcutReference = false
+    @Published var showingActionMenu = false
+    var commandMenuContext: FeedActionContext?
+    var feedActionDisabledReason: String? {
+        if showingSettings || showingFeedback || showingCommands || showingHistory || showingActionMenu
+            || showingShortcutReference || exportingDiagnostics { return "Close the dialog to use feed actions." }
+        guard let context = feedActionContext else { return "Select an email in the feed first." }
+        if pendingFeedActions.contains(context.selection) { return "An action is running for this email. Follow its result in Activity." }
+        if selectingFeedItem { return "Wait for the selected email to appear." }
+        return nil
+    }
     var feedActionContext: FeedActionContext? { FeedActionContext(renderedState) }
     @Published var taskText = ""
     @Published var taskCorrection = ""

@@ -16,6 +16,7 @@ protocol DesktopWorkspaceHandler {
     func selectReturnedResult(_ id: UUID)
     func selectFeedItem(_ row: DesktopFeedRow)
     func performFeedAction(_ action: LiveFastAction, context: FeedActionContext)
+    func performFeedShortcut(_ action: LiveFastAction, context: FeedActionContext)
     func submitTask(_ text: String, commandID: String?, context: FeedActionContext)
     func retryEmailReader()
     func refreshFeed()
@@ -23,6 +24,7 @@ protocol DesktopWorkspaceHandler {
 
 @MainActor
 extension DesktopWorkspaceHandler {
+    func performFeedShortcut(_ action: LiveFastAction, context: FeedActionContext) { performFeedAction(action, context: context) }
     func setNarrationMode(_ mode: WorkSessionMode) { Container.shared.realtimeService().setNarrationMode(mode) }
     func controlBrowser(_ action: String, job: DispatchJob, model: DesktopWorkspaceModel) {
         guard !model.updatingTask else { return }
@@ -323,25 +325,41 @@ class DesktopWorkspaceInteractor: ViewModelInteractor<DesktopWorkspaceModel>, De
         }
     }
 
+    func performFeedShortcut(_ action: LiveFastAction, context: FeedActionContext) {
+        performFeedAction(action, context: context, inputSource: "keyboard")
+    }
+
     func performFeedAction(_ action: LiveFastAction, context: FeedActionContext) {
-        guard let model, let origin = model.taskOrigin(context) else { return }
+        performFeedAction(action, context: context, inputSource: "button")
+    }
+
+    private func performFeedAction(_ action: LiveFastAction, context: FeedActionContext, inputSource: String) {
+        guard let model else { return }
+        guard let origin = model.taskOrigin(context) else {
+            model.feedActionError = "The selected email changed. Select it again before taking this action."
+            return
+        }
         if let reason = tasks.refusal(owner: backend.userId, profile: context.profileID, origin: origin) {
             model.feedActionError = reason
             return
         }
         guard pendingActions.insert(context.selection).inserted else { return }
+        model.pendingFeedActions.insert(context.selection)
         if model.inSession { realtime.beginDesktopInteraction() }
         model.feedActionError = nil
         model.requestedActionContext = context
         let owner = backend.userId
         Task { [self, weak model] in
-            defer { pendingActions.remove(context.selection) }
+            defer {
+                pendingActions.remove(context.selection)
+                model?.pendingFeedActions.remove(context.selection)
+            }
             guard let model else { return }
             if action != .next {
                 let result = await tasks.perform(name: action.rawValue,
                     arguments: GmailReadTools.json(["account": origin.account, "message_id": origin.messageID]),
                     profile: context.profileID, origin: origin, conversationID: context.conversationID,
-                    diagnostics: realtime.actionDiagnostics(conversationID: context.conversationID), inputSource: "button")
+                    diagnostics: realtime.actionDiagnostics(conversationID: context.conversationID), inputSource: inputSource)
                 guard owner == backend.userId, context.profileID == ProfileRuntime.snapshot?.profileId else { return }
                 if let effects = result.effects {
                     _ = await mailQueue.applyConfirmedEffects(effects, store: Container.shared.mailStore())
