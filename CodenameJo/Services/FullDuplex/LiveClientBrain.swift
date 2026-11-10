@@ -31,6 +31,15 @@ final class LiveClientBrain {
         return calendar.source(for: call)
     }
 
+    func authorizesPreservedReply(_ callID: String, name: String) -> Bool {
+        guard ["send_email", "reply_email", "create_draft"].contains(ToolNarration.canonical(name)),
+              functionItems[callID] != nil, let composition = replyComposition,
+              composition.active, composition.targetConfirmed, composition.writeCall == callID,
+              let selected = DispatchJob.MailOrigin.captured(in: state) else { return false }
+        return selected.account.lowercased() == composition.source.account.lowercased()
+            && selected.threadID == composition.source.threadID && selected.messageID == composition.source.messageID
+    }
+
     private func persistCalendarIntent() {
         guard let intent = calendar.intent else { return }
         let store = Container.shared.dispatchJobs(), owner = Container.shared.backend().userId, profile = ProfileRuntime.snapshot?.profileId

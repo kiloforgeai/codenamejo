@@ -10,6 +10,8 @@ final class WriteConfirmationRegressionTests: XCTestCase {
         let adapter = LiveSessionAdapter(wire: { sent.append($0) }, emit: {
             if case .liveFunction(let call) = $0 { calls.append(call) }
         })
+        var selection = #"{"done":false,"item":{"id":"invitation-a","threadId":"thread-a","account":"owner@example.test"}}"#
+        adapter.clientBrainState = { (selection, "work") }
         defer { adapter.close() }
         func receive(_ event: [String: Any]) throws {
             adapter.receive(try JSONSerialization.data(withJSONObject: event))
@@ -43,6 +45,7 @@ final class WriteConfirmationRegressionTests: XCTestCase {
         try call("stale-archive", delegation: "interrupted-request", tool: "archive_message", message: "invitation-a")
         XCTAssertTrue(calls.isEmpty, "A clarification must supersede an uncommitted write")
         try await Task.sleep(for: .milliseconds(1100))
+        selection = #"{"done":false,"item":{"id":"booking-b","threadId":"thread-b","account":"owner@example.test"}}"#
         try receive(["type": "session.output_transcript.delta", "delta": "Archive booking B?",
                      "start_ms": 3000, "end_ms": 3300])
         try input("Correct, go ahead.", at: 5000)
