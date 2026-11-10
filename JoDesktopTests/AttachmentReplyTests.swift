@@ -57,6 +57,114 @@ final class AttachmentReplyTests: XCTestCase {
         try await super.tearDown()
     }
 
+    @MainActor private final class SessionFeedback: UserFeedback {
+        var session = UUID()
+        var notes: [String] = []
+        override func capture() -> Submission {
+            .init(userID: "attachment-user", context: .init(sessionID: session,
+                conversationID: session, profileID: "attachment-profile"))
+        }
+        override func save(_ message: String, source: FeedbackSource, submission: Submission) async throws -> UUID {
+            notes.append(message)
+            return submission.noteID ?? UUID()
+        }
+    }
+
+    func testExtendedFeedUseKeepsReplyExecutionAfterFeedbackAndRefusals() async throws {
+        for variant in ["none", "saved", "unfinished", "cancelled"] {
+            let feedback = SessionFeedback()
+            feedback.voiceSaveDelay = .milliseconds(5)
+            var offset = 0
+            var accepted: [String] = []
+            var wire: [[String: Any]] = []
+            var adapter: LiveSessionAdapter!
+            adapter = LiveSessionAdapter(wire: { wire.append($0) }, emit: { signal in
+                if case .liveInputFinished(let text) = signal {
+                    if feedback.voiceInput(text, turnID: "turn-\(offset)", reply: { _ in }, transition: { _ in }) {
+                        adapter.resolveLocalInput(applicationResult: "Handled as feedback", allowPresentation: false)
+                    } else if let action = LiveFastAction.parse(text) {
+                        let id = "voice-\(offset)"
+                        if adapter.beginFastAction(callId: id, action: action) { accepted.append(id) }
+                    }
+                }
+                if case .liveButtonAction(let id, _) = signal { accepted.append(id) }
+            })
+            defer { adapter.close() }
+            adapter.enableClientDelegation { _ in
+                XCTFail("Local actions must not need a model round trip")
+                return ["output": []]
+            }
+            func receive(_ event: [String: Any]) throws { adapter.receive(try JSONSerialization.data(withJSONObject: event)) }
+            func result(_ id: String, _ text: String) {
+                adapter.outbound(["type": "conversation.item.create", "item": [
+                    "type": "function_call_output", "call_id": id, "output": text]])
+            }
+            try receive(["type": "session.started"])
+            for event in wire where event["type"] as? String == "session.instructions.append" {
+                try receive(["type": "session.instructions.appended", "client_event_id": event["event_id"]!])
+            }
+            if variant != "none" {
+                XCTAssertTrue(feedback.voiceInput("Record feedback: workspace search did not start", turnID: "feedback",
+                    reply: { _ in }, transition: { _ in }))
+                if variant != "unfinished" {
+                    XCTAssertTrue(feedback.voiceInput(variant == "saved" ? "save it" : "cancel feedback", turnID: "finish",
+                        reply: { _ in }, transition: { _ in }))
+                }
+                try await Task.sleep(for: .milliseconds(40))
+            }
+            let before = await provider.requests.filter { $0.url?.path.hasSuffix("/messages/send") == true }.count
+            var replyCount = 0
+            for session in 0..<2 {
+                for index in 0..<30 {
+                    offset += 3000
+                    let action: LiveFastAction = index.isMultiple(of: 2) ? .archive : .next
+                    let id: String
+                    if index.isMultiple(of: 3) {
+                        id = "voice-\(offset)"
+                        try receive(["type": "session.input_transcript.delta", "delta": action.requestText,
+                            "start_ms": offset, "end_ms": offset + 100])
+                        for _ in 0..<150 where !accepted.contains(id) { try await Task.sleep(for: .milliseconds(5)) }
+                    } else {
+                        id = "click-\(offset)"
+                        XCTAssertTrue(adapter.beginButtonAction(callId: id, action: action))
+                    }
+                    XCTAssertEqual(accepted.filter { $0 == id }.count, 1)
+                    XCTAssertFalse(adapter.beginButtonAction(callId: "duplicate-\(offset)", action: action))
+                    try await Task.sleep(for: .milliseconds(2))
+                    result(id, "The application is presenting the action result.")
+                    if index % 10 == 9 {
+                        let request = "Reply to this email: thanks, received"
+                        XCTAssertFalse(feedback.voiceInput(request, turnID: "reply-\(offset)", reply: { _ in }, transition: { _ in }))
+                        let call = "\(variant)-\(session)-\(index)"
+                        let reply = await LocalCompose.run(name: "send_email", argumentsJSON: #"{"body":"Thanks, received."}"#,
+                            defer: false, conversationId: feedback.session.uuidString, callID: call, replySource: selectedReply())
+                        XCTAssertEqual(reply.ok, true, reply.text)
+                        replyCount += 1
+                        let duplicate = await LocalCompose.run(name: "send_email", argumentsJSON: #"{"body":"Thanks, received."}"#,
+                            defer: false, conversationId: feedback.session.uuidString, callID: call, replySource: selectedReply())
+                        XCTAssertEqual(duplicate.ok, true)
+                    }
+                }
+                // A locally refused background attempt must not hold subsequent replies.
+                XCTAssertNotNil(LiveRequestRecovery.dispatchRefusal("[sniffing]"))
+                XCTAssertFalse(feedback.voiceInput("Reply: thank you", turnID: "after-refusal-\(session)", reply: { _ in }, transition: { _ in }))
+                let recovered = await LocalCompose.run(name: "send_email", argumentsJSON: #"{"body":"Thank you."}"#,
+                    defer: false, conversationId: feedback.session.uuidString, callID: "\(variant)-recovered-\(session)", replySource: selectedReply())
+                XCTAssertEqual(recovered.ok, true, recovered.text)
+                replyCount += 1
+                feedback.suspendVoiceCapture(endingSession: true)
+                feedback.session = UUID()
+            }
+            let after = await provider.requests.filter { $0.url?.path.hasSuffix("/messages/send") == true }.count
+            XCTAssertEqual(after - before, replyCount, "One provider send per authorized request; no replay")
+            XCTAssertEqual(accepted.count, 60)
+            XCTAssertTrue(feedback.notes.allSatisfy { $0 == "workspace search did not start" })
+            let receipts = await actions()
+            XCTAssertTrue(receipts.filter { $0.mailAction?.requestKey?.contains(variant) == true }
+                .allSatisfy { $0.mailAction?.state == .sent && $0.origin?.messageID == "reply-mail" })
+        }
+    }
+
     private var refs: [[String: String]] { [["account": "source@example.test", "message_id": "source-mail",
         "filename": "deck.pptx", "attachment_id": "deck-bytes"]] }
     private func compose(_ files: [[String: String]]? = nil, name: String = "send_email") async -> FullDuplexBroker.ToolResult {
