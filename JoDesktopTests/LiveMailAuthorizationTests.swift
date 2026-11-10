@@ -68,6 +68,19 @@ final class LiveMailAuthorizationTests: XCTestCase {
         XCTAssertEqual(h.calls.map(\.name), ["list_calendar_events"])
     }
 
+    func testNonverbalAndUnfinishedInputCannotReuseAnEarlierArchive() async throws {
+        for text in ["[sniffing]", "[breathing]", "Please reply to", "Uh"] {
+            let h = Harness(); defer { h.adapter.close() }
+            try await h.start(text, afterButton: true)
+            h.adapter.silentInputRecoveryDelay = 0.01
+            try await Task.sleep(for: .milliseconds(80))
+            for (index, tool) in ["archive_message", "trash_message", "send_email", "triage_next"].enumerated() {
+                try h.call(tool, id: "delayed-\(index)")
+            }
+            XCTAssertTrue(h.calls.isEmpty, "Incidental or incomplete input must not reach the executor: \(text)")
+        }
+    }
+
     func testExplicitCombinedRequestAllowsReadAndExactlyOneArchive() async throws {
         let h = Harness(); defer { h.adapter.close() }
         try await h.start("Check availability, then archive this email")
