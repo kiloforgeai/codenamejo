@@ -4,6 +4,7 @@ import SwiftUI
 import UIKit
 
 struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWorkspaceModel> & DesktopWorkspaceHandler>: View {
+    @StateObject private var keyboardWindow = DesktopKeyboardWindow()
     @StateObject var viewModel: DesktopWorkspaceModel
     @StateObject var interactor: Interactor
     @ObservedObject private var localSpeech = Container.shared.localSpeech()
@@ -52,6 +53,10 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
         .background(DesktopWorkspaceStyle.canvas)
         .background(DesktopRenderProbe(state: viewModel.renderedState, applied: interactor.rendered)
             .allowsHitTesting(false).accessibilityHidden(true))
+        .background(DesktopKeyboardWindowProbe { window in
+            keyboardWindow.value = window
+        }.allowsHitTesting(false).accessibilityHidden(true))
+        .focusedSceneValue(\.desktopFeedCommands, keyboardCommands)
         .tint(DesktopWorkspaceStyle.accent)
         .bind(observer: interactor, viewModel: viewModel)
         .fileExporter(isPresented: $viewModel.exportingDiagnostics,
@@ -65,6 +70,8 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
             Button("OK") { viewModel.diagnosticsError = nil }
         } message: { Text(viewModel.diagnosticsError ?? "") }
         .sheet(isPresented: $viewModel.showingFeedback) { feedbackSheet }
+        .sheet(isPresented: $viewModel.showingShortcutReference) { shortcutReference }
+        .sheet(isPresented: $viewModel.showingActionMenu) { actionMenu }
         .sheet(isPresented: $viewModel.showingCommands) {
             NavigationStack {
                 CustomCommandsComponent.make()
@@ -99,6 +106,78 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
         } message: {
             Text("Allow Jo Desktop to use your microphone in System Settings, then start a session.")
         }
+    }
+
+    private var keyboardCommands: DesktopFeedCommandContext {
+        let context = viewModel.feedActionContext
+        return .init(disabledReason: viewModel.feedActionDisabledReason, action: { action in
+            guard DesktopKeyboardFocus.allowsFeedAction(in: keyboardWindow.value), viewModel.feedActionDisabledReason == nil,
+                  let context else { return }
+            interactor.performFeedShortcut(action, context: context)
+        }, focusFeed: {
+            guard !keyboardDialogOpen else { return }
+            keyboardWindow.value?.endEditing(true)
+        }, refresh: {
+            guard DesktopKeyboardFocus.allowsFeedAction(in: keyboardWindow.value), !keyboardDialogOpen else { return }
+            interactor.refreshFeed()
+        }, showCommands: {
+            guard DesktopKeyboardFocus.allowsFeedAction(in: keyboardWindow.value), !keyboardDialogOpen else { return }
+            viewModel.commandMenuContext = context
+            viewModel.showingActionMenu = true
+        }, showReference: {
+            guard !keyboardDialogOpen else { return }
+            viewModel.showingShortcutReference = true
+        })
+    }
+
+    private var keyboardDialogOpen: Bool {
+        viewModel.showingSettings || viewModel.showingFeedback || viewModel.showingCommands || viewModel.showingHistory
+            || viewModel.showingActionMenu || viewModel.showingShortcutReference || viewModel.exportingDiagnostics
+    }
+
+    private var shortcutReference: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Keyboard shortcuts").font(.title2.weight(.semibold))
+            Grid(alignment: .leading, horizontalSpacing: 32, verticalSpacing: 14) {
+                GridRow { Text("Focus work feed"); Text("Esc").monospaced() }
+                GridRow { Text("Archive selected email"); Text("⌃⌘A").monospaced() }
+                GridRow { Text("Next · leave unread"); Text("⌃⌘→").monospaced() }
+                GridRow { Text("Actions and commands"); Text("⌃⌘K").monospaced() }
+                GridRow { Text("Refresh feed"); Text("⌃⌘R").monospaced() }
+            }
+            Text("Feed shortcuts work in the active workspace. They pause while you type, use a browser, or have a dialog open. Press Escape to leave a text field. Select an email before taking an action. Holding a key does not repeat it.")
+                .font(.callout).foregroundStyle(.secondary)
+            HStack { Spacer(); Button("Done") { viewModel.showingShortcutReference = false }.keyboardShortcut(.cancelAction) }
+        }.padding(28).frame(width: 520)
+    }
+
+    private var actionMenu: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("Actions and commands").font(.title2.weight(.semibold))
+                Spacer()
+                Button("Done") { viewModel.showingActionMenu = false }.keyboardShortcut(.cancelAction)
+            }
+            if let context = viewModel.commandMenuContext {
+                ForEach([LiveFastAction.archive, .next], id: \.rawValue) { action in
+                    Button(action.title, systemImage: action.symbol) {
+                        viewModel.showingActionMenu = false
+                        interactor.performFeedAction(action, context: context)
+                    }.buttonRepeatBehavior(.disabled)
+                }
+                Divider()
+                ForEach(commands.commands.filter(\.enabled)) { command in
+                    Button(command.title) {
+                        viewModel.showingActionMenu = false
+                        interactor.submitTask(command.title, commandID: command.id, context: context)
+                    }
+                }
+            } else { Text("Select an email to run an action.").foregroundStyle(.secondary) }
+            Button("Edit saved commands…") {
+                viewModel.showingActionMenu = false
+                DispatchQueue.main.async { viewModel.showingCommands = true }
+            }
+        }.padding(28).frame(width: 520)
     }
 
     private var header: some View {
@@ -138,6 +217,8 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                     viewModel.showingActivity.toggle()
                 }.accessibilityIdentifier("toggleDesktopActivity")
             }
+            DesktopToolbarButton(title: "Keyboard shortcuts", symbol: "keyboard") { viewModel.showingShortcutReference = true }
+                .accessibilityIdentifier("desktopKeyboardShortcuts")
             DesktopToolbarButton(title: "Leave feedback", symbol: "bubble.left.and.text.bubble.right", action: interactor.showFeedback)
                 .accessibilityIdentifier("desktopFeedback")
             DesktopToolbarButton(title: "Settings and connections", symbol: "gearshape", active: viewModel.showingSettings) {
@@ -208,7 +289,7 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                     additionalFeedActions(context)
                 }
             }
-            .disabled(context == nil)
+            .disabled(viewModel.feedActionDisabledReason != nil)
             HStack {
                 TextField("Ask Jo to work on this email…", text: $viewModel.taskText)
                     .textFieldStyle(.roundedBorder).accessibilityIdentifier("desktopTaskRequest")
@@ -238,7 +319,8 @@ struct DesktopWorkspaceView<Interactor: ViewWithModelLifecycleObserver<DesktopWo
                     Label(action == .spam ? "Mark as spam" : action.title, systemImage: action.symbol)
                         .padding(.vertical, 5)
                 }
-                .buttonStyle(.bordered).help(action.explanation).fixedSize()
+                .buttonStyle(.bordered).buttonRepeatBehavior(.disabled)
+                .help(viewModel.feedActionDisabledReason ?? (action.explanation + (action == .archive ? " ⌃⌘A" : action == .next ? " ⌃⌘→" : ""))).fixedSize()
                 .padding(.leading, action == .spam ? 8 : 0)
                 .accessibilityIdentifier("feedAction-\(action.rawValue)")
             }

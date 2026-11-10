@@ -1488,6 +1488,50 @@ final class ApplicationTasksTests: XCTestCase {
         XCTAssertNil(model.selectedJob)
     }
 
+    func testKeyboardActionsAcceptImmediatelyDeduplicateAndRetainSourceDuringFailure() async throws {
+        let tasks = ApplicationTasks(request: { _ in XCTFail("Keyboard actions need no model round trip"); return [] })
+        Container.shared.applicationTasks.register { tasks }
+        let realtime = RealtimeService()
+        Container.shared.realtimeService.register { realtime }
+        let model = DesktopWorkspaceModel()
+        let interactor = DesktopWorkspaceInteractor(hasMicrophone: { false })
+        let subscriptions = interactor.onLoad(viewModel: model)
+        subscriptions.forEach { $0.cancel() }
+        for _ in 0..<30 { await Task.yield() }
+        model.scopeHydrating = false
+        model.startingFeedRows = nil
+        let rows = ["A", "B", "C"].map { DesktopFeedRow.email(account: "one@example.test", messageID: $0, subject: $0, sender: "Sender") }
+        model.feedPreview = .init(mail: .init(rows: rows, count: 3), slack: .init())
+        model.previewSelection = rows[0]
+        let a = try XCTUnwrap(model.feedActionContext)
+        await provider.pauseWrites()
+        let acceptedAt = Date()
+        interactor.performFeedShortcut(.archive, context: a)
+        XCTAssertTrue(model.pendingFeedActions.contains(a.selection))
+        XCTAssertEqual(model.requestedActionContext, a)
+        XCTAssertLessThan(Date().timeIntervalSince(acceptedAt), 0.1, "Visual acceptance is synchronous, before the provider runs")
+        interactor.performFeedAction(.archive, context: a)
+        interactor.performFeedShortcut(.next, context: a)
+        for _ in 0..<200 where !(await provider.isWaiting()) { try await Task.sleep(for: .milliseconds(5)) }
+        let waiting = await provider.isWaiting()
+        XCTAssertTrue(waiting)
+        model.feedPreview = .init(mail: .init(rows: Array(rows.dropFirst()), count: 2), slack: .init())
+        model.previewSelection = rows[1]
+        let b = try XCTUnwrap(model.feedActionContext)
+        interactor.performFeedShortcut(.next, context: b)
+        await waitFor { model.previewSelection?.selection?.messageID == "C" }
+        XCTAssertEqual(model.previewSelection?.selection?.messageID, "C")
+        await provider.releaseWrite()
+        await waitFor { model.pendingFeedActions.isEmpty }
+        let writes = await provider.writes()
+        XCTAssertEqual(writes, ["A"], "A held shortcut or alternating action must not create a second provider mutation")
+        XCTAssertNotNil(model.feedActionError, "An uncertain provider outcome must remain visible")
+        XCTAssertEqual(model.previewSelection?.selection?.messageID, "C", "A late result cannot advance the replacement email")
+        let history = await store.history()
+        let receipt = try XCTUnwrap(history.first { $0.origin?.messageID == "A" })
+        XCTAssertEqual(receipt.origin?.account, "one@example.test")
+    }
+
     func testDesktopSelectionAuthorizesActionsWithoutInventingAConversation() throws {
         let model = DesktopWorkspaceModel()
         let a = DesktopFeedRow.email(account: "one@example.test", messageID: "A", subject: "Same", sender: "Same")

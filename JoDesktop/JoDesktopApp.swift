@@ -39,6 +39,7 @@ struct JoDesktopApp: App {
             #endif
         }
         .commands {
+            DesktopFeedCommands()
             #if !JO_QA
             CommandGroup(after: .appInfo) {
                 Button("Start work session") {
