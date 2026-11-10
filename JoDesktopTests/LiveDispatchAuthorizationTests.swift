@@ -62,6 +62,21 @@ final class LiveDispatchAuthorizationTests: XCTestCase {
         }
     }
 
+    func testFilingAndReadOnlySearchRemainAuthorizedAcrossSessionRestart() async throws {
+        for _ in 0..<2 {
+            for request in ["File this email in the Example Workspace project notes page.",
+                            "Search Example Workspace for Project notes. Only find it; do not change anything."] {
+                let h = Harness()
+                try await h.start(request, desktop: true)
+                try h.call()
+                XCTAssertEqual(h.grants.compactMap { $0 }, [request])
+                h.result()
+                XCTAssertNil(h.adapter.dispatchRequest(for: "call-1"))
+                h.adapter.close()
+            }
+        }
+    }
+
     func testNewInputDesktopDismissalScopeChangeAndCloseInvalidatePendingGrant() async throws {
         for transition in ["input", "desktop", "scope", "close"] {
             let h = Harness(); defer { h.adapter.close() }
