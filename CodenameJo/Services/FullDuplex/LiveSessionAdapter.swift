@@ -165,6 +165,39 @@ final class LiveSessionAdapter {
         finalizedInput && !closed && !desktopQuiet && inputTurn > desktopDismissedThroughTurn
             && LiveRequestRecovery.dispatchRefusal(authorizationText) == nil
     }
+    private struct DispatchAuthorization {
+        let callID: String
+        let turn: Int
+        let request: String
+        let profile: String?
+        let scope: String?
+    }
+    private var dispatchAuthorization: DispatchAuthorization?
+    private var dispatchResponseRequests: [String: DispatchAuthorization] = [:]
+    private var dispatchCallRequests: [String: DispatchAuthorization] = [:]
+
+    func dispatchRequest(for callID: String) -> String? {
+        guard let grant = dispatchAuthorization, grant.callID == callID, grant.turn == inputTurn,
+              activeCall?.id == callID || activeFastCall?.id == callID,
+              finalizedInput, grant.request == inputText, !closed, !desktopQuiet, inputTurn > desktopDismissedThroughTurn,
+              grant.profile == ProfileRuntime.snapshot?.profileId,
+              grant.scope == clientBrainState?().scope,
+              !LiveRequestRecovery.isFeedback(grant.request),
+              LiveRequestRecovery.dispatchRefusal(grant.request) == nil else { return nil }
+        return grant.request
+    }
+
+    private func captureDispatchAuthorization(callID: String) {
+        let original = dispatchCallRequests[callID]
+        if let original {
+            dispatchAuthorization = DispatchAuthorization(callID: callID, turn: original.turn,
+                request: original.request, profile: original.profile, scope: original.scope)
+        } else {
+            dispatchAuthorization = DispatchAuthorization(callID: callID, turn: inputTurn,
+                request: inputText, profile: ProfileRuntime.snapshot?.profileId, scope: clientBrainState?().scope)
+        }
+    }
+
     private var sourceInquiryTurn: Int?
     private var questionTurn: Int?
     private var speechAfterInput = ""
@@ -596,6 +629,7 @@ final class LiveSessionAdapter {
         delegationTurns[delegation] = inputTurn
         activeFastCall = (callId, inputTurn, delegation)
         trace("fast_started", call: callId, delegation: delegation)
+        if routed, action == nil { captureDispatchAuthorization(callID: callId) }
         authorizationText = ""
         turnsWithTools.insert(inputTurn)
         turnsWithQueueActions.insert(inputTurn)
@@ -1096,6 +1130,9 @@ final class LiveSessionAdapter {
                 if responseDelegations[responseID] == nil {
                     responseDelegations[responseID] = continuationDelegation
                 }
+                let turn = responseDelegations[responseID].flatMap { delegationTurns[$0] } ?? inputTurn
+                dispatchResponseRequests[responseID] = DispatchAuthorization(callID: "", turn: turn,
+                    request: inputText, profile: ProfileRuntime.snapshot?.profileId, scope: clientBrainState?().scope)
                 backendStarting = false
                 runningResponses.insert(responseID)
                 trace("backend_started", call: responseID)
@@ -1120,6 +1157,9 @@ final class LiveSessionAdapter {
                let delegation = event["delegation_id"] as? String ?? responseID.flatMap({ responseDelegations[$0] }),
                seenCalls.insert(id).inserted {
                 clientBrain?.acceptToolCall(id)
+                if let outputResponseID, let request = dispatchResponseRequests[outputResponseID] {
+                    dispatchCallRequests[id] = request
+                }
                 calls.append(Call(id: id, name: name, arguments: arguments, delegation: delegation,
                                   recoveryAnchor: delegationTurns[delegation].flatMap { recoveryAnchors[$0] }))
                 if let outputResponseID { responseStepTools[outputResponseID, default: []].append(name) }
@@ -1490,7 +1530,10 @@ final class LiveSessionAdapter {
             turnsWithQueueActions.insert(turn)
             if turn == inputTurn { stopQueueActionRecovery() }
         }
-        if delegationTurns[call.delegation] == inputTurn { authorizationText = "" }
+        if delegationTurns[call.delegation] == inputTurn {
+            if ["dispatch", "dispatch_command"].contains(call.name) { captureDispatchAuthorization(callID: call.id) }
+            authorizationText = ""
+        }
         trace("tool_started", call: call.id, delegation: call.delegation)
         toolStartedAt[call.id] = ProcessInfo.processInfo.systemUptime
         var fields = ["call_id": call.id, "tool": call.name, "delegation_id": call.delegation,
